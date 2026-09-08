@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log"
 	"sync"
 
 	"github.com/oklog/ulid/v2"
@@ -40,10 +41,13 @@ func (cn *conn) send(msg any) {
 }
 
 // notify enqueues a server-to-client notification (a request with no id). A marshal failure
-// is dropped rather than returned: every params type this plan sends is known to marshal.
+// is logged and the notification dropped rather than returned: every params type this plan
+// sends is known to marshal, so this should never fire, but silently losing a notification the
+// client is waiting on (a permission question, a state change) is worse than a stderr line.
 func (cn *conn) notify(method string, params any) {
 	req, err := protocol.NewNotification(method, params)
 	if err != nil {
+		log.Printf("server: conn %d: marshal %s notification: %v", cn.id, method, err)
 		return
 	}
 	cn.send(req)

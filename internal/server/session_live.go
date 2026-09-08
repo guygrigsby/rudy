@@ -21,27 +21,50 @@ var errNoAsker = errors.New("server: no asker attached")
 // liveSession is one open session: the real, single-owner *session.Session plus everything
 // the server tracks about it while it is live.
 //
-// session.Session carries no lock of its own; only one goroutine may touch it at a time. While
-// a turn is running, that goroutine belongs to the turn.Runner the session was handed to in
-// Config.Session, and the server must not call any *session.Session method concurrently with
-// it. So every read the server needs while a turn might be active (replaying entries to a
-// resuming connection, answering what session.set_model/set_mode/set_thinking/set_title need
-// to know about the session's current title, model, mode, thinking and workspace) is served
-// from entries, a mirror kept in step with the real log instead: seeded once from
-// sess.Entries() at construction, before the liveSession is visible to anyone else, and from
-// then on appended to only inside the fanout Observer (while a turn owns sess) or inside
-// appendAndBroadcastLocked (when the server appends directly, which it only does once it has
-// confirmed under mu that no turn is active). Every access to entries, conns, pending, runner
-// and closed goes through mu.
+// It carries two locks with a strict, never-reversed nesting order (mu outer, obsMu inner,
+// each also independently self-locking) chosen specifically to avoid an AB-BA deadlock against
+// turn.Runner's own mutex:
+//
+//   - mu guards sess, model, runner, pending and closed: the fields that decide whether a turn
+//     may start and that only the server ever mutates (never the running turn itself). Nothing
+//     that holds mu may call any turn.Runner method (State, TurnID, Interrupt, Run): the
+//     runner calls its Observer's methods while holding its own mutex, and if a handler here
+//     held mu while blocking on a Runner call, a concurrent Observer callback wanting mu (or
+//     obsMu, see below) would deadlock against it. A handler that needs "is a turn active"
+//     reads the mirror in obsMu instead of asking the runner directly.
+//
+//   - obsMu guards entries (the log mirror), conns (subscribers) and state/turnID (a mirror of
+//     the runner's State/TurnID, updated from the Observer callbacks). It is the ONLY lock a
+//     turn.Observer callback (fanout's EntryAppended/Delta/StateChanged) may take, together
+//     with each connection's own outbox lock (conn.mu, unrelated to either lock here): those
+//     callbacks run while the turn.Runner holds its own mutex, so taking mu, or calling any
+//     Runner method, from inside one would risk the same deadlock mu's own rule guards
+//     against. Every read of the runner's current state or turn id anywhere in this package,
+//     even from a handler that also holds mu, goes through this mirror instead of the runner,
+//     except where no liveSession lock is held at all (session.interrupt, and the two lines in
+//     startTurn and runTurn noted there) - calling the runner directly is fine, and fresher,
+//     when neither lock is held.
+//
+// Because the mirror is only ever updated by the Observer callback for the state or entry that
+// already happened, a handler's active-turn check can observe it one callback late: between
+// the runner appending its first entry (which unblocks startTurn's caller, see
+// firstAppendSignal) and that first StateChanged callback landing, a concurrent handler could
+// still see the pre-turn mirrored state. This is a deliberately accepted, narrow lag rather
+// than something eliminated by holding a lock across both changes; it exists because closing
+// it would mean re-introducing exactly the AB-BA risk mu's own doc above rules out.
 type liveSession struct {
 	mu      sync.Mutex
 	sess    *session.Session
 	model   provider.Model
-	entries []session.Entry
 	runner  *turn.Runner
-	conns   []*conn
 	pending map[string]chan turn.Answer
 	closed  bool // sess has been closed and removed from Server.live; never touch sess again
+
+	obsMu   sync.Mutex
+	entries []session.Entry
+	conns   []*conn
+	state   turn.State
+	turnID  string
 }
 
 // newLive wraps a freshly opened, loaded or forked session. It must be called before the
@@ -56,9 +79,20 @@ func newLive(sess *session.Session, m provider.Model) *liveSession {
 	}
 }
 
-// firstAskerLocked is the connection a turn's permission questions route to: the first
-// subscriber whose hello declared asker, or nil when none has. Caller holds mu.
-func (ls *liveSession) firstAskerLocked() *conn {
+// mirroredState returns the runner's last-observed state and turn id. Self-locking (takes
+// obsMu); safe to call whether or not the caller already holds mu (obsMu nests inside mu, never
+// the reverse - see the liveSession doc).
+func (ls *liveSession) mirroredState() (turn.State, string) {
+	ls.obsMu.Lock()
+	defer ls.obsMu.Unlock()
+	return ls.state, ls.turnID
+}
+
+// firstAsker is the connection a turn's permission questions route to: the first subscriber
+// whose hello declared asker, or nil when none has. Self-locking (takes obsMu).
+func (ls *liveSession) firstAsker() *conn {
+	ls.obsMu.Lock()
+	defer ls.obsMu.Unlock()
 	for _, c := range ls.conns {
 		if c.asker {
 			return c
@@ -67,19 +101,18 @@ func (ls *liveSession) firstAskerLocked() *conn {
 	return nil
 }
 
-// broadcastLocked sends one notification to every current subscriber. Caller holds mu.
-// conn.notify never blocks (it only enqueues), so this is safe to call from inside the
-// turn.Runner's Observer callbacks, which run under the runner's own mutex and must never
-// block or call back into the runner.
-func (ls *liveSession) broadcastLocked(method string, params any) {
-	for _, c := range ls.conns {
-		c.notify(method, params)
-	}
+// snapshotEntries returns a copy of the entries mirror. Self-locking (takes obsMu).
+func (ls *liveSession) snapshotEntries() []session.Entry {
+	ls.obsMu.Lock()
+	defer ls.obsMu.Unlock()
+	return append([]session.Entry(nil), ls.entries...)
 }
 
-// latestEntryIDLocked is the id of the newest mirrored entry of any of the given kinds, or ""
-// when none matches. Caller holds mu.
-func (ls *liveSession) latestEntryIDLocked(kinds ...session.Kind) string {
+// latestEntryID is the id of the newest mirrored entry of any of the given kinds, or "" when
+// none matches. Self-locking (takes obsMu).
+func (ls *liveSession) latestEntryID(kinds ...session.Kind) string {
+	ls.obsMu.Lock()
+	defer ls.obsMu.Unlock()
 	for _, e := range slices.Backward(ls.entries) {
 		if slices.Contains(kinds, e.Kind) {
 			return e.ID.String()
@@ -88,17 +121,49 @@ func (ls *liveSession) latestEntryIDLocked(kinds ...session.Kind) string {
 	return ""
 }
 
+// broadcastObsLocked sends one notification to every current subscriber. Caller holds obsMu.
+// conn.notify never blocks (it only enqueues), so this is safe to call from inside the
+// turn.Runner's Observer callbacks, which run under the runner's own mutex and must never
+// block or call back into the runner or take any lock but obsMu and a conn's own mu.
+func (ls *liveSession) broadcastObsLocked(method string, params any) {
+	for _, c := range ls.conns {
+		c.notify(method, params)
+	}
+}
+
+// subscribeLocked registers cn as a subscriber and returns a snapshot of entries to replay
+// plus the info to reply with. Caller holds mu (from installAndAttach or attachIfLive, both of
+// which hold Server.mu across the whole lookup-then-subscribe, which is what keeps this from
+// ever racing detach's decide-and-remove into subscribing to a session that is concurrently
+// being closed - see detach).
+func (ls *liveSession) subscribeLocked(cn *conn) ([]session.Entry, protocol.SessionInfo) {
+	ls.obsMu.Lock()
+	ls.conns = append(ls.conns, cn)
+	entries := append([]session.Entry(nil), ls.entries...)
+	info := deriveInfo(ls.sess.ID(), ls.entries)
+	ls.obsMu.Unlock()
+
+	cn.mu.Lock()
+	cn.subs[ls.sess.ID()] = ls
+	cn.mu.Unlock()
+
+	return entries, info
+}
+
 // appendAndBroadcastLocked appends an entry the server produces directly. The caller must
 // already have confirmed, under mu, that no turn is active: this is the one place outside a
-// turn that touches sess, and it is only safe because of that. It keeps the mirror in step and
-// broadcasts the new entry. Caller holds mu.
+// turn that calls sess.Append. Caller holds mu; this takes obsMu itself to keep the entries
+// mirror and conns list in step, consistent with the mu-outer, obsMu-inner order everywhere
+// else.
 func (ls *liveSession) appendAndBroadcastLocked(p session.Payload) (session.Entry, error) {
 	e, err := ls.sess.Append(p)
 	if err != nil {
 		return session.Entry{}, err
 	}
+	ls.obsMu.Lock()
 	ls.entries = append(ls.entries, e)
-	ls.broadcastLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e})
+	ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e})
+	ls.obsMu.Unlock()
 	return e, nil
 }
 
@@ -152,33 +217,35 @@ func isActive(s turn.State) bool {
 	return false
 }
 
-// fanout is the turn.Observer wired into every turn: it keeps a liveSession's entries mirror
-// in step with the session's real log and forwards every runner event to its subscribers. Its
-// methods run while the Runner holds its own mutex (see turn.Runner.EntryAppended and
-// StateChanged), so they must never block and must never call back into the runner; they only
-// take ls.mu and enqueue onto each connection's own outbox.
+// fanout is the turn.Observer wired into every turn: it keeps a liveSession's entries and
+// state mirrors in step with the runner and forwards every event to its subscribers. Its
+// methods run while the Runner holds its own mutex (see turn.Runner.EntryAppended,
+// StateChanged), so per the liveSession doc they take only obsMu, never mu, and never call
+// back into the runner.
 type fanout struct {
 	ls  *liveSession
 	sid string
 }
 
 func (f *fanout) EntryAppended(e session.Entry) {
-	f.ls.mu.Lock()
+	f.ls.obsMu.Lock()
 	f.ls.entries = append(f.ls.entries, e)
-	f.ls.broadcastLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: f.sid, Entry: e})
-	f.ls.mu.Unlock()
+	f.ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: f.sid, Entry: e})
+	f.ls.obsMu.Unlock()
 }
 
 func (f *fanout) Delta(turnID string, p provider.Part) {
-	f.ls.mu.Lock()
-	f.ls.broadcastLocked(protocol.NotifyStreamDelta, protocol.StreamDelta{SessionID: f.sid, TurnID: turnID, Part: p})
-	f.ls.mu.Unlock()
+	f.ls.obsMu.Lock()
+	f.ls.broadcastObsLocked(protocol.NotifyStreamDelta, protocol.StreamDelta{SessionID: f.sid, TurnID: turnID, Part: p})
+	f.ls.obsMu.Unlock()
 }
 
 func (f *fanout) StateChanged(turnID string, s turn.State) {
-	f.ls.mu.Lock()
-	f.ls.broadcastLocked(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: f.sid, TurnID: turnID, State: string(s)})
-	f.ls.mu.Unlock()
+	f.ls.obsMu.Lock()
+	f.ls.state = s
+	f.ls.turnID = turnID
+	f.ls.broadcastObsLocked(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: f.sid, TurnID: turnID, State: string(s)})
+	f.ls.obsMu.Unlock()
 }
 
 // firstAppendSignal wraps an Observer so the first EntryAppended call also sends the entry,
@@ -186,7 +253,9 @@ func (f *fanout) StateChanged(turnID string, s turn.State) {
 // first action, synchronously and before any provider call (see turn.Runner.Run), so this is
 // how startTurn learns a fresh turn's id, the id of that entry, without waiting for the turn
 // itself, which can run for as long as the provider and any tool calls take. started is
-// buffered by one so the send here never blocks on nobody reading it yet.
+// buffered by one so the send here never blocks on nobody reading it yet. This is deliberately
+// separate from the state mirror above (which StateChanged keeps current): it exists only to
+// answer the one RPC call that started this turn, synchronously, with the id that call needs.
 type firstAppendSignal struct {
 	turn.Observer
 	once    sync.Once
@@ -207,17 +276,19 @@ type liveAsker struct {
 	runner *turn.Runner
 }
 
+// Ask runs on the turn.Runner's own goroutine, between steps, with no turn.Runner or
+// liveSession lock held (see turn.Runner.runTool): calling a.runner.TurnID() here is safe and
+// gives the freshest value, unlike a handler that already holds mu or obsMu, which must use
+// the mirror instead.
 func (a *liveAsker) Ask(ctx context.Context, q turn.Question) (turn.Answer, error) {
-	ch := make(chan turn.Answer, 1)
-	a.ls.mu.Lock()
-	first := a.ls.firstAskerLocked()
-	if first != nil {
-		a.ls.pending[q.ToolUseID] = ch
-	}
-	a.ls.mu.Unlock()
+	first := a.ls.firstAsker()
 	if first == nil {
 		return turn.Answer{}, errNoAsker
 	}
+	ch := make(chan turn.Answer, 1)
+	a.ls.mu.Lock()
+	a.ls.pending[q.ToolUseID] = ch
+	a.ls.mu.Unlock()
 	first.notify(protocol.NotifyPermissionRequested, protocol.PermissionRequested{
 		SessionID: a.sid, TurnID: a.runner.TurnID(), ToolUseID: q.ToolUseID, Tool: q.Tool, Input: q.Input, Matcher: q.Matcher,
 	})

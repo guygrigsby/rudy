@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -510,4 +511,316 @@ func errorsAs(err error, target **protocol.Error) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// longTurnProvider answers with a safe tool call for its first toolCalls completions, then
+// ends the turn. It never blocks: the point of TestLongTurnConcurrentMutationNoDeadlock is to
+// hammer the session with concurrent mutation RPCs while a real turn is genuinely in flight and
+// its Observer callbacks are genuinely firing, not to synchronize on a channel.
+type longTurnProvider struct {
+	mu        sync.Mutex
+	calls     int
+	toolCalls int
+}
+
+func (p *longTurnProvider) Name() string { return "long" }
+
+func (p *longTurnProvider) ListModels(ctx context.Context) ([]provider.Model, error) {
+	return []provider.Model{{
+		Ref:           session.ModelRef{Provider: "long", Model: "m1"},
+		DisplayName:   "Long 1",
+		ContextWindow: 100000,
+		Capabilities:  provider.Capabilities{Tools: true},
+	}}, nil
+}
+
+func (p *longTurnProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
+	p.mu.Lock()
+	p.calls++
+	n := p.calls
+	p.mu.Unlock()
+	var parts []provider.Part
+	if n <= p.toolCalls {
+		id := fmt.Sprintf("tu%d", n)
+		parts = []provider.Part{
+			{Type: provider.PartTextDelta, Text: "step"},
+			{Type: provider.PartToolUseStart, ID: id, Name: "safe"},
+			{Type: provider.PartToolUseDelta, ID: id, Text: `{}`},
+			{Type: provider.PartToolUseEnd, ID: id},
+			{Type: provider.PartUsage, Usage: session.Usage{Input: 1, Output: 1}},
+			{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
+		}
+	} else {
+		parts = []provider.Part{
+			{Type: provider.PartTextDelta, Text: "done"},
+			{Type: provider.PartUsage, Usage: session.Usage{Input: 1, Output: 1}},
+			{Type: provider.PartStop, StopReason: session.StopEndTurn, StopReasonRaw: "stop"},
+		}
+	}
+	for _, part := range parts {
+		if err := emit(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type longTurnPlugin struct {
+	prov      *longTurnProvider
+	toolCalls int32
+}
+
+func (f *longTurnPlugin) Name() string { return "long" }
+
+func (f *longTurnPlugin) Init(ctx context.Context, h plugin.Host) error {
+	if err := h.RegisterProvider(f.prov); err != nil {
+		return err
+	}
+	return h.RegisterTool(tool.Tool{
+		Name:        "safe",
+		Description: "a safe fake tool that always runs without asking",
+		Schema:      json.RawMessage(`{"type":"object"}`),
+		Safety:      tool.Safe,
+		Invoke: func(ctx context.Context, call tool.Call) (tool.Result, error) {
+			atomic.AddInt32(&f.toolCalls, 1)
+			return tool.Result{Content: []session.Block{session.TextBlock("ran")}}, nil
+		},
+	})
+}
+
+func newLongTurnHarness(t *testing.T, toolCalls int) (*server.Server, string) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := session.OpenStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := &longTurnProvider{toolCalls: toolCalls}
+	fp := &longTurnPlugin{prov: prov}
+	plugins := plugin.NewRegistry(nil, func(string) {})
+	plugins.Load(ctx, fp)
+	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"), plugins.Providers()...)
+	if err := reg.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Default.Provider = "long"
+	cfg.Default.Model = "m1"
+	cfg.Default.Thinking = "off"
+	cfg.Permissions.Mode = "strict"
+	cfg.MaxTokens = 1000
+	srv := server.New(server.Deps{
+		Version:  "test",
+		Config:   cfg,
+		Store:    store,
+		Registry: reg,
+		Plugins:  plugins,
+		Gate:     gate.New(nil),
+	})
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+	return srv, t.TempDir()
+}
+
+func dialRaw(t *testing.T, srv *server.Server) *protocol.Client {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cc, sc := protocol.Pipe()
+	go func() { _ = srv.Serve(ctx, sc) }()
+	cl := protocol.NewClient(cc)
+	t.Cleanup(func() { _ = cl.Close(); cancel() })
+	var hr protocol.ClientHelloResult
+	if err := cl.Call(ctx, protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0"}, &hr); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	return cl
+}
+
+// TestLongTurnConcurrentMutationNoDeadlock is the regression test for the AB-BA deadlock
+// between a liveSession's mutex and turn.Runner's: a real turn runs for twenty consecutive
+// tool calls (so its Observer fires many times, genuinely concurrently with everything below)
+// while a second connection hammers session.set_title and session.set_mode in a tight loop for
+// the whole turn. Run with -race -count=10 -timeout 120s: a reintroduced deadlock shows up as
+// the run timing out rather than as a race report.
+func TestLongTurnConcurrentMutationNoDeadlock(t *testing.T) {
+	const toolCalls = 20
+	srv, ws := newLongTurnHarness(t, toolCalls)
+	cl := dialRaw(t, srv)
+	var info protocol.SessionInfo
+	if err := cl.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: ws}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	cl2 := dialRaw(t, srv)
+	stop := make(chan struct{})
+	var hammer sync.WaitGroup
+	hammer.Add(2)
+	go func() {
+		defer hammer.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var res server.EntryIDResult
+			_ = cl2.Call(ctx, protocol.MethodSessionSetTitle, protocol.SessionSetTitleParams{
+				SessionID: info.SessionID, Title: fmt.Sprintf("title %d", i),
+			}, &res)
+		}
+	}()
+	go func() {
+		defer hammer.Done()
+		modes := []session.Mode{session.ModeStrict, session.ModePermissive, session.ModeOff}
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var res server.EntryIDResult
+			_ = cl2.Call(ctx, protocol.MethodSessionSetMode, protocol.SessionSetModeParams{
+				SessionID: info.SessionID, Mode: modes[i%len(modes)],
+			}, &res)
+		}
+	}()
+
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+	close(stop)
+	hammer.Wait()
+}
+
+// TestConcurrentColdResume is the regression test for single-flighting cold session.Load
+// calls: two connections resume the same session, currently held by nobody, at once.
+// session.Store's flock is exclusive per file descriptor within one process, so without
+// single-flighting the loser would fail with CodeUnavailable instead of sharing the winner's
+// result.
+func TestConcurrentColdResume(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+	// session.close detaches synchronously within the RPC handler; since this is the only
+	// subscriber and no turn is active, the session is now cold (removed from Server.live and
+	// closed on disk).
+	if err := cl.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 2
+	conns := make([]*protocol.Client, n)
+	for i := range n {
+		conns[i] = h.dial(t, false)
+	}
+	results := make([]protocol.SessionInfo, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = conns[i].Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &results[i])
+		}(i)
+	}
+	wg.Wait()
+
+	for i := range n {
+		if errs[i] != nil {
+			t.Fatalf("resume %d: %v", i, errs[i])
+		}
+		if results[i].SessionID != info.SessionID {
+			t.Fatalf("resume %d: got session %s, want %s", i, results[i].SessionID, info.SessionID)
+		}
+	}
+	for i := range n {
+		seen := 0
+		drain(t, conns[i], func(n protocol.Notification) bool {
+			if n.Method == protocol.NotifyEntryAppended {
+				seen++
+			}
+			return seen >= 3
+		})
+	}
+}
+
+// TestDetachRacesResume is the regression test for the zombie-subscription race: one
+// connection's session.close (which detaches it, and since it is the only subscriber with no
+// active turn, closes the session) runs concurrently with a second connection's
+// session.resume for the same id. However that race resolves, the resuming connection must end
+// up attached to a live, working session, never one that has already been (or is concurrently
+// being) closed out from under it. Run with -count=20: each run picks a different interleaving.
+func TestDetachRacesResume(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	clA := h.dial(t, false)
+	info := h.open(t, clA)
+	clB := h.dial(t, false)
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	var resumeErr error
+	var resumeInfo protocol.SessionInfo
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = clA.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{})
+	}()
+	go func() {
+		defer wg.Done()
+		resumeErr = clB.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &resumeInfo)
+	}()
+	wg.Wait()
+	if resumeErr != nil {
+		t.Fatalf("resume: %v", resumeErr)
+	}
+	if resumeInfo.SessionID != info.SessionID {
+		t.Fatalf("resumed %s, want %s", resumeInfo.SessionID, info.SessionID)
+	}
+
+	// However the race resolved, clB must be attached to a live, working session: submit a
+	// turn and confirm the resulting notifications actually reach clB. Under the bug this
+	// fixes, clB could end up subscribed to a liveSession already removed from Server.live and
+	// closed, and submitting through it would panic inside the runner's goroutine (session's
+	// log is nil after Close).
+	var sub protocol.SessionSubmitResult
+	if err := clB.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: resumeInfo.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	drain(t, clB, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
 }

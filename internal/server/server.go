@@ -45,16 +45,24 @@ type InterruptResult struct {
 
 // Server dispatches JSON-RPC requests, holds live sessions, runs turns through turn.Runner and
 // fans notifications out to every connection subscribed to a session, in order.
+//
+// Lock order, strict and never reversed, across Server and liveSession: mu > (a
+// liveSession's) mu > (that liveSession's) obsMu. wgMu is an independent leaf, only ever
+// nested inside a liveSession's mu (see spawnTurn); cn.mu (per connection) is never nested
+// with any of the others. See liveSession's own doc for why mu/obsMu are split at all.
 type Server struct {
 	d      Deps
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup // running turns; Shutdown waits on this before closing sessions
 
-	mu           sync.Mutex
-	live         map[ulid.ULID]*liveSession
-	nextID       int
+	wgMu         sync.Mutex // guards wg.Add against Shutdown's wg.Wait; see spawnTurn
+	wg           sync.WaitGroup
 	shuttingDown bool
+
+	mu      sync.Mutex
+	live    map[ulid.ULID]*liveSession
+	loading map[ulid.ULID]chan struct{} // sids with a cold load in flight; see loadCold
+	nextID  int
 }
 
 // New wires a Server. Deps must already be fully populated.
@@ -114,8 +122,15 @@ func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
 // (or run to completion) before closing every live session, or until ctx ends, whichever comes
 // first.
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.mu.Lock()
+	// Set shuttingDown before touching wg.Wait below: spawnTurn checks it and calls wg.Add
+	// together under the same wgMu, so any spawnTurn call that could still race this is
+	// guaranteed to either see shuttingDown already true (and refuse) or have its Add counted
+	// before the Wait below runs. See spawnTurn.
+	s.wgMu.Lock()
 	s.shuttingDown = true
+	s.wgMu.Unlock()
+
+	s.mu.Lock()
 	lives := make([]*liveSession, 0, len(s.live))
 	for _, ls := range s.live {
 		lives = append(lives, ls)
@@ -284,6 +299,10 @@ func (s *Server) handleSubmit(raw json.RawMessage) (any, *protocol.Error) {
 	return protocol.SessionSubmitResult{TurnID: tid}, nil
 }
 
+// handleInterrupt never holds ls.mu or ls.obsMu while calling into r: it reads ls.runner once
+// under mu, releases it, and only then calls State/Interrupt/TurnID directly on the runner
+// (safe and freshest, since no liveSession lock is held during those calls - see liveSession's
+// doc).
 func (s *Server) handleInterrupt(raw json.RawMessage) (any, *protocol.Error) {
 	var p protocol.SessionInterruptParams
 	if e := decode(raw, &p); e != nil {
@@ -350,12 +369,13 @@ func (s *Server) handleSetModel(raw json.RawMessage) (any, *protocol.Error) {
 	if ls.closed {
 		return nil, perr(protocol.CodeNotFound, "session closed")
 	}
-	if ls.runner != nil && isActive(ls.runner.State()) {
+	st, _ := ls.mirroredState()
+	if ls.runner != nil && isActive(st) {
 		return nil, perr(protocol.CodeConflict, "a turn is active")
 	}
-	view := deriveInfo(ls.sess.ID(), ls.entries)
+	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
 	if m.Ref == view.Model {
-		return EntryIDResult{EntryID: ls.latestEntryIDLocked(session.KindModelChange, session.KindSessionOpened)}, nil
+		return EntryIDResult{EntryID: ls.latestEntryID(session.KindModelChange, session.KindSessionOpened)}, nil
 	}
 	e2, err := ls.appendAndBroadcastLocked(session.ModelChange{Model: m.Ref})
 	if err != nil {
@@ -417,9 +437,7 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 	if !ok {
 		return nil, perr(protocol.CodeNotFound, "unknown command /"+p.Name)
 	}
-	ls.mu.Lock()
-	call := plugin.CommandCall{SessionID: ls.sess.ID(), Workspace: deriveInfo(ls.sess.ID(), ls.entries).Workspace, Args: p.Args}
-	ls.mu.Unlock()
+	call := plugin.CommandCall{SessionID: ls.sess.ID(), Workspace: deriveInfo(ls.sess.ID(), ls.snapshotEntries()).Workspace, Args: p.Args}
 	act, err := cmd.Run(ctx, call)
 	if err != nil {
 		return nil, perr(protocol.CodePluginError, err.Error())
@@ -466,13 +484,14 @@ func (s *Server) setEntry(id string, kind session.Kind, f func(view protocol.Ses
 	if ls.closed {
 		return nil, perr(protocol.CodeNotFound, "session closed")
 	}
-	if ls.runner != nil && isActive(ls.runner.State()) {
+	st, _ := ls.mirroredState()
+	if ls.runner != nil && isActive(st) {
 		return nil, perr(protocol.CodeConflict, "a turn is active")
 	}
-	view := deriveInfo(ls.sess.ID(), ls.entries)
+	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
 	same, p := f(view)
 	if same {
-		return EntryIDResult{EntryID: ls.latestEntryIDLocked(kind, session.KindSessionOpened)}, nil
+		return EntryIDResult{EntryID: ls.latestEntryID(kind, session.KindSessionOpened)}, nil
 	}
 	e2, err := ls.appendAndBroadcastLocked(p)
 	if err != nil {
@@ -515,42 +534,28 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	if err != nil {
 		return nil, protocol.ErrorFrom(err)
 	}
-	ls := newLive(sess, m)
-	s.mu.Lock()
-	s.live[sess.ID()] = ls
-	s.mu.Unlock()
-	return s.attach(cn, ls), nil
+	return s.installAndAttach(cn, newLive(sess, m)), nil
 }
 
+// resume attaches cn to sid, loading it from disk first when it is not already live. loadCold
+// single-flights concurrent cold loads of the same id (see loadCold); attachIfLive then
+// subscribes atomically with the s.live lookup (see detach for why that matters).
 func (s *Server) resume(cn *conn, p protocol.SessionResumeParams) (any, *protocol.Error) {
 	sid, err := ulid.Parse(p.SessionID)
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, "bad session id")
 	}
-	s.mu.Lock()
-	ls, ok := s.live[sid]
-	s.mu.Unlock()
-	if !ok {
-		sess, lerr := session.Load(s.d.Store, sid)
-		if lerr != nil {
-			return nil, loadErr(lerr)
-		}
-		m, rerr := s.d.Registry.Resolve(sess.Model().String())
-		if rerr != nil {
-			m = provider.Model{Ref: sess.Model()}
-			cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "model not in registry: " + sess.Model().String()})
-		}
-		ls = newLive(sess, m)
-		s.mu.Lock()
-		if existing, raced := s.live[sid]; raced {
-			ls = existing
-			_ = sess.Close()
-		} else {
-			s.live[sid] = ls
-		}
-		s.mu.Unlock()
+	if _, lerr := s.loadCold(cn, sid); lerr != nil {
+		return nil, lerr
 	}
-	return s.attach(cn, ls), nil
+	info, ok := s.attachIfLive(cn, sid)
+	if !ok {
+		// Vanishingly rare: the session was detached and closed by someone else between
+		// loadCold returning and this attach (or the server is shutting down). Ask the client
+		// to retry rather than looping here.
+		return nil, perr(protocol.CodeUnavailable, "session unavailable, retry")
+	}
+	return info, nil
 }
 
 func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Error) {
@@ -562,32 +567,26 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, "bad entry id")
 	}
-	s.mu.Lock()
-	parent, live := s.live[sid]
-	s.mu.Unlock()
-
-	var child *session.Session
-	if live {
-		parent.mu.Lock()
-		switch {
-		case parent.closed:
-			parent.mu.Unlock()
-			live = false
-		case parent.runner != nil && isActive(parent.runner.State()):
-			parent.mu.Unlock()
-			return nil, perr(protocol.CodeConflict, "a turn is active")
-		default:
-			child, err = parent.sess.Fork(s.d.Store, at)
-			parent.mu.Unlock()
-		}
+	parent, lerr := s.loadCold(cn, sid)
+	if lerr != nil {
+		return nil, lerr
 	}
-	if !live {
-		loaded, lerr := session.Load(s.d.Store, sid)
-		if lerr != nil {
-			return nil, loadErr(lerr)
-		}
-		child, err = loaded.Fork(s.d.Store, at)
-		_ = loaded.Close()
+
+	parent.mu.Lock()
+	st, _ := parent.mirroredState()
+	active := parent.runner != nil && isActive(st)
+	closed := parent.closed
+	var child *session.Session
+	switch {
+	case closed:
+		parent.mu.Unlock()
+		return nil, perr(protocol.CodeUnavailable, "session unavailable, retry")
+	case active:
+		parent.mu.Unlock()
+		return nil, perr(protocol.CodeConflict, "a turn is active")
+	default:
+		child, err = parent.sess.Fork(s.d.Store, at)
+		parent.mu.Unlock()
 	}
 	if err != nil {
 		if errors.Is(err, session.ErrInvariant) {
@@ -599,44 +598,118 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 	if rerr != nil {
 		m = provider.Model{Ref: child.Model()}
 	}
-	ls := newLive(child, m)
-	s.mu.Lock()
-	s.live[child.ID()] = ls
-	s.mu.Unlock()
-	return s.attach(cn, ls), nil
+	return s.installAndAttach(cn, newLive(child, m)), nil
 }
 
-// attach subscribes cn to ls and replays every entry known so far. It registers cn before
-// releasing ls.mu, in the same critical section that snapshots the entries to replay, so no
-// entry appended concurrently (by a running turn or another connection's mutation) is ever
-// missed or delivered twice: anything appended before the snapshot is in it, and anything
-// appended after cn was registered reaches cn through the normal broadcast path.
-func (s *Server) attach(cn *conn, ls *liveSession) protocol.SessionInfo {
-	ls.mu.Lock()
-	ls.conns = append(ls.conns, cn)
-	entries := append([]session.Entry(nil), ls.entries...)
-	info := deriveInfo(ls.sess.ID(), ls.entries)
-	ls.mu.Unlock()
+// loadCold returns the live session for sid, loading it from disk first if it is not already
+// live. Concurrent cold loads for the same id single-flight through s.loading: session.Store's
+// flock is exclusive across file descriptors within one process, not just across processes, so
+// a second concurrent session.Load for the same id fails with ErrLocked instead of blocking.
+// Without single-flighting, two connections resuming (or forking from) the same cold session at
+// once would race, and the loser would see a spurious "locked" error instead of the same live
+// session the winner produced.
+func (s *Server) loadCold(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Error) {
+	for {
+		s.mu.Lock()
+		if ls, ok := s.live[sid]; ok {
+			s.mu.Unlock()
+			return ls, nil
+		}
+		if ch, ok := s.loading[sid]; ok {
+			s.mu.Unlock()
+			<-ch
+			continue // the winner has installed it into s.live, or failed; check s.live again
+		}
+		ch := make(chan struct{})
+		if s.loading == nil {
+			s.loading = map[ulid.ULID]chan struct{}{}
+		}
+		s.loading[sid] = ch
+		s.mu.Unlock()
 
-	cn.mu.Lock()
-	cn.subs[ls.sess.ID()] = ls
-	cn.mu.Unlock()
+		ls, lerr := s.coldLoadOne(cn, sid)
 
-	sid := ls.sess.ID().String()
-	for _, e := range entries {
-		cn.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: sid, Entry: e})
+		s.mu.Lock()
+		delete(s.loading, sid)
+		s.mu.Unlock()
+		close(ch)
+		return ls, lerr
 	}
+}
+
+// coldLoadOne does the actual disk load and installs the result into s.live. Called with no
+// lock held. Only the single goroutine loadCold lets through for a given sid at a time ever
+// calls this for that sid, so the final install needs no raced-insert check.
+func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Error) {
+	sess, err := session.Load(s.d.Store, sid)
+	if err != nil {
+		return nil, loadErr(err)
+	}
+	m, rerr := s.d.Registry.Resolve(sess.Model().String())
+	if rerr != nil {
+		m = provider.Model{Ref: sess.Model()}
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "model not in registry: " + sess.Model().String()})
+	}
+	ls := newLive(sess, m)
+	s.mu.Lock()
+	s.live[sid] = ls
+	s.mu.Unlock()
+	return ls, nil
+}
+
+// installAndAttach installs a freshly created (never-before-shared) liveSession into s.live and
+// subscribes cn to it in one critical section. Used by open, fork's child and resume's cold
+// load. Safe unconditionally: the session is not yet visible to any other goroutine before this
+// call, so there is no id to race.
+func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInfo {
+	s.mu.Lock()
+	s.live[ls.sess.ID()] = ls
+	entries, info := ls.subscribeLocked(cn)
+	s.mu.Unlock()
+	replay(cn, ls.sess.ID(), entries)
 	return info
 }
 
+// attachIfLive subscribes cn to sid's live session, atomically with the s.live lookup: holding
+// Server.mu across both is what keeps this from ever racing detach's decide-and-remove into
+// subscribing to a session that is concurrently being closed (see detach). ok is false when
+// sid is not currently live.
+func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bool) {
+	s.mu.Lock()
+	ls, ok := s.live[sid]
+	if !ok {
+		s.mu.Unlock()
+		return protocol.SessionInfo{}, false
+	}
+	entries, info := ls.subscribeLocked(cn)
+	s.mu.Unlock()
+	replay(cn, sid, entries)
+	return info, true
+}
+
+func replay(cn *conn, sid ulid.ULID, entries []session.Entry) {
+	sidStr := sid.String()
+	for _, e := range entries {
+		cn.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: sidStr, Entry: e})
+	}
+}
+
 // detach drops one subscription and, once nothing else holds the session and no turn is
-// running on it, removes it from the server and closes it.
+// running on it, removes it from the server and closes it. It holds Server.mu across the whole
+// decide-then-remove sequence, the same lock attachIfLive and installAndAttach hold across
+// their lookup-then-subscribe, so the two can never interleave: either a concurrent attach
+// registers its connection before this reads conns (so this correctly sees "not empty" and
+// leaves the session alone), or this removes the session from s.live before that attach's
+// lookup can find it (so that attach correctly falls through to a cold reload instead of
+// subscribing to a session about to be closed out from under it).
 func (s *Server) detach(cn *conn, ls *liveSession) {
 	cn.mu.Lock()
 	delete(cn.subs, ls.sess.ID())
 	cn.mu.Unlock()
 
-	ls.mu.Lock()
+	s.mu.Lock()
+
+	ls.obsMu.Lock()
 	kept := ls.conns[:0]
 	for _, c := range ls.conns {
 		if c != cn {
@@ -644,18 +717,34 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 		}
 	}
 	ls.conns = kept
-	active := ls.runner != nil && isActive(ls.runner.State())
 	empty := len(ls.conns) == 0
-	closed := ls.closed
-	ls.mu.Unlock()
-	if !empty || active || closed {
+	ls.obsMu.Unlock()
+	if !empty {
+		s.mu.Unlock()
 		return
 	}
 
-	s.mu.Lock()
+	ls.mu.Lock()
+	st, _ := ls.mirroredState()
+	active := ls.runner != nil && isActive(st)
+	alreadyClosed := ls.closed
+	if !active && !alreadyClosed {
+		ls.closed = true
+	}
+	ls.mu.Unlock()
+	if active || alreadyClosed {
+		s.mu.Unlock()
+		return
+	}
+
+	// The delete is what has to happen before releasing mu: it is what stops a concurrent
+	// attachIfLive from finding this session again. The actual Close, once that is done, no
+	// longer needs mu - nothing can reach ls through s.live to race it, and ls.closed (set
+	// above, under ls.mu) is what stops any other path (Shutdown's closeIfOpen) from also
+	// closing it.
 	delete(s.live, ls.sess.ID())
 	s.mu.Unlock()
-	_ = ls.closeIfOpen()
+	_ = ls.sess.Close()
 }
 
 func (s *Server) detachAll(cn *conn) {
@@ -671,42 +760,49 @@ func (s *Server) detachAll(cn *conn) {
 }
 
 // startTurn refuses a typed submit while a turn is active and a steer submit unless the
-// runner is Steering; otherwise it starts or resumes one in its own goroutine.
+// runner is Steering; otherwise it starts or resumes one in its own goroutine. It never holds
+// ls.mu while calling a turn.Runner method or while waiting on first.started: both would risk
+// the AB-BA deadlock documented on liveSession.
 func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *protocol.Error) {
 	ls.mu.Lock()
-	defer ls.mu.Unlock()
 	if ls.closed {
+		ls.mu.Unlock()
 		return "", perr(protocol.CodeNotFound, "session closed")
 	}
 	if ls.runner != nil {
-		st := ls.runner.State()
+		st, _ := ls.mirroredState()
 		if msg.Source == session.SourceSteer {
 			if st != turn.Steering {
+				ls.mu.Unlock()
 				return "", perr(protocol.CodeRefusedByInvariant, "session is not steering")
 			}
 			r := ls.runner
+			ls.mu.Unlock()
 			if e := s.spawnTurn(ls, r, msg); e != nil {
 				return "", e
 			}
-			return r.TurnID(), nil
+			return r.TurnID(), nil // no lock held here; direct call is fine and freshest
 		}
 		if isActive(st) {
+			ls.mu.Unlock()
 			return "", perr(protocol.CodeConflict, "a turn is active")
 		}
 	} else if msg.Source == session.SourceSteer {
+		ls.mu.Unlock()
 		return "", perr(protocol.CodeRefusedByInvariant, "session is not steering")
 	}
 	prov, ok := s.d.Registry.Provider(ls.model.Ref.Provider)
 	if !ok {
+		ls.mu.Unlock()
 		return "", perr(protocol.CodeUnavailable, "provider not loaded: "+ls.model.Ref.Provider)
 	}
 	sid := ls.sess.ID().String()
 	la := &liveAsker{ls: ls, sid: sid}
 	var asker turn.Asker
-	if ls.firstAskerLocked() != nil {
+	if ls.firstAsker() != nil {
 		asker = la
 	}
-	view := deriveInfo(ls.sess.ID(), ls.entries)
+	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
 	first := &firstAppendSignal{Observer: &fanout{ls: ls, sid: sid}, started: make(chan session.Entry, 1)}
 	r := turn.NewRunner(turn.Config{
 		Session:   ls.sess,
@@ -721,13 +817,21 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	})
 	la.runner = r
 	ls.runner = r
+	ls.mu.Unlock()
+
 	if e := s.spawnTurn(ls, r, msg); e != nil {
-		ls.runner = nil // nobody is running it; undo the assignment above
+		ls.mu.Lock()
+		if ls.runner == r {
+			ls.runner = nil // nobody is running it; undo the assignment above
+		}
+		ls.mu.Unlock()
 		return "", e
 	}
 	// The turn id is the id of the user_message entry Run appends as its first action (see
 	// turn.Runner.TurnID); wait for that append, not the whole turn, so this returns quickly
-	// and correctly instead of racing runTurn's goroutine for r.TurnID().
+	// and correctly instead of racing runTurn's goroutine for r.TurnID(). ls.mu is not held
+	// here: nothing in this wait needs it, and holding it would block every other handler for
+	// this session for as long as the wait takes.
 	select {
 	case e := <-first.started:
 		return e.ID.String(), nil
@@ -737,18 +841,17 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 }
 
 // spawnTurn starts the goroutine that drives r.Run, tracked in s.wg so Shutdown can wait for
-// it. Caller holds ls.mu. Checking shuttingDown and calling wg.Add together under s.mu is what
-// keeps this from ever racing Shutdown's wg.Wait: Shutdown sets shuttingDown under s.mu before
-// it can reach Wait, so any spawnTurn that observes shuttingDown false here is guaranteed to
-// have its Add counted before that Wait runs.
+// it. Does not touch ls.mu or Server.mu, only wgMu: it may be called with ls.mu held (from
+// startTurn) or not (it does not matter either way), and never nests under Server.mu, keeping
+// wgMu out of the mu > ls.mu > ls.obsMu order entirely.
 func (s *Server) spawnTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage) *protocol.Error {
-	s.mu.Lock()
+	s.wgMu.Lock()
 	if s.shuttingDown {
-		s.mu.Unlock()
+		s.wgMu.Unlock()
 		return perr(protocol.CodeUnavailable, "server is shutting down")
 	}
 	s.wg.Add(1)
-	s.mu.Unlock()
+	s.wgMu.Unlock()
 	go s.runTurn(ls, r, msg)
 	return nil
 }
@@ -758,8 +861,9 @@ func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessag
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 	_ = r.Run(ctx, msg) // failures are already recorded as turn_failed entries by the runner
+	final := r.State()  // read before taking ls.mu: never call a Runner method while holding it
 	ls.mu.Lock()
-	if ls.runner == r && r.State() != turn.Steering {
+	if ls.runner == r && final != turn.Steering {
 		ls.runner = nil
 	}
 	ls.mu.Unlock()
