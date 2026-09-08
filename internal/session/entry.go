@@ -211,7 +211,7 @@ func (b BlockType) Valid() bool {
 // Workspace is the directory a session acts on.
 type Workspace struct {
 	Root      string `json:"root"`
-	GitRoot   string `json:"git_root"` // empty means not a git repository
+	GitRoot   string `json:"git_root"`   // empty means not a git repository
 	ProjectID string `json:"project_id"` // empty means no derivable project id; project-scoped memory is unavailable
 }
 
