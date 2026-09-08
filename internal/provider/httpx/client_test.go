@@ -36,7 +36,7 @@ func TestDoRetriesThenSucceedsAndReplaysBody(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok")
 	}))
 	defer srv.Close()
 	c, slept := newClient(t)
@@ -45,7 +45,7 @@ func TestDoRetriesThenSucceedsAndReplaysBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 || attempts.Load() != 3 {
 		t.Fatalf("status %d attempts %d", resp.StatusCode, attempts.Load())
 	}
@@ -72,7 +72,7 @@ func TestDoGivesUpAfterFiveAttemptsReturningTheLastResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 502 || attempts.Load() != 5 {
 		t.Fatalf("status %d attempts %d", resp.StatusCode, attempts.Load())
 	}
@@ -99,7 +99,7 @@ func TestDoHonorsRetryAfterSecondsAndDate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if len(*slept) != 2 || (*slept)[0] != 3*time.Second || (*slept)[1] != 7*time.Second {
 		t.Fatalf("slept %v", *slept)
 	}
@@ -118,7 +118,7 @@ func TestDoSetsHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if !strings.HasPrefix(ua, "rudy/0.1.0 (") || !strings.HasSuffix(ua, ")") {
 		t.Errorf("user agent %q", ua)
 	}
@@ -130,7 +130,7 @@ func TestDoSetsHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if sid != "" {
 		t.Errorf("zero session id must send no header, got %q", sid)
 	}
