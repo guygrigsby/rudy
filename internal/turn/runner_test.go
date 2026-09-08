@@ -893,3 +893,51 @@ func textOf(blocks []session.Block) string {
 	}
 	return b.String()
 }
+
+// TestMalformedToolInputIsAnErrorResult covers a model that streams tool-call JSON the log
+// will not accept. The block cannot be appended as sent (Append refuses a tool_use whose
+// input is not valid JSON), and dropping the block would leave the model's own message
+// disagreeing with the record. The input is recorded as an empty object, the call is
+// answered with an error result quoting exactly what arrived, and the turn continues so the
+// model can correct itself.
+func TestMalformedToolInputIsAnErrorResult(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "read", `{"path": `), stop(session.StopToolUse, "tool_calls")),
+		{text("sorry, retrying"), stop(session.StopEndTurn, "stop")},
+	}}
+	invoked := false
+	rd := echoTool(tool.Safe, "read")
+	rd.Invoke = func(context.Context, tool.Call) (tool.Result, error) { invoked = true; return tool.Result{}, nil }
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"read": rd}, nil, rec)
+
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "read it")); err != nil {
+		t.Fatal(err)
+	}
+	if r.State() != Completed {
+		t.Fatalf("state %s", r.State())
+	}
+	if invoked {
+		t.Fatal("a tool_use with malformed input must not run")
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage, session.KindPermissionDecision, session.KindToolResult, session.KindAssistantMessage}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v want %v", got, want)
+	}
+	am := rec.entries[1].Payload.(session.AssistantMessage)
+	if len(am.Content) != 1 || am.Content[0].Type != session.BlockToolUse || string(am.Content[0].Input) != "{}" {
+		t.Fatalf("recorded tool_use %+v, want its input replaced with an empty object", am.Content)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.ToolUseID != "tu1" || pd.Decision != session.Deny || pd.DecidedBy != session.ByClass || pd.Reason != "malformed input" {
+		t.Fatalf("decision %+v", pd)
+	}
+	tr := rec.entries[3].Payload.(session.ToolResult)
+	if tr.ToolUseID != "tu1" || tr.Outcome != session.OutcomeError || tr.Content[0].Text != `malformed tool input: {"path": ` {
+		t.Fatalf("tool result %+v", tr)
+	}
+	if len(p.requests) != 2 {
+		t.Fatalf("the model must get a second turn to retry, got %d requests", len(p.requests))
+	}
+}

@@ -231,6 +231,7 @@ func (r *Runner) loop(ctx context.Context) error {
 			}
 			return r.fail(session.ErrTransport, err)
 		}
+		malformed := sanitizeToolInputs(am.Content)
 		if _, err := r.append(am); err != nil {
 			return r.fail(session.ErrInternal, err)
 		}
@@ -245,6 +246,12 @@ func (r *Runner) loop(ctx context.Context) error {
 			return r.rest(Completed)
 		}
 		for _, tu := range toolUses {
+			if raw, bad := malformed[tu.ID]; bad {
+				if err := r.rejectMalformed(tu, raw); err != nil {
+					return r.fail(session.ErrInternal, err)
+				}
+				continue
+			}
 			done, err := r.runTool(ctx, tu)
 			if err != nil {
 				return err
@@ -648,6 +655,53 @@ func (a *accumulator) blocks() []session.Block {
 		a.finishToolUse(id)
 	}
 	return a.blocksOut
+}
+
+// sanitizeToolInputs replaces every tool_use input that is not valid JSON with an empty
+// object, in place, and returns what the model actually sent, keyed by tool_use id. The log
+// refuses a tool_use whose input is not JSON, so a model that truncates or mangles its
+// arguments would otherwise kill the turn as an internal failure. Dropping the block instead
+// would leave the recorded message disagreeing with what the model said; keeping it with an
+// empty input, and answering it with an error result naming the raw bytes (see
+// rejectMalformed), lets the model see its own mistake and retry.
+func sanitizeToolInputs(blocks []session.Block) map[string]string {
+	var raw map[string]string
+	for i, b := range blocks {
+		if b.Type != session.BlockToolUse || len(b.Input) == 0 || json.Valid(b.Input) {
+			continue
+		}
+		if raw == nil {
+			raw = map[string]string{}
+		}
+		raw[b.ID] = string(b.Input)
+		blocks[i].Input = json.RawMessage("{}")
+	}
+	return raw
+}
+
+// rejectMalformed answers a tool_use whose input never parsed. The tool is not consulted at
+// all, so the decision is the gate's own class rule rather than anything a mode or an asker
+// had a say in; it exists because a tool_result needs a permission_decision for its tool_use
+// ahead of it.
+func (r *Runner) rejectMalformed(tu session.Block, raw string) error {
+	if _, err := r.append(session.PermissionDecision{
+		ToolUseID: tu.ID,
+		Tool:      tu.Name,
+		Mode:      r.cfg.Session.Mode(),
+		Matcher:   session.Matcher{Tool: tu.Name},
+		Decision:  session.Deny,
+		DecidedBy: session.ByClass,
+		Scope:     session.ScopeOnce,
+		Reason:    "malformed input",
+	}); err != nil {
+		return err
+	}
+	_, err := r.append(session.ToolResult{
+		ToolUseID: tu.ID,
+		Outcome:   session.OutcomeError,
+		Content:   []session.Block{session.TextBlock("malformed tool input: " + raw)},
+	})
+	return err
 }
 
 // dropIncompleteToolUses removes tool_use blocks whose input is not valid JSON. They
