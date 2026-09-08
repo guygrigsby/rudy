@@ -170,6 +170,13 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 	if err != nil || code != 0 {
 		return code, err
 	}
+	if turnID == "" {
+		// The command produced no turn (plugin.Notice, whose text submit already printed
+		// above, or plugin.NoAction): there is nothing for the loop below to wait on. A
+		// turn.state for this turn id will never arrive, so waiting here would block
+		// until SIGINT. Report a completed no-op immediately instead.
+		return noOpResult(o, info, stdout)
+	}
 
 	out := &turnOutput{turnID: turnID}
 	enc := json.NewEncoder(stdout)
@@ -199,6 +206,20 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 			return out.finish(o, b, info, stdout, stderr)
 		}
 	}
+}
+
+// noOpResult reports a command that produced no turn as a completed no-op. Text and
+// stream-json print nothing beyond what submit already wrote (a plugin.Notice's text, if
+// any); json prints a zero-result shape with stop_reason "none", a value outside
+// session.StopReason's own vocabulary since no turn ran to report a real one.
+func noOpResult(o printOptions, info protocol.SessionInfo, stdout io.Writer) (int, error) {
+	if o.Output == "json" {
+		res := printResult{SessionID: info.SessionID, Result: "", StopReason: session.StopReason("none")}
+		if err := json.NewEncoder(stdout).Encode(res); err != nil {
+			return 1, err
+		}
+	}
+	return 0, nil
 }
 
 // openOrResume opens a new session or resumes one named by --resume or --continue and applies

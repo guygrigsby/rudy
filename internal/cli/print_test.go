@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -25,6 +26,22 @@ func (helloCommandPlugin) Init(ctx context.Context, h plugin.Host) error {
 		Description: "submit a greeting",
 		Run: func(ctx context.Context, call plugin.CommandCall) (plugin.Action, error) {
 			return plugin.SubmitPrompt{Text: "hi " + call.Args}, nil
+		},
+	})
+}
+
+// noopCommandPlugin registers a command that does nothing: no prompt submitted, no
+// notice shown. This is the shape a plugin.NoAction command takes.
+type noopCommandPlugin struct{}
+
+func (noopCommandPlugin) Name() string { return "noop" }
+
+func (noopCommandPlugin) Init(ctx context.Context, h plugin.Host) error {
+	return h.RegisterCommand(plugin.Command{
+		Name:        "noop",
+		Description: "do nothing",
+		Run: func(ctx context.Context, call plugin.CommandCall) (plugin.Action, error) {
+			return plugin.NoAction{}, nil
 		},
 	})
 }
@@ -214,6 +231,85 @@ func TestPrintUnknownSlashCommand(t *testing.T) {
 	code, _ := runPrint(context.Background(), printOptions{Output: "text"}, "/nope", testBuilder(t, fp), io.Discard, &errb)
 	if code != 2 || !strings.Contains(errb.String(), "unknown command /nope") {
 		t.Fatalf("code %d stderr %q", code, errb.String())
+	}
+}
+
+// TestPrintNoActionCommandCompletesWithoutWaiting proves the bug the coordinator flagged:
+// a command that returns plugin.NoAction produces no turn id, and runPrint used to enter
+// its notification loop and block until SIGINT, since no turn.state for "" would ever
+// arrive. runPrint must instead recognize the no-op and return immediately.
+func TestPrintNoActionCommandCompletesWithoutWaiting(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fp := &fakeProvider{}
+	build := testBuilder(t, fp, noopCommandPlugin{})
+	var out bytes.Buffer
+	done := make(chan struct{})
+	var code int
+	var err error
+	go func() {
+		code, err = runPrint(context.Background(), printOptions{Output: "text"}, "/noop", build, &out, io.Discard)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("runPrint did not return within a second")
+	}
+	if err != nil || code != 0 {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	if out.String() != "" {
+		t.Fatalf("stdout %q, want empty for a no-op command", out.String())
+	}
+}
+
+// TestPrintNoActionCommandJSON pins the --output json shape for a no-op command: an
+// otherwise-empty result with stop_reason "none", a value outside session.StopReason's
+// own vocabulary since no turn ran to report a real one.
+func TestPrintNoActionCommandJSON(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fp := &fakeProvider{}
+	build := testBuilder(t, fp, noopCommandPlugin{})
+	var out bytes.Buffer
+	code, err := runPrint(context.Background(), printOptions{Output: "json"}, "/noop", build, &out, io.Discard)
+	if err != nil || code != 0 {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	var res printResult
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		t.Fatalf("not JSON: %v: %s", err, out.String())
+	}
+	if res.SessionID == "" || res.Result != "" || res.StopReason != session.StopReason("none") {
+		t.Fatalf("result %+v", res)
+	}
+}
+
+// TestPrintCancelReturns130 drives the interrupt path in runPrint's own select loop
+// directly, using a pre-cancelled context: fp.block makes Complete hang on its own ctx
+// until the interrupt (or the deferred Server.Shutdown, once runPrint returns) cancels
+// it, so no turn.state can complete before ctx.Done() fires. That keeps the assertion
+// deterministic rather than racing wall-clock timing against the fake provider.
+func TestPrintCancelReturns130(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fp := &fakeProvider{block: true}
+	build := testBuilder(t, fp)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var out bytes.Buffer
+	done := make(chan struct{})
+	var code int
+	var err error
+	go func() {
+		code, err = runPrint(ctx, printOptions{Output: "text"}, "hi", build, &out, io.Discard)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runPrint did not return after cancellation")
+	}
+	if err != nil || code != 130 {
+		t.Fatalf("code %d err %v", code, err)
 	}
 }
 

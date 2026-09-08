@@ -19,6 +19,7 @@ type fakeProvider struct {
 	mu       sync.Mutex
 	script   [][]provider.Part
 	fail     error
+	block    bool // when true, Complete blocks on ctx instead of running fail or script
 	calls    int
 	requests []provider.Request
 }
@@ -39,6 +40,13 @@ func (f *fakeProvider) ListModels(ctx context.Context) ([]provider.Model, error)
 func (f *fakeProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
 	f.mu.Lock()
 	f.requests = append(f.requests, req)
+	block := f.block
+	f.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	f.mu.Lock()
 	if f.fail != nil {
 		f.mu.Unlock()
 		return f.fail
