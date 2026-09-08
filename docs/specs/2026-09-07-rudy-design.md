@@ -271,18 +271,24 @@ closes a picker or a selection. ADR 0006.
 
 ## CLI
 
-Cobra with Viper. Config is read, never written.
+Cobra with Viper. Noun then verb: `rudy skills migrate`, never
+`rudy migrate skills`. Long flags take two dashes, short flags one, so
+`-p` and `--print` are the same flag. The harness never rewrites
+`config.toml`; the commands below that persist state write their own
+dedicated files and nothing else.
 
 | command | does |
 |---|---|
 | `rudy` | TUI; embeds the server or attaches to a running `rudy serve` |
-| `rudy -p "prompt"` | headless printer client; `--output text|json|stream-json`, `--mode`, `--model` |
+| `rudy -p "prompt"`, `rudy --print` | headless printer client; `--output text|json|stream-json`, `--mode`, `--model` |
 | `rudy serve` | server on `$XDG_RUNTIME_DIR/rudy.sock` (0600) |
 | `rudy sessions list|resume|fork` | session management |
 | `rudy models` | the discovered registry with prices |
-| `rudy plugins` | loaded plugins and their state |
+| `rudy mcp add|remove|list|get` | MCP servers, the Claude Code shape: `add <name> <command…>`, `add --transport http <name> <url>`, `--scope user|project`; writes `mcp.toml` under XDG config or the workspace's `.rudy/` |
+| `rudy plugin install|uninstall|list|enable|disable|update` | spawned plugins, the Claude Code shape; installs under `$XDG_DATA_HOME/rudy/plugins/<name>/` with a lock file |
 | `rudy skills list|migrate` | discovered skills; one-way import from `.claude/skills` and pi |
 | `rudy keys migrate pi`, `rudy themes migrate pi` | one-way imports of pi keybindings and themes |
+| `rudy update` | self-update the binary from the release channel, the Claude Code shape |
 
 ## Durability and errors
 

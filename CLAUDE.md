@@ -24,8 +24,10 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
   appended and fsynced. No asker means deny.
 - Tool inputs and thinking signatures are raw bytes end to end. Never
   re-marshal them.
-- Config is read, never written by the harness. XDG paths, `XDG_CONFIG_HOME`
-  honored first, default `~/.config/rudy`.
+- `config.toml` is read, never written by the harness. Commands that persist
+  state (`mcp add`, `plugin install`) write their own dedicated files. XDG
+  paths, `XDG_CONFIG_HOME` honored first, default `~/.config/rudy`.
+- CLI is noun then verb (`rudy skills migrate`). Long flags take two dashes.
 - No model lists in config beyond a default. The registry comes from
   `/v1/models`.
 - No timers for refresh. Registry refreshes on session open, picker open and
