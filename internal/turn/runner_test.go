@@ -1,0 +1,612 @@
+package turn
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/guygrigsby/rudy/internal/gate"
+	"github.com/guygrigsby/rudy/internal/provider"
+	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tool"
+)
+
+// pause is a sentinel part: the scripted provider blocks on release until the test lets
+// it continue, or returns ctx.Err() when the runner cancels first.
+const pause provider.PartType = "test_pause"
+
+type scripted struct {
+	mu       sync.Mutex
+	scripts  [][]provider.Part
+	calls    int
+	requests []provider.Request
+	release  chan struct{}
+	err      error // returned instead of streaming when set
+}
+
+func (p *scripted) Name() string { return "fake" }
+
+func (p *scripted) ListModels(context.Context) ([]provider.Model, error) { return nil, nil }
+
+func (p *scripted) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	if p.err != nil {
+		p.mu.Unlock()
+		return p.err
+	}
+	if p.calls >= len(p.scripts) {
+		p.mu.Unlock()
+		return &provider.Error{Class: session.ErrInternal, Message: "script exhausted"}
+	}
+	parts := p.scripts[p.calls]
+	p.calls++
+	p.mu.Unlock()
+	for _, part := range parts {
+		if part.Type == pause {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-p.release:
+			}
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := emit(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func text(s string) provider.Part { return provider.Part{Type: provider.PartTextDelta, Text: s} }
+
+func stop(reason session.StopReason, raw string) provider.Part {
+	return provider.Part{Type: provider.PartStop, StopReason: reason, StopReasonRaw: raw}
+}
+
+func usage(in, out int64) provider.Part {
+	return provider.Part{Type: provider.PartUsage, Usage: session.Usage{Input: in, Output: out}}
+}
+
+func toolCall(id, name, input string) []provider.Part {
+	return []provider.Part{
+		{Type: provider.PartToolUseStart, ID: id, Name: name},
+		{Type: provider.PartToolUseDelta, ID: id, Text: input},
+		{Type: provider.PartToolUseEnd, ID: id},
+	}
+}
+
+type recorder struct {
+	mu      sync.Mutex
+	entries []session.Entry
+	states  []State
+	deltas  []provider.Part
+}
+
+func (r *recorder) EntryAppended(e session.Entry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries = append(r.entries, e)
+}
+
+func (r *recorder) Delta(_ string, p provider.Part) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.deltas = append(r.deltas, p)
+}
+
+func (r *recorder) StateChanged(_ string, s State) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.states = append(r.states, s)
+}
+
+func (r *recorder) kinds() []session.Kind {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]session.Kind, 0, len(r.entries))
+	for _, e := range r.entries {
+		out = append(out, e.Kind)
+	}
+	return out
+}
+
+type askerFunc func(ctx context.Context, q Question) (Answer, error)
+
+func (f askerFunc) Ask(ctx context.Context, q Question) (Answer, error) { return f(ctx, q) }
+
+type toolSet map[string]tool.Tool
+
+func (ts toolSet) Tool(name string) (tool.Tool, bool) { t, ok := ts[name]; return t, ok }
+
+func (ts toolSet) Tools() []tool.Tool {
+	out := make([]tool.Tool, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t)
+	}
+	return out
+}
+
+func echoTool(safety tool.Safety, name string) tool.Tool {
+	return tool.Tool{Name: name, Description: "echo", Schema: json.RawMessage(`{"type":"object"}`), Safety: safety,
+		Invoke: func(_ context.Context, c tool.Call) (tool.Result, error) {
+			return tool.Result{Content: []session.Block{session.TextBlock("echo:" + string(c.Input))}}, nil
+		}}
+}
+
+func newRunner(t *testing.T, s *session.Session, p *scripted, tools toolSet, asker Asker, rec *recorder) *Runner {
+	t.Helper()
+	return NewRunner(Config{
+		Session:   s,
+		Provider:  p,
+		Model:     provider.Model{Ref: s.Model(), ContextWindow: 100000},
+		Tools:     tools,
+		Gate:      gate.New([]string{"rm -rf"}),
+		Asker:     asker,
+		Observer:  rec,
+		System:    "SYSTEM",
+		MaxTokens: 1024,
+	})
+}
+
+func userMsg(src session.Source, s string) session.UserMessage {
+	return session.UserMessage{Source: src, Content: []session.Block{session.TextBlock(s)}}
+}
+
+func equalKinds(a, b []session.Kind) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestRunTextOnly(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{scripts: [][]provider.Part{{text("Hel"), text("lo"), usage(10, 2), stop(session.StopEndTurn, "stop")}}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	if r.State() != Completed {
+		t.Fatalf("state %s", r.State())
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v", got)
+	}
+	am := rec.entries[1].Payload.(session.AssistantMessage)
+	if len(am.Content) != 1 || am.Content[0].Text != "Hello" || am.Usage.Input != 10 || am.StopReason != session.StopEndTurn || am.StopReasonRaw != "stop" {
+		t.Fatalf("assistant message %+v", am)
+	}
+	if len(rec.deltas) != 4 {
+		t.Fatalf("every part must reach the observer, got %d", len(rec.deltas))
+	}
+	if len(p.requests) != 1 || p.requests[0].System != "SYSTEM" || p.requests[0].Messages[0].Content[0].Text != "hi" {
+		t.Fatalf("request %+v", p.requests)
+	}
+}
+
+func TestRunToolFlowStrictAskerAllows(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	var seenAllowOnDisk bool
+	unsafe := tool.Tool{Name: "bash", Description: "run", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Unsafe,
+		Invoke: func(_ context.Context, c tool.Call) (tool.Result, error) {
+			entries, err := session.ReadLog(s.Dir())
+			if err != nil {
+				t.Error(err)
+			}
+			for _, e := range entries {
+				if d, ok := e.Payload.(session.PermissionDecision); ok && d.ToolUseID == c.ID && d.Decision == session.Allow {
+					seenAllowOnDisk = true
+				}
+			}
+			return tool.Result{Content: []session.Block{session.TextBlock("ran")}}, nil
+		}}
+	p := &scripted{scripts: [][]provider.Part{
+		append(append([]provider.Part{text("running")}, toolCall("tu1", "bash", `{"command":"go test ./..."}`)...), usage(5, 5), stop(session.StopToolUse, "tool_calls")),
+		{text("done"), usage(6, 1), stop(session.StopEndTurn, "stop")},
+	}}
+	var asked Question
+	asker := askerFunc(func(_ context.Context, q Question) (Answer, error) {
+		asked = q
+		return Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "looks fine"}, nil
+	})
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": unsafe}, asker, rec)
+
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "test it")); err != nil {
+		t.Fatal(err)
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage, session.KindPermissionDecision, session.KindToolResult, session.KindAssistantMessage}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v", got)
+	}
+	if !seenAllowOnDisk {
+		t.Fatal("the allow decision must be on disk before the tool runs")
+	}
+	if asked.ToolUseID != "tu1" || asked.Tool != "bash" || string(asked.Input) != `{"command":"go test ./..."}` {
+		t.Fatalf("question %+v", asked)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Decision != session.Allow || pd.DecidedBy != session.ByAsker || pd.Scope != session.ScopeOnce || pd.Reason != "looks fine" || pd.Mode != session.ModeStrict {
+		t.Fatalf("decision %+v", pd)
+	}
+	tr := rec.entries[3].Payload.(session.ToolResult)
+	if tr.Outcome != session.OutcomeOK || tr.Content[0].Text != "ran" || tr.ToolUseID != "tu1" {
+		t.Fatalf("tool result %+v", tr)
+	}
+	wantStates := []State{Streaming, AwaitingPermission, RunningTool, Streaming, Completed}
+	if len(rec.states) != len(wantStates) {
+		t.Fatalf("states %v", rec.states)
+	}
+	for i := range wantStates {
+		if rec.states[i] != wantStates[i] {
+			t.Fatalf("states %v want %v", rec.states, wantStates)
+		}
+	}
+	if len(p.requests) != 2 || p.requests[1].Messages[2].Role != provider.RoleToolResult {
+		t.Fatalf("second request must carry the tool result: %+v", p.requests[1].Messages)
+	}
+}
+
+func TestRunToolDenied(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	invoked := false
+	unsafe := echoTool(tool.Unsafe, "bash")
+	unsafe.Invoke = func(context.Context, tool.Call) (tool.Result, error) { invoked = true; return tool.Result{}, nil }
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"ls"}`), stop(session.StopToolUse, "tool_calls")),
+		{text("ok, skipping"), stop(session.StopEndTurn, "stop")},
+	}}
+	asker := askerFunc(func(context.Context, Question) (Answer, error) {
+		return Answer{Decision: session.Deny, Scope: session.ScopeOnce, Reason: "not now"}, nil
+	})
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": unsafe}, asker, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "list")); err != nil {
+		t.Fatal(err)
+	}
+	if invoked {
+		t.Fatal("denied tool must not run")
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Decision != session.Deny || pd.DecidedBy != session.ByAsker || pd.Reason != "not now" {
+		t.Fatalf("decision %+v", pd)
+	}
+	tr := rec.entries[3].Payload.(session.ToolResult)
+	if tr.Outcome != session.OutcomeError || tr.Content[0].Text != "denied: not now" {
+		t.Fatalf("tool result %+v", tr)
+	}
+}
+
+func TestRunStrictWithoutAskerDenies(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"ls"}`), stop(session.StopToolUse, "tool_calls")),
+		{text("understood"), stop(session.StopEndTurn, "stop")},
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": echoTool(tool.Unsafe, "bash")}, nil, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "list")); err != nil {
+		t.Fatal(err)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Decision != session.Deny || pd.DecidedBy != session.ByNoAsker {
+		t.Fatalf("decision %+v", pd)
+	}
+	for _, st := range rec.states {
+		if st == AwaitingPermission {
+			t.Fatal("no asker means no waiting")
+		}
+	}
+}
+
+func TestRunSafeToolNeverAsks(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "read", `{"path":"a"}`), stop(session.StopToolUse, "tool_calls")),
+		{text("read it"), stop(session.StopEndTurn, "stop")},
+	}}
+	asker := askerFunc(func(context.Context, Question) (Answer, error) {
+		t.Fatal("safe tool must not ask")
+		return Answer{}, nil
+	})
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"read": echoTool(tool.Safe, "read")}, asker, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "read a")); err != nil {
+		t.Fatal(err)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Decision != session.Allow || pd.DecidedBy != session.ByClass {
+		t.Fatalf("decision %+v", pd)
+	}
+}
+
+func TestRunOffModeAllowsByMode(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"rm -rf build"}`), stop(session.StopToolUse, "tool_calls")),
+		{text("gone"), stop(session.StopEndTurn, "stop")},
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": echoTool(tool.Unsafe, "bash")}, nil, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "clean")); err != nil {
+		t.Fatal(err)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Decision != session.Allow || pd.DecidedBy != session.ByMode {
+		t.Fatalf("decision %+v", pd)
+	}
+}
+
+func TestRunPermissiveAsksForDangerous(t *testing.T) {
+	s := openTestSession(t, session.ModePermissive)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"rm -rf build"}`), stop(session.StopToolUse, "tool_calls")),
+		{text("gone"), stop(session.StopEndTurn, "stop")},
+	}}
+	asked := false
+	asker := askerFunc(func(context.Context, Question) (Answer, error) {
+		asked = true
+		return Answer{Decision: session.Allow, Scope: session.ScopeSession, Reason: "yes for this session"}, nil
+	})
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": echoTool(tool.Unsafe, "bash")}, asker, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "clean")); err != nil {
+		t.Fatal(err)
+	}
+	if !asked {
+		t.Fatal("dangerous command in permissive mode must ask")
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Scope != session.ScopeSession || pd.DecidedBy != session.ByAsker {
+		t.Fatalf("decision %+v", pd)
+	}
+	if len(s.Allowances()) != 1 {
+		t.Fatalf("session allowance must be derivable, got %v", s.Allowances())
+	}
+}
+
+func TestRunUnknownToolIsAnErrorResult(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "nope", `{}`), stop(session.StopToolUse, "tool_calls")),
+		{text("sorry"), stop(session.StopEndTurn, "stop")},
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "x")); err != nil {
+		t.Fatal(err)
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage, session.KindPermissionDecision, session.KindToolResult, session.KindAssistantMessage}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v", got)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Decision != session.Deny || pd.DecidedBy != session.ByClass {
+		t.Fatalf("decision %+v", pd)
+	}
+	tr := rec.entries[3].Payload.(session.ToolResult)
+	if tr.Outcome != session.OutcomeError || tr.Content[0].Text != "unknown tool nope" {
+		t.Fatalf("tool result %+v", tr)
+	}
+}
+
+func TestSteerMidStreamThenContinue(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{
+		release: make(chan struct{}),
+		scripts: [][]provider.Part{
+			{text("Half"), {Type: pause}, text(" never sent"), stop(session.StopEndTurn, "stop")},
+			{text("Steered"), stop(session.StopEndTurn, "stop")},
+		},
+	}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+	waitForDelta(t, rec, 1)
+	r.Interrupt(session.InterruptSteer)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after steer")
+	}
+	if r.State() != Steering {
+		t.Fatalf("state %s", r.State())
+	}
+	am := rec.entries[1].Payload.(session.AssistantMessage)
+	if am.StopReason != session.StopInterrupted || am.Content[0].Text != "Half" || am.StopReasonRaw != "" {
+		t.Fatalf("partial message %+v", am)
+	}
+	turnID := r.TurnID()
+
+	if err := r.Run(context.Background(), userMsg(session.SourceSteer, "do it differently")); err != nil {
+		t.Fatal(err)
+	}
+	if r.State() != Completed || r.TurnID() != turnID {
+		t.Fatalf("state %s turn %s want %s", r.State(), r.TurnID(), turnID)
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage, session.KindUserMessage, session.KindAssistantMessage}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v", got)
+	}
+	if len(p.requests) != 2 || len(p.requests[1].Messages) != 3 {
+		t.Fatalf("the steer request must carry the partial and the steer: %+v", p.requests[1].Messages)
+	}
+}
+
+func TestCancelMidStream(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{release: make(chan struct{}), scripts: [][]provider.Part{{text("Half"), {Type: pause}, stop(session.StopEndTurn, "stop")}}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+	waitForDelta(t, rec, 1)
+	r.Interrupt(session.InterruptCancel)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if r.State() != Idle {
+		t.Fatalf("state %s", r.State())
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage, session.KindTurnInterrupted}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v", got)
+	}
+	if ti := rec.entries[2].Payload.(session.TurnInterrupted); ti.How != session.InterruptCancel || ti.TurnID != rec.entries[0].ID {
+		t.Fatalf("interrupted %+v want turn %s", ti, rec.entries[0].ID)
+	}
+}
+
+func TestSteerDuringToolKillsIt(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	started := make(chan struct{})
+	slow := tool.Tool{Name: "bash", Description: "slow", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Unsafe,
+		Invoke: func(ctx context.Context, _ tool.Call) (tool.Result, error) {
+			close(started)
+			<-ctx.Done()
+			return tool.Result{Content: []session.Block{session.TextBlock("partial output")}}, ctx.Err()
+		}}
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"sleep 100"}`), stop(session.StopToolUse, "tool_calls")),
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": slow}, nil, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "sleep")) }()
+	<-started
+	r.Interrupt(session.InterruptSteer)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return")
+	}
+	if r.State() != Steering {
+		t.Fatalf("state %s", r.State())
+	}
+	tr := rec.entries[3].Payload.(session.ToolResult)
+	if tr.Outcome != session.OutcomeKilled || tr.Content[0].Text != "partial output" {
+		t.Fatalf("tool result %+v", tr)
+	}
+}
+
+func TestProviderErrorFailsTurn(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{err: &provider.Error{Class: session.ErrProvider, Status: 502, Message: "bad gateway", Body: []byte("x"), Attempts: 5}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+	err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi"))
+	var pe *provider.Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("want *provider.Error, got %v", err)
+	}
+	if r.State() != Failed {
+		t.Fatalf("state %s", r.State())
+	}
+	tf := rec.entries[1].Payload.(session.TurnFailed)
+	if tf.Class != session.ErrProvider || tf.Message != "bad gateway" || tf.Retries != 5 {
+		t.Fatalf("turn_failed %+v", tf)
+	}
+	if tf.TurnID != rec.entries[0].ID || r.TurnID() != rec.entries[0].ID.String() {
+		t.Fatalf("turn id %s want the user_message id %s", tf.TurnID, rec.entries[0].ID)
+	}
+}
+
+func TestPanickingToolIsAPluginFault(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	p := &scripted{scripts: [][]provider.Part{append(toolCall("t1", "boom", `{}`), stop(session.StopToolUse, "tool_calls"))}}
+	rec := &recorder{}
+	tools := toolSet{"boom": tool.Tool{Name: "boom", Safety: tool.Unsafe, Invoke: func(context.Context, tool.Call) (tool.Result, error) {
+		panic("nil map write")
+	}}}
+	r := newRunner(t, s, p, tools, nil, rec)
+	err := r.Run(context.Background(), userMsg(session.SourceTyped, "go"))
+	if err == nil || r.State() != Failed {
+		t.Fatalf("err %v state %s", err, r.State())
+	}
+	tf := rec.entries[len(rec.entries)-1].Payload.(session.TurnFailed)
+	if tf.Class != session.ErrPlugin || tf.Retries != 0 || !strings.Contains(tf.Message, "nil map write") {
+		t.Fatalf("turn_failed %+v", tf)
+	}
+}
+
+func TestCallerContextCancelIsCancel(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{release: make(chan struct{}), scripts: [][]provider.Part{{text("Half"), {Type: pause}, stop(session.StopEndTurn, "stop")}}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx, userMsg(session.SourceTyped, "go")) }()
+	waitForDelta(t, rec, 1)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("want context.Canceled, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return")
+	}
+	if r.State() != Idle {
+		t.Fatalf("state %s", r.State())
+	}
+	if got := rec.kinds(); got[len(got)-1] != session.KindTurnInterrupted {
+		t.Fatalf("entries %v", got)
+	}
+}
+
+func TestInterruptWhenIdleIsNoop(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	rec := &recorder{}
+	r := newRunner(t, s, &scripted{}, toolSet{}, nil, rec)
+	r.Interrupt(session.InterruptCancel)
+	if r.State() != Idle || len(rec.entries) != 0 {
+		t.Fatalf("idle interrupt must change nothing: %s %v", r.State(), rec.kinds())
+	}
+}
+
+func waitForDelta(t *testing.T, rec *recorder, n int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		rec.mu.Lock()
+		got := len(rec.deltas)
+		rec.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("waited for %d deltas", n)
+}
