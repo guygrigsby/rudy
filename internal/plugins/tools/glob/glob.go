@@ -50,41 +50,51 @@ func invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	if !doublestar.ValidatePattern(a.Pattern) {
 		return fsroot.Fail("glob: bad pattern %q", a.Pattern), nil
 	}
+	start := "."
+	if a.Path != "" {
+		rel, err := fsroot.Rel(call.Workspace.Root, a.Path)
+		if err != nil {
+			return fsroot.Fail("glob: %v", err), nil
+		}
+		start = fsToSlash(rel)
+	}
 	root, err := os.OpenRoot(call.Workspace.Root)
 	if err != nil {
 		return tool.Result{}, err
 	}
 	defer func() { _ = root.Close() }()
 	fsys := root.FS()
-	prefix := ""
-	if a.Path != "" {
-		rel, err := fsroot.Rel(call.Workspace.Root, a.Path)
+
+	// Walk the tree ourselves, the way grep does, so .git is pruned at every depth
+	// rather than filtered out of the match list after doublestar has already
+	// descended into it.
+	var out []string
+	walkErr := fs.WalkDir(fsys, start, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return fsroot.Fail("glob: %v", err), nil
+			return nil
 		}
-		prefix = path.Clean(strings.ReplaceAll(rel, string(os.PathSeparator), "/"))
-		if prefix != "." {
-			fsys, err = fs.Sub(fsys, prefix)
-			if err != nil {
-				return fsroot.Fail("glob: %v", err), nil
-			}
-		} else {
-			prefix = ""
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-	}
-	found, err := doublestar.Glob(fsys, a.Pattern)
-	if err != nil {
-		return fsroot.Fail("glob: %v", err), nil
-	}
-	out := make([]string, 0, len(found))
-	for _, p := range found {
-		if p == ".git" || strings.HasPrefix(p, ".git/") || strings.Contains(p, "/.git/") {
-			continue
+		if d.IsDir() && d.Name() == ".git" {
+			return fs.SkipDir
 		}
-		if prefix != "" {
-			p = prefix + "/" + p
+		if p == start {
+			return nil
+		}
+		matchPath := p
+		if start != "." {
+			matchPath = strings.TrimPrefix(p, start+"/")
+		}
+		ok, err := doublestar.Match(a.Pattern, matchPath)
+		if err != nil || !ok {
+			return nil
 		}
 		out = append(out, p)
+		return nil
+	})
+	if walkErr != nil {
+		return fsroot.Fail("glob: %v", walkErr), nil
 	}
 	sort.Strings(out)
 	if len(out) == 0 {
@@ -100,4 +110,9 @@ func invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 		text += "… truncated at 1000 results\n"
 	}
 	return fsroot.Text(text), nil
+}
+
+func fsToSlash(rel string) string {
+	s := strings.ReplaceAll(rel, string(os.PathSeparator), "/")
+	return path.Clean(s)
 }

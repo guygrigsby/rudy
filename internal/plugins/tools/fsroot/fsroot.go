@@ -3,11 +3,14 @@ package fsroot
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -36,6 +39,22 @@ func Rel(root, p string) (string, error) {
 	return p, nil
 }
 
+// tmpSeq gives every call to WriteAtomic in this process a distinct ordinal, so two
+// concurrent writes to the same rel path never share a temp file name.
+var tmpSeq atomic.Uint64
+
+// tempName builds a temp file name for rel that is unique per call: pid, a process-wide
+// counter and 8 random hex bytes, so concurrent writers (even across processes) never
+// collide on the same tmp path.
+func tempName(rel string) (string, error) {
+	var r [8]byte
+	if _, err := rand.Read(r[:]); err != nil {
+		return "", fmt.Errorf("fsroot: temp name: %w", err)
+	}
+	seq := tmpSeq.Add(1)
+	return fmt.Sprintf("%s.rudy-%d-%d-%s.tmp", rel, os.Getpid(), seq, hex.EncodeToString(r[:])), nil
+}
+
 // WriteAtomic writes data to rel inside root through a temp file and rename.
 func WriteAtomic(root *os.Root, rel string, data []byte) error {
 	if dir := filepath.Dir(rel); dir != "." {
@@ -43,7 +62,10 @@ func WriteAtomic(root *os.Root, rel string, data []byte) error {
 			return err
 		}
 	}
-	tmp := fmt.Sprintf("%s.rudy-%d.tmp", rel, os.Getpid())
+	tmp, err := tempName(rel)
+	if err != nil {
+		return err
+	}
 	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err

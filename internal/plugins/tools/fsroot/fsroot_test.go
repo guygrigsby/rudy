@@ -1,8 +1,11 @@
 package fsroot_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/plugins/tools/fsroot"
@@ -52,6 +55,62 @@ func TestWriteAtomicCreatesParents(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(dir, "a", "b"))
 	if len(entries) != 1 {
 		t.Fatalf("temp file left behind: %d entries", len(entries))
+	}
+}
+
+func TestWriteAtomicConcurrentSameRelDoesNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	const n = 16
+	contents := make([][]byte, n)
+	for i := range n {
+		contents[i] = []byte(fmt.Sprintf("content-%02d-%s", i, strings.Repeat("x", 200)))
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = fsroot.WriteAtomic(root, "same.txt", contents[i])
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("WriteAtomic goroutine %d: %v", i, err)
+		}
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, "same.txt"))
+	if err != nil {
+		t.Fatalf("read final file: %v", err)
+	}
+	matched := false
+	for _, c := range contents {
+		if string(got) == string(c) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		t.Fatalf("final file (%d bytes) does not match any of the %d written contents in full", len(got), n)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file: %s", e.Name())
+		}
 	}
 }
 

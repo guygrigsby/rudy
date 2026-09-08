@@ -76,6 +76,33 @@ func TestGlobListsSortedRelativePaths(t *testing.T) {
 	}
 }
 
+func TestGlobSkipsNestedGit(t *testing.T) {
+	ws := t.TempDir()
+	for _, name := range []string{"a.go", "sub/b.go", "sub/.git/config", "sub/.git/objects/pack/x"} {
+		p := filepath.Join(ws, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tl := load(t)
+	res := call(t, tl, ws, `{"pattern":"**/*"}`)
+	if res.IsError {
+		t.Fatal(res.Content[0].Text)
+	}
+	out := res.Content[0].Text
+	if strings.Contains(out, ".git") {
+		t.Fatalf("nested .git leaked: %q", out)
+	}
+	for _, want := range []string{"a.go", "sub/b.go", "sub"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in %q", want, out)
+		}
+	}
+}
+
 func TestGlobRefusesBadPatternAndEscape(t *testing.T) {
 	ws := seed(t)
 	tl := load(t)

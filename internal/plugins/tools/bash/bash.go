@@ -110,7 +110,10 @@ func invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 		return fsroot.Fail("bash: %v", err), nil
 	}
 	err := cmd.Wait()
-	// Whatever survived SIGTERM and the grace period dies with the group.
+	// Whatever survived SIGTERM and the grace period dies with the group. This always
+	// fires, even on a normal exit, so it can in principle kill an unrelated process
+	// group that the kernel has already reused this pid for; accepted tradeoff since
+	// Wait has already reaped this pid and the window is vanishingly small in practice.
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 
 	text := out.String()
