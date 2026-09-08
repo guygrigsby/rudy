@@ -824,3 +824,123 @@ func TestDetachRacesResume(t *testing.T) {
 		return ts.State == "completed"
 	})
 }
+
+// blockingProvider blocks inside Complete, before emitting anything, until block is closed.
+type blockingProvider struct {
+	block chan struct{}
+}
+
+func (p *blockingProvider) Name() string { return "blocking" }
+
+func (p *blockingProvider) ListModels(ctx context.Context) ([]provider.Model, error) {
+	return []provider.Model{{
+		Ref:           session.ModelRef{Provider: "blocking", Model: "m1"},
+		DisplayName:   "Blocking 1",
+		ContextWindow: 100000,
+	}}, nil
+}
+
+func (p *blockingProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-p.block:
+	}
+	parts := []provider.Part{
+		{Type: provider.PartTextDelta, Text: "done"},
+		{Type: provider.PartUsage, Usage: session.Usage{Input: 1, Output: 1}},
+		{Type: provider.PartStop, StopReason: session.StopEndTurn, StopReasonRaw: "stop"},
+	}
+	for _, part := range parts {
+		if err := emit(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type blockingPlugin struct{ prov *blockingProvider }
+
+func (p *blockingPlugin) Name() string { return "blocking" }
+
+func (p *blockingPlugin) Init(ctx context.Context, h plugin.Host) error {
+	return h.RegisterProvider(p.prov)
+}
+
+func newBlockingHarness(t *testing.T, prov *blockingProvider) (*server.Server, string) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := session.OpenStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := &blockingPlugin{prov: prov}
+	plugins := plugin.NewRegistry(nil, func(string) {})
+	plugins.Load(ctx, fp)
+	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"), plugins.Providers()...)
+	if err := reg.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	cfg.Default.Provider = "blocking"
+	cfg.Default.Model = "m1"
+	cfg.Default.Thinking = "off"
+	cfg.Permissions.Mode = "strict"
+	cfg.MaxTokens = 1000
+	srv := server.New(server.Deps{
+		Version:  "test",
+		Config:   cfg,
+		Store:    store,
+		Registry: reg,
+		Plugins:  plugins,
+		Gate:     gate.New(nil),
+	})
+	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
+	return srv, t.TempDir()
+}
+
+// TestSetTitleRefusedImmediatelyAfterSubmit is the protocol-level regression test for the fix
+// round 2 residual: session.submit's response only arrives once the runner has appended the
+// user_message (see firstAppendSignal), which happens before the provider is ever called - the
+// provider here blocks on a channel before emitting anything at all, so no stream.delta or
+// turn.state notification can have reached the client yet either. A session.set_title issued
+// immediately after submit returns, with no wait and no drain, must still be refused with
+// CodeConflict: without fix round 2's markStarting, the mirrored state at that point could
+// still be whatever it was before this turn started, and set_title would pass the active-turn
+// check and append to the session concurrently with the turn.
+func TestSetTitleRefusedImmediatelyAfterSubmit(t *testing.T) {
+	prov := &blockingProvider{block: make(chan struct{})}
+	srv, ws := newBlockingHarness(t, prov)
+	cl := dialRaw(t, srv)
+	var info protocol.SessionInfo
+	if err := cl.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: ws}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	ctx := context.Background()
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	var res server.EntryIDResult
+	err := cl.Call(ctx, protocol.MethodSessionSetTitle, protocol.SessionSetTitleParams{
+		SessionID: info.SessionID, Title: "new title",
+	}, &res)
+	var pe *protocol.Error
+	if !errorsAs(err, &pe) || pe.Code != protocol.CodeConflict {
+		t.Fatalf("set_title immediately after submit err = %v, want CodeConflict", err)
+	}
+
+	close(prov.block)
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+}

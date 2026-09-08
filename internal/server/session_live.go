@@ -88,6 +88,27 @@ func (ls *liveSession) mirroredState() (turn.State, string) {
 	return ls.state, ls.turnID
 }
 
+// markStarting sets the mirrored state to Streaming, and the mirrored turn id when it is
+// already known, before the runner has run far enough to report either itself through
+// StateChanged. Caller holds mu and is about to install (or has just installed) ls.runner and
+// call spawnTurn; call this in that same critical section, before releasing mu, so that once
+// mu is released, "ls.runner != nil" and "isActive(mirroredState)" are true atomically from
+// any concurrent reader's point of view. Without it, a handler landing in the gap between mu
+// being released and the runner's own first StateChanged callback could see ls.runner != nil
+// but an unrelated, stale mirrored state, pass the active-turn check, and append to the
+// session concurrently with the runner. The runner's first real StateChanged overwrites both
+// fields moments later; turnID here matters only for a steer resume (where it is already known
+// and unchanged) - pass "" for a fresh turn, whose id is not known until its first append (see
+// firstAppendSignal).
+func (ls *liveSession) markStarting(turnID string) {
+	ls.obsMu.Lock()
+	ls.state = turn.Streaming
+	if turnID != "" {
+		ls.turnID = turnID
+	}
+	ls.obsMu.Unlock()
+}
+
 // firstAsker is the connection a turn's permission questions route to: the first subscriber
 // whose hello declared asker, or nil when none has. Self-locking (takes obsMu).
 func (ls *liveSession) firstAsker() *conn {

@@ -777,6 +777,12 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 				return "", perr(protocol.CodeRefusedByInvariant, "session is not steering")
 			}
 			r := ls.runner
+			// state is already Steering (isActive) here, but stamp it explicitly anyway,
+			// same as the fresh-turn path below: it is what makes "ls.runner != nil and
+			// isActive(mirror)" hold atomically the instant mu is released, rather than
+			// relying on the reader also knowing Steering was never touched in between.
+			// turnID is already correct (a steer resume keeps the same turn id), so leave it.
+			ls.markStarting("")
 			ls.mu.Unlock()
 			if e := s.spawnTurn(ls, r, msg); e != nil {
 				return "", e
@@ -817,6 +823,12 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	})
 	la.runner = r
 	ls.runner = r
+	// Mark active before releasing mu: the turn id isn't known yet (Run hasn't appended the
+	// user_message that defines it - see firstAppendSignal below), but the state must be, or a
+	// set_title/set_mode/steer submit landing between here and the runner's first
+	// StateChanged callback would see ls.runner != nil and a stale, inactive mirrored state,
+	// pass the active-turn check, and append to the session concurrently with the runner.
+	ls.markStarting("")
 	ls.mu.Unlock()
 
 	if e := s.spawnTurn(ls, r, msg); e != nil {
