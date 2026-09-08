@@ -122,3 +122,37 @@ func TestIsBinary(t *testing.T) {
 		t.Fatal("NUL not flagged")
 	}
 }
+
+// TestWriteAtomicKeepsTheExistingMode covers what the rename used to throw away: writing to
+// an executable file left it 0644, so a script the agent edited stopped being runnable.
+func TestWriteAtomicKeepsTheExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "run.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := fsroot.WriteAtomic(root, "run.sh", []byte("#!/bin/sh\necho hi\n")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Fatalf("mode after write = %04o, want 0755", fi.Mode().Perm())
+	}
+	if err := fsroot.WriteAtomic(root, "new.txt", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = os.Stat(filepath.Join(dir, "new.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o644 {
+		t.Fatalf("new file mode = %04o, want 0644", fi.Mode().Perm())
+	}
+}

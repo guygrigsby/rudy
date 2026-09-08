@@ -55,18 +55,27 @@ func tempName(rel string) (string, error) {
 	return fmt.Sprintf("%s.rudy-%d-%d-%s.tmp", rel, os.Getpid(), seq, hex.EncodeToString(r[:])), nil
 }
 
-// WriteAtomic writes data to rel inside root through a temp file and rename.
+// WriteAtomic writes data to rel inside root through a temp file and rename. An existing
+// file's permission bits are carried onto the replacement: the rename swaps a whole new
+// inode in, so without this an edit to an executable script would silently drop its
+// executable bit. A file that does not exist yet gets 0644. Chmod is explicit because the
+// create mode is masked by the process umask, which would strip bits the original had.
 func WriteAtomic(root *os.Root, rel string, data []byte) error {
 	if dir := filepath.Dir(rel); dir != "." {
 		if err := root.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
+	perm := os.FileMode(0o644)
+	keep := false
+	if fi, err := root.Stat(rel); err == nil && fi.Mode().IsRegular() {
+		perm, keep = fi.Mode().Perm(), true
+	}
 	tmp, err := tempName(rel)
 	if err != nil {
 		return err
 	}
-	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return err
 	}
@@ -74,6 +83,13 @@ func WriteAtomic(root *os.Root, rel string, data []byte) error {
 		_ = f.Close()
 		_ = root.Remove(tmp)
 		return err
+	}
+	if keep {
+		if err := f.Chmod(perm); err != nil {
+			_ = f.Close()
+			_ = root.Remove(tmp)
+			return err
+		}
 	}
 	if err := f.Close(); err != nil {
 		_ = root.Remove(tmp)
