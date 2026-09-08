@@ -75,7 +75,7 @@ Authn column names the caller class table. Domain column names the aggregate met
 | `session.close` | TUI, headless, ACP | per class | any attached | `{session_id}` | `{}` | `not_found` | idempotent | detach; fires `session_closed` hook when the last client detaches; appends nothing |
 | `session.submit` | TUI, headless, plugin | per class | plugin only to sessions it opened | `{session_id, content: [ContentBlock text or image], source: typed, queued, steer, idempotency_key?: string}` | `{entry_id, turn_id, queued_position: int}`; `queued_position` zero means it started or continued a turn | `refused_by_invariant` typed while a turn is active, steer while not steering; `invalid_argument` empty content | keyed by `idempotency_key` within the session; absent key means not idempotent | `Turn.Start` for typed on idle, `Turn.Resume` for steer, `Session.Enqueue` for queued; appends `user_message` |
 | `session.interrupt` | TUI, headless, ACP | per class | any attached | `{session_id, how: steer or cancel}` | `{turn_id, state: TurnState}` | `refused_by_invariant` no active turn | idempotent; repeating returns current state | `Turn.Steer` or `Turn.Cancel`; cancel appends `turn_interrupted` |
-| `session.answer` | TUI, ACP | per class | connection declared `asker: true` | `{session_id, tool_use_id, decision: allow or deny, scope: once or session, reason: string}` | `{}` | `unauthorized` not an asker; `not_found` no pending request; `conflict` already answered | keyed by `tool_use_id`; a second answer is `conflict` | `Turn.Answer` via the Gate; appends `permission_decision` |
+| `session.answer` | TUI, ACP | per class | connection declared `asker: true` | `{session_id, tool_use_id, decision: allow or deny, scope: once or session, reason: string}` | `{}` | `unauthorized` not an asker; `not_found` no pending request; `not_found` when the question was already answered | keyed by `tool_use_id`; a second answer is `conflict` | `Turn.Answer` via the Gate; appends `permission_decision` |
 | `session.set_model` | TUI, headless, ACP | per class | any attached | `{session_id, model: ModelRef}` | `{entry_id}` | `conflict` a turn is active; `not_found` model not in registry | same value appends nothing and returns the latest `model_change` id | `Session.SetModel`; appends `model_change` |
 | `session.set_mode` | TUI, headless, ACP | per class | any attached | `{session_id, mode: PermissionMode}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetMode`; appends `mode_change` |
 | `session.set_thinking` | TUI, headless, ACP | per class | any attached | `{session_id, thinking: ThinkingLevel}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetThinking`; appends `thinking_change` |
@@ -200,7 +200,7 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 | Compactor | after `AssistantMessageAppended` or `ToolResultAppended`, if usage against the model's context window crosses the threshold, summarize with the session's model and append `compaction` | Session, Registry (context window), Provider |
 | Recovery | on `Session.Load`, for every `permission_decision` allow without a `tool_result`, append `tool_result` with outcome `lost`; single aggregate, listed here because it runs outside a turn | Session |
 
-A session allowance is checked before the dangerous set in every mode but off: a prior session-scope allow silences the ask even when the command is in `permissions.dangerous`.
+The dangerous set is checked before session allowances in every mode but off: a dangerous command always asks even when a prior session-scope allow matches, so widening a matcher prefix can never silence a dangerous command. See ADR 0011.
 
 Steering is `Turn.Steer` and `Turn.Resume`, one aggregate, no service.
 
@@ -448,7 +448,7 @@ Every key, its type, default and meaning. A missing key takes the default. Unkno
 | `hook_timeout_ms` | int | 5000 | per handler |
 | `tool_timeout_ms` | int | 600000 | per tool invocation |
 | `permissions.mode` | PermissionMode | `strict` | |
-| `permissions.dangerous` | [string] | see open list | matchers that ask under `permissive`; each is `tool` or `tool:prefix`. Pass 1 entries are plain shell command prefixes for bash; the `tool:prefix` form is deferred |
+| `permissions.dangerous` | [string] | see open list | matchers that always ask unless the mode is off, ahead of any session allowance; each is `tool` or `tool:prefix`. Pass 1 entries are plain shell command prefixes for bash; the `tool:prefix` form is deferred |
 | `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |

@@ -368,6 +368,6 @@ The implementation plan breaks these into tasks.
 - Subagent model selection: a tier ladder from registry prices, as the owner's
   pi routing extension does, or per agent definition only.
 - The matcher prefix rule for session allowances (today the first two words of
-  the first command) is undecided; a session allowance is checked before the
-  dangerous set, so widening the prefix widens what one allow can silently
-  permit, including commands on the dangerous list.
+  the first command) is undecided. The dangerous set is checked before
+  allowances (ADR 0011), so widening the prefix only widens what one allow
+  covers among non-dangerous commands.
