@@ -34,6 +34,8 @@ func OpenLog(dir string) (*Log, error) {
 }
 
 // Append writes one entry as one line. The write is buffered; Sync makes it durable.
+// Appending to a closed log is ErrClosed, not a panic: a session outlives its file whenever
+// something else closed it first, and the holder deserves an error it can record.
 func (l *Log) Append(e Entry) error {
 	line, err := e.MarshalJSON()
 	if err != nil {
@@ -41,6 +43,9 @@ func (l *Log) Append(e Entry) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.f == nil {
+		return fmt.Errorf("session: append: %w", ErrClosed)
+	}
 	if _, err := l.w.Write(line); err != nil {
 		return fmt.Errorf("session: append: %w", err)
 	}
@@ -50,10 +55,14 @@ func (l *Log) Append(e Entry) error {
 	return nil
 }
 
-// Sync flushes the buffer and fsyncs the file.
+// Sync flushes the buffer and fsyncs the file. A closed log is ErrClosed, for the same
+// reason Append is.
 func (l *Log) Sync() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.f == nil {
+		return fmt.Errorf("session: sync: %w", ErrClosed)
+	}
 	return l.syncLocked()
 }
 

@@ -12,6 +12,9 @@ import (
 // ErrInvariant wraps every refusal by Append and Fork.
 var ErrInvariant = errors.New("session: invariant")
 
+// ErrClosed wraps every Append or Sync on a session, or a log, that has been closed.
+var ErrClosed = errors.New("session: closed")
+
 func invariant(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvariant, fmt.Sprintf(format, args...))
 }
@@ -382,13 +385,12 @@ func (s *Session) decisionFor(toolUseID string) (PermissionDecision, bool) {
 	return PermissionDecision{}, false
 }
 
-// Close syncs and closes the log and releases the lock.
+// Close syncs and closes the log and releases the lock. The log pointer is kept: anything
+// that still holds this session, a turn the server closed out from under after its shutdown
+// budget ran out, gets ErrClosed from its next Append or Sync instead of dereferencing a nil
+// log and taking the process down. Closing twice is a no-op.
 func (s *Session) Close() error {
-	var err error
-	if s.log != nil {
-		err = s.log.Close()
-		s.log = nil
-	}
+	err := s.log.Close()
 	if s.unlock != nil {
 		s.unlock()
 		s.unlock = nil

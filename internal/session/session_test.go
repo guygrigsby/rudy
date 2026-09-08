@@ -262,3 +262,23 @@ func rewriteLog(dir string, entries []Entry) error {
 	}
 	return l.Close()
 }
+
+// TestAppendAfterCloseIsAnError covers the crash a shutdown could cause: Close used to drop
+// the log pointer, so anything still holding the session (a turn the server closed out from
+// under after its shutdown budget ran out) panicked on its next Append instead of failing.
+func TestAppendAfterCloseIsAnError(t *testing.T) {
+	_, s := newSession(t)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Append(UserMessage{Source: SourceTyped, Content: []Block{TextBlock("after close")}})
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("Append after Close = %v, want ErrClosed", err)
+	}
+	if err := s.Sync(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Sync after Close = %v, want ErrClosed", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close = %v", err)
+	}
+}
