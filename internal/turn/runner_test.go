@@ -722,3 +722,102 @@ func waitForDelta(t *testing.T, rec *recorder, n int) {
 	}
 	t.Fatalf("waited for %d deltas", n)
 }
+
+// TestSteerWhileAwaitingPermission and TestCancelWhileAwaitingPermission cover the
+// interrupt that lands while the asker still holds the question. Every tool_result needs a
+// permission_decision for its tool_use before it, so the killed result the interrupt
+// records has to be preceded by a deny for that same tool_use; without one Append refuses
+// the result and the turn dies as an internal failure instead of steering or cancelling.
+func TestSteerWhileAwaitingPermission(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"ls"}`), stop(session.StopToolUse, "tool_calls")),
+		{text("steered"), stop(session.StopEndTurn, "stop")},
+	}}
+	asked, release := make(chan struct{}), make(chan struct{})
+	asker := askerFunc(func(context.Context, Question) (Answer, error) {
+		close(asked)
+		<-release
+		return Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "too late"}, nil
+	})
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": echoTool(tool.Unsafe, "bash")}, asker, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "list")) }()
+	<-asked
+	r.Interrupt(session.InterruptSteer)
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after steer")
+	}
+	if r.State() != Steering {
+		t.Fatalf("state %s", r.State())
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage, session.KindPermissionDecision, session.KindToolResult}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v want %v", got, want)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.ToolUseID != "tu1" || pd.Decision != session.Deny || pd.DecidedBy != session.ByAsker || pd.Scope != session.ScopeOnce || pd.Reason != "interrupted" {
+		t.Fatalf("decision %+v", pd)
+	}
+	tr := rec.entries[3].Payload.(session.ToolResult)
+	if tr.ToolUseID != "tu1" || tr.Outcome != session.OutcomeKilled {
+		t.Fatalf("tool result %+v", tr)
+	}
+	if err := r.Run(context.Background(), userMsg(session.SourceSteer, "never mind")); err != nil {
+		t.Fatal(err)
+	}
+	if r.State() != Completed {
+		t.Fatalf("state after the steer resume %s", r.State())
+	}
+}
+
+func TestCancelWhileAwaitingPermission(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"ls"}`), stop(session.StopToolUse, "tool_calls")),
+	}}
+	asked, release := make(chan struct{}), make(chan struct{})
+	asker := askerFunc(func(context.Context, Question) (Answer, error) {
+		close(asked)
+		<-release
+		return Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "too late"}, nil
+	})
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": echoTool(tool.Unsafe, "bash")}, asker, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "list")) }()
+	<-asked
+	r.Interrupt(session.InterruptCancel)
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if r.State() != Idle {
+		t.Fatalf("state %s", r.State())
+	}
+	want := []session.Kind{session.KindUserMessage, session.KindAssistantMessage, session.KindPermissionDecision, session.KindToolResult, session.KindTurnInterrupted}
+	if got := rec.kinds(); !equalKinds(got, want) {
+		t.Fatalf("entries %v want %v", got, want)
+	}
+	pd := rec.entries[2].Payload.(session.PermissionDecision)
+	if pd.Decision != session.Deny || pd.DecidedBy != session.ByAsker || pd.Reason != "interrupted" {
+		t.Fatalf("decision %+v", pd)
+	}
+	if ti := rec.entries[4].Payload.(session.TurnInterrupted); ti.How != session.InterruptCancel || ti.TurnID != rec.entries[0].ID {
+		t.Fatalf("interrupted %+v", ti)
+	}
+}

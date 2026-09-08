@@ -334,15 +334,13 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: tu.Input, Matcher: verdict.Matcher})
 		cancel()
 		if how := r.takeInterrupt(); how != "" {
-			if _, err := r.append(session.ToolResult{ToolUseID: tu.ID, Outcome: session.OutcomeKilled,
-				Content: []session.Block{session.TextBlock("interrupted while awaiting permission")}}); err != nil {
+			if err := r.denyInterrupted(dec); err != nil {
 				return true, r.fail(session.ErrInternal, err)
 			}
 			return true, r.finishInterrupt(how)
 		}
 		if ctx.Err() != nil {
-			if _, err := r.append(session.ToolResult{ToolUseID: tu.ID, Outcome: session.OutcomeKilled,
-				Content: []session.Block{session.TextBlock("interrupted while awaiting permission")}}); err != nil {
+			if err := r.denyInterrupted(dec); err != nil {
 				return true, r.fail(session.ErrInternal, err)
 			}
 			_ = r.finishInterrupt(session.InterruptCancel)
@@ -432,6 +430,25 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		return true, r.fail(session.ErrInternal, err)
 	}
 	return false, nil
+}
+
+// denyInterrupted closes out a tool_use the asker never answered because a steer or a
+// cancel arrived first. Every tool_result needs a permission_decision for its tool_use
+// ahead of it, so the question is denied before the killed result is recorded: without the
+// deny, Append refuses the result and an ordinary interrupt turns into an internal failure.
+// The decision is attributed to the asker because interrupting is the asker's own act, and
+// scoped once so it never becomes a session allowance.
+func (r *Runner) denyInterrupted(dec session.PermissionDecision) error {
+	dec.Decision, dec.DecidedBy, dec.Scope, dec.Reason = session.Deny, session.ByAsker, session.ScopeOnce, "interrupted"
+	if _, err := r.append(dec); err != nil {
+		return err
+	}
+	_, err := r.append(session.ToolResult{
+		ToolUseID: dec.ToolUseID,
+		Outcome:   session.OutcomeKilled,
+		Content:   []session.Block{session.TextBlock("interrupted while awaiting permission")},
+	})
+	return err
 }
 
 func (r *Runner) finishInterrupt(how session.Interrupt) error {
