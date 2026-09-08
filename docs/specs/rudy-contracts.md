@@ -89,7 +89,7 @@ Authn column names the caller class table. Domain column names the aggregate met
 | `plugin.register_widget` | plugin | per class | own name only | `{key, slot: header, above_editor or below_editor, content: [Span]}` | `{}` | `invalid_argument` unknown slot | idempotent; re-registering replaces content | `PluginRegistry.SetWidget` |
 | `plugin.set_status` | plugin | per class | own name only | `{key, content: [Span]}`; empty content clears | `{}` | none | idempotent | `PluginRegistry.SetStatus` |
 | `plugin.register_provider` | plugin | per class | own name only | `{name, wire: anthropic_messages, openai_chat or custom}`; `custom` means the server calls `provider.complete` on the plugin | `{}` | `conflict` provider name taken | idempotent for identical definition | `PluginRegistry.RegisterProvider` |
-| `plugin.append_note` | plugin | per class | any session the plugin can see | `{session_id, content: [Span]}` | `{entry_id}` | `not_found` | not idempotent | `Session.Append(note)` |
+| `plugin.append_note` | plugin | per class | any session the plugin can see | `{session_id, text, role: info, muted, warn or error}` | `{entry_id}` | `not_found` | not idempotent | `Session.Append(note)` |
 
 ### Requests, server to plugin
 
@@ -162,7 +162,7 @@ Delivery inside the process is synchronous and ordered per session. Published ev
 | `TurnResumed` | Turn | steering to streaming | `{session_id, turn_id}` | RequestAssembler, `before_request` hook | sync | published as `before_request` | `Turn.Resume` |
 | `TurnCompleted` | Turn | streaming to completed | `{session_id, turn_id, usage: Usage}` | clients, `turn_completed` hook, Session (`Dequeue` next queued message) | sync | published as `turn_completed` | `Turn.Complete` |
 | `TurnCancelled` | Turn | steering to idle | `{session_id, turn_id}` | Session (`Append turn_interrupted`), clients | sync | internal | `Turn.Cancel` |
-| `TurnFailedEvent` | Turn | any active to failed | `{session_id, turn_id, error_class, message, retries}` | Session (`Append turn_failed`), clients | sync | internal | `Turn.Fail` |
+| `TurnFailedEvent` | Turn | any active to failed | `{session_id, turn_id, class, message, retries}` | Session (`Append turn_failed`), clients | sync | internal | `Turn.Fail` |
 
 ### Plugin and Registry events
 
@@ -244,7 +244,7 @@ Invariants, enforced by `Session.Append` and checked by `Session.Load`:
 - an `assistant_message` containing `tool_use` blocks is followed, for each `tool_use.id`, by exactly one `permission_decision` and then exactly one `tool_result` before the next `assistant_message`; `Load` appends `tool_result` outcome `lost` for any allow without a result
 - for a tool whose safety is `unsafe`, the `permission_decision` line is fsynced before the tool runs
 - `user_message` with source `steer` appears only after an `assistant_message` with `stop_reason: interrupted` or a `tool_result` with outcome `killed`
-- `compaction.from_entry_id` and `to_entry_id` name entries in this file or, for a fork, in the parent chain
+- `compaction.first_entry_id` and `last_entry_id` name entries in this file or, for a fork, in the parent chain
 - a session with children under `fork_point` is refused deletion
 
 Kinds:
@@ -379,13 +379,13 @@ Kinds:
 | field | type | null | meaning |
 |---|---|---|---|
 | `summary` | string | no | what the model sees in place of the covered entries |
-| `from_entry_id` | ulid | no | first covered entry |
-| `to_entry_id` | ulid | no | last covered entry |
+| `first_entry_id` | ulid | no | first covered entry |
+| `last_entry_id` | ulid | no | last covered entry; must be present and not before `first_entry_id` |
 | `model` | ModelRef | no | the model that wrote the summary |
 | `usage` | Usage | no | cost of writing it |
 
 ```json
-{"id":"01K4M0AF...","at":"...","kind":"compaction","summary":"...","from_entry_id":"01K4M0A8...","to_entry_id":"01K4M0AD...","model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"usage":{"input":40000,"output":900,"cache_read":0,"cache_write":0}}
+{"id":"01K4M0AF...","at":"...","kind":"compaction","summary":"...","first_entry_id":"01K4M0A8...","last_entry_id":"01K4M0AD...","model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"usage":{"input":40000,"output":900,"cache_read":0,"cache_write":0}}
 ```
 
 **`turn_interrupted`**
@@ -404,12 +404,12 @@ Kinds:
 | field | type | null | meaning |
 |---|---|---|---|
 | `turn_id` | ulid | no | |
-| `error_class` | `provider_error`, `plugin_error`, `internal` | no | |
+| `class` | `provider`, `transport`, `plugin`, `internal` | no | `provider` answered with an error after retries; `transport` never answered; `plugin` a plugin fault; `internal` a rudy fault |
 | `message` | string | no | |
-| `retries` | int | no | attempts made before giving up |
+| `retries` | int | no | attempts made before giving up; 0 when not applicable |
 
 ```json
-{"id":"01K4M0AH...","at":"...","kind":"turn_failed","turn_id":"01K4M0A8...","error_class":"provider_error","message":"502 from aperture after 4 attempts","retries":4}
+{"id":"01K4M0AH...","at":"...","kind":"turn_failed","turn_id":"01K4M0A8...","class":"provider","message":"502 from aperture after 4 attempts","retries":4}
 ```
 
 **`note`**
@@ -417,10 +417,11 @@ Kinds:
 | field | type | null | meaning |
 |---|---|---|---|
 | `plugin` | string | no | owner |
-| `content` | [Span] | no | display only; never sent to a model |
+| `text` | string | no | display only; never sent to a model |
+| `role` | `info`, `muted`, `warn`, `error` | no | the theme role the client renders it with |
 
 ```json
-{"id":"01K4M0AI...","at":"...","kind":"note","plugin":"memory","content":[{"text":"3 concepts folded","role":"muted"}]}
+{"id":"01K4M0AI...","at":"...","kind":"note","plugin":"memory","text":"3 concepts folded","role":"muted"}
 ```
 
 ### registry.json
@@ -438,13 +439,14 @@ Every key, its type, default and meaning. A missing key takes the default. Unkno
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `model` | string `provider/model` | required | the one model in config; everything else comes from the registry |
-| `thinking` | ThinkingLevel | `high` | |
+| `default.provider` | string | required when `providers` is non-empty | the provider of the one model in config; everything else comes from the registry |
+| `default.model` | string | required | the model id under that provider. A model spec on the CLI or in the protocol is `provider:id`, or a bare id that is unique across providers |
+| `default.thinking` | ThinkingLevel | `high` | |
 | `agent` | string | `default` | agent definition for new sessions |
 | `hook_timeout_ms` | int | 5000 | per handler |
 | `tool_timeout_ms` | int | 600000 | per tool invocation |
 | `permissions.mode` | PermissionMode | `strict` | |
-| `permissions.dangerous` | [string] | see open list | matchers that ask under `permissive`; each is `tool` or `tool:prefix` |
+| `permissions.dangerous` | [string] | see open list | matchers that ask under `permissive`; each is `tool` or `tool:prefix`. Pass 1 entries are plain shell command prefixes for bash; the `tool:prefix` form is deferred |
 | `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
@@ -466,7 +468,7 @@ Every key, its type, default and meaning. A missing key takes the default. Unkno
 | `keys.<action id>` | string or [string] | pi defaults | pi's namespaced action ids; a value replaces the default for that action; `[]` unbinds |
 | `providers.<name>.wire` | `anthropic_messages`, `openai_chat` | required | |
 | `providers.<name>.base_url` | string | required | |
-| `providers.<name>.auth_ref` | string | `` | `env:NAME` or `op:VAR` resolved from the 1Password cache; empty means no auth header |
+| `providers.<name>.auth` | string | `` | `env:NAME` reads the environment; `cache:KEY` reads a `KEY=value` line from the 1Password cache file; empty means no auth header |
 | `providers.<name>.headers` | table | `{}` | sent on every request |
 | `providers.<name>.models_path` | string | `/v1/models` | discovery endpoint relative to `base_url` |
 | `plugins.disabled` | [string] | `[]` | linked or spawned plugins not to load |
@@ -500,7 +502,7 @@ YAML frontmatter then the system prompt body.
 | `name` | string | file stem | |
 | `description` | string | required | |
 | `tools` | [string] | all | tool names exposed; empty list means none |
-| `model` | string | inherit | `provider/model` or empty to inherit the parent's |
+| `model` | string | inherit | `provider:id`, a bare id unique across providers, or empty to inherit the parent's |
 | `thinking` | ThinkingLevel | inherit | |
 | `max_turns` | int | 0 | zero means unlimited |
 

@@ -53,7 +53,7 @@ Entity, aggregate root. One conversation over one workspace, persisted as an app
 - `Model() ModelRef` returns the ref from the most recent `session_opened` or `model_change`.
 - `Mode() PermissionMode` returns the mode from the most recent `session_opened` or `mode_change`.
 - `ThinkingLevel() ThinkingLevel` returns the level from the most recent `session_opened` or a thinking change.
-- `Usage() Usage` sums the usage across all `assistant_message` entries.
+- `Usage() Usage` sums the usage across all `assistant_message` and `compaction` entries, since both are provider calls the session paid for.
 - `Title() string` returns the title from the most recent `title_change`; empty when none. Whether the first user message stands in is open.
 - `Allowances() []Matcher` returns the matchers of every `permission_decision` with decision `allow` and scope `session`. Derived from the log, never stored separately.
 
@@ -230,15 +230,20 @@ Value object, payload of a `compaction` entry. Marks a boundary: entries it cove
 | Field | Type | Meaning |
 |---|---|---|
 | `summary` | string | The compressed summary of the covered range |
-| `firstEntry` | ULID | First entry id covered, inclusive |
-| `lastEntry` | ULID | Last entry id covered, inclusive |
+| `firstEntryID` | ULID | First entry id covered, inclusive |
+| `lastEntryID` | ULID | Last entry id covered, inclusive; not before `firstEntryID` |
+| `model` | `ModelRef` | The model that wrote the summary |
+| `usage` | `Usage` | What writing the summary cost, verbatim from the provider |
 
 ## TurnInterrupted
 
 Value object, payload of a `turn_interrupted` entry.
 
+A turn id is the id of the `user_message` entry that started the turn. Turns are not stored; that id is enough to find one in the log, and it is the `turn_id` every protocol message carries.
+
 | Field | Type | Meaning |
 |---|---|---|
+| `turnID` | ULID | The turn this interruption ended or paused |
 | `how` | `InterruptKind` | steer or cancel |
 
 ## TurnFailed
@@ -247,8 +252,10 @@ Value object, payload of a `turn_failed` entry.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `errorClass` | `ErrorClass` | The closed failure category |
+| `turnID` | ULID | The turn that failed |
+| `class` | `ErrorClass` | The closed failure category |
 | `message` | string | The provider or system message, for display |
+| `retries` | int | Attempts made before giving up; 0 when not applicable |
 
 ## Note
 
@@ -257,7 +264,19 @@ Value object, payload of a `note` entry. Display-only; never part of a request c
 | Field | Type | Meaning |
 |---|---|---|
 | `plugin` | string | The plugin name that emitted the note |
-| `content` | string | The note text |
+| `text` | string | The note text |
+| `role` | `NoteRole` | The theme role the client renders it with |
+
+## NoteRole
+
+Enumeration.
+
+| Value | Means |
+|---|---|
+| `info` | Ordinary information |
+| `muted` | Low emphasis |
+| `warn` | Something to look at |
+| `error` | Something failed |
 
 ## Turn
 
@@ -491,6 +510,7 @@ Enumeration.
 |---|---|
 | `provider` | The provider returned an error after retries |
 | `transport` | The connection failed |
+| `plugin` | A plugin fault: a panic or a programming error in a tool, not a tool that ran and reported an error |
 | `internal` | A rudy fault |
 
 ## EntryKind
