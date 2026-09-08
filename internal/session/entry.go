@@ -212,7 +212,7 @@ func (b BlockType) Valid() bool {
 type Workspace struct {
 	Root      string `json:"root"`
 	GitRoot   string `json:"git_root"` // empty means not a git repository
-	ProjectID string `json:"project_id"`
+	ProjectID string `json:"project_id"` // empty means no derivable project id; project-scoped memory is unavailable
 }
 
 // ModelRef names a model on a provider.

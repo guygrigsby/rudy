@@ -25,7 +25,11 @@ var (
 )
 
 // Detect resolves cwd to a Workspace. Root is the absolute cwd, GitRoot the repository
-// top level or empty, ProjectID the id the memory CLI derives for the same directory.
+// top level or empty, ProjectID the id the memory CLI derives for the same directory, or
+// "" when even the local/<basename> fallback is malformed (for example cwd is "/", or its
+// basename contains whitespace); an empty ProjectID means project-scoped memory is
+// unavailable for this workspace, not that Detect failed. Detect never returns an error
+// for a legal directory.
 func Detect(cwd string) (session.Workspace, error) {
 	root, err := filepath.Abs(cwd)
 	if err != nil {
@@ -34,17 +38,17 @@ func Detect(cwd string) (session.Workspace, error) {
 	ws := session.Workspace{Root: filepath.Clean(root)}
 	ws.GitRoot = git(ws.Root, "rev-parse", "--show-toplevel")
 	if ws.GitRoot == "" {
-		ws.ProjectID = LocalProjectID(ws.Root)
+		ws.ProjectID = localOrEmpty(ws.Root)
 		return ws, nil
 	}
 	origin := git(ws.GitRoot, "remote", "get-url", "origin")
 	if origin == "" {
-		ws.ProjectID = LocalProjectID(ws.GitRoot)
+		ws.ProjectID = localOrEmpty(ws.GitRoot)
 		return ws, nil
 	}
 	id, err := ProjectIDFromOrigin(origin)
 	if errors.Is(err, ErrRefused) {
-		ws.ProjectID = LocalProjectID(ws.GitRoot)
+		ws.ProjectID = localOrEmpty(ws.GitRoot)
 		return ws, nil
 	}
 	if err != nil {
@@ -52,6 +56,17 @@ func Detect(cwd string) (session.Workspace, error) {
 	}
 	ws.ProjectID = id
 	return ws, nil
+}
+
+// localOrEmpty is LocalProjectID validated against the same rules memory's
+// localProjectId enforces; a dir whose derived id is malformed (dir is "/", or its
+// basename contains whitespace) yields "" instead of an unusable id.
+func localOrEmpty(dir string) string {
+	id := LocalProjectID(dir)
+	if _, err := AssertProjectID(id); err != nil {
+		return ""
+	}
+	return id
 }
 
 // git runs one git command in dir and returns its trimmed stdout, or "" on any failure.

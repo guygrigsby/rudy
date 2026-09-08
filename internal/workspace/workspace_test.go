@@ -164,3 +164,46 @@ func TestDetectFilesystemOriginFallsBackToLocal(t *testing.T) {
 		t.Errorf("got %q", ws.ProjectID)
 	}
 }
+
+func TestDetectRefusesMalformedLocalID(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T) (dir, want string)
+	}{
+		{
+			name: "filesystem root",
+			setup: func(t *testing.T) (string, string) {
+				return "/", ""
+			},
+		},
+		{
+			name: "basename with a space",
+			setup: func(t *testing.T) (string, string) {
+				dir := filepath.Join(t.TempDir(), "my project")
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return dir, ""
+			},
+		},
+		{
+			name: "normal temp dir",
+			setup: func(t *testing.T) (string, string) {
+				dir := t.TempDir()
+				return dir, "local/" + filepath.Base(dir)
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir, want := c.setup(t)
+			ws, err := workspace.Detect(dir)
+			if err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			if ws.ProjectID != want {
+				t.Errorf("%s: got %q want %q", c.name, ws.ProjectID, want)
+			}
+		})
+	}
+}
