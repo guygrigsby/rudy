@@ -3,6 +3,7 @@ module github.com/guygrigsby/rudy
 go 1.26.2
 
 require (
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/oklog/ulid/v2 v2.1.2
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/spf13/cobra v1.10.2
