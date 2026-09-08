@@ -31,6 +31,10 @@ const (
 	Failed             State = "failed"
 )
 
+// interruptedText is the tool_result content for a tool_use killed while its permission
+// question was still with the asker.
+const interruptedText = "interrupted while awaiting permission"
+
 // Question is a permission request for one tool_use.
 type Question struct {
 	ToolUseID string
@@ -247,7 +251,7 @@ func (r *Runner) loop(ctx context.Context) error {
 		}
 		for _, tu := range toolUses {
 			if raw, bad := malformed[tu.ID]; bad {
-				if err := r.rejectMalformed(tu, raw); err != nil {
+				if err := r.refuse(r.classDeny(tu, "malformed input"), session.OutcomeError, "malformed tool input: "+raw); err != nil {
 					return r.fail(session.ErrInternal, err)
 				}
 				continue
@@ -297,25 +301,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 	s := r.cfg.Session
 	t, ok := r.cfg.Tools.Tool(tu.Name)
 	if !ok {
-		// Every tool_result must have a preceding permission_decision for its
-		// tool_use id, even one that never runs because the tool is unknown.
-		if _, err := r.append(session.PermissionDecision{
-			ToolUseID: tu.ID,
-			Tool:      tu.Name,
-			Mode:      s.Mode(),
-			Matcher:   session.Matcher{Tool: tu.Name},
-			Decision:  session.Deny,
-			DecidedBy: session.ByClass,
-			Scope:     session.ScopeOnce,
-			Reason:    "unknown tool",
-		}); err != nil {
-			return true, r.fail(session.ErrInternal, err)
-		}
-		if _, err := r.append(session.ToolResult{
-			ToolUseID: tu.ID,
-			Outcome:   session.OutcomeError,
-			Content:   []session.Block{session.TextBlock("unknown tool " + tu.Name)},
-		}); err != nil {
+		if err := r.refuse(r.classDeny(tu, "unknown tool"), session.OutcomeError, "unknown tool "+tu.Name); err != nil {
 			return true, r.fail(session.ErrInternal, err)
 		}
 		return false, nil
@@ -346,13 +332,13 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: tu.Input, Matcher: verdict.Matcher})
 		cancel()
 		if how := r.takeInterrupt(); how != "" {
-			if err := r.denyInterrupted(dec); err != nil {
+			if err := r.refuse(interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {
 				return true, r.fail(session.ErrInternal, err)
 			}
 			return true, r.finishInterrupt(how)
 		}
 		if ctx.Err() != nil {
-			if err := r.denyInterrupted(dec); err != nil {
+			if err := r.refuse(interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {
 				return true, r.fail(session.ErrInternal, err)
 			}
 			_ = r.finishInterrupt(session.InterruptCancel)
@@ -444,23 +430,44 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 	return false, nil
 }
 
-// denyInterrupted closes out a tool_use the asker never answered because a steer or a
-// cancel arrived first. Every tool_result needs a permission_decision for its tool_use
-// ahead of it, so the question is denied before the killed result is recorded: without the
-// deny, Append refuses the result and an ordinary interrupt turns into an internal failure.
-// The decision is attributed to the asker because interrupting is the asker's own act, and
-// scoped once so it never becomes a session allowance.
-func (r *Runner) denyInterrupted(dec session.PermissionDecision) error {
-	dec.Decision, dec.DecidedBy, dec.Scope, dec.Reason = session.Deny, session.ByAsker, session.ScopeOnce, "interrupted"
+// refuse records a tool_use that will not run: the deny the log requires ahead of any
+// tool_result for that tool_use, then the result itself. Every path that answers a tool_use
+// without invoking the tool goes through here, so the ordering invariant lives in one place
+// rather than being remembered separately at each of them.
+func (r *Runner) refuse(dec session.PermissionDecision, outcome session.Outcome, text string) error {
 	if _, err := r.append(dec); err != nil {
 		return err
 	}
 	_, err := r.append(session.ToolResult{
 		ToolUseID: dec.ToolUseID,
-		Outcome:   session.OutcomeKilled,
-		Content:   []session.Block{session.TextBlock("interrupted while awaiting permission")},
+		Outcome:   outcome,
+		Content:   []session.Block{session.TextBlock(text)},
 	})
 	return err
+}
+
+// classDeny is the decision for a tool_use the gate never got to weigh: nothing about the
+// mode, the allowances or an asker entered into it, so it is denied by class.
+func (r *Runner) classDeny(tu session.Block, reason string) session.PermissionDecision {
+	return session.PermissionDecision{
+		ToolUseID: tu.ID,
+		Tool:      tu.Name,
+		Mode:      r.cfg.Session.Mode(),
+		Matcher:   session.Matcher{Tool: tu.Name},
+		Decision:  session.Deny,
+		DecidedBy: session.ByClass,
+		Scope:     session.ScopeOnce,
+		Reason:    reason,
+	}
+}
+
+// interruptedDeny turns a question the asker never answered, because a steer or a cancel
+// arrived first, into the deny that has to precede the killed result. It keeps the gate's
+// own matcher and mode from the verdict, is attributed to the asker because interrupting is
+// the asker's own act, and is scoped once so it never becomes a session allowance.
+func interruptedDeny(dec session.PermissionDecision) session.PermissionDecision {
+	dec.Decision, dec.DecidedBy, dec.Scope, dec.Reason = session.Deny, session.ByAsker, session.ScopeOnce, "interrupted"
+	return dec
 }
 
 func (r *Runner) finishInterrupt(how session.Interrupt) error {
@@ -677,31 +684,6 @@ func sanitizeToolInputs(blocks []session.Block) map[string]string {
 		blocks[i].Input = json.RawMessage("{}")
 	}
 	return raw
-}
-
-// rejectMalformed answers a tool_use whose input never parsed. The tool is not consulted at
-// all, so the decision is the gate's own class rule rather than anything a mode or an asker
-// had a say in; it exists because a tool_result needs a permission_decision for its tool_use
-// ahead of it.
-func (r *Runner) rejectMalformed(tu session.Block, raw string) error {
-	if _, err := r.append(session.PermissionDecision{
-		ToolUseID: tu.ID,
-		Tool:      tu.Name,
-		Mode:      r.cfg.Session.Mode(),
-		Matcher:   session.Matcher{Tool: tu.Name},
-		Decision:  session.Deny,
-		DecidedBy: session.ByClass,
-		Scope:     session.ScopeOnce,
-		Reason:    "malformed input",
-	}); err != nil {
-		return err
-	}
-	_, err := r.append(session.ToolResult{
-		ToolUseID: tu.ID,
-		Outcome:   session.OutcomeError,
-		Content:   []session.Block{session.TextBlock("malformed tool input: " + raw)},
-	})
-	return err
 }
 
 // dropIncompleteToolUses removes tool_use blocks whose input is not valid JSON. They
