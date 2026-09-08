@@ -488,7 +488,7 @@ func Validate(p Payload) error {
 		if v.FirstEntryID.Compare(v.LastEntryID) > 0 {
 			return errors.New("compaction: last_entry_id before first_entry_id")
 		}
-		if v.Model.Provider == "" || v.Model.Model == "" {
+		if v.Model == (ModelRef{}) {
 			return errors.New("compaction: model required")
 		}
 	case TurnInterrupted:

@@ -189,6 +189,50 @@ func TestEntryTextAndSignatureVerbatim(t *testing.T) {
 	}
 }
 
+// TestEntryContentKeyAppearsOnce guards against a regression where blocksOf
+// zeroed Content on a copy of the payload and marshaled that copy for the
+// scalar fields: since Content has no omitempty tag, the scalar encode
+// still emitted "content":null, and MarshalJSON then appended a second,
+// real "content" array after it. A round trip does not catch this because
+// json.Unmarshal takes the last "content" key, so the buggy line decodes
+// and re-encodes to the same (still doubled) bytes.
+func TestEntryContentKeyAppearsOnce(t *testing.T) {
+	id := mustULID(t, "01K4M0A7Q8ZJ3N6R9T2V5X8B1D")
+	at := time.Date(2026, 9, 7, 20, 30, 0, 0, time.UTC)
+
+	entries := []Entry{
+		{ID: id, At: at, Kind: KindUserMessage, Payload: UserMessage{
+			Source: SourceTyped, Content: []Block{TextBlock("hi")},
+		}},
+		{ID: id, At: at, Kind: KindAssistantMessage, Payload: AssistantMessage{
+			Model: ModelRef{"aperture", "m"}, Thinking: ThinkingOff,
+			Content:    []Block{TextBlock("hi")},
+			StopReason: StopEndTurn, StopReasonRaw: "stop",
+		}},
+		{ID: id, At: at, Kind: KindToolResult, Payload: ToolResult{
+			ToolUseID: "t1", Outcome: OutcomeOK, Content: []Block{TextBlock("ok")}, DurationMS: 1,
+		}},
+	}
+	for _, e := range entries {
+		line, err := e.MarshalJSON()
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", e.Kind, err)
+		}
+		if n := bytes.Count(line, []byte(`"content":`)); n != 1 {
+			t.Fatalf("%s: expected exactly one content key, got %d in %s", e.Kind, n, line)
+		}
+	}
+
+	want := `{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00Z","kind":"user_message","source":"typed","content":[{"type":"text","text":"hi"}]}`
+	got, err := entries[0].MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("user_message line = %s, want %s", got, want)
+	}
+}
+
 func TestEntryUnmarshalRejects(t *testing.T) {
 	cases := map[string]string{
 		"unknown kind":  `{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00Z","kind":"event"}`,

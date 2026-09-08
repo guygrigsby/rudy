@@ -132,6 +132,10 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 // way), so zeroing it in place and marshaling the payload would still emit
 // "content":null alongside the content array appendBlocks writes by hand,
 // producing a line with two "content" keys.
+//
+// The three anonymous structs below mirror UserMessage, AssistantMessage
+// and ToolResult minus Content, field for field; a field added to, removed
+// from or retagged on one of those types must change here too.
 func blocksOf(p Payload) (blocks []Block, rest any, has bool) {
 	switch v := p.(type) {
 	case UserMessage:
