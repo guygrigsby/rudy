@@ -58,12 +58,28 @@ func (b *Blobs) Put(data []byte) (string, error) {
 
 // Get reads a blob by its sha256 hex.
 func (b *Blobs) Get(sha256hex string) ([]byte, error) {
-	if len(sha256hex) != 64 {
-		return nil, errors.New("session: get blob: not a sha256 hex")
+	if !isSHA256Hex(sha256hex) {
+		return nil, errors.New("session: blobs: invalid sha256")
 	}
 	data, err := os.ReadFile(filepath.Join(b.dir, sha256hex))
 	if err != nil {
 		return nil, fmt.Errorf("session: get blob: %w", err)
 	}
 	return data, nil
+}
+
+// isSHA256Hex reports whether s is exactly 64 lowercase hex characters. Get
+// rejects anything else before it ever reaches the filesystem, so a name
+// carrying "../" or uppercase characters cannot escape the blobs directory.
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := range len(s) {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

@@ -93,8 +93,10 @@ func (t Truncated) Error() string {
 
 // ReadLog returns every complete entry in dir's log. A missing file yields no
 // entries and no error. A truncated final line is dropped and reported as a
-// Truncated error alongside the entries read before it. Any other malformed
-// line is an error with no entries.
+// Truncated error alongside the entries read before it. A final line with no
+// trailing newline is reported as Truncated and dropped even when its JSON
+// parses cleanly: the newline is the commit marker for a line, not the JSON
+// syntax. Any other malformed line is an error with no entries.
 func ReadLog(dir string) ([]Entry, error) {
 	f, err := os.Open(filepath.Join(dir, LogFile))
 	if errors.Is(err, os.ErrNotExist) {
