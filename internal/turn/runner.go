@@ -123,6 +123,13 @@ func (r *Runner) State() State {
 // with a steer message continues the turn; cancel appends turn_interrupted and returns to
 // Idle. Cancel overrides a pending steer. Interrupting an idle, completed or failed runner
 // changes nothing.
+//
+// Interrupt touches the session directly only in the Steering case, appending
+// turn_interrupted itself: no Run goroutine is executing while the runner is Steering, so
+// there is nothing to serialize against there. That append happens under r.mu, the same
+// lock Run takes to claim its resume out of Steering (see Run), so the two calls still
+// serialize correctly against each other: whichever acquires r.mu first decides the
+// outcome, and the other observes the state the first one left behind.
 func (r *Runner) Interrupt(how session.Interrupt) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -149,12 +156,19 @@ func (r *Runner) Interrupt(how session.Interrupt) {
 // internal error for Failed, and ctx.Err() when the caller's context ended the turn.
 func (r *Runner) Run(ctx context.Context, msg session.UserMessage) error {
 	r.mu.Lock()
+	starting := true
 	switch r.state {
 	case Steering:
 		if msg.Source != session.SourceSteer {
 			r.mu.Unlock()
 			return fmt.Errorf("%w: a steering turn continues only with a steer message", session.ErrInvariant)
 		}
+		starting = false
+		// Claim the resume here, still holding r.mu: this is what serializes against a
+		// concurrent Interrupt(cancel), whose Steering branch also runs under r.mu. Once
+		// this is set, that branch no longer sees Steering and takes its other path
+		// instead of also appending turn_interrupted for the same decision.
+		r.setStateLocked(Streaming)
 	case Idle, Completed, Failed:
 		if msg.Source == session.SourceSteer {
 			r.mu.Unlock()
@@ -164,7 +178,6 @@ func (r *Runner) Run(ctx context.Context, msg session.UserMessage) error {
 		r.mu.Unlock()
 		return fmt.Errorf("%w: turn already active", session.ErrInvariant)
 	}
-	starting := r.state != Steering
 	r.interrupt = ""
 	r.mu.Unlock()
 
@@ -429,7 +442,7 @@ func (r *Runner) finishInterrupt(how session.Interrupt) error {
 	r.mu.Lock()
 	turn := r.turn
 	r.mu.Unlock()
-	if _, err := r.append(session.TurnInterrupted{TurnID: turn, How: session.InterruptCancel}); err != nil {
+	if _, err := r.append(session.TurnInterrupted{TurnID: turn, How: how}); err != nil {
 		return r.fail(session.ErrInternal, err)
 	}
 	r.setState(Idle)
@@ -465,8 +478,8 @@ func (r *Runner) fail(class session.ErrorClass, err error) error {
 	r.mu.Lock()
 	turn := r.turn
 	r.mu.Unlock()
-	if _, aerr := r.cfg.Session.Append(session.TurnFailed{TurnID: turn, Class: class, Message: msg, Retries: retries}); aerr == nil {
-		r.notifyLast()
+	if e, aerr := r.cfg.Session.Append(session.TurnFailed{TurnID: turn, Class: class, Message: msg, Retries: retries}); aerr == nil {
+		r.cfg.Observer.EntryAppended(e)
 	}
 	r.setState(Failed)
 	return err
@@ -487,13 +500,6 @@ func (r *Runner) append(p session.Payload) (session.Entry, error) {
 func (r *Runner) appendLocked(p session.Payload) {
 	if e, err := r.cfg.Session.Append(p); err == nil {
 		r.cfg.Observer.EntryAppended(e)
-	}
-}
-
-func (r *Runner) notifyLast() {
-	entries := r.cfg.Session.Entries()
-	if len(entries) > 0 {
-		r.cfg.Observer.EntryAppended(entries[len(entries)-1])
 	}
 }
 

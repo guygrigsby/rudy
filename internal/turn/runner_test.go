@@ -520,6 +520,118 @@ func TestSteerDuringToolKillsIt(t *testing.T) {
 	}
 }
 
+// TestResumeVsCancelRace is a regression test for a race between resuming a steered turn
+// and cancelling it at the same instant. Both Run (resuming with a steer message) and
+// Interrupt(InterruptCancel) check the runner's state and, in the Steering case, act on
+// it: Run claims the state (Steering -> Streaming) before appending the steer message;
+// Interrupt's Steering branch appends turn_interrupted itself. Before the fix, that check
+// and action were not atomic in Run, so both goroutines could independently observe
+// Steering and each proceed to append to the session with no serialization between them,
+// racing on Session's unprotected internal state.
+//
+// With the fix, both checks run under the runner's mutex, so exactly one of Run or
+// Interrupt observes Steering and resolves it; Run's return value pins down which:
+// wrapping ErrInvariant means Interrupt won the claim (Run is refused before it can
+// append anything), anything else means Run won it (it always appends the steer message
+// and returns nil in this scenario, since nothing here can fail).
+//
+// A losing Interrupt call is not necessarily a no-op past that point, though: once it
+// observes the runner is no longer Steering, it falls through to the same general
+// active-state handling TestCancelMidStream exercises, and its cancel signal very often
+// still lands on the turn Run just resumed, producing a further turn_interrupted for that
+// same turn moments later. That is correct, ordinary cancellation, not corruption: a
+// cancel arriving essentially simultaneously with a steer resume legitimately cancels the
+// resumed turn instead of silently losing the race to prevent it. What must never happen
+// is the two calls both believing they resolved the Steering state itself: Run appending
+// the steer message while Interrupt, at the same moment, also appends turn_interrupted
+// through its Steering branch believing the state was still Steering. Run's return value
+// makes that pairing directly checkable.
+//
+// Run with: go test -race -run TestResumeVsCancelRace -count=50 ./internal/turn/...
+func TestResumeVsCancelRace(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{
+		release: make(chan struct{}),
+		scripts: [][]provider.Part{
+			{text("Half"), {Type: pause}, text(" never sent"), stop(session.StopEndTurn, "stop")},
+			{text("Steered"), stop(session.StopEndTurn, "stop")},
+		},
+	}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+	waitForDelta(t, rec, 1)
+	r.Interrupt(session.InterruptSteer)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after steer")
+	}
+	if r.State() != Steering {
+		t.Fatalf("state %s", r.State())
+	}
+	before := len(s.Entries())
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var runErr error
+	go func() {
+		defer wg.Done()
+		runErr = r.Run(context.Background(), userMsg(session.SourceSteer, "race"))
+	}()
+	go func() {
+		defer wg.Done()
+		r.Interrupt(session.InterruptCancel)
+	}()
+	wg.Wait()
+
+	after := s.Entries()[before:]
+	hasUserMessage, hasTurnInterrupted := false, false
+	for _, e := range after {
+		switch e.Kind {
+		case session.KindUserMessage:
+			hasUserMessage = true
+		case session.KindTurnInterrupted:
+			hasTurnInterrupted = true
+		}
+	}
+
+	if errors.Is(runErr, session.ErrInvariant) {
+		// Interrupt won the claim: Run must never have appended the steer message, and
+		// Interrupt's own Steering branch must have appended turn_interrupted.
+		if hasUserMessage {
+			t.Fatalf("Interrupt won the claim but a steer user_message was still appended: %v", after)
+		}
+		if !hasTurnInterrupted {
+			t.Fatalf("Interrupt won the claim but appended no turn_interrupted: %v", after)
+		}
+		return
+	}
+	if runErr != nil {
+		t.Fatalf("Run won the claim but returned an unexpected error: %v", runErr)
+	}
+	// Run won the claim: it must have appended the steer message. A turn_interrupted may
+	// also be present (the losing Interrupt's cancel signal catching the resumed turn),
+	// but only after the steer message, never appended independently of it.
+	if !hasUserMessage {
+		t.Fatalf("Run won the claim but appended no steer user_message: %v", after)
+	}
+	sawUserMessage := false
+	for _, e := range after {
+		if e.Kind == session.KindUserMessage {
+			sawUserMessage = true
+		}
+		if e.Kind == session.KindTurnInterrupted && !sawUserMessage {
+			t.Fatalf("turn_interrupted appeared before the steer user_message: %v", after)
+		}
+	}
+}
+
 func TestProviderErrorFailsTurn(t *testing.T) {
 	s := openTestSession(t, session.ModeStrict)
 	p := &scripted{err: &provider.Error{Class: session.ErrProvider, Status: 502, Message: "bad gateway", Body: []byte("x"), Attempts: 5}}
