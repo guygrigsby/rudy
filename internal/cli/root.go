@@ -3,6 +3,9 @@
 package cli
 
 import (
+	"context"
+	"io"
+
 	"github.com/spf13/cobra"
 )
 
@@ -13,25 +16,23 @@ var version = "dev"
 // Version reports the build version.
 func Version() string { return version }
 
-// NewRoot builds the root command. Subcommands attach here in later tasks.
+// NewRoot is the rudy command with the real wiring. Same signature as Task 1.
 func NewRoot() *cobra.Command {
+	return newRoot(version, func(ctx context.Context, stderr io.Writer) (*Built, error) {
+		return Build(ctx, BuildOptions{Version: version, Stderr: stderr})
+	})
+}
+
+// newRoot takes the wiring as a parameter so tests can substitute a fake provider.
+func newRoot(version string, build buildFunc) *cobra.Command {
 	root := &cobra.Command{
-		Use:           "rudy",
-		Short:         "A coding agent harness",
+		Use:           "rudy [prompt]",
+		Short:         "a coding agent harness",
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
 	root.SetVersionTemplate("rudy {{.Version}}\n")
+	registerPrint(root, build)
 	return root
-}
-
-// Execute runs the root command against os.Args and reports the error once.
-func Execute() error {
-	root := NewRoot()
-	if err := root.Execute(); err != nil {
-		root.PrintErrln("rudy:", err)
-		return err
-	}
-	return nil
 }
