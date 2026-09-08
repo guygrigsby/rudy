@@ -1,6 +1,6 @@
 # ADR 0008: Memory is integrated through a Go SDK
 
-- Status: Accepted
+- Status: Accepted, implemented 2026-09-08 as memory-go in the memory repository
 - Date: 2026-09-07
 - Deciders: Guy Grigsby
 
