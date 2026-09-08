@@ -207,6 +207,12 @@ func (s *Session) Append(p Payload) (Entry, error) {
 	return e, nil
 }
 
+// Sync flushes the log's write buffer and fsyncs it. Append leaves most entries in that
+// buffer, so nothing a turn wrote is on disk until this runs (or until Close). Callers
+// sync at the boundaries that matter to them: the turn runner does it every time a turn
+// comes to rest, so a crash between turns cannot lose entries a user has already seen.
+func (s *Session) Sync() error { return s.log.Sync() }
+
 // Fork syncs this log, then creates a new session whose first entry is a
 // fork_point at `at`. Entries up to and including `at` are inherited by
 // reference, so the parent's bytes must be on disk before the child exists.

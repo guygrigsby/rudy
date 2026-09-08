@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -139,6 +140,11 @@ func (r *Runner) Interrupt(how session.Interrupt) {
 	case Steering:
 		if how == session.InterruptCancel {
 			r.appendLocked(session.TurnInterrupted{TurnID: r.turn, How: session.InterruptCancel})
+			// This ends the turn, so sync it here as rest does elsewhere. A failure can
+			// only be logged: fail takes r.mu, which this branch already holds.
+			if err := r.cfg.Session.Sync(); err != nil {
+				log.Printf("turn: sync session log at turn_interrupted: %v", err)
+			}
 			r.setStateLocked(Idle)
 		}
 		return
@@ -236,8 +242,7 @@ func (r *Runner) loop(ctx context.Context) error {
 			}
 		}
 		if len(toolUses) == 0 {
-			r.setState(Completed)
-			return nil
+			return r.rest(Completed)
 		}
 		for _, tu := range toolUses {
 			done, err := r.runTool(ctx, tu)
@@ -453,8 +458,7 @@ func (r *Runner) denyInterrupted(dec session.PermissionDecision) error {
 
 func (r *Runner) finishInterrupt(how session.Interrupt) error {
 	if how == session.InterruptSteer {
-		r.setState(Steering)
-		return nil
+		return r.rest(Steering)
 	}
 	r.mu.Lock()
 	turn := r.turn
@@ -462,7 +466,20 @@ func (r *Runner) finishInterrupt(how session.Interrupt) error {
 	if _, err := r.append(session.TurnInterrupted{TurnID: turn, How: how}); err != nil {
 		return r.fail(session.ErrInternal, err)
 	}
-	r.setState(Idle)
+	return r.rest(Idle)
+}
+
+// rest makes everything the turn appended durable, then enters the resting state that ends
+// this step: Completed, Steering, or Idle after a cancel. Append leaves entries in the
+// log's write buffer, so without this a crash between turns loses replies the user has
+// already seen. Every call site here is an otherwise successful turn, so a sync failure is
+// the turn's failure and is recorded as a turn_failed; the failing paths sync in fail
+// instead, where the error can only be logged.
+func (r *Runner) rest(s State) error {
+	if err := r.cfg.Session.Sync(); err != nil {
+		return r.fail(session.ErrInternal, fmt.Errorf("sync session log: %w", err))
+	}
+	r.setState(s)
 	return nil
 }
 
@@ -497,6 +514,12 @@ func (r *Runner) fail(class session.ErrorClass, err error) error {
 	r.mu.Unlock()
 	if e, aerr := r.cfg.Session.Append(session.TurnFailed{TurnID: turn, Class: class, Message: msg, Retries: retries}); aerr == nil {
 		r.cfg.Observer.EntryAppended(e)
+	}
+	// The turn is already failing, so a sync failure here is only logged: err, which the
+	// caller is about to receive, says more about what went wrong than a write error on
+	// the record of it would.
+	if serr := r.cfg.Session.Sync(); serr != nil {
+		log.Printf("turn: sync session log at turn_failed: %v", serr)
 	}
 	r.setState(Failed)
 	return err

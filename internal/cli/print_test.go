@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -368,4 +370,38 @@ func errorsAs(err error, target *ExitError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// TestPrintReleasesTheSessionLock proves runPrint leaves nothing holding the session
+// directory's flock once it returns. The session is detached and closed by the Serve
+// goroutine, not by runPrint itself, so runPrint has to wait for that goroutine before
+// handing control back; otherwise the next `rudy --continue` races a lock the previous
+// process has not let go of yet. session.Load here stands in for that next process.
+func TestPrintReleasesTheSessionLock(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
+	build := testBuilder(t, fp)
+	var out bytes.Buffer
+	code, err := runPrint(context.Background(), printOptions{Output: "json"}, "hi", build, &out, io.Discard)
+	if err != nil || code != 0 {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	var res printResult
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		t.Fatalf("not JSON: %v: %s", err, out.String())
+	}
+	id, err := ulid.Parse(res.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := build(context.Background(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = b.Server.Shutdown(context.Background()) }()
+	s, err := session.Load(b.Store, id)
+	if err != nil {
+		t.Fatalf("the session is still locked after runPrint returned: %v", err)
+	}
+	_ = s.Close()
 }

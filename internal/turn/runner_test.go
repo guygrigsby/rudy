@@ -821,3 +821,75 @@ func TestCancelWhileAwaitingPermission(t *testing.T) {
 		t.Fatalf("interrupted %+v", ti)
 	}
 }
+
+// TestLogIsDurableWhenTheTurnRests proves a turn's entries are on disk by the time Run
+// returns, not whenever the log's write buffer happens to fill or the session is finally
+// closed. ReadLog opens the file itself, so it sees only what has actually been written.
+func TestLogIsDurableWhenTheTurnRests(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{scripts: [][]provider.Part{{text("durable"), usage(1, 1), stop(session.StopEndTurn, "stop")}}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	onDisk, err := session.ReadLog(s.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range onDisk {
+		if am, ok := e.Payload.(session.AssistantMessage); ok && textOf(am.Content) == "durable" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the completed turn's assistant message is not on disk: %v", kindsOf(onDisk))
+	}
+}
+
+// TestLogIsDurableAfterACancel is the same guarantee for the other resting states: an
+// interrupted turn's turn_interrupted must survive a crash right after the interrupt.
+func TestLogIsDurableAfterACancel(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	p := &scripted{release: make(chan struct{}), scripts: [][]provider.Part{{text("Half"), {Type: pause}, stop(session.StopEndTurn, "stop")}}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{}, nil, rec)
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+	waitForDelta(t, rec, 1)
+	r.Interrupt(session.InterruptCancel)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	onDisk, err := session.ReadLog(s.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := kindsOf(onDisk); len(got) == 0 || got[len(got)-1] != session.KindTurnInterrupted {
+		t.Fatalf("turn_interrupted is not on disk: %v", got)
+	}
+}
+
+func kindsOf(entries []session.Entry) []session.Kind {
+	out := make([]session.Kind, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Kind)
+	}
+	return out
+}
+
+func textOf(blocks []session.Block) string {
+	var b strings.Builder
+	for _, bl := range blocks {
+		if bl.Type == session.BlockText {
+			b.WriteString(bl.Text)
+		}
+	}
+	return b.String()
+}

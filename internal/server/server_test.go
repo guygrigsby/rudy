@@ -378,13 +378,16 @@ func TestInterruptCancelMidStream(t *testing.T) {
 	}, &ir); err != nil {
 		t.Fatalf("interrupt: %v", err)
 	}
+	// Wait for turn.state idle, not just for the turn_interrupted entry: the entry is
+	// broadcast while the runner is still finishing (it syncs the log before it rests), and
+	// turn.state is the notification that says the session is free for the next turn.
 	ns := drain(t, cl, func(n protocol.Notification) bool {
-		if n.Method != protocol.NotifyEntryAppended {
+		if n.Method != protocol.NotifyTurnState {
 			return false
 		}
-		var ea protocol.EntryAppended
-		_ = json.Unmarshal(n.Params, &ea)
-		return ea.Entry.Kind == session.KindTurnInterrupted
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "idle"
 	})
 	last := entries(t, ns)
 	ti := last[len(last)-1].Payload.(session.TurnInterrupted)
@@ -943,4 +946,63 @@ func TestSetTitleRefusedImmediatelyAfterSubmit(t *testing.T) {
 		_ = json.Unmarshal(n.Params, &ts)
 		return ts.State == "completed"
 	})
+}
+
+// TestShutdownWaitsForServe pins the shutdown order: Shutdown closes every live session,
+// and a Serve loop still running can still be dispatching requests against one, so
+// Shutdown must not close anything until every Serve loop has returned. It is bounded by
+// the context it is given, since a connection's own lifetime is the caller's to end.
+func TestShutdownWaitsForServe(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+	cc, sc := protocol.Pipe()
+	served := make(chan struct{})
+	go func() { defer close(served); _ = h.srv.Serve(serveCtx, sc) }()
+	cl := protocol.NewClient(cc)
+	defer func() { _ = cl.Close() }()
+	var hr protocol.ClientHelloResult
+	if err := cl.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0"}, &hr); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() { defer close(done); _ = h.srv.Shutdown(context.Background()) }()
+	select {
+	case <-done:
+		t.Fatal("Shutdown returned while a Serve loop was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	cancelServe()
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after its context ended")
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after Serve did")
+	}
+}
+
+// TestShutdownIsBoundedByItsContext is the other half: a Serve loop the caller never ends
+// must not hold Shutdown past the deadline it was given.
+func TestShutdownIsBoundedByItsContext(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	defer cancelServe()
+	_, sc := protocol.Pipe()
+	go func() { _ = h.srv.Serve(serveCtx, sc) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _ = h.srv.Shutdown(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown outlived the context it was given")
+	}
 }

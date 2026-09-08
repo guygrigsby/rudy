@@ -143,9 +143,17 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 		_ = b.Server.Shutdown(shutdownCtx)
 	}()
 	clientConn, serverConn := protocol.Pipe()
-	go func() { _ = b.Server.Serve(srvCtx, serverConn) }()
+	served := make(chan struct{})
+	go func() { defer close(served); _ = b.Server.Serve(srvCtx, serverConn) }()
 	client := protocol.NewClient(clientConn)
-	defer func() { _ = client.Close() }()
+	// Closing the client is what ends the Serve loop, and that loop is what detaches the
+	// session and closes it, releasing the store's flock. Wait for it here, before the
+	// deferred Shutdown below and before returning, so nothing this process started is
+	// still holding the session when the next command opens it.
+	defer func() {
+		_ = client.Close()
+		<-served
+	}()
 
 	// Calls use a background context so an interrupt can still be delivered after ctx ends.
 	bg := context.Background()

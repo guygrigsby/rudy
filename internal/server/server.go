@@ -77,6 +77,20 @@ func New(d Deps) *Server {
 // order they were produced. Permission questions go to the first such connection whose hello
 // declared asker; none means no asker.
 func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
+	// Tracked in the same WaitGroup as running turns, and registered under wgMu against
+	// shuttingDown for the same reason spawnTurn is (see spawnTurn): a Serve loop can be
+	// dispatching a request against a live session at any moment, so Shutdown must not
+	// close a session until every loop has returned. The Done below is deferred before the
+	// detach, so it fires only after this connection has released its sessions.
+	s.wgMu.Lock()
+	if s.shuttingDown {
+		s.wgMu.Unlock()
+		return ErrShuttingDown
+	}
+	s.wg.Add(1)
+	s.wgMu.Unlock()
+	defer s.wg.Done()
+
 	s.mu.Lock()
 	s.nextID++
 	cn := newConn(s.nextID, c)
@@ -119,9 +133,16 @@ func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
 	}
 }
 
+// ErrShuttingDown is returned by Serve for a connection offered after Shutdown has begun.
+var ErrShuttingDown = errors.New("server: shutting down")
+
 // Shutdown cancels every running turn and waits for it to record its turn_interrupted entry
-// (or run to completion) before closing every live session, or until ctx ends, whichever comes
-// first.
+// (or run to completion), and for every Serve loop to return, before closing every live
+// session, or until ctx ends, whichever comes first. Both waits matter: a turn still writing
+// and a connection still dispatching requests can each be using a session, and closing one out
+// from under either loses entries or fails an in-flight call. A Serve loop ends when its own
+// context ends or its client disconnects, neither of which Shutdown controls, so ctx is the
+// caller's bound on how long that is worth waiting for.
 func (s *Server) Shutdown(ctx context.Context) error {
 	// Set shuttingDown before touching wg.Wait below: spawnTurn checks it and calls wg.Add
 	// together under the same wgMu, so any spawnTurn call that could still race this is
