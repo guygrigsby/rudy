@@ -11,8 +11,8 @@ import (
 
 func TestPipeRoundTrip(t *testing.T) {
 	a, b := Pipe()
-	defer a.Close()
-	defer b.Close()
+	defer func() { _ = a.Close() }()
+	defer func() { _ = b.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
@@ -64,7 +64,7 @@ func TestPipeCloseGivesPeerEOF(t *testing.T) {
 
 func TestPipeRecvHonorsContext(t *testing.T) {
 	a, _ := Pipe()
-	defer a.Close()
+	defer func() { _ = a.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if _, err := a.Recv(ctx); !errors.Is(err, context.DeadlineExceeded) {
