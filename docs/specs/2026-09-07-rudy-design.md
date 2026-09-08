@@ -152,7 +152,9 @@ Linked plugins are Go packages compiled in. Spawned plugins are subprocesses
 speaking the protocol over stdio, any language. Both implement one interface;
 the protocol is a transport over it. A plugin registers tools, slash commands,
 hook handlers, widgets, status items and providers. A duplicate tool name is
-refused with a notice and the plugin still loads.
+refused with a notice and the plugin still loads. The first built-in slash
+command is `/init`, the Claude Code shape: it inspects the workspace and writes
+`./AGENTS.md`, and `rudy -p "/init"` runs it headless.
 
 Hook points, a closed set: `session_opened`, `before_turn`, `before_request`,
 `after_response`, `before_tool`, `after_tool`, `turn_completed`,

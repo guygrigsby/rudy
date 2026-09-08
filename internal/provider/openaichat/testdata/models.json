@@ -1,0 +1,146 @@
+{
+ "object": "list",
+ "data": [
+  {
+   "id": "cline-pass/deepseek-v4-flash",
+   "display_name": "DeepSeek V4 Flash",
+   "pricing_display_name": "DeepSeek V4 Flash",
+   "object": "model",
+   "created": 1788835854,
+   "supported_endpoints": [
+    "/v1/chat/completions"
+   ],
+   "context_window_tokens": 1000000,
+   "max_output_tokens": 384000,
+   "metadata": {
+    "provider": {
+     "id": "Cline",
+     "name": "ClinePass",
+     "description": "",
+     "requires_client_auth": false,
+     "upstream": "default"
+    }
+   },
+   "owned_by": "ts-llm-proxy",
+   "pricing": {
+    "input": "0.00000014",
+    "input_cache_read": "0.00000000",
+    "output": "0.00000028"
+   }
+  },
+  {
+   "id": "cline-pass/kimi-k3",
+   "display_name": "Kimi K3",
+   "pricing_display_name": "Kimi K3",
+   "object": "model",
+   "created": 1788835854,
+   "supported_endpoints": [
+    "/v1/chat/completions"
+   ],
+   "context_window_tokens": 1048576,
+   "max_output_tokens": 131072,
+   "metadata": {
+    "provider": {
+     "id": "Cline",
+     "name": "ClinePass",
+     "description": "",
+     "requires_client_auth": false,
+     "upstream": "default"
+    }
+   },
+   "owned_by": "ts-llm-proxy",
+   "pricing": {
+    "input": "0.00000300",
+    "input_cache_read": "0.00000030",
+    "output": "0.00001500"
+   }
+  },
+  {
+   "id": "deepseek-v4-pro",
+   "display_name": "DeepSeek V4 Pro",
+   "pricing_display_name": "DeepSeek V4 Pro",
+   "object": "model",
+   "created": 1788835854,
+   "supported_endpoints": [
+    "/v1/chat/completions"
+   ],
+   "context_window_tokens": 1048576,
+   "max_output_tokens": 384000,
+   "metadata": {
+    "provider": {
+     "id": "DeepSeek",
+     "name": "",
+     "description": "",
+     "requires_client_auth": false,
+     "upstream": "default"
+    }
+   },
+   "owned_by": "ts-llm-proxy",
+   "pricing": {
+    "input": "0.00000099",
+    "input_cache_read": "0.00000008",
+    "output": "0.00000198"
+   }
+  },
+  {
+   "id": "gpt-5.6-sol",
+   "display_name": "GPT 5.6 Sol",
+   "pricing_display_name": "GPT 5.6 Sol",
+   "object": "model",
+   "created": 1788835854,
+   "supported_endpoints": [
+    "/v1/responses",
+    "/v1/chat/completions"
+   ],
+   "context_window_tokens": 922000,
+   "max_output_tokens": 128000,
+   "metadata": {
+    "provider": {
+     "id": "openai",
+     "name": "OpenAI (API Key)",
+     "description": "",
+     "requires_client_auth": false,
+     "upstream": "openai"
+    }
+   },
+   "owned_by": "ts-llm-proxy",
+   "pricing": {
+    "input": "0.00000400",
+    "input_cache_read": "0.00000040",
+    "input_cache_write": "0.00000500",
+    "output": "0.00002000",
+    "web_search": "0.01000000"
+   }
+  },
+  {
+   "id": "anthropic/claude-fable-5",
+   "display_name": "Claude Fable 5",
+   "pricing_display_name": "Claude Fable 5",
+   "object": "model",
+   "created": 1788835854,
+   "supported_endpoints": [
+    "/v1/chat/completions"
+   ],
+   "context_window_tokens": 1000000,
+   "max_output_tokens": 128000,
+   "metadata": {
+    "provider": {
+     "id": "openrouter",
+     "name": "OpenRouter",
+     "description": "",
+     "requires_client_auth": false,
+     "upstream": "openrouter"
+    }
+   },
+   "owned_by": "ts-llm-proxy",
+   "pricing": {
+    "input": "0.00001000",
+    "input_cache_read": "0.00000100",
+    "input_cache_write": "0.00001250",
+    "input_cache_write_1h": "0.00002000",
+    "output": "0.00005000",
+    "web_search": "0.01000000"
+   }
+  }
+ ]
+}
