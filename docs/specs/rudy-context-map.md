@@ -58,7 +58,8 @@ Inside Session, groupings that share one language:
 | Vendor SDK, aperture, local servers | Provider | ACL | The two codecs and the provider plugins are the only packages that speak a wire format |
 | Plugin | Session | Partnership | Plugins contribute tools, commands and hook handlers; Session fires hook points |
 | Session | Plugin | Open Host Service | Spawned plugins are protocol clients with registration rights |
-| MCP servers | Plugin | ACL | The MCP plugin adapts go-sdk tools into rudy tools; MCP types stay inside it |
+| MCP servers | Plugin | ACL | The `mcp` plugin adapts go-sdk tools into rudy tools; MCP types stay inside it; servers come from `mcp.toml` |
+| Session (child) | Plugin (subagents) | Open Host Service | The `agent` tool opens a child session over the protocol like any client and reads its outcome back |
 | Memory (memory-go) | Plugin | ACL | The memory plugin is the only importer; fold's model call is a port satisfied from Provider |
 | Codex, Claude Code, pi | rudy | Separate Ways | Precedents only; no protocol or format shared |
 

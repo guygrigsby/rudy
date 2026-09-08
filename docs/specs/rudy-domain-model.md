@@ -122,6 +122,8 @@ Value object, payload of a `session_opened` entry.
 | `thinking` | `ThinkingLevel` | The thinking level at open |
 | `mode` | `PermissionMode` | The permission mode at open |
 | `agent` | string | The agent definition name this session runs under; `default` when none |
+| `parentSessionID` | ULID or empty | The session whose `tool_use` opened this one; empty means a root session |
+| `parentToolUseID` | string | The `tool_use` id in the parent that opened this one; empty exactly when `parentSessionID` is empty |
 
 ## ForkPoint
 
@@ -814,6 +816,7 @@ Enumeration. The closed set of lifecycle attachment points.
 | `after_response` | After each assistant message is appended | Nothing |
 | `before_tool` | Before the Gate sees a tool_use | pass, allow, deny or modify with input and reason. allow and deny short-circuit the Gate and are recorded with `decidedBy = hook`; modify replaces the input |
 | `after_tool` | After a tool result is appended, before it reaches the next request | Replacement content the model sees; the stored entry is unchanged |
+| `before_compaction` | When the Compactor decides to compact, before it asks the model | A summary; the first non-empty one is used and the model is not asked |
 | `turn_completed` | After a turn ends | Nothing |
 | `session_closed` | Before a session closes | Nothing |
 
@@ -877,22 +880,83 @@ Value object. A discovered instruction file loaded from a standards-based skills
 
 ## AgentDefinition
 
-Value object. A named profile a subagent session runs under.
+Value object. A named profile a subagent session runs under, read from `agents/<name>.md`.
 
 ### Fields
 
 | Field | Type | Meaning |
 |---|---|---|
-| `name` | string | The profile name |
-| `prompt` | string | The system prompt for the subagent |
-| `tools` | []string | The tool names the subagent may use |
-| `model` | `ModelRef` | The model the subagent runs |
+| `name` | string | The profile name; the file stem |
+| `description` | string | One line shown to the parent model in the `agent` tool's description |
+| `prompt` | string | The system prompt body for the subagent |
+| `tools` | []string | The tool names the subagent may use; `agent` is never among them |
+| `model` | string | `provider:id`, a unique bare id, or empty to inherit the parent's |
+| `thinking` | `ThinkingLevel` or empty | Empty inherits the parent's |
+| `maxTurns` | int | Zero means unlimited |
 
 ### Relationships
 
 | With | Kind | Cardinality |
 |---|---|---|
 | `Session` (subagent) | referenced by | 1 to n |
+
+## MCPServer
+
+Entity, identity by name, owned by the `mcp` plugin. One configured Model Context Protocol server whose tools the plugin registers as `mcp__<name>__<tool>`.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | Identity; the table key in `mcp.toml` |
+| `scope` | `user`, `project` | Which `mcp.toml` it came from; a project entry replaces a user entry of the same name |
+| `transport` | `stdio`, `http` | |
+| `command` | string | Executable; empty for `http` |
+| `args` | []string | Arguments; empty for `http` |
+| `env` | map[string]string | Secret references added to the child environment; empty for `http` |
+| `url` | string | Endpoint; empty for `stdio` |
+| `headers` | map[string]string | Secret references sent on every request; empty for `stdio` |
+| `state` | `connecting`, `ready`, `failed` | |
+| `failReason` | string | Empty unless `failed` |
+
+### Behaviors
+
+- `Connect()` opens the transport, lists tools and moves to `ready`; a failure moves to `failed` with the reason and emits a notice.
+- `Call(tool, input) Result` invokes one tool and maps the content to `ContentBlock`s.
+
+### Invariants
+
+- Exactly the fields of its transport are set; the others are empty.
+- Every registered tool name is `mcp__<name>__<tool>` and carries safety `unsafe`.
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> connecting
+    connecting --> ready: tools listed
+    connecting --> failed: connect or list error
+    ready --> failed: transport lost
+```
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `Plugin` (`mcp`) | owned by | n to 1 |
+| `Tool` | has-a (owned) | 1 to n |
+
+## InstalledPlugin
+
+Value object. One row of `plugins.lock.toml`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | The manifest name; the checkout directory |
+| `source` | string | Git URL or absolute path given to `rudy plugin install` |
+| `commit` | string | Checked-out commit; empty when the source is a path outside a repository |
+| `installedAt` | instant | |
+| `enabled` | bool | A disabled plugin is discovered and not spawned |
 
 ## Origin
 

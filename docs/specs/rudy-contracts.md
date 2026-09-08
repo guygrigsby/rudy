@@ -1,6 +1,6 @@
 # rudy contracts
 
-Pass 2, 2026-09-08. This pass aligns the protocol section with the kernel implementation. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
+Pass 3, 2026-09-08. Pass 2 aligned the protocol section with the kernel implementation; pass 3 adds the plugins wave (ADR 0012): child sessions for subagents, `session.compact` and the ninth hook point `before_compaction`, the clinepass dialect key, the memory summary model, skill migration sources, and the `mcp.toml` and `plugins.lock.toml` records. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
 
 ## Error taxonomy
 
@@ -34,7 +34,8 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `PermissionMode` | `strict`, `permissive`, `off` |
 | `ThinkingLevel` | `off`, `low`, `medium`, `high` |
 | `TurnState` | `idle`, `streaming`, `running_tool`, `awaiting_permission`, `steering`, `completed`, `failed` |
-| `HookPoint` | `session_opened`, `before_turn`, `before_request`, `after_response`, `before_tool`, `after_tool`, `turn_completed`, `session_closed` |
+| `HookPoint` | `session_opened`, `before_turn`, `before_request`, `after_response`, `before_tool`, `after_tool`, `before_compaction`, `turn_completed`, `session_closed` |
+| `ParentRef` | `{session_id: ulid, tool_use_id: string}`; the session and the `tool_use` that spawned a child session |
 | `Safety` | `safe`, `unsafe` |
 
 `turn_id` everywhere is the entry id of the `user_message` that started the turn. Turns are not stored; that id is enough to find one in the log.
@@ -68,7 +69,7 @@ Authn column names the caller class table. Domain column names the aggregate met
 | method | caller | authn | authz | request | response | errors | idempotency | domain |
 |---|---|---|---|---|---|---|---|---|
 | `client.hello` | TUI, headless, ACP | per class | first request on a connection; refused otherwise | `{client, version, asker: bool}` | `{server, version}` | `invalid_argument` on protocol mismatch | idempotent per connection; a second hello is `refused_by_invariant` | none; registers the connection as an asker or not |
-| `session.open` | TUI, headless, plugin | per class | any; plugin-opened child sessions are a later plan, not yet in `SessionOpenParams` | `{cwd, model?: string, mode?: PermissionMode, thinking?: ThinkingLevel, agent?: string}`; `model` is `provider:id` or a unique bare id; absent `model`, `mode`, `thinking` take config defaults; absent `agent` means the default agent | `SessionInfo`, same shape as `session.resume`; the `session_opened` entry is replayed first as `entry.appended`, this response returns once replay finishes | `invalid_argument` root not a directory; `not_found` model or agent; `unavailable` registry unreachable and no cached snapshot | not idempotent; every call opens a session | `Session.Open` factory; appends `session_opened` |
+| `session.open` | TUI, headless, plugin | per class | any; `parent` only from a plugin, and only naming a session that plugin can see and a `tool_use` pending in it | `{cwd, model?: string, mode?: PermissionMode, thinking?: ThinkingLevel, agent?: string, parent?: ParentRef}`; `model` is `provider:id` or a unique bare id; absent `model`, `mode`, `thinking` take the agent definition's values, then the parent's when `parent` is given, then config defaults; absent `agent` means the default agent; a child session's tool set is the agent definition's list minus `agent` | `SessionInfo`, same shape as `session.resume`; the `session_opened` entry is replayed first as `entry.appended`, this response returns once replay finishes | `invalid_argument` root not a directory or `parent` from a non-plugin; `not_found` model, agent, parent session or parent tool_use; `unavailable` registry unreachable and no cached snapshot | not idempotent; every call opens a session | `Session.Open` factory; appends `session_opened` with `parent_session_id` and `parent_tool_use_id` |
 | `session.resume` | TUI, headless, ACP | per class | any session on this machine | `{session_id}` | `SessionInfo`: `{session_id, workspace: Workspace, model: ModelRef, mode: PermissionMode, thinking: ThinkingLevel, title: string}`; every entry is replayed first as `entry.appended` notifications, this response returns once replay finishes | `not_found`; `unavailable` locked by another process without a socket | idempotent; re-attaches | `Session.Load` then attach; `Session.Load` runs recovery |
 | `session.fork` | TUI, headless, ACP | per class | any session | `{session_id, at_entry_id}` | `SessionInfo` for the new session, same shape as `session.resume`; its entries are replayed first as `entry.appended`, this response returns once replay finishes | `not_found` session or entry | not idempotent | `Session.Fork(at)`; appends `fork_point` |
 | `session.list` | TUI, headless, ACP | per class | any | `{}` no params | `{sessions: [SessionSummary]}` | none | idempotent | query over `session_opened` and last entries; no mutation |
@@ -80,6 +81,7 @@ Authn column names the caller class table. Domain column names the aggregate met
 | `session.set_mode` | TUI, headless, ACP | per class | any attached | `{session_id, mode: PermissionMode}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetMode`; appends `mode_change` |
 | `session.set_thinking` | TUI, headless, ACP | per class | any attached | `{session_id, thinking: ThinkingLevel}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetThinking`; appends `thinking_change` |
 | `session.set_title` | TUI, ACP | per class | any attached | `{session_id, title: string}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` empty | same value appends nothing | `Session.SetTitle`; appends `title_change` |
+| `session.compact` | TUI, headless, ACP | per class | any attached | `{session_id, instructions?: string}`; `instructions` steers the model's summary and skips the `before_compaction` hook when present | `{entry_id}` of the `compaction`; `{entry_id: ""}` when the request context holds fewer than two entries to cover | `conflict` a turn is active; `provider_error` the summary request failed | not idempotent | Compactor; appends `compaction` |
 | `registry.list` | TUI, headless, plugin, ACP | per class | any | `{provider?: string}` | `{fetched_at, models: [Model]}` | none | idempotent | query over the Registry snapshot |
 | `registry.refresh` | TUI, headless, ACP | per class | any | `{provider?: string}` | `{fetched_at, models: [Model], failures: [{provider, error}]}` | none; a failing provider lands in `failures` and the rest succeed | idempotent | `Registry.Refresh` |
 | `command.run` | TUI, headless, ACP | per class | any attached | `{session_id, name, args: string}` | `{handled: bool}`; false means no plugin owns the command | `not_found` | not idempotent; the command decides | routes to the owning plugin through `command.invoke` |
@@ -163,6 +165,7 @@ Delivery inside the process is synchronous and ordered per session. Published ev
 | `TurnCompleted` | Turn | streaming to completed | `{session_id, turn_id, usage: Usage}` | clients, `turn_completed` hook, Session (`Dequeue` next queued message) | sync | published as `turn_completed` | `Turn.Complete` |
 | `TurnCancelled` | Turn | steering to idle | `{session_id, turn_id}` | Session (`Append turn_interrupted`), clients | sync | internal | `Turn.Cancel` |
 | `TurnFailedEvent` | Turn | any active to failed | `{session_id, turn_id, class, message, retries}` | Session (`Append turn_failed`), clients | sync | internal | `Turn.Fail` |
+| `CompactionRequested` | Turn | streaming, after an `assistant_message` whose prompt tokens cross `sessions.compact_at` of the context window, or `session.compact` | `{session_id, first_entry_id, last_entry_id, prompt_tokens, context_window}` | `before_compaction` hook (a summary), else Compactor (model summary) | sync | published as `before_compaction` | Compactor |
 
 ### Plugin and Registry events
 
@@ -188,6 +191,7 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 | `after_response` | `AssistantMessageAppended` | `{session_id, turn_id, message: Entry}` | nothing |
 | `before_tool` | `ToolRequested`, before the Gate | `{session_id, turn_id, tool_use_id, tool, input, safety}` | `{decision: pass, allow, deny or modify, input, reason}`; `allow` and `deny` short-circuit the Gate and are recorded with `decided_by: hook`; `modify` replaces `input` |
 | `after_tool` | `ToolResultAppended`, before the result reaches the next request | `{session_id, turn_id, tool_use_id, result: Entry}` | `{content: [ContentBlock]}` replacing what the model sees; the stored entry is unchanged |
+| `before_compaction` | `CompactionRequested`, when the Compactor decides to compact and `session.compact` carried no `instructions` | `{session_id, first_entry_id, last_entry_id, prompt_tokens: int, context_window: int}` | `{summary: string}`; the first non-empty summary in handler order is used and the model is not asked; empty means pass |
 | `turn_completed` | `TurnCompleted` | `{session_id, turn_id, usage}` | nothing |
 | `session_closed` | last client detaches, or the server exits | `{session_id}` | nothing; the server waits `hook_timeout_ms` |
 
@@ -197,7 +201,8 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 |---|---|---|
 | Gate | given a `tool_use`, the tool's safety class, the session's mode, session allowances and whether an asker is attached, decide allow, deny or ask; classify the input into a matcher; hold the dangerous set for permissive mode | Turn, Plugin (tool safety), Session (mode, allowances), connection registry (askers) |
 | RequestAssembler | build the provider request: `Session.RequestContext`, system prompt from the agent definition, skills index, `session_opened` context and `before_turn` additions, tool definitions from ready plugins, model and thinking | Session, Plugin registry, Registry |
-| Compactor | after `AssistantMessageAppended` or `ToolResultAppended`, if usage against the model's context window crosses the threshold, summarize with the session's model and append `compaction` | Session, Registry (context window), Provider |
+| Compactor | after `AssistantMessageAppended`, when that message's prompt tokens (`usage.input + cache_read + cache_write`) reach `sessions.compact_at` of the model's context window and the window is known, or on `session.compact`: cover every request-context entry before the current turn's `user_message`, ask the `before_compaction` hook for a summary, else summarize with the session's model, append `compaction` | Session, Registry (context window), Provider, Plugin registry (hook) |
+| Subagent runner | given an `agent` tool call, open a child session under the named agent definition with `parent` set, submit the prompt, wait for `turn.state` completed or failed, return the final assistant text or the failure as the tool result; a child session exposes no `agent` tool | Session (child), Plugin (tool), Registry (model) |
 | Recovery | on `Session.Load`, for every `permission_decision` allow without a `tool_result`, append `tool_result` with outcome `lost`; single aggregate, listed here because it runs outside a turn | Session |
 
 The dangerous set is checked before session allowances in every mode but off: a dangerous command always asks even when a prior session-scope allow matches, so widening a matcher prefix can never silence a dangerous command. See ADR 0011.
@@ -225,6 +230,10 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | `~/.agents/skills/<name>/SKILL.md` | standard | skill |
 | `<workspace>/.agents/skills/<name>/SKILL.md` | standard | skill |
 | `~/.agents/memory` | memory SDK | the OKF bundle; rudy reads and writes only through the SDK |
+| `$XDG_CONFIG_HOME/rudy/mcp.toml` | `rudy mcp` | user-scope MCP servers; written only by `rudy mcp add` and `remove` |
+| `<workspace>/.rudy/mcp.toml` | `rudy mcp` | project-scope MCP servers, merged over the user scope by name |
+| `$XDG_DATA_HOME/rudy/plugins/<name>/` | `rudy plugin` | an installed spawned plugin, a git checkout holding `plugin.toml` |
+| `$XDG_DATA_HOME/rudy/plugins.lock.toml` | `rudy plugin` | what is installed, from where, at which commit, enabled or not |
 
 ### entries.jsonl
 
@@ -262,10 +271,14 @@ Kinds:
 | `thinking` | ThinkingLevel | no | initial |
 | `mode` | PermissionMode | no | initial |
 | `agent` | string | no | agent definition name; `default` when none |
+| `parent_session_id` | ulid string | no | the session whose tool call opened this one; empty means a root session |
+| `parent_tool_use_id` | string | no | the `tool_use` id in the parent that opened this one; empty exactly when `parent_session_id` is empty |
 
 ```json
-{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":1,"rudy_version":"0.1.0","workspace":{"root":"/Users/guy/projects/rudy","git_root":"/Users/guy/projects/rudy","project_id":"local/rudy"},"model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"thinking":"high","mode":"strict","agent":"default"}
+{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":1,"rudy_version":"0.1.0","workspace":{"root":"/Users/guy/projects/rudy","git_root":"/Users/guy/projects/rudy","project_id":"local/rudy"},"model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"thinking":"high","mode":"strict","agent":"default","parent_session_id":"","parent_tool_use_id":""}
 ```
+
+A pass 1 log lacks the two parent fields; `Load` reads their absence as empty.
 
 **`fork_point`**
 
@@ -473,11 +486,16 @@ Every key, its type, default and meaning. A missing key takes the default. Unkno
 | `providers.<name>.auth` | string | `` | `env:NAME` reads the environment; `cache:KEY` reads a `KEY=value` line from the 1Password cache file; empty means no auth header |
 | `providers.<name>.headers` | table | `{}` | sent on every request |
 | `providers.<name>.models_path` | string | `/v1/models` | discovery endpoint relative to `base_url` |
+| `providers.<name>.dialect` | `` or `clinepass` | `` | a dialect plugin that wraps the wire codec for this endpoint; the `openai_chat` plugin skips a provider that names one |
 | `plugins.disabled` | [string] | `[]` | linked or spawned plugins not to load |
 | `plugins.<name>` | table | `{}` | handed to the plugin verbatim on `plugin.init` |
 | `skills.dirs` | [path] | `["~/.agents/skills", ".agents/skills"]` | relative paths resolve against the workspace |
 | `memory.dir` | path | `~/.agents/memory` | passed to the memory SDK |
 | `memory.enabled` | bool | true | |
+| `memory.summary_model` | string | `` | model spec for fold summaries; empty means the session's model |
+| `memory.fold` | table | `{}` | `observe_after_tokens`, `reflect_after_tokens`, `observations_max_tokens`, `observations_target_tokens`, `observer_max_tokens`; a missing key takes the SDK default |
+| `skills.migrate_from` | [path] | `["~/.claude/skills", "~/.pi/agent/skills"]` | roots `rudy skills migrate` copies from, one directory per skill |
+| `mcp.connect_timeout_ms` | int | 10000 | per server at boot |
 
 ### themes/<name>.toml
 
@@ -494,6 +512,38 @@ Roles, every one required in a theme file or the built-in default applies: `acce
 | `args` | [string] | `[]` | |
 | `env` | table | `{}` | added to the child environment |
 | `description` | string | `` | shown in `/plugins` |
+
+### mcp.toml
+
+One table per server. `rudy mcp add` writes the user file or, with `--scope project`, the workspace file; a name present in both takes the project entry. Written whole, never appended.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `servers.<name>.transport` | `stdio`, `http` | required | |
+| `servers.<name>.command` | string | required for `stdio` | executable |
+| `servers.<name>.args` | [string] | `[]` | |
+| `servers.<name>.env` | table | `{}` | added to the child environment |
+| `servers.<name>.url` | string | required for `http` | streamable HTTP endpoint |
+| `servers.<name>.headers` | table | `{}` | sent on every request |
+
+```toml
+[servers.github]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "cache:GITHUB_TOKEN" }
+```
+
+Values in `env` and `headers` are secret references resolved like `providers.<name>.auth`: `env:NAME`, `cache:KEY`, or a literal.
+
+### plugins.lock.toml
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `plugins.<name>.source` | string | required | the git URL or absolute path `rudy plugin install` was given |
+| `plugins.<name>.commit` | string | required | the checked-out commit; empty for a path source that is not a repository |
+| `plugins.<name>.installed_at` | rfc3339 | required | |
+| `plugins.<name>.enabled` | bool | true | `rudy plugin disable` sets false; a disabled plugin is not spawned |
 
 ### agents/<name>.md
 
@@ -519,6 +569,7 @@ Every transition traced through protocol, event and record, else a recorded reas
 | transition | protocol | event | record |
 |---|---|---|---|
 | Session.Open | `session.open` | `SessionOpened` | `session_opened` |
+| Session.Open, child | `session.open` with `parent` from a plugin | `SessionOpened`; the subagent runner consumes `TurnCompleted` and `TurnFailed` of the child | `session_opened` with `parent_session_id` and `parent_tool_use_id` |
 | Session.Fork | `session.fork` | `ForkPointRecorded` | `fork_point` |
 | Session.Load and Recovery | `session.resume` | none; recovery appends through `Append` | `tool_result` outcome `lost` |
 | Session.SetModel | `session.set_model` | `ModelChanged` | `model_change` |
@@ -537,7 +588,9 @@ Every transition traced through protocol, event and record, else a recorded reas
 | Turn.Cancel | `session.interrupt` how cancel | `TurnCancelled` | `turn_interrupted` how cancel |
 | Turn.Complete | none | `TurnCompleted` | none beyond the final `assistant_message`; completion is derived from `stop_reason` |
 | Turn.Fail | none | `TurnFailedEvent`, `TurnFailed` | `turn_failed` |
-| Compactor | none | `CompactionRecorded` | `compaction` |
+| Compactor | `session.compact`, implicit on threshold | `CompactionRequested`, `CompactionRecorded` | `compaction` |
+| MCP server connect | none; boot | none; a failure is a `notice` | `mcp.toml` read, nothing written |
+| Plugin install, enable, disable, update | `rudy plugin` CLI, not protocol | none | `plugins.lock.toml`, the checkout |
 | Plugin.Load, Ready, Fail, Stop | `plugin.init`; state via `plugin.state` | `PluginLoading`, `PluginReady`, `PluginFailed`, `PluginStopped` | none; plugin state is runtime, rebuilt at boot from config |
 | PluginRegistry.Register* | `plugin.register_*`, `plugin.set_status` | `CapabilityRegistered`, `CapabilityRejected` | none; capabilities are runtime |
 | Registry.Refresh | `registry.refresh`, implicit on open | `RegistryRefreshed` | `registry.json` |
@@ -566,6 +619,7 @@ Invariants and where they are enforced:
 - [x] every transition traces through all three or carries a reason
 - [ ] `before_request` exposes headers only; body mutation is deferred and marked open
 - [ ] the dangerous set is not enumerated
+- [x] pass 3: child sessions, `session.compact`, `before_compaction`, `mcp.toml`, `plugins.lock.toml` trace through all three
 
 ## Open
 
@@ -574,6 +628,7 @@ Invariants and where they are enforced:
 - paging for `session.resume` on very large logs; pass 1 returns every entry
 - whether `session` scope allowances should survive a fork
 - the exact prefix rule the Gate uses to build `matcher.prefix` for bash; leading words up to the first operator is the candidate
-- whether `.claude/skills` is read for compatibility or only offered for migration
+- live verification of `anthropic_messages`: no configured endpoint serves the route; the codec is proven against recorded fixtures until one does
+- the subagent model ladder from registry prices; pass 3 takes the model from the agent definition or inherits
 - the socket path on macOS when neither `XDG_RUNTIME_DIR` nor `TMPDIR` is set
 - how a spawned provider plugin authenticates to its upstream; pass 1 leaves it to the plugin's own config table
