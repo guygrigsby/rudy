@@ -45,9 +45,9 @@ func TestEvaluateTable(t *testing.T) {
 		{name: "allowance beats strict", tool: "bash", safety: tool.Unsafe, mode: session.ModeStrict, args: bashArgs("go test ./internal/..."),
 			allowances: []session.Matcher{{Tool: "bash", Prefix: "go test"}},
 			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowance bash go test"},
-		{name: "allowance beats dangerous", tool: "bash", safety: tool.Unsafe, mode: session.ModePermissive, args: bashArgs("rm -rf build"),
+		{name: "dangerous beats an allowance", tool: "bash", safety: tool.Unsafe, mode: session.ModePermissive, asker: true, args: bashArgs("rm -rf build"),
 			allowances: []session.Matcher{{Tool: "bash", Prefix: "rm -rf"}},
-			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowance bash rm -rf"},
+			wantAsk:    true, wantReason: "dangerous rm -rf"},
 		{name: "allowance for a non-bash tool", tool: "write", safety: tool.Unsafe, mode: session.ModeStrict, args: json.RawMessage(`{"path":"x"}`),
 			allowances: []session.Matcher{{Tool: "write"}},
 			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowance write "},
@@ -84,5 +84,35 @@ func TestEvaluateReturnsMatcher(t *testing.T) {
 	v := g.Evaluate(Input{Tool: "bash", Safety: tool.Unsafe, Mode: session.ModeStrict, AskerPresent: true, Args: bashArgs("git status --short")})
 	if v.Matcher != (session.Matcher{Tool: "bash", Prefix: "git status"}) {
 		t.Fatalf("matcher = %+v", v.Matcher)
+	}
+}
+
+// TestDangerousBeatsAnAllowance pins the ordering the whole allowance model rests on: the
+// matcher a session allowance is keyed by is only the first two words of a bash command, so
+// an allowance granted for "git push" also matches "git push --force". Evaluating the
+// dangerous set first is what keeps the second from riding in on the first's permission.
+func TestDangerousBeatsAnAllowance(t *testing.T) {
+	g := New([]string{"git push --force"})
+	allow := []session.Matcher{{Tool: "bash", Prefix: "git push"}}
+	for _, mode := range []session.Mode{session.ModeStrict, session.ModePermissive} {
+		t.Run(string(mode), func(t *testing.T) {
+			v := g.Evaluate(Input{Tool: "bash", Safety: tool.Unsafe, Mode: mode, AskerPresent: true,
+				Allowances: allow, Args: bashArgs("git push --force origin main")})
+			if !v.Ask || v.Reason != "dangerous git push --force" {
+				t.Fatalf("got %+v, want an ask on the dangerous entry", v)
+			}
+			// The allowance still covers the ordinary command it was granted for.
+			v = g.Evaluate(Input{Tool: "bash", Safety: tool.Unsafe, Mode: mode, AskerPresent: true,
+				Allowances: allow, Args: bashArgs("git push origin main")})
+			if v.Ask || v.Decision != session.Allow || v.DecidedBy != session.ByAllowance {
+				t.Fatalf("got %+v, want allow by allowance", v)
+			}
+		})
+	}
+	// Mode off is the one exception: nothing is gated there at all.
+	v := g.Evaluate(Input{Tool: "bash", Safety: tool.Unsafe, Mode: session.ModeOff, AskerPresent: true,
+		Allowances: allow, Args: bashArgs("git push --force origin main")})
+	if v.Ask || v.Decision != session.Allow || v.DecidedBy != session.ByMode {
+		t.Fatalf("mode off got %+v, want allow by mode", v)
 	}
 }

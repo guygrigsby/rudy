@@ -34,6 +34,16 @@ func New(dangerous []string) *Gate {
 	return &Gate{dangerous: append([]string(nil), dangerous...)}
 }
 
+// Evaluate decides one tool call, in this order: a safe tool always runs; mode off runs
+// everything; a command in the dangerous set always asks; an allowance the session already
+// granted runs; then the mode decides, permissive running what is left and strict asking.
+// Nobody attached to answer turns every ask into a deny.
+//
+// Dangerous is checked before allowances deliberately. An allowance is keyed on the matcher,
+// and a bash matcher is only the first two words of the command, so an allowance granted for
+// "git push" also matches "git push --force". Checking allowances first would let the second
+// ride in on permission given for the first. The one mode that skips the check is off, which
+// gates nothing at all by definition.
 func (g *Gate) Evaluate(in Input) Verdict {
 	m := g.MatcherFor(in.Tool, in.Args)
 	if in.Safety == tool.Safe {
@@ -42,23 +52,23 @@ func (g *Gate) Evaluate(in Input) Verdict {
 	if in.Mode == session.ModeOff {
 		return Verdict{Decision: session.Allow, DecidedBy: session.ByMode, Matcher: m, Reason: "mode off"}
 	}
-	for _, a := range in.Allowances {
-		if a == m {
-			return Verdict{Decision: session.Allow, DecidedBy: session.ByAllowance, Matcher: m, Reason: fmt.Sprintf("allowance %s %s", m.Tool, m.Prefix)}
-		}
-	}
 	var askReason string
-	switch in.Mode {
-	case session.ModePermissive:
-		dangerous, entry := g.Dangerous(in.Tool, in.Args)
-		if !dangerous {
-			return Verdict{Decision: session.Allow, DecidedBy: session.ByMode, Matcher: m, Reason: "mode permissive"}
-		}
+	if dangerous, entry := g.Dangerous(in.Tool, in.Args); dangerous {
 		askReason = "dangerous " + entry
-	case session.ModeStrict:
-		askReason = "mode strict"
-	default:
-		askReason = fmt.Sprintf("mode strict (unknown mode %q)", string(in.Mode))
+	} else {
+		for _, a := range in.Allowances {
+			if a == m {
+				return Verdict{Decision: session.Allow, DecidedBy: session.ByAllowance, Matcher: m, Reason: fmt.Sprintf("allowance %s %s", m.Tool, m.Prefix)}
+			}
+		}
+		switch in.Mode {
+		case session.ModePermissive:
+			return Verdict{Decision: session.Allow, DecidedBy: session.ByMode, Matcher: m, Reason: "mode permissive"}
+		case session.ModeStrict:
+			askReason = "mode strict"
+		default:
+			askReason = fmt.Sprintf("mode strict (unknown mode %q)", string(in.Mode))
+		}
 	}
 	if !in.AskerPresent {
 		return Verdict{Decision: session.Deny, DecidedBy: session.ByNoAsker, Matcher: m, Reason: "no asker attached"}
