@@ -63,12 +63,12 @@ func invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	if err != nil {
 		return tool.Result{}, err
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	f, err := root.Open(rel)
 	if err != nil {
 		return fsroot.Fail("read: %v", err), nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	head := make([]byte, 8000)
 	n, _ := io.ReadFull(f, head)
 	if fsroot.IsBinary(head[:n]) {

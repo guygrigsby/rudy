@@ -41,7 +41,7 @@ func TestWriteAtomicCreatesParents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	if err := fsroot.WriteAtomic(root, "a/b/c.txt", []byte("hi")); err != nil {
 		t.Fatal(err)
 	}

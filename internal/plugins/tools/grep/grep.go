@@ -77,7 +77,7 @@ func invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	if err != nil {
 		return tool.Result{}, err
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	fsys := root.FS()
 
 	var b strings.Builder

@@ -54,7 +54,7 @@ func invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	if err != nil {
 		return tool.Result{}, err
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	b, err := root.ReadFile(rel)
 	if err != nil {
 		return fsroot.Fail("edit: %v", err), nil

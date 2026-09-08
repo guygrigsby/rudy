@@ -48,7 +48,7 @@ func invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	if err != nil {
 		return tool.Result{}, err
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	if err := fsroot.WriteAtomic(root, rel, []byte(a.Content)); err != nil {
 		return fsroot.Fail("write: %v", err), nil
 	}
