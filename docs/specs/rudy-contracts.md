@@ -1,6 +1,6 @@
 # rudy contracts
 
-Pass 1, 2026-09-07. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
+Pass 2, 2026-09-08. This pass aligns the protocol section with the kernel implementation. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
 
 ## Error taxonomy
 
@@ -67,19 +67,19 @@ Authn column names the caller class table. Domain column names the aggregate met
 
 | method | caller | authn | authz | request | response | errors | idempotency | domain |
 |---|---|---|---|---|---|---|---|---|
-| `client.hello` | TUI, headless, ACP | per class | first request on a connection; refused otherwise | `{name, version, protocol_version: int, asker: bool}` | `{server_version, protocol_version, capabilities: [string]}` | `invalid_argument` on protocol mismatch | idempotent per connection; a second hello is `refused_by_invariant` | none; registers the connection as an asker or not |
-| `session.open` | TUI, headless, plugin | per class | plugin may open only child sessions: `parent` required for plugins | `{workspace_root, model?: ModelRef, mode?: PermissionMode, thinking?: ThinkingLevel, agent?: string, parent?: {session_id, entry_id}}`; absent `model`, `mode`, `thinking` take config defaults; absent `agent` means the default agent | `{session_id, entries: [Entry]}` the `session_opened` entry | `invalid_argument` root not a directory; `not_found` model or agent; `unavailable` registry unreachable and no cached snapshot | not idempotent; every call opens a session | `Session.Open` factory; appends `session_opened` |
-| `session.resume` | TUI, headless, ACP | per class | any session on this machine | `{session_id}` | `{summary: SessionSummary, entries: [Entry], turn: {turn_id, state, partial: [ContentBlock]}}`; `partial` is the streamed but not yet appended assistant content, empty when idle | `not_found`; `unavailable` locked by another process without a socket | idempotent; re-attaches | `Session.Load` then attach; `Session.Load` runs recovery |
+| `client.hello` | TUI, headless, ACP | per class | first request on a connection; refused otherwise | `{client, version, asker: bool}` | `{server_version, protocol_version, capabilities: [string]}` | `invalid_argument` on protocol mismatch | idempotent per connection; a second hello is `refused_by_invariant` | none; registers the connection as an asker or not |
+| `session.open` | TUI, headless, plugin | per class | plugin may open only child sessions: `parent` required for plugins | `{cwd, model?: string, mode?: PermissionMode, thinking?: ThinkingLevel, agent?: string}`; `model` is `provider:id` or a unique bare id; absent `model`, `mode`, `thinking` take config defaults; absent `agent` means the default agent | `{session_id, entries: [Entry]}` the `session_opened` entry | `invalid_argument` root not a directory; `not_found` model or agent; `unavailable` registry unreachable and no cached snapshot | not idempotent; every call opens a session | `Session.Open` factory; appends `session_opened` |
+| `session.resume` | TUI, headless, ACP | per class | any session on this machine | `{session_id}` | `SessionInfo`: `{session_id, workspace: Workspace, model: ModelRef, mode: PermissionMode, thinking: ThinkingLevel, title: string}`; every entry is replayed first as `entry.appended` notifications, this response returns once replay finishes | `not_found`; `unavailable` locked by another process without a socket | idempotent; re-attaches | `Session.Load` then attach; `Session.Load` runs recovery |
 | `session.fork` | TUI, headless, ACP | per class | any session | `{session_id, at_entry_id}` | `{session_id}` the new one | `not_found` session or entry | not idempotent | `Session.Fork(at)`; appends `fork_point` |
-| `session.list` | TUI, headless, ACP | per class | any | `{workspace_root?: string, limit?: int, cursor?: string}`; absent `workspace_root` means all | `{sessions: [SessionSummary], next_cursor: string}`; empty cursor means end | `invalid_argument` | idempotent | query over `session_opened` and last entries; no mutation |
+| `session.list` | TUI, headless, ACP | per class | any | `{}` no params | `{sessions: [SessionSummary]}` | none | idempotent | query over `session_opened` and last entries; no mutation |
 | `session.close` | TUI, headless, ACP | per class | any attached | `{session_id}` | `{}` | `not_found` | idempotent | detach; fires `session_closed` hook when the last client detaches; appends nothing |
 | `session.submit` | TUI, headless, plugin | per class | plugin only to sessions it opened | `{session_id, content: [ContentBlock text or image], source: typed, queued, steer, idempotency_key?: string}` | `{entry_id, turn_id, queued_position: int}`; `queued_position` zero means it started or continued a turn | `refused_by_invariant` typed while a turn is active, steer while not steering; `invalid_argument` empty content | keyed by `idempotency_key` within the session; absent key means not idempotent | `Turn.Start` for typed on idle, `Turn.Resume` for steer, `Session.Enqueue` for queued; appends `user_message` |
 | `session.interrupt` | TUI, headless, ACP | per class | any attached | `{session_id, how: steer or cancel}` | `{turn_id, state: TurnState}` | `refused_by_invariant` no active turn | idempotent; repeating returns current state | `Turn.Steer` or `Turn.Cancel`; cancel appends `turn_interrupted` |
 | `session.answer` | TUI, ACP | per class | connection declared `asker: true` | `{session_id, request_id, decision: allow or deny, scope: once or session, reason: string}` | `{}` | `unauthorized` not an asker; `not_found` no pending request; `conflict` already answered | keyed by `request_id`; a second answer is `conflict` | `Turn.Answer` via the Gate; appends `permission_decision` |
-| `session.set_model` | TUI, headless, ACP | per class | any attached | `{session_id, model: ModelRef}` | `{entry_id}` | `not_found` model not in registry | same value appends nothing and returns the latest `model_change` id | `Session.SetModel`; appends `model_change` |
-| `session.set_mode` | TUI, headless, ACP | per class | any attached | `{session_id, mode: PermissionMode}` | `{entry_id}` | `invalid_argument` | same value appends nothing | `Session.SetMode`; appends `mode_change` |
-| `session.set_thinking` | TUI, headless, ACP | per class | any attached | `{session_id, thinking: ThinkingLevel}` | `{entry_id}` | `invalid_argument` | same value appends nothing | `Session.SetThinking`; appends `thinking_change` |
-| `session.set_title` | TUI, ACP | per class | any attached | `{session_id, title: string}` | `{entry_id}` | `invalid_argument` empty | same value appends nothing | `Session.SetTitle`; appends `title_change` |
+| `session.set_model` | TUI, headless, ACP | per class | any attached | `{session_id, model: ModelRef}` | `{entry_id}` | `conflict` a turn is active; `not_found` model not in registry | same value appends nothing and returns the latest `model_change` id | `Session.SetModel`; appends `model_change` |
+| `session.set_mode` | TUI, headless, ACP | per class | any attached | `{session_id, mode: PermissionMode}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetMode`; appends `mode_change` |
+| `session.set_thinking` | TUI, headless, ACP | per class | any attached | `{session_id, thinking: ThinkingLevel}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetThinking`; appends `thinking_change` |
+| `session.set_title` | TUI, ACP | per class | any attached | `{session_id, title: string}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` empty | same value appends nothing | `Session.SetTitle`; appends `title_change` |
 | `registry.list` | TUI, headless, plugin, ACP | per class | any | `{provider?: string}` | `{fetched_at, models: [Model]}` | none | idempotent | query over the Registry snapshot |
 | `registry.refresh` | TUI, headless, ACP | per class | any | `{provider?: string}` | `{fetched_at, models: [Model], failures: [{provider, error}]}` | none; a failing provider lands in `failures` and the rest succeed | idempotent | `Registry.Refresh` |
 | `command.run` | TUI, headless, ACP | per class | any attached | `{session_id, name, args: string}` | `{handled: bool}`; false means no plugin owns the command | `not_found` | not idempotent; the command decides | routes to the owning plugin through `command.invoke` |
@@ -105,14 +105,14 @@ Authn column names the caller class table. Domain column names the aggregate met
 
 ### Notifications, server to clients
 
-Per session, notifications are delivered in entry order. On `session.resume` the client receives every entry in the response body, then live notifications from the next entry on. Over in-memory and socket transports delivery is exactly once per connection; after a reconnect the client resumes and de-duplicates by entry id. `stream.delta` is never replayed; the partial is carried in the resume response instead.
+Per session, notifications are delivered in entry order. On `session.resume` the client receives every entry as `entry.appended` notifications first, then the `SessionInfo` response, then live notifications from the next entry on. Over in-memory and socket transports delivery is exactly once per connection; after a reconnect the client resumes and de-duplicates by entry id. `stream.delta` is never replayed.
 
 | notification | to | payload | delivery |
 |---|---|---|---|
 | `entry.appended` | every client attached to the session | `{session_id, entry: Entry}` | ordered by entry id; replayed on attach via resume |
 | `stream.delta` | attached clients | `{session_id, turn_id, delta: {type: text, thinking or tool_use_input, text: string, tool_use_id: string, name: string}}`; `tool_use_id` and `name` empty for text and thinking deltas | ordered; not replayed; superseded by the `assistant_message` entry |
-| `turn.state` | attached clients | `{session_id, turn_id, state: TurnState, since_entry_id}` | ordered; the latest state is in the resume response |
-| `permission.requested` | attached asker clients | `{session_id, request_id, tool_use_id, tool, input, summary: string, mode, matcher: {tool, prefix}, options: [once, session, deny]}`; `request_id` equals `tool_use_id` | delivered once per asker; with no asker attached the Gate denies immediately and appends `permission_decision` |
+| `turn.state` | attached clients | `{session_id, turn_id, state: TurnState}` | ordered |
+| `permission.requested` | attached asker clients | `{session_id, turn_id, tool_use_id, tool, input, matcher: {tool, prefix}}` | delivered once per asker; with no asker attached the Gate denies immediately and appends `permission_decision` |
 | `status.updated` | every client | `{items: [{owner, key, content: [Span]}]}` full set | latest wins; sent on connect |
 | `widget.updated` | every client | `{owner, key, slot, content: [Span]}` | latest wins per owner and key; all sent on connect |
 | `notice` | every client | `{level: info, warn or error, owner, text}` | best effort; not replayed |
@@ -200,19 +200,21 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 | Compactor | after `AssistantMessageAppended` or `ToolResultAppended`, if usage against the model's context window crosses the threshold, summarize with the session's model and append `compaction` | Session, Registry (context window), Provider |
 | Recovery | on `Session.Load`, for every `permission_decision` allow without a `tool_result`, append `tool_result` with outcome `lost`; single aggregate, listed here because it runs outside a turn | Session |
 
+A session allowance is checked before the dangerous set in every mode but off: a prior session-scope allow silences the ask even when the command is in `permissions.dangerous`.
+
 Steering is `Turn.Steer` and `Turn.Resume`, one aggregate, no service.
 
 ## 3. Record layer
 
-No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config`, `$XDG_DATA_HOME` or `~/.local/share`, `$XDG_STATE_HOME` or `~/.local/state`, on every platform including macOS.
+No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config`, `$XDG_DATA_HOME` or `~/.local/share`, `$XDG_RUNTIME_DIR` or the OS temp dir, `$XDG_CACHE_HOME` or `~/.cache`, on every platform including macOS.
 
 | path | owner | holds |
 |---|---|---|
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/entries.jsonl` | Session | the log; append-only |
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/blobs/<sha256>` | Session | image bytes referenced by `blob` |
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/lock` | Session | `flock` held by the process serving the session; a second process gets `unavailable` and is told the socket path |
-| `$XDG_STATE_HOME/rudy/registry.json` | Registry | the last discovered snapshot |
-| `$XDG_STATE_HOME/rudy/rudy.log` | kernel | slog JSON lines |
+| `$XDG_CACHE_HOME/rudy/registry.json` | Registry | the last discovered snapshot; a snapshot is a cache |
+| `$XDG_CACHE_HOME/rudy/rudy.log` | kernel | slog JSON lines |
 | `$XDG_CONFIG_HOME/rudy/config.toml` | user | config; rudy never writes it |
 | `$XDG_CONFIG_HOME/rudy/themes/<name>.toml` | user | theme roles |
 | `$XDG_CONFIG_HOME/rudy/plugins/<name>/plugin.toml` | user | spawned plugin manifest |
@@ -452,7 +454,7 @@ Every key, its type, default and meaning. A missing key takes the default. Unkno
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
 | `server.socket` | path | `$XDG_RUNTIME_DIR/rudy/rudy.sock` | |
 | `log.level` | `debug`, `info`, `warn`, `error` | `info` | |
-| `log.file` | path | `$XDG_STATE_HOME/rudy/rudy.log` | |
+| `log.file` | path | `$XDG_CACHE_HOME/rudy/rudy.log` | |
 | `ui.render` | `inline`, `altscreen` | `inline` | |
 | `ui.vim` | bool | true | |
 | `ui.layout.slots` | [string] | `["transcript", "input", "status"]` | order top to bottom; `header` may be added |

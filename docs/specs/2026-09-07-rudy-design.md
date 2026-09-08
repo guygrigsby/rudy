@@ -367,3 +367,7 @@ The implementation plan breaks these into tasks.
 - Whether `note` entries from plugins are replayed to a reattaching client.
 - Subagent model selection: a tier ladder from registry prices, as the owner's
   pi routing extension does, or per agent definition only.
+- The matcher prefix rule for session allowances (today the first two words of
+  the first command) is undecided; a session allowance is checked before the
+  dangerous set, so widening the prefix widens what one allow can silently
+  permit, including commands on the dangerous list.
