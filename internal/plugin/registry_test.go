@@ -231,4 +231,57 @@ func TestEmptyNamesRefused(t *testing.T) {
 	}
 }
 
+func TestLoadNeverExposesHalfLoadedPlugin(t *testing.T) {
+	r, _ := newTestRegistry(nil)
+	proceed := make(chan struct{})
+	loadDone := make(chan struct{})
+
+	go func() {
+		defer close(loadDone)
+		r.Load(context.Background(),
+			fakePlugin{"slow", func(_ context.Context, h Host) error {
+				if err := h.RegisterTool(namedTool("read")); err != nil {
+					return err
+				}
+				<-proceed
+				return errors.New("boom")
+			}},
+		)
+	}()
+
+	stop := make(chan struct{})
+	pollDone := make(chan struct{})
+	var sawTool bool
+	go func() {
+		defer close(pollDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, ok := r.Tool("read"); ok {
+				sawTool = true
+			}
+			r.Tools()
+			r.Statuses()
+		}
+	}()
+
+	close(proceed)
+	<-loadDone
+	close(stop)
+	<-pollDone
+
+	if sawTool {
+		t.Fatal("tool became visible while Init was still running")
+	}
+	if _, ok := r.Tool("read"); ok {
+		t.Fatal("failed plugin's tool must never be committed")
+	}
+	if st := r.Statuses(); len(st) != 1 || st[0].State != StateFailed || st[0].Reason != "boom" {
+		t.Fatalf("status = %+v", st)
+	}
+}
+
 var _ = session.Workspace{} // CommandCall carries one; keep the import honest
