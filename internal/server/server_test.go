@@ -1006,3 +1006,29 @@ func TestShutdownIsBoundedByItsContext(t *testing.T) {
 		t.Fatal("Shutdown outlived the context it was given")
 	}
 }
+
+// TestSubmitRejectsAnInvalidMessage covers the submit that used to hang the caller: a
+// user_message the session log refuses (here a text block with no text) makes the runner's
+// very first append fail, and the runner cannot record a turn_failed for a turn whose id
+// was never assigned, so nothing ever answered the submit. Validating the message here is
+// the answer the caller deserves.
+func TestSubmitRejectsAnInvalidMessage(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var sub protocol.SessionSubmitResult
+	err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID,
+		Content:   []session.Block{{Type: session.BlockText}},
+		Source:    session.SourceTyped,
+	}, &sub)
+	var pe *protocol.Error
+	if !errorsAs(err, &pe) {
+		t.Fatalf("submit err = %v, want a protocol error", err)
+	}
+	if pe.Code != protocol.CodeInvalidArgument {
+		t.Fatalf("submit code = %d, want CodeInvalidArgument", pe.Code)
+	}
+}

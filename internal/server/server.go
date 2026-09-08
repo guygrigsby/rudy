@@ -314,7 +314,14 @@ func (s *Server) handleSubmit(raw json.RawMessage) (any, *protocol.Error) {
 	if p.Source != session.SourceTyped && p.Source != session.SourceSteer {
 		return nil, perr(protocol.CodeInvalidArgument, "source must be typed or steer")
 	}
-	tid, e := s.startTurn(ls, session.UserMessage{Source: p.Source, Content: p.Content})
+	msg := session.UserMessage{Source: p.Source, Content: p.Content}
+	// Validate here rather than letting the runner discover it: a message the log refuses
+	// makes the runner's first append fail, and it cannot record a turn_failed for a turn
+	// whose id that append was going to assign. The caller gets the refusal instead.
+	if err := session.Validate(msg); err != nil {
+		return nil, perr(protocol.CodeInvalidArgument, err.Error())
+	}
+	tid, e := s.startTurn(ls, msg)
 	if e != nil {
 		return nil, e
 	}
@@ -858,7 +865,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		asker = la
 	}
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
-	first := &firstAppendSignal{Observer: &fanout{ls: ls, sid: sid}, started: make(chan session.Entry, 1)}
+	first := &firstAppendSignal{Observer: &fanout{ls: ls, sid: sid}, started: make(chan session.Entry, 1), failed: make(chan struct{})}
 	r := turn.NewRunner(turn.Config{
 		Session:   ls.sess,
 		Provider:  prov,
@@ -896,6 +903,11 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	select {
 	case e := <-first.started:
 		return e.ID.String(), nil
+	case <-first.failed:
+		// The runner failed before it appended anything, so there is no turn id to report
+		// and no turn_failed entry naming one either (see firstAppendSignal). Answering
+		// the caller is what matters; the runner has already logged what went wrong.
+		return "", perr(protocol.CodeInternal, "the turn failed before it started")
 	case <-s.ctx.Done():
 		return "", perr(protocol.CodeUnavailable, "server is shutting down")
 	}

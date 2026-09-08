@@ -277,15 +277,29 @@ func (f *fanout) StateChanged(turnID string, s turn.State) {
 // buffered by one so the send here never blocks on nobody reading it yet. This is deliberately
 // separate from the state mirror above (which StateChanged keeps current): it exists only to
 // answer the one RPC call that started this turn, synchronously, with the id that call needs.
+//
+// A turn that reaches Failed without ever appending closes failed instead: that first append
+// is exactly what can fail (a user_message the log refuses), and the runner cannot record a
+// turn_failed for a turn whose id that same append was going to assign, so no entry would
+// ever arrive and startTurn would wait forever. One sync.Once covers both channels, so a
+// turn that started normally and failed later never also reports itself as never started.
 type firstAppendSignal struct {
 	turn.Observer
 	once    sync.Once
 	started chan session.Entry
+	failed  chan struct{}
 }
 
 func (o *firstAppendSignal) EntryAppended(e session.Entry) {
 	o.once.Do(func() { o.started <- e })
 	o.Observer.EntryAppended(e)
+}
+
+func (o *firstAppendSignal) StateChanged(turnID string, s turn.State) {
+	if s == turn.Failed {
+		o.once.Do(func() { close(o.failed) })
+	}
+	o.Observer.StateChanged(turnID, s)
 }
 
 // liveAsker routes one turn's permission questions to the session's first asker connection
