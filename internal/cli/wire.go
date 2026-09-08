@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
@@ -37,13 +39,18 @@ type Built struct {
 
 // BuildOptions tunes wiring. Zero values mean the real environment.
 type BuildOptions struct {
-	Version   string
-	Overrides map[string]any      // config keys that win over file and env, dotted ("default.model")
-	Plugins   []plugin.Plugin     // nil means BuiltinPlugins
-	Env       func(string) string // nil means os.Getenv
-	Home      string              // "" means os.UserHomeDir
-	Stderr    io.Writer           // nil means os.Stderr
+	Version        string
+	Overrides      map[string]any      // config keys that win over file and env, dotted ("default.model")
+	Plugins        []plugin.Plugin     // nil means BuiltinPlugins
+	Env            func(string) string // nil means os.Getenv
+	Home           string              // "" means os.UserHomeDir
+	Stderr         io.Writer           // nil means os.Stderr
+	RefreshTimeout time.Duration       // <= 0 means 20 seconds; bounds the startup registry refresh
 }
+
+// defaultRefreshTimeout bounds the startup registry refresh when BuildOptions.RefreshTimeout
+// is unset, so a stalled provider cannot hold a command silent forever.
+const defaultRefreshTimeout = 20 * time.Second
 
 // buildFunc is what commands call to wire a server; tests substitute fakes through it.
 type buildFunc func(ctx context.Context, stderr io.Writer) (*Built, error)
@@ -86,19 +93,34 @@ func Build(ctx context.Context, o BuildOptions) (*Built, error) {
 	if err := os.MkdirAll(paths.Cache, 0o700); err != nil {
 		return nil, fmt.Errorf("cache dir: %w", err)
 	}
-	registry := provider.NewRegistry(filepath.Join(paths.Cache, "registry.json"), plugins.Providers()...)
+	providers := plugins.Providers()
+	registry := provider.NewRegistry(filepath.Join(paths.Cache, "registry.json"), providers...)
 	if err := registry.LoadSnapshot(); err != nil {
 		return nil, err
 	}
+	refreshTimeout := o.RefreshTimeout
+	if refreshTimeout <= 0 {
+		refreshTimeout = defaultRefreshTimeout
+	}
+	hadSnapshot := len(registry.Models()) > 0
+	if !hadSnapshot {
+		names := make([]string, len(providers))
+		for i, p := range providers {
+			names[i] = p.Name()
+		}
+		_, _ = fmt.Fprintln(stderr, "refreshing model registry from "+strings.Join(names, ", "))
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	refreshErr := registry.Refresh(refreshCtx)
+	cancel()
 	// Refresh returns nil when there is nothing to refresh (no provider plugin loaded), so an
 	// empty registry after a nil-error refresh is just as fatal as one after a failed refresh:
 	// either way there is no model to open a session with and no snapshot to fall back on.
-	refreshErr := registry.Refresh(ctx)
 	if len(registry.Models()) == 0 {
 		if refreshErr == nil {
 			refreshErr = fmt.Errorf("no provider registered for default.provider %q; configure a [providers.*] table or a provider plugin", cfg.Default.Provider)
 		}
-		return nil, fmt.Errorf("model registry: %w", refreshErr)
+		return nil, fmt.Errorf("model registry: default provider %q could not be reached within %s: %w", cfg.Default.Provider, refreshTimeout, refreshErr)
 	}
 	if refreshErr != nil {
 		notice("registry refresh: " + refreshErr.Error())

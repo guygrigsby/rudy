@@ -100,9 +100,8 @@ func (c *Client) Do(ctx context.Context, req *http.Request, sessionID ulid.ULID)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			c.Sleep(delay)
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
+			if err := c.sleepCtx(ctx, delay); err != nil {
+				return nil, err
 			}
 		}
 		resp, err := c.HTTP.Do(req)
@@ -152,6 +151,24 @@ func (c *Client) Do(ctx context.Context, req *http.Request, sessionID ulid.ULID)
 		last = fmt.Errorf("httpx: %s %s: status %d", req.Method, req.URL, resp.StatusCode)
 	}
 	return nil, &Error{Attempts: len(backoff), Err: last}
+}
+
+// sleepCtx runs c.Sleep(d) to completion but returns as soon as ctx is done, so a
+// cancellation or deadline during backoff does not hold Do hostage for the rest of the
+// delay. The underlying Sleep still runs to completion in the background; it is bounded by
+// d itself (at most 16s) and touches nothing but the caller-supplied Sleep hook.
+func (c *Client) sleepCtx(ctx context.Context, d time.Duration) error {
+	done := make(chan struct{})
+	go func() {
+		c.Sleep(d)
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // RetryAfter parses a Retry-After header in delta-seconds or HTTP-date form, clamped to

@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -167,6 +170,113 @@ func TestStoreFromEnv(t *testing.T) {
 	}
 	if _, err := os.Stat(want); err != nil {
 		t.Fatalf("store dir not created: %v", err)
+	}
+}
+
+// blockingProvider never answers ListModels; it blocks until its context is done, standing
+// in for a stalled proxy on the real path this fix guards against.
+type blockingProvider struct{ name string }
+
+func (b blockingProvider) Name() string { return b.name }
+
+func (b blockingProvider) ListModels(ctx context.Context) ([]provider.Model, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (b blockingProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type blockingPlugin struct{ p blockingProvider }
+
+func (blockingPlugin) Name() string { return "blocking" }
+
+func (bp blockingPlugin) Init(ctx context.Context, h plugin.Host) error {
+	return h.RegisterProvider(bp.p)
+}
+
+func TestBuildFailsFastWhenRefreshTimesOutWithNoSnapshot(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+	var stderr bytes.Buffer
+	start := time.Now()
+	_, err := Build(context.Background(), BuildOptions{
+		Version: "test",
+		Overrides: map[string]any{
+			"default.provider": "blocking",
+			"default.model":    "m",
+			"permissions.mode": "off",
+		},
+		Plugins:        append(BuiltinTools(), blockingPlugin{blockingProvider{"blocking"}}),
+		Home:           base,
+		Stderr:         &stderr,
+		RefreshTimeout: 200 * time.Millisecond,
+	})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Build took %v with no snapshot, want under 1s", elapsed)
+	}
+	if err == nil {
+		t.Fatal("expected a fatal error when the registry cannot be reached")
+	}
+	if !strings.Contains(err.Error(), "blocking") {
+		t.Errorf("error %q does not name the default provider", err.Error())
+	}
+	if !strings.Contains(err.Error(), "200ms") {
+		t.Errorf("error %q does not mention the timeout", err.Error())
+	}
+	if !strings.Contains(stderr.String(), "refreshing model registry from blocking") {
+		t.Errorf("stderr %q missing the pre-refresh notice", stderr.String())
+	}
+}
+
+func TestBuildWarnsAndSucceedsWhenRefreshTimesOutWithASnapshot(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+	cacheDir := filepath.Join(base, "cache", "rudy")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := `{"fetched_at":"2026-09-07T00:00:00Z","models":[` +
+		`{"ref":{"provider":"blocking","model":"m"},"display_name":"Blocking M",` +
+		`"context_window":1000,"max_output":100,"pricing":{"input":"0","output":"0"},` +
+		`"capabilities":{"tools":true}}]}`
+	if err := os.WriteFile(filepath.Join(cacheDir, "registry.json"), []byte(snapshot), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	start := time.Now()
+	b, err := Build(context.Background(), BuildOptions{
+		Version: "test",
+		Overrides: map[string]any{
+			"default.provider": "blocking",
+			"default.model":    "m",
+			"permissions.mode": "off",
+		},
+		Plugins:        append(BuiltinTools(), blockingPlugin{blockingProvider{"blocking"}}),
+		Home:           base,
+		Stderr:         &stderr,
+		RefreshTimeout: 200 * time.Millisecond,
+	})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Build took %v with a snapshot present, want under 1s", elapsed)
+	}
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer func() { _ = b.Server.Shutdown(context.Background()) }()
+	if !strings.Contains(stderr.String(), "registry refresh:") {
+		t.Errorf("stderr %q missing the refresh warning", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "refreshing model registry from") {
+		t.Errorf("stderr %q printed the pre-refresh notice despite a snapshot on disk", stderr.String())
 	}
 }
 

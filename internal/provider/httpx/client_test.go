@@ -238,3 +238,27 @@ func TestRetryAfter(t *testing.T) {
 		t.Error("garbage must be ignored")
 	}
 }
+
+func TestDoDoesNotOutliveContextDuringBackoffSleep(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	// Real Sleep, real backoff (1s, 2s, 4s, 8s, 16s): a context that expires well inside the
+	// first backoff delay must cut Do short instead of letting it block for the full sleep.
+	c := httpx.New("0.1.0")
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	start := time.Now()
+	_, err := c.Do(ctx, req, ulid.ULID{})
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want context.DeadlineExceeded, got %v", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("Do outlived its context: took %v against a 50ms timeout and a 1s backoff", elapsed)
+	}
+}
