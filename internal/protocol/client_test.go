@@ -229,3 +229,67 @@ func TestClientAnswersServerRequestWithMethodNotFound(t *testing.T) {
 		t.Fatalf("id %s", resp.ID)
 	}
 }
+
+// TestClientCloseStopsDrainWithNoConsumer proves Close stops drain even when the queue
+// holds more than the 256-slot notes buffer and nothing ever reads Notifications before
+// Close runs. With the bug, drain is parked on a plain c.notes <- n send for whichever
+// notification did not fit in the buffer, and no cond broadcast can interrupt a blocked
+// channel send, so it leaks and notes never closes. The fix gives drain's send a select
+// against a closed channel Close closes, so it can bail out and discard the rest of the
+// queue instead of waiting for a consumer that may never come.
+//
+// The assertion checks two things: the channel closes within one second, and strictly
+// fewer than all n notifications are ever delivered. The second check is load-bearing:
+// this test's own receive loop is, unavoidably, a consumer, and a consumer that keeps
+// reading would eventually unstick even the buggy blocking send one notification at a
+// time until the queue drained naturally — which is fast enough, with no real I/O, to
+// finish inside the one-second deadline anyway. Only the discard behavior distinguishes
+// the fix: the buffer holds at most 256 notifications when Close runs, so the fixed
+// drain can never deliver anywhere near all 1000.
+func TestClientCloseStopsDrainWithNoConsumer(t *testing.T) {
+	cc, sc := Pipe()
+	setupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const n = 1000
+	srv := &fakeServer{conn: sc, handle: func(req Request) Response {
+		for i := range n {
+			note, _ := NewNotification(NotifyNotice, NoticeParams{Level: "info", Text: strconv.Itoa(i)})
+			if err := sc.Send(setupCtx, note); err != nil {
+				t.Error(err)
+			}
+		}
+		resp, _ := NewResponse(req.ID, nil)
+		return resp
+	}}
+	go srv.run(setupCtx)
+
+	c := NewClient(cc)
+	if err := c.Call(setupCtx, "anything", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing has read Notifications yet. All n notifications are already queued (Call
+	// only returned after read received the final response behind them), so drain is
+	// parked on a full notes channel the instant Close runs.
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	received := 0
+	for {
+		select {
+		case _, ok := <-c.Notifications():
+			if !ok {
+				if received >= n {
+					t.Fatalf("drain delivered all %d notifications instead of discarding what was still queued when Close ran", n)
+				}
+				return
+			}
+			received++
+		case <-deadline.C:
+			t.Fatalf("Notifications channel did not close within one second of Close (received %d of %d)", received, n)
+		}
+	}
+}

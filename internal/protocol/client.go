@@ -18,7 +18,8 @@ type Notification struct {
 
 // Client multiplexes calls and notifications over one Conn. Notifications are queued
 // in memory without bound between the reader and Notifications, so a slow or absent
-// consumer never stalls a pending Call; it only grows the queue.
+// consumer never stalls a pending Call; it only grows the queue, until Close, which
+// drops whatever is still queued rather than waiting the consumer out.
 type Client struct {
 	conn    Conn
 	nextID  atomic.Int64
@@ -32,9 +33,10 @@ type Client struct {
 	queue    []Notification // unbounded, in arrival order
 	readDone bool           // set once read has returned; queue is final from then on
 
-	done chan struct{} // closed once read has returned
-	err  error
-	once sync.Once
+	done   chan struct{} // closed once read has returned
+	closed chan struct{} // closed exactly once, by Close
+	err    error
+	once   sync.Once
 }
 
 // NewClient starts the reader and the notification drain goroutines.
@@ -44,6 +46,7 @@ func NewClient(conn Conn) *Client {
 		pending: make(map[int64]chan Response),
 		notes:   make(chan Notification, 256),
 		done:    make(chan struct{}),
+		closed:  make(chan struct{}),
 	}
 	c.qcond = sync.NewCond(&c.qmu)
 	go c.read()
@@ -52,8 +55,9 @@ func NewClient(conn Conn) *Client {
 }
 
 // Notifications yields server notifications in arrival order. The channel closes once
-// the connection has ended and every notification already received has drained into it;
-// nothing queued is ever dropped.
+// the connection has ended and every notification already received has drained into it,
+// or once Close runs, whichever comes first: a notification still queued when Close is
+// called may never reach this channel. See Close.
 func (c *Client) Notifications() <-chan Notification { return c.notes }
 
 // Call sends a request and waits for its response. A JSON-RPC error is returned as
@@ -102,11 +106,16 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	}
 }
 
-// Close ends the connection. The reader then stops, and the drain goroutine follows it
-// once every already-queued notification has been delivered.
+// Close ends the connection. The reader then stops, and the drain goroutine follows: it
+// delivers whatever it can hand off promptly, but a notification not yet consumed when
+// Close is called may be dropped rather than delivered. That is fine: a client that
+// closes is done with the session and does not need them.
 func (c *Client) Close() error {
 	var err error
-	c.once.Do(func() { err = c.conn.Close() })
+	c.once.Do(func() {
+		err = c.conn.Close()
+		close(c.closed)
+	})
 	return err
 }
 
@@ -177,7 +186,9 @@ func (c *Client) finishReading() {
 
 // drain moves queued notifications into notes one at a time, in order. Sending on notes
 // may block on a slow consumer, but that only blocks drain, never read. drain exits and
-// closes notes once the reader has finished and the queue is empty.
+// closes notes once the reader has finished and the queue is empty, or as soon as Close
+// fires: a slow or absent consumer must never leak drain parked on a full notes channel,
+// so Close discards whatever remains queued instead of waiting the consumer out.
 func (c *Client) drain() {
 	defer close(c.notes)
 	for {
@@ -192,7 +203,11 @@ func (c *Client) drain() {
 		n := c.queue[0]
 		c.queue = c.queue[1:]
 		c.qmu.Unlock()
-		c.notes <- n
+		select {
+		case c.notes <- n:
+		case <-c.closed:
+			return
+		}
 	}
 }
 
