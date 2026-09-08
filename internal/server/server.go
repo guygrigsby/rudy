@@ -62,6 +62,7 @@ type Server struct {
 	mu      sync.Mutex
 	live    map[ulid.ULID]*liveSession
 	loading map[ulid.ULID]chan struct{} // sids with a cold load in flight; see loadCold
+	closing map[ulid.ULID]chan struct{} // sids detach is closing; see detach, loadCold
 	nextID  int
 }
 
@@ -608,6 +609,11 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 // Without single-flighting, two connections resuming (or forking from) the same cold session at
 // once would race, and the loser would see a spurious "locked" error instead of the same live
 // session the winner produced.
+//
+// It also waits out a concurrent detach that is still closing this same id (see s.closing,
+// detach): detach removes a session from s.live before its own sess.Close has actually
+// released the flock, so a cold load that only checked s.live could still lose to that flock,
+// seeing session.ErrLocked for a session nobody has held live for a while.
 func (s *Server) loadCold(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Error) {
 	for {
 		s.mu.Lock()
@@ -619,6 +625,12 @@ func (s *Server) loadCold(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Erro
 			s.mu.Unlock()
 			<-ch
 			continue // the winner has installed it into s.live, or failed; check s.live again
+		}
+		if ch, ok := s.closing[sid]; ok {
+			s.mu.Unlock()
+			<-ch
+			continue // detach's Close has released the flock now; re-check from the top, since
+			// the session may have become live again through another path in the meantime
 		}
 		ch := make(chan struct{})
 		if s.loading == nil {
@@ -741,10 +753,26 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	// attachIfLive from finding this session again. The actual Close, once that is done, no
 	// longer needs mu - nothing can reach ls through s.live to race it, and ls.closed (set
 	// above, under ls.mu) is what stops any other path (Shutdown's closeIfOpen) from also
-	// closing it.
-	delete(s.live, ls.sess.ID())
+	// closing it. But sess.Close still has to run (releasing the store's flock) before a cold
+	// load for this same id can safely call session.Load again, so register it in s.closing in
+	// this same critical section, before releasing mu: a concurrent loadCold checks s.closing
+	// right alongside s.live and s.loading (see loadCold) and waits instead of racing the
+	// flock.
+	id := ls.sess.ID()
+	closingCh := make(chan struct{})
+	if s.closing == nil {
+		s.closing = map[ulid.ULID]chan struct{}{}
+	}
+	s.closing[id] = closingCh
+	delete(s.live, id)
 	s.mu.Unlock()
+
 	_ = ls.sess.Close()
+
+	s.mu.Lock()
+	delete(s.closing, id)
+	close(closingCh)
+	s.mu.Unlock()
 }
 
 func (s *Server) detachAll(cn *conn) {
