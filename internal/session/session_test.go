@@ -156,7 +156,6 @@ func TestForkInheritsByReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = child.Close() }()
 	es := child.Entries()
 	if len(es) != 4 || es[0].Kind != KindSessionOpened || es[2].ID != at.ID || es[3].Kind != KindForkPoint {
 		t.Fatalf("child entries = %+v", es)
@@ -170,6 +169,11 @@ func TestForkInheritsByReference(t *testing.T) {
 	}
 	if _, err := parent.Fork(st, NewID()); !errors.Is(err, ErrInvariant) {
 		t.Fatalf("fork at unknown entry: %v", err)
+	}
+	// A session must be closed, releasing its lock, before it can be loaded
+	// again; loading it while still open is exactly what ErrLocked guards.
+	if err := child.Close(); err != nil {
+		t.Fatal(err)
 	}
 
 	reloaded, err := Load(st, child.ID())

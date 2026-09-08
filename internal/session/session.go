@@ -38,6 +38,13 @@ func Open(st *Store, opened SessionOpened) (*Session, error) {
 		_ = s.Close()
 		return nil, err
 	}
+	// session_opened must be visible to a fresh ReadLog the moment Open
+	// returns, the same reason Fork syncs fork_point: otherwise a concurrent
+	// Load reads an empty file and reports "empty log" instead of ErrLocked.
+	if err := s.log.Sync(); err != nil {
+		_ = s.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
