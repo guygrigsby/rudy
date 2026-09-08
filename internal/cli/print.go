@@ -186,7 +186,11 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 		return noOpResult(o, info, stdout)
 	}
 
-	out := &turnOutput{turnID: turnID}
+	turnULID, err := ulid.Parse(turnID)
+	if err != nil {
+		return 1, fmt.Errorf("turn id %q: %w", turnID, err)
+	}
+	out := &turnOutput{turnID: turnID, turnULID: turnULID}
 	enc := json.NewEncoder(stdout)
 	for {
 		select {
@@ -339,6 +343,7 @@ func submit(ctx context.Context, client *protocol.Client, sessionID, prompt stri
 // turnOutput folds notifications into what the printer reports.
 type turnOutput struct {
 	turnID     string
+	turnULID   ulid.ULID // parsed turnID; entries below it belong to earlier turns
 	text       string
 	usage      session.Usage
 	stopReason session.StopReason
@@ -346,13 +351,20 @@ type turnOutput struct {
 	state      string
 }
 
-// observe folds one notification in and reports whether the turn is over.
+// observe folds one notification in and reports whether the turn is over. Entries from
+// before this turn are ignored: resume and fork replay the whole log, and folding those
+// replayed assistant messages in would report every earlier turn's tokens and cost as this
+// run's. A turn id is the ULID of the user_message that started it, so every entry of this
+// turn sorts at or above it and every earlier entry sorts below.
 func (t *turnOutput) observe(n protocol.Notification) (bool, error) {
 	switch n.Method {
 	case protocol.NotifyEntryAppended:
 		var ea protocol.EntryAppended
 		if err := json.Unmarshal(n.Params, &ea); err != nil {
 			return false, fmt.Errorf("entry.appended: %w", err)
+		}
+		if ea.Entry.ID.Compare(t.turnULID) < 0 {
+			return false, nil
 		}
 		switch p := ea.Entry.Payload.(type) {
 		case session.AssistantMessage:

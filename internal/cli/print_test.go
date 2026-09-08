@@ -197,6 +197,14 @@ func TestPrintContinueReusesSession(t *testing.T) {
 	if got := len(fp.request(1).Messages); got != 3 {
 		t.Fatalf("second request carries %d messages, want 3", got)
 	}
+	// The resume replays the whole log, including the first turn's assistant_message. Only
+	// this turn's entries count toward what this run reports it cost.
+	if r2.Usage != (session.Usage{Input: 10, Output: 2}) {
+		t.Fatalf("second run usage %+v, want only its own turn's %+v", r2.Usage, session.Usage{Input: 10, Output: 2})
+	}
+	if r2.Cost != r1.Cost {
+		t.Fatalf("second run cost %q, want the same one turn as the first, %q", r2.Cost, r1.Cost)
+	}
 }
 
 func TestPrintContinueWithNoSession(t *testing.T) {
