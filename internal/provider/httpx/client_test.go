@@ -3,6 +3,7 @@ package httpx_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,74 @@ func TestDoGivesUpAfterFiveAttemptsReturningTheLastResponse(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != 502 || attempts.Load() != 5 {
 		t.Fatalf("status %d attempts %d", resp.StatusCode, attempts.Load())
+	}
+}
+
+func TestDoRetriesWhenDrainingARetryableBodyFails(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			// Content-Length overstates the bytes actually written; the server closes
+			// the connection when the handler returns, so the client's drain of the
+			// retryable body hits an unexpected EOF.
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "short")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c, _ := newClient(t)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	resp, err := c.Do(context.Background(), req, ulid.ULID{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != 200 || httpx.AttemptsOf(resp) != 2 {
+		t.Fatalf("status %d attempts %d", resp.StatusCode, httpx.AttemptsOf(resp))
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("server saw %d attempts", attempts.Load())
+	}
+}
+
+func TestDoGivesUpAfterFiveAttemptsWhenDrainFailsEveryTime(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "short")
+	}))
+	defer srv.Close()
+	c, _ := newClient(t)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	_, err := c.Do(context.Background(), req, ulid.ULID{})
+	var herr *httpx.Error
+	if !errors.As(err, &herr) || herr.Attempts != 5 {
+		t.Fatalf("want *httpx.Error with Attempts=5, got %v", err)
+	}
+	if attempts.Load() != 5 {
+		t.Fatalf("server saw %d attempts", attempts.Load())
+	}
+}
+
+func TestAttemptsOfIsOneWhenTheFirstAttemptSucceeds(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c, _ := newClient(t)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	resp, err := c.Do(context.Background(), req, ulid.ULID{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if got := httpx.AttemptsOf(resp); got != 1 {
+		t.Fatalf("want 1 attempt, got %d", got)
 	}
 }
 

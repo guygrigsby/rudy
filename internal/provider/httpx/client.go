@@ -3,6 +3,7 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -67,6 +68,13 @@ func AttemptsOf(resp *http.Response) int {
 	return n
 }
 
+// withAttempts records n as the attempt count Do made for resp, readable back through
+// AttemptsOf.
+func withAttempts(resp *http.Response, n int) *http.Response {
+	resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), attemptsKey{}, n))
+	return resp
+}
+
 // Do sends req with rudy's headers, retrying retryable statuses and transport errors up
 // to five attempts. The request body must be replayable through req.GetBody, which
 // http.NewRequest sets for bytes.Reader, strings.Reader and bytes.Buffer bodies. On the
@@ -106,21 +114,40 @@ func (c *Client) Do(ctx context.Context, req *http.Request, sessionID ulid.ULID)
 			delay = backoff[attempt]
 			continue
 		}
-		if !Retryable(resp.StatusCode) || attempt == len(backoff)-1 {
-			resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), attemptsKey{}, attempt+1))
-			return resp, nil
+		if !Retryable(resp.StatusCode) {
+			return withAttempts(resp, attempt+1), nil
 		}
 		if d, ok := RetryAfter(resp.Header, c.Now()); ok {
 			delay = d
 		} else {
 			delay = backoff[attempt]
 		}
+		if attempt == len(backoff)-1 {
+			// Last attempt at a retryable status: still hand the response back so the
+			// caller can classify it (a codec reads the body for a provider error
+			// message), but only once the body has proven readable. A body that fails
+			// to read or close here is a transport failure like any other, so it
+			// becomes *Error with the full attempt count rather than a response the
+			// caller cannot actually read.
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				_ = resp.Body.Close()
+				return nil, &Error{Attempts: len(backoff), Err: fmt.Errorf("httpx: drain body: %w", err)}
+			}
+			if err := resp.Body.Close(); err != nil {
+				return nil, &Error{Attempts: len(backoff), Err: fmt.Errorf("httpx: close body: %w", err)}
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			return withAttempts(resp, attempt+1), nil
+		}
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 			_ = resp.Body.Close()
-			return nil, fmt.Errorf("httpx: drain body: %w", err)
+			last = fmt.Errorf("httpx: drain body: %w", err)
+			continue
 		}
 		if err := resp.Body.Close(); err != nil {
-			return nil, fmt.Errorf("httpx: close body: %w", err)
+			last = fmt.Errorf("httpx: close body: %w", err)
+			continue
 		}
 		last = fmt.Errorf("httpx: %s %s: status %d", req.Method, req.URL, resp.StatusCode)
 	}

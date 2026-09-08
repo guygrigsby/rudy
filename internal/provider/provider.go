@@ -65,7 +65,7 @@ type Part struct {
 	Text          string             `json:"text,omitempty"`
 	ID            string             `json:"id,omitempty"`
 	Name          string             `json:"name,omitempty"`
-	Usage         session.Usage      `json:"usage,omitempty"`
+	Usage         session.Usage      `json:"usage"`
 	StopReason    session.StopReason `json:"stop_reason,omitempty"`
 	StopReasonRaw string             `json:"stop_reason_raw,omitempty"`
 }
