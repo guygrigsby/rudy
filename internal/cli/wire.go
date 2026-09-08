@@ -123,6 +123,14 @@ func Build(ctx context.Context, o BuildOptions) (*Built, error) {
 	}, nil
 }
 
+// storeFromEnv opens the session store at its XDG data path without wiring the rest of the
+// server; commands that only read sessions (sessions list) use this instead of Build so they
+// pay for no plugin load or registry refresh.
+func storeFromEnv(env func(string) string, home string) (*session.Store, error) {
+	paths := config.XDG(env, home)
+	return session.OpenStore(filepath.Join(paths.Data, "sessions"))
+}
+
 // BuiltinPlugins is the linked-in set: the six tools, /init and the openai_chat providers.
 func BuiltinPlugins(cfg *config.Config, httpc *httpx.Client, home string, env func(string) string) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")

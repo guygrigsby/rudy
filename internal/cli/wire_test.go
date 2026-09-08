@@ -149,6 +149,27 @@ func TestBuildLoadsPluginsAndRegistry(t *testing.T) {
 	}
 }
 
+func TestStoreFromEnv(t *testing.T) {
+	base := t.TempDir()
+	env := func(key string) string {
+		if key == "XDG_DATA_HOME" {
+			return filepath.Join(base, "data")
+		}
+		return ""
+	}
+	st, err := storeFromEnv(env, base)
+	if err != nil {
+		t.Fatalf("storeFromEnv: %v", err)
+	}
+	want := filepath.Join(base, "data", "rudy", "sessions")
+	if st.Root() != want {
+		t.Fatalf("Root() = %q want %q", st.Root(), want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("store dir not created: %v", err)
+	}
+}
+
 func TestBuildFailsWithNoModels(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
