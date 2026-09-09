@@ -92,9 +92,9 @@ func Resolve(defs map[string]Definition, name string) (Definition, bool) {
 // parse splits the frontmatter from the body and validates the header. stem is the file name
 // without its extension, which is the definition's name unless the header repeats it.
 func parse(stem string, data []byte) (Definition, error) {
-	head, body, ok := frontmatter.Split(string(data))
-	if !ok {
-		return Definition{}, errors.New("frontmatter: file must start with --- and close with ---")
+	head, body, err := frontmatter.Split(string(data))
+	if err != nil {
+		return Definition{}, err
 	}
 	var fm header
 	if err := yaml.Unmarshal([]byte(head), &fm); err != nil {

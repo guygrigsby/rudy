@@ -80,9 +80,9 @@ func Load(roots []string) ([]Skill, []error) {
 // parse splits the frontmatter from the body and validates the header. name is the
 // directory's own name, which is the skill's name unless the header gives one.
 func parse(name, dir string, data []byte) (Skill, error) {
-	head, _, ok := frontmatter.Split(string(data))
-	if !ok {
-		return Skill{}, errors.New("frontmatter: file must start with --- and close with ---")
+	head, _, err := frontmatter.Split(string(data))
+	if err != nil {
+		return Skill{}, err
 	}
 	var h header
 	if err := yaml.Unmarshal([]byte(head), &h); err != nil {
@@ -136,12 +136,40 @@ func Migrate(from []string, to string) (copied, skipped []string, err error) {
 				skipped = append(skipped, name)
 				continue
 			}
-			if err := os.CopyFS(dst, os.DirFS(src)); err != nil {
-				return copied, skipped, fmt.Errorf("skills: copy %s: %w", src, err)
+			if err := copyStaged(src, dst, to, name); err != nil {
+				return copied, skipped, err
 			}
 			done[name] = true
 			copied = append(copied, name)
 		}
 	}
 	return copied, skipped, nil
+}
+
+// copyStaged copies src into a staging directory beside dst and renames it into place only
+// once the copy finishes without error. os.CopyFS stops at the first error and leaves
+// whatever it already wrote behind; copying into a scratch directory first, rather than
+// straight into dst, keeps a partial copy from ever landing at the path a later Migrate's
+// os.Stat treats as "already migrated". Any failure removes the staging directory and
+// reports the skill name, and dst is left untouched for the next attempt.
+func copyStaged(src, dst, to, name string) (err error) {
+	if err := os.MkdirAll(to, 0o755); err != nil {
+		return fmt.Errorf("skills: migrate %s: %w", name, err)
+	}
+	staging, err := os.MkdirTemp(to, ".migrate-"+name+"-*")
+	if err != nil {
+		return fmt.Errorf("skills: migrate %s: %w", name, err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+	if err = os.CopyFS(staging, os.DirFS(src)); err != nil {
+		return fmt.Errorf("skills: migrate %s: %w", name, err)
+	}
+	if err = os.Rename(staging, dst); err != nil {
+		return fmt.Errorf("skills: migrate %s: %w", name, err)
+	}
+	return nil
 }

@@ -1,11 +1,13 @@
 package agentdef
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/guygrigsby/rudy/internal/frontmatter"
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
@@ -47,5 +49,37 @@ func TestLoadRejectsBadFrontmatter(t *testing.T) {
 	}
 	if !reflect.DeepEqual(defs["agent"].Tools, []string{"read"}) {
 		t.Errorf("agent never in tools: %v", defs["agent"].Tools)
+	}
+}
+
+// TestLoadDistinguishesMissingFromUnterminatedFence covers a regression from moving the
+// frontmatter reader to the shared internal/frontmatter package: a file with no opening
+// fence and one whose fence never closes must still be told apart, not collapsed into one
+// generic "bad frontmatter" message.
+func TestLoadDistinguishesMissingFromUnterminatedFence(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("noopen.md", "description: x\nbody")
+	write("noclose.md", "---\ndescription: x\nbody")
+	_, errs := Load([]string{dir})
+	if len(errs) != 2 {
+		t.Fatalf("errs %v", errs)
+	}
+	var noOpen, noClose int
+	for _, err := range errs {
+		switch {
+		case errors.Is(err, frontmatter.ErrNoOpeningFence):
+			noOpen++
+		case errors.Is(err, frontmatter.ErrNoClosingFence):
+			noClose++
+		}
+	}
+	if noOpen != 1 || noClose != 1 {
+		t.Errorf("want one of each fence error, got %v", errs)
 	}
 }
