@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,6 +112,13 @@ func callTool(id, name, input string) []provider.Part {
 // and returns a buildFunc that opens mode off on model fake:m.
 func testBuilder(t *testing.T, fp *fakeProvider, extra ...plugin.Plugin) buildFunc {
 	t.Helper()
+	return testBuilderOver(t, fp, nil, extra...)
+}
+
+// testBuilderOver is testBuilder with over laid on top of its three defaults, for the tests
+// that need a config value the default set does not carry.
+func testBuilderOver(t *testing.T, fp *fakeProvider, over map[string]any, extra ...plugin.Plugin) buildFunc {
+	t.Helper()
 	base := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
@@ -118,17 +126,19 @@ func testBuilder(t *testing.T, fp *fakeProvider, extra ...plugin.Plugin) buildFu
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
 	plugins := append(BuiltinTools(), fakePlugin{fp})
 	plugins = append(plugins, extra...)
+	overrides := map[string]any{
+		"default.provider": "fake",
+		"default.model":    "m",
+		"permissions.mode": "off",
+	}
+	maps.Copy(overrides, over)
 	return func(ctx context.Context, stderr io.Writer) (*Built, error) {
 		return Build(ctx, BuildOptions{
-			Version: "test",
-			Overrides: map[string]any{
-				"default.provider": "fake",
-				"default.model":    "m",
-				"permissions.mode": "off",
-			},
-			Plugins: plugins,
-			Home:    base,
-			Stderr:  stderr,
+			Version:   "test",
+			Overrides: overrides,
+			Plugins:   plugins,
+			Home:      base,
+			Stderr:    stderr,
 		})
 	}
 }

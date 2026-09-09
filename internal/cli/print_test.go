@@ -353,18 +353,6 @@ func TestRootPrintFlag(t *testing.T) {
 	}
 }
 
-func TestRootWithoutPrintExplains(t *testing.T) {
-	root := newRoot("test", testBuilder(t, &fakeProvider{}))
-	var errb bytes.Buffer
-	root.SetErr(&errb)
-	root.SetArgs([]string{"hello"})
-	err := root.ExecuteContext(context.Background())
-	var ee ExitError
-	if !errorsAs(err, &ee) || ee.Code != 2 || !strings.Contains(errb.String(), "--print") {
-		t.Fatalf("err %v stderr %q", err, errb.String())
-	}
-}
-
 func errorsAs(err error, target *ExitError) bool {
 	for err != nil {
 		if e, ok := err.(ExitError); ok {

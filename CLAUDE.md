@@ -50,12 +50,14 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
 `build` (default), `test`, `lint`, `check`, `fmt-check`, `vendor-types`,
 `install`, `redeploy`. CI calls these and nothing else.
 
-## Building against memory-go
+## Building against the two siblings
 
 `go.mod` replaces `github.com/aeryx-ai/memory/memory-go` with
-`../memory/memory-go`, so the memory repository has to sit beside this one:
-`~/projects/rudy` and `~/projects/memory`. CI checks the two out side by side
-under the workspace, rudy into `rudy/` and `aeryx-ai/memory` into `memory/`,
+`../memory/memory-go` and `github.com/guygrigsby/vimbubble/v2` with
+`../vimbubble/v2`, so both repositories have to sit beside this one:
+`~/projects/rudy`, `~/projects/memory` and `~/projects/vimbubble`. CI checks
+the three out side by side under the workspace, rudy into `rudy/`,
+`aeryx-ai/memory` into `memory/` and `guygrigsby/vimbubble` into `vimbubble/`,
 and runs `make check` with `working-directory: rudy`. The workflow cannot pass
 until the memory repository is pushed to `aeryx-ai/memory`.
 

@@ -34,6 +34,6 @@ func newRoot(version string, build buildFunc) *cobra.Command {
 	}
 	root.SetVersionTemplate("rudy {{.Version}}\n")
 	registerPrint(root, build)
-	root.AddCommand(newModelsCommand(build), newSessionsCommand(), newSkillsCommand(), newMCPCommand(), newPluginCommand())
+	root.AddCommand(newModelsCommand(build), newSessionsCommand(build), newSkillsCommand(), newMCPCommand(), newPluginCommand())
 	return root
 }

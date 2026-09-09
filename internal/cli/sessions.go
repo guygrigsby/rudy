@@ -11,8 +11,8 @@ import (
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
-// newSessionsCommand is the "sessions" noun with a "list" verb under it.
-func newSessionsCommand() *cobra.Command {
+// newSessionsCommand is the "sessions" noun with the list, resume and fork verbs under it.
+func newSessionsCommand(build buildFunc) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "sessions",
 		Short: "list and manage sessions",
@@ -37,7 +37,27 @@ func newSessionsCommand() *cobra.Command {
 			return renderSessions(cmd.OutOrStdout(), summaries)
 		},
 	}
-	cmd.AddCommand(list)
+	resume := &cobra.Command{
+		Use:   "resume <session id>",
+		Short: "open the client on an existing session",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			stderr := cmd.ErrOrStderr()
+			return tuiExit(runTUI(cmd.Context(), build, resumeWith(printOptions{Resume: args[0]}), launchTUI, stderr))
+		},
+	}
+	var at string
+	fork := &cobra.Command{
+		Use:   "fork <session id>",
+		Short: "open the client on a fork of an existing session",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			stderr := cmd.ErrOrStderr()
+			return tuiExit(runTUI(cmd.Context(), build, forkAt(args[0], at), launchTUI, stderr))
+		},
+	}
+	fork.Flags().StringVar(&at, "at", "", "entry id to fork at; the newest entry by default")
+	cmd.AddCommand(list, resume, fork)
 	return cmd
 }
 
