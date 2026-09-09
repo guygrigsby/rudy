@@ -1,0 +1,5 @@
+name = "hello"
+version = "0.1.0"
+protocol_version = 1
+command = "hello"
+description = "Example spawned plugin"

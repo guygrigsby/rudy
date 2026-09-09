@@ -412,3 +412,49 @@ func TestBuiltCloseShutsTheServerAndThePlugins(t *testing.T) {
 		t.Fatal("Built.Close did not close the plugins")
 	}
 }
+
+// writeManifest puts one plugin.toml under root/plugins/<dir>.
+func writeManifest(t *testing.T, root, dir, name string) {
+	t.Helper()
+	pdir := filepath.Join(root, "plugins", dir)
+	if err := os.MkdirAll(pdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := "name = \"" + name + "\"\nversion = \"0.1.0\"\nprotocol_version = 1\ncommand = \"" + name + "\"\n"
+	if err := os.WriteFile(filepath.Join(pdir, "plugin.toml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDiscoverPluginsSkipsDisabledAndReportsMismatches(t *testing.T) {
+	data := t.TempDir()
+	cfgRoot := t.TempDir()
+	writeManifest(t, data, "hello", "hello")
+	writeManifest(t, cfgRoot, "other", "other")
+	writeManifest(t, cfgRoot, "wrongdir", "elsewhere")
+	lock := filepath.Join(data, "plugins.lock.toml")
+	body := "[plugins.hello]\nenabled = true\n\n[plugins.other]\nenabled = false\n"
+	if err := os.WriteFile(lock, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ms, errs := discoverPlugins([]string{data, cfgRoot}, lock)
+	if len(ms) != 1 || ms[0].Name != "hello" {
+		t.Fatalf("manifests = %+v", ms)
+	}
+	if ms[0].Command != "hello" || ms[0].Dir != filepath.Join(data, "plugins", "hello") {
+		t.Fatalf("manifest = %+v", ms[0])
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "elsewhere") {
+		t.Fatalf("errors = %v", errs)
+	}
+}
+
+func TestDiscoverPluginsWithoutALockKeepsEverything(t *testing.T) {
+	data := t.TempDir()
+	writeManifest(t, data, "hello", "hello")
+	ms, errs := discoverPlugins([]string{data}, filepath.Join(data, "plugins.lock.toml"))
+	if len(ms) != 1 || len(errs) != 0 {
+		t.Fatalf("manifests = %+v, errors = %v", ms, errs)
+	}
+}

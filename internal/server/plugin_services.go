@@ -16,10 +16,6 @@ import (
 // dispatch path turns it into not_found.
 var errSessionNotOpen = errors.New("session not open")
 
-// originLinked is what plugin.state reports for a plugin compiled into the binary. Spawned
-// plugins arrive in Task 12 and carry their own origin then.
-const originLinked = "linked"
-
 // PluginServices is what the registry's hosts call. Connect returns the client end of a pipe
 // whose server end is served on s.ctx as caller class plugin; Note appends a note entry to a
 // live session; StatusChanged and WidgetChanged broadcast to every connection. It is the
@@ -34,6 +30,7 @@ func (s *Server) PluginServices() plugin.Services {
 		Connect:       s.connectPlugin,
 		StatusChanged: s.broadcastStatus,
 		WidgetChanged: s.broadcastWidget,
+		OnStatus:      s.broadcastPluginState,
 	}
 }
 
@@ -81,6 +78,24 @@ func (s *Server) broadcastStatus() {
 	}
 }
 
+// broadcastPluginState tells every client what one plugin's load state has become: loading
+// and ready as the registry loads it, failed when its process dies under a live session.
+func (s *Server) broadcastPluginState(st plugin.Status) {
+	ps := protocol.PluginState{Name: st.Name, Origin: stateOrigin(st), State: string(st.State), Reason: st.Reason}
+	for _, cn := range s.clientConns() {
+		cn.notify(protocol.NotifyPluginState, ps)
+	}
+}
+
+// stateOrigin is where a plugin came from, for the wire. A status that does not say is a
+// linked plugin: that is what being compiled in looks like.
+func stateOrigin(st plugin.Status) string {
+	if st.Origin == "" {
+		return plugin.OriginLinked
+	}
+	return st.Origin
+}
+
 func (s *Server) broadcastWidget(w plugin.Widget) {
 	for _, cn := range s.clientConns() {
 		cn.notify(protocol.NotifyWidgetUpdated, w)
@@ -97,7 +112,7 @@ func (s *Server) sendConnectState(cn *conn) {
 	}
 	for _, st := range s.d.Plugins.Statuses() {
 		cn.notify(protocol.NotifyPluginState, protocol.PluginState{
-			Name: st.Name, Origin: originLinked, State: string(st.State), Reason: st.Reason,
+			Name: st.Name, Origin: stateOrigin(st), State: string(st.State), Reason: st.Reason,
 		})
 	}
 }

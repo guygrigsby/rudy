@@ -5,7 +5,12 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tool"
 )
+
+// ProtocolVersion is the wire version the server and a spawned plugin agree on in
+// plugin.init. A plugin answering anything else is refused and never loads.
+const ProtocolVersion = 1
 
 // Methods, client to server.
 const (
@@ -31,7 +36,31 @@ const (
 // Methods, plugin to server. A connection may send these only when its caller class is
 // plugin; a client gets unauthorized.
 const (
-	MethodPluginAppendNote = "plugin.append_note"
+	MethodPluginAppendNote       = "plugin.append_note"
+	MethodPluginRegisterTool     = "plugin.register_tool"
+	MethodPluginRegisterCommand  = "plugin.register_command"
+	MethodPluginRegisterHook     = "plugin.register_hook"
+	MethodPluginRegisterWidget   = "plugin.register_widget"
+	MethodPluginRegisterProvider = "plugin.register_provider"
+	MethodPluginSetStatus        = "plugin.set_status"
+)
+
+// Methods, server to plugin. Only a spawned plugin is ever called: a linked plugin is the
+// same Go interface on the other side of a function call.
+const (
+	MethodPluginInit         = "plugin.init"
+	MethodToolInvoke         = "tool.invoke"
+	MethodToolCancel         = "tool.cancel"
+	MethodHookFire           = "hook.fire"
+	MethodCommandInvoke      = "command.invoke"
+	MethodProviderComplete   = "provider.complete"
+	MethodProviderListModels = "provider.list_models"
+)
+
+// Notifications, plugin to server.
+const (
+	NotifyToolProgress  = "tool.progress"
+	NotifyProviderDelta = "provider.delta"
 )
 
 // Notifications, server to client.
@@ -263,4 +292,147 @@ type PermissionRequested struct {
 type NoticeParams struct {
 	Level string `json:"level"`
 	Text  string `json:"text"`
+}
+
+// The plugin registration payloads. A spawned plugin asserts these under its own name; the
+// connection's caller class is what the name comes from, never the params.
+//
+// Point and Slot travel as strings rather than the plugin package's own types: internal/plugin
+// imports this package for its wire vocabulary (Span, WidgetSlot), so nothing here can import
+// it back. The server converts at the edge, which is also where an unknown value is refused.
+type PluginRegisterToolParams struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	InputSchema json.RawMessage `json:"input_schema"`
+	Safety      tool.Safety     `json:"safety"`
+}
+
+type PluginRegisterCommandParams struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type PluginRegisterHookParams struct {
+	Point    string `json:"point"`
+	Priority int    `json:"priority"`
+}
+
+type PluginRegisterWidgetParams struct {
+	Key     string     `json:"key"`
+	Slot    WidgetSlot `json:"slot"`
+	Content []Span     `json:"content"`
+}
+
+type PluginSetStatusParams struct {
+	Key     string `json:"key"`
+	Content []Span `json:"content"`
+}
+
+// PluginRegisterProviderParams names the wire the plugin speaks: custom means the server
+// calls provider.complete on the plugin itself.
+type PluginRegisterProviderParams struct {
+	Name string `json:"name"`
+	Wire string `json:"wire"`
+}
+
+// The provider wires a plugin may register.
+const (
+	WireCustom            = "custom"
+	WireOpenAIChat        = "openai_chat"
+	WireAnthropicMessages = "anthropic_messages"
+)
+
+// PluginInitParams is the first request the server sends a spawned plugin. Config is the
+// plugin's [plugins.<name>] table verbatim.
+type PluginInitParams struct {
+	Name            string         `json:"name"`
+	Version         string         `json:"version"`
+	ProtocolVersion int            `json:"protocol_version"`
+	Config          map[string]any `json:"config"`
+	WorkspaceRoots  []string       `json:"workspace_roots"`
+}
+
+type PluginInitResult struct {
+	Name            string `json:"name"`
+	Version         string `json:"version"`
+	ProtocolVersion int    `json:"protocol_version"`
+}
+
+type ToolInvokeParams struct {
+	SessionID string            `json:"session_id"`
+	ToolUseID string            `json:"tool_use_id"`
+	Name      string            `json:"name"`
+	Input     json.RawMessage   `json:"input"`
+	Workspace session.Workspace `json:"workspace"`
+	TimeoutMS int64             `json:"timeout_ms"`
+}
+
+type ToolInvokeResult struct {
+	Content []session.Block `json:"content"`
+	IsError bool            `json:"is_error"`
+}
+
+type ToolCancelParams struct {
+	ToolUseID string `json:"tool_use_id"`
+}
+
+// ToolProgress is a running tool saying it is still working. Nothing in this plan renders
+// it; it is delivered to the plugin adapter and dropped there rather than dropped here,
+// where a later renderer would have to reopen the transport to find it.
+type ToolProgress struct {
+	ToolUseID string `json:"tool_use_id"`
+	Text      string `json:"text"`
+}
+
+type HookFireParams struct {
+	Point     string          `json:"point"`
+	SessionID string          `json:"session_id"`
+	TurnID    string          `json:"turn_id"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// HookFireResult carries the point's own result shape, or nothing for a point that returns
+// nothing and for a handler that means pass.
+type HookFireResult struct {
+	Result json.RawMessage `json:"result"`
+}
+
+type CommandInvokeParams struct {
+	SessionID string `json:"session_id"`
+	Name      string `json:"name"`
+	Args      string `json:"args"`
+}
+
+// CommandInvokeResult is what the command asks the server to do. A non-empty Prompt is
+// submitted as a user message; a non-empty Notice is shown to the client.
+type CommandInvokeResult struct {
+	Prompt string `json:"prompt,omitempty"`
+	Notice string `json:"notice,omitempty"`
+}
+
+type ProviderCompleteParams struct {
+	RequestID string                `json:"request_id"`
+	Model     session.ModelRef      `json:"model"`
+	System    string                `json:"system"`
+	Messages  []provider.Message    `json:"messages"`
+	Tools     []provider.ToolDef    `json:"tools"`
+	Thinking  session.ThinkingLevel `json:"thinking"`
+	MaxTokens int                   `json:"max_tokens"`
+}
+
+type ProviderCompleteResult struct {
+	StopReason    session.StopReason `json:"stop_reason"`
+	StopReasonRaw string             `json:"stop_reason_raw"`
+	Usage         session.Usage      `json:"usage"`
+}
+
+// ProviderDelta is one streamed part of a completion in flight, keyed by the request it
+// belongs to.
+type ProviderDelta struct {
+	RequestID string        `json:"request_id"`
+	Part      provider.Part `json:"part"`
+}
+
+type ProviderListModelsResult struct {
+	Models []provider.Model `json:"models"`
 }

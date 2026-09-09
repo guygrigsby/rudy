@@ -23,16 +23,16 @@ const (
 
 // Message is one turn of conversation in the shape the loop keeps it.
 type Message struct {
-	Role      Role
-	Content   []session.Block
-	ToolUseID string // tool_result only
+	Role      Role            `json:"role"`
+	Content   []session.Block `json:"content"`
+	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result only
 }
 
 // ToolDef is a tool as the model sees it.
 type ToolDef struct {
-	Name        string
-	Description string
-	Schema      json.RawMessage
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Schema      json.RawMessage `json:"input_schema"`
 }
 
 // Request is one completion request.

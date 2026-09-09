@@ -47,6 +47,10 @@ type Services struct {
 	// set that survives. The provider registry keeps its own copy of the provider set, so
 	// withdrawing one here is invisible to a turn until that copy is replaced.
 	ProvidersChanged func(ps []provider.Provider)
+	// OnStatus is called for every load state change, in order; the server broadcasts
+	// plugin.state. It is called with no registry lock held, so a sink is free to read the
+	// registry back.
+	OnStatus func(s Status)
 }
 
 // Action is what a slash command asks the server to do.
@@ -133,7 +137,10 @@ const (
 )
 
 type Status struct {
-	Name   string
+	Name string
+	// Origin is linked or spawned: where the plugin came from, which is what a client shows
+	// next to a failure. Empty is treated as linked.
+	Origin string
 	State  State
 	Reason string // failed only
 }

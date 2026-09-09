@@ -85,19 +85,37 @@ func New(d Deps) *Server {
 // order they were produced. Permission questions go to the first such connection whose hello
 // declared asker; none means no asker.
 func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
-	return s.serveConn(ctx, c, "")
+	return s.serveConn(ctx, c, "", nil)
 }
 
 // servePlugin runs one connection whose caller class is plugin: it needs no hello (one
 // arriving is answered normally) and may append notes and name a parent session. Only the
 // server hands these out, through Host.Connect.
 func (s *Server) servePlugin(ctx context.Context, c protocol.Conn, name string) error {
-	return s.serveConn(ctx, c, name)
+	return s.serveConn(ctx, c, name, nil)
+}
+
+// ServePlugin runs a spawned plugin's connection: servePlugin plus the adapter its
+// registrations and notifications are applied to. The plugin adapter calls it with the peer
+// it holds over the child's stdio, so a spawned plugin reaches the server through exactly the
+// requests a linked plugin's Host.Connect client sends, and registers through the same
+// registry. The name is the manifest's, taken from the Registrar rather than from anything
+// the child says.
+func (s *Server) ServePlugin(ctx context.Context, c protocol.Conn, reg plugin.Registrar) error {
+	// The loop ends with the caller's context or with the server's, whichever comes first.
+	// The server's matters: Shutdown waits for every serve loop to return before it closes a
+	// session, and the context a plugin adapter loads under outlives the server (it is the
+	// process's), so without this a spawned plugin's loop would keep Shutdown waiting for a
+	// child that is only asked to exit afterwards.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(s.ctx, cancel)()
+	return s.serveConn(ctx, c, reg.Name(), reg)
 }
 
 // serveConn sets a connection up, runs its loop and tears it down. name is the caller class:
 // empty for a client, the plugin's name for a plugin connection.
-func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string) error {
+func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, reg plugin.Registrar) error {
 	// Tracked in the same WaitGroup as running turns, and registered under wgMu against
 	// shuttingDown for the same reason spawnTurn is (see spawnTurn): a serve loop can be
 	// dispatching a request against a live session at any moment, so Shutdown must not
@@ -116,6 +134,7 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string) er
 	s.nextID++
 	cn := newConn(s.nextID, c)
 	cn.plugin = name
+	cn.reg = reg
 	cn.hello = name != ""
 	s.conns[cn.id] = cn
 	s.mu.Unlock()
@@ -147,7 +166,12 @@ func (s *Server) serve(ctx context.Context, cn *conn) error {
 			continue
 		}
 		if req.IsNotification() {
-			continue // client-to-server notifications are not part of this plan
+			// A spawned plugin's notifications (tool.progress, provider.delta) belong to the
+			// adapter that owns its registrations. A client's are not part of this plan.
+			if cn.reg != nil {
+				cn.reg.Deliver(req.Method, req.Params)
+			}
+			continue
 		}
 		result, rerr := s.dispatch(ctx, cn, req)
 		if rerr != nil {
@@ -256,6 +280,9 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 	if !cn.hello {
 		return nil, perr(protocol.CodeUnauthorized, "client.hello must be the first request")
 	}
+	if e := s.authorizePlugin(cn, req); e != nil {
+		return nil, e
+	}
 	switch req.Method {
 	case protocol.MethodSessionOpen:
 		var p protocol.SessionOpenParams
@@ -310,9 +337,78 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 		return s.handleCommandRun(ctx, cn, req.Params)
 	case protocol.MethodPluginAppendNote:
 		return s.handleAppendNote(cn, req.Params)
+	case protocol.MethodPluginRegisterTool, protocol.MethodPluginRegisterCommand,
+		protocol.MethodPluginRegisterHook, protocol.MethodPluginRegisterProvider,
+		protocol.MethodPluginRegisterWidget, protocol.MethodPluginSetStatus:
+		return s.handleRegister(cn, req)
 	default:
 		return nil, perr(protocol.CodeNotFound, "unknown method "+req.Method)
 	}
+}
+
+// authorizePlugin is the caller class table for the plugin class, in one place. A plugin
+// asserts things about itself and about the sessions it opened: it never lists or resumes
+// somebody else's session, never answers a permission question, and never refreshes the
+// registry the whole process shares. Everything session-shaped it may do, it may do only to a
+// session on its own connection.
+func (s *Server) authorizePlugin(cn *conn, req protocol.Request) *protocol.Error {
+	if cn.plugin == "" {
+		return nil
+	}
+	switch req.Method {
+	case protocol.MethodSessionList, protocol.MethodSessionResume, protocol.MethodSessionFork,
+		protocol.MethodSessionAnswer, protocol.MethodRegistryRefresh:
+		return perr(protocol.CodeUnauthorized, "a plugin may not call "+req.Method)
+	case protocol.MethodSessionInterrupt, protocol.MethodSessionClose, protocol.MethodSessionSetModel,
+		protocol.MethodSessionSetMode, protocol.MethodSessionSetThinking, protocol.MethodSessionSetTitle,
+		protocol.MethodSessionCompact, protocol.MethodCommandRun:
+		return s.ownSession(cn, req)
+	}
+	return nil
+}
+
+// ownSession refuses a plugin naming a session it does not hold. The subscription is the
+// proof: a plugin holds exactly the sessions it opened on its own connection.
+func (s *Server) ownSession(cn *conn, req protocol.Request) *protocol.Error {
+	var p struct {
+		SessionID string `json:"session_id"`
+	}
+	if e := decode(req.Params, &p); e != nil {
+		return e
+	}
+	sid, err := ulid.Parse(p.SessionID)
+	if err != nil {
+		return perr(protocol.CodeInvalidArgument, "bad session id")
+	}
+	if !cn.subscribed(sid) {
+		return perr(protocol.CodeUnauthorized, "a plugin may only "+req.Method+" a session it opened")
+	}
+	return nil
+}
+
+// handleRegister applies one plugin.register_* or plugin.set_status. The name it registers
+// under is the connection's, never anything in the params.
+func (s *Server) handleRegister(cn *conn, req protocol.Request) (any, *protocol.Error) {
+	if cn.plugin == "" {
+		return nil, perr(protocol.CodeUnauthorized, req.Method+" is for plugins")
+	}
+	if cn.reg == nil {
+		return nil, perr(protocol.CodeUnauthorized, "linked plugins register through the Host")
+	}
+	res, err := plugin.Register(cn.reg, req.Method, req.Params)
+	if err != nil {
+		return nil, registerErr(err)
+	}
+	return res, nil
+}
+
+// registerErr maps a registration failure: a name another plugin already owns is a conflict,
+// everything else goes through the usual taxonomy.
+func registerErr(err error) *protocol.Error {
+	if errors.Is(err, plugin.ErrDuplicate) {
+		return perr(protocol.CodeConflict, err.Error())
+	}
+	return protocol.ErrorFrom(err)
 }
 
 func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
@@ -410,9 +506,6 @@ func (s *Server) handleAnswer(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	var p protocol.SessionAnswerParams
 	if e := decode(raw, &p); e != nil {
 		return nil, e
-	}
-	if cn.plugin != "" {
-		return nil, perr(protocol.CodeUnauthorized, "plugins cannot answer permission questions")
 	}
 	if !cn.asker {
 		return nil, perr(protocol.CodeUnauthorized, "connection did not declare asker")
@@ -1200,8 +1293,27 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 		}
 	}
 	ls.conns = kept
+	empty := len(ls.conns) == 0
+	steering := ls.state == turn.Steering
 	ls.obsMu.Unlock()
 
+	s.closeIfUnusedLocked(ls)
+	if !empty || !steering {
+		return
+	}
+	// A steering turn owns the session but nothing is running: it is parked waiting for a
+	// steer message that the connection which would have sent it has just gone. Cancel it so
+	// the turn records its interruption and the session can close, rather than staying live
+	// for the rest of the process. Both locks are released first: nothing holding ls.mu or
+	// Server.mu may call a Runner method (see liveSession).
+	ls.mu.Lock()
+	r := ls.runner
+	ls.mu.Unlock()
+	if r == nil {
+		return
+	}
+	r.Interrupt(session.InterruptCancel)
+	s.mu.Lock()
 	s.closeIfUnusedLocked(ls)
 }
 

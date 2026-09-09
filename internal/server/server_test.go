@@ -28,16 +28,19 @@ import (
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
+	"github.com/guygrigsby/rudy/internal/turn"
 )
 
 // scriptProvider answers odd calls with a tool_use for "danger" and even calls with "done".
 // When block is non-nil it streams one delta and then waits for ctx or block.
 type scriptProvider struct {
-	mu       sync.Mutex
-	calls    int
-	block    chan struct{}
-	textOnly bool               // answer every call with text, never a tool_use
-	reqs     []provider.Request // every request, in order
+	mu        sync.Mutex
+	calls     int
+	block     chan struct{}
+	textOnly  bool               // answer every call with text, never a tool_use
+	toolName  string             // the tool to call; empty means danger
+	toolInput string             // that tool's input; empty means {"x":1}
+	reqs      []provider.Request // every request, in order
 	// A compaction's summary request (the one carrying the summary system prompt) waits on
 	// summary when it is non-nil, so a test can hold a compaction open. summaryHit is signalled
 	// once when such a request arrives, summaryDone is closed when it returns, and summaryErr
@@ -66,6 +69,16 @@ func (p *scriptProvider) lastRequest() provider.Request {
 
 func (p *scriptProvider) lastSystem() string { return p.lastRequest().System }
 
+// request is the nth request the provider saw, in order.
+func (p *scriptProvider) request(i int) provider.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if i >= len(p.reqs) {
+		return provider.Request{}
+	}
+	return p.reqs[i]
+}
+
 func (p *scriptProvider) Name() string { return "fake" }
 
 func (p *scriptProvider) ListModels(ctx context.Context) ([]provider.Model, error) {
@@ -83,7 +96,14 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 	n := p.calls
 	p.reqs = append(p.reqs, req)
 	textOnly := p.textOnly
+	toolName, toolInput := p.toolName, p.toolInput
 	p.mu.Unlock()
+	if toolName == "" {
+		toolName = "danger"
+	}
+	if toolInput == "" {
+		toolInput = `{"x":1}`
+	}
 	if p.summary != nil && strings.Contains(req.System, "summarize") {
 		select {
 		case p.summaryHit <- struct{}{}:
@@ -117,8 +137,8 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 	if n%2 == 1 && !textOnly {
 		parts = []provider.Part{
 			{Type: provider.PartTextDelta, Text: "Looking."},
-			{Type: provider.PartToolUseStart, ID: "tu" + itoa(n), Name: "danger"},
-			{Type: provider.PartToolUseDelta, ID: "tu" + itoa(n), Text: `{"x":1}`},
+			{Type: provider.PartToolUseStart, ID: "tu" + itoa(n), Name: toolName},
+			{Type: provider.PartToolUseDelta, ID: "tu" + itoa(n), Text: toolInput},
 			{Type: provider.PartToolUseEnd, ID: "tu" + itoa(n)},
 			{Type: provider.PartUsage, Usage: session.Usage{Input: 10, Output: 5}},
 			{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
@@ -1407,12 +1427,13 @@ func TestPluginHostReachesTheServerOverTheProtocol(t *testing.T) {
 	if err := pc.Call(ctx, protocol.MethodClientHello, protocol.ClientHelloParams{Client: "p", Version: "0"}, &hr); err != nil {
 		t.Fatalf("plugin hello: %v", err)
 	}
-	var list protocol.SessionListResult
-	if err := pc.Call(ctx, protocol.MethodSessionList, nil, &list); err != nil {
-		t.Fatalf("plugin session.list: %v", err)
+	// The registry is one of the few things a plugin may query.
+	var models protocol.RegistryListResult
+	if err := pc.Call(ctx, protocol.MethodRegistryList, nil, &models); err != nil {
+		t.Fatalf("plugin registry.list: %v", err)
 	}
-	if len(list.Sessions) != 1 {
-		t.Fatalf("sessions %+v", list.Sessions)
+	if len(models.Models) == 0 {
+		t.Fatal("registry.list came back empty")
 	}
 
 	// A plugin may name a parent, so it reaches the branch that looks the parent up.
@@ -1552,6 +1573,125 @@ func TestPluginConnectionCannotAnswerOrSubmitElsewhere(t *testing.T) {
 	}, &protocol.SessionSubmitResult{})
 	if got := code(t, err); got != protocol.CodeUnauthorized {
 		t.Fatalf("plugin submit elsewhere: code %d (%v)", got, err)
+	}
+}
+
+// TestDetachWhileSteeringCancelsTheTurn is the other end of a steer: the turn is parked
+// waiting for a steer message, and the only connection that could send one has gone. Nothing
+// else would ever resolve that turn, so the session would stay live for the life of the
+// process; detaching cancels it instead, and the log says so.
+func TestDetachWhileSteeringCancelsTheTurn(t *testing.T) {
+	prov := &scriptProvider{block: make(chan struct{})}
+	h := newHarness(t, prov)
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, cl, func(n protocol.Notification) bool { return n.Method == protocol.NotifyStreamDelta })
+	var ir server.InterruptResult
+	if err := cl.Call(ctx, protocol.MethodSessionInterrupt, protocol.SessionInterruptParams{
+		SessionID: info.SessionID, How: session.InterruptSteer,
+	}, &ir); err != nil {
+		t.Fatalf("interrupt: %v", err)
+	}
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == string(turn.Steering)
+	})
+
+	// The last subscriber leaves while the turn is still steering.
+	if err := cl.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{}); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	cl2 := dialAs(t, h.srv, false)
+	if err := cl2.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &protocol.SessionInfo{}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	var ti session.TurnInterrupted
+	found := false
+	for _, e := range entries(t, drain(t, cl2, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.Entry.Kind == session.KindTurnInterrupted
+	})) {
+		if got, ok := e.Payload.(session.TurnInterrupted); ok {
+			ti, found = got, true
+		}
+	}
+	if !found || ti.How != session.InterruptCancel {
+		t.Fatalf("turn_interrupted = %+v (found %v)", ti, found)
+	}
+	close(prov.block)
+}
+
+// TestPluginClassIsGatedPerTheCallerTable is the plugin caller class in one place: what a
+// plugin may never ask for at all, and what it may ask for only about a session it opened.
+func TestPluginClassIsGatedPerTheCallerTable(t *testing.T) {
+	hp := &hostPlugin{}
+	h := newHarnessWith(t, &scriptProvider{}, hp)
+	ctx := context.Background()
+	cl := h.dial(t, true)
+	info := h.open(t, cl) // the client's session, not the plugin's
+	pc := dialPlugin(t, hp)
+
+	never := []struct {
+		method string
+		params any
+	}{
+		{protocol.MethodSessionList, nil},
+		{protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}},
+		{protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: info.SessionID}},
+		{protocol.MethodRegistryRefresh, nil},
+	}
+	for _, c := range never {
+		err := pc.Call(ctx, c.method, c.params, &struct{}{})
+		if got := code(t, err); got != protocol.CodeUnauthorized {
+			t.Errorf("plugin %s: code %d (%v)", c.method, got, err)
+		}
+	}
+
+	notMine := []struct {
+		method string
+		params any
+	}{
+		{protocol.MethodSessionInterrupt, protocol.SessionInterruptParams{SessionID: info.SessionID, How: session.InterruptCancel}},
+		{protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}},
+		{protocol.MethodSessionSetTitle, protocol.SessionSetTitleParams{SessionID: info.SessionID, Title: "mine now"}},
+		{protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}},
+		{protocol.MethodCommandRun, protocol.CommandRunParams{SessionID: info.SessionID, Name: "hello"}},
+	}
+	for _, c := range notMine {
+		err := pc.Call(ctx, c.method, c.params, &struct{}{})
+		if got := code(t, err); got != protocol.CodeUnauthorized {
+			t.Errorf("plugin %s on somebody else's session: code %d (%v)", c.method, got, err)
+		}
+	}
+
+	// Its own session, though, it may drive.
+	var own protocol.SessionInfo
+	if err := pc.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: h.ws}, &own); err != nil {
+		t.Fatalf("plugin open: %v", err)
+	}
+	err := pc.Call(ctx, protocol.MethodSessionSetTitle, protocol.SessionSetTitleParams{
+		SessionID: own.SessionID, Title: "mine",
+	}, &server.EntryIDResult{})
+	if err != nil {
+		t.Fatalf("plugin set_title on its own session: %v", err)
+	}
+	if err := pc.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: own.SessionID}, &struct{}{}); err != nil {
+		t.Fatalf("plugin close of its own session: %v", err)
 	}
 }
 

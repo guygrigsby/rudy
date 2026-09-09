@@ -102,10 +102,11 @@ func (r *Registry) Load(ctx context.Context, plugins ...Plugin) {
 		if r.isDisabled(name) {
 			continue
 		}
-		idx := r.setStatus(Status{Name: name, State: StateLoading})
+		origin := originOf(p)
+		idx := r.setStatus(Status{Name: name, Origin: origin, State: StateLoading})
 		h := newHost(r, name)
 		if err := safeInit(ctx, p, h); err != nil {
-			r.statusAt(idx, Status{Name: name, State: StateFailed, Reason: err.Error()})
+			r.statusAt(idx, Status{Name: name, Origin: origin, State: StateFailed, Reason: err.Error()})
 			r.notice(fmt.Sprintf("plugin %s: failed: %s", name, err.Error()))
 			continue
 		}
@@ -113,7 +114,13 @@ func (r *Registry) Load(ctx context.Context, plugins ...Plugin) {
 		r.mu.Lock()
 		r.loaded = append(r.loaded, p)
 		r.mu.Unlock()
-		r.statusAt(idx, Status{Name: name, State: StateReady})
+		r.statusAt(idx, Status{Name: name, Origin: origin, State: StateReady})
+		// Last, and only for a plugin that has one: a spawned plugin's child can die at any
+		// moment, and its failure path must not withdraw registrations the commit above has
+		// not installed yet.
+		if c, ok := p.(committer); ok {
+			c.committed()
+		}
 	}
 }
 
@@ -138,6 +145,21 @@ func (r *Registry) Close() error {
 	return errors.Join(errs...)
 }
 
+// committer is a plugin that must be told when its registrations have been committed. Only
+// Spawned implements it; the method is unexported, so only this package can.
+type committer interface{ committed() }
+
+// originOf is where a plugin came from, for its status row. A plugin that does not say is
+// linked: that is what being compiled in looks like.
+func originOf(p Plugin) string {
+	if o, ok := p.(interface{ Origin() string }); ok {
+		if s := o.Origin(); s != "" {
+			return s
+		}
+	}
+	return OriginLinked
+}
+
 func safeInit(ctx context.Context, p Plugin, h Host) (err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -153,17 +175,29 @@ func (r *Registry) isDisabled(name string) bool {
 	return r.disabled[name]
 }
 
+// setStatus appends a load state and announces it. The sink is called after the lock is
+// released: it broadcasts to every connection, and a connection handler is free to read the
+// registry back.
 func (r *Registry) setStatus(s Status) int {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.statuses = append(r.statuses, s)
-	return len(r.statuses) - 1
+	i := len(r.statuses) - 1
+	f := r.services.OnStatus
+	r.mu.Unlock()
+	if f != nil {
+		f(s)
+	}
+	return i
 }
 
 func (r *Registry) statusAt(i int, s Status) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.statuses[i] = s
+	f := r.services.OnStatus
+	r.mu.Unlock()
+	if f != nil {
+		f(s)
+	}
 }
 
 // commit moves everything a plugin staged during a successful Init into the
@@ -328,17 +362,25 @@ func (r *Registry) Fail(name, reason string) {
 		}
 	}
 	r.widgetOrder = slices.DeleteFunc(r.widgetOrder, func(k ownerKey) bool { return k.owner == name })
+	var failed []Status
 	for i, st := range r.statuses {
 		if st.Name == name {
-			r.statuses[i] = Status{Name: name, State: StateFailed, Reason: reason}
+			r.statuses[i] = Status{Name: name, Origin: st.Origin, State: StateFailed, Reason: reason}
+			failed = append(failed, r.statuses[i])
 		}
 	}
 	statusChanged := r.services.StatusChanged
 	providersChanged := r.services.ProvidersChanged
+	onStatus := r.services.OnStatus
 	remaining := r.providersLocked()
 	r.mu.Unlock()
 	if hadStatus && statusChanged != nil {
 		statusChanged()
+	}
+	if onStatus != nil {
+		for _, st := range failed {
+			onStatus(st)
+		}
 	}
 	// The provider registry took its own copy of the set at boot and never revisits it, so
 	// without this the withdrawn plugin's provider still answers the next turn.

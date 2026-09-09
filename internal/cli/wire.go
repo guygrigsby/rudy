@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/plugins/tools/grep"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/read"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/write"
+	"github.com/guygrigsby/rudy/internal/pluginstore"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/provider/httpx"
 	"github.com/guygrigsby/rudy/internal/server"
@@ -106,7 +108,10 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	// call time, long after Load has filled it.
 	registry := provider.NewRegistry(filepath.Join(paths.Cache, "registry.json"))
 	set := o.Plugins
-	if set == nil {
+	// A caller that named its own plugin set means exactly that set: no discovery, no child
+	// processes it did not ask for.
+	discover := set == nil
+	if discover {
 		set = BuiltinPlugins(cfg, paths, httpc, home, env, o.Version, summarizeWith(cfg, registry, notice))
 	}
 	if err := os.MkdirAll(paths.Cache, 0o700); err != nil {
@@ -133,6 +138,9 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 			_ = built.Close(shutCtx)
 		}
 	}()
+	if discover {
+		set = append(set, spawnedPlugins(paths, plugins, srv, o.Version, notice)...)
+	}
 	services := srv.PluginServices()
 	// Withdrawing a provider has to reach the provider registry's own copy, not just the
 	// plugin registry; SetProviders below installs the initial set the same way.
@@ -194,6 +202,48 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 		return nil, err
 	}
 	return session.OpenStore(cfg.Sessions.Dir)
+}
+
+// spawnedPlugins is every manifest the roots hold that the lock file has not disabled, in
+// discovery order, after the built-ins: a spawned plugin never shadows a linked one, since
+// the first registration of a name wins. The roots are the data root (where rudy plugin
+// install puts them), the config root (where a user drops one by hand) and the workspace's
+// own .rudy, which is how a repository ships a plugin with itself.
+func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, notice func(string)) []plugin.Plugin {
+	// No working directory is no project scope, never a reason to fail the build.
+	cwd, _ := os.Getwd()
+	roots := []string{paths.Data, paths.Config}
+	if cwd != "" {
+		roots = append(roots, filepath.Join(cwd, ".rudy"))
+	}
+	manifests, errs := discoverPlugins(roots, filepath.Join(paths.Data, pluginstore.LockFile))
+	for _, err := range errs {
+		notice(err.Error())
+	}
+	var workspaces []string
+	if cwd != "" {
+		workspaces = []string{cwd}
+	}
+	out := make([]plugin.Plugin, 0, len(manifests))
+	for _, m := range manifests {
+		out = append(out, plugin.NewSpawned(m, plugin.SpawnServices{
+			ServePlugin: srv.ServePlugin,
+			Version:     version,
+			Workspaces:  workspaces,
+			Fail:        plugins.Fail,
+		}))
+	}
+	return out
+}
+
+// discoverPlugins is Discover minus what the lock file disables. A disabled plugin is not
+// started at all, so it gets no status row: it was never asked to load.
+func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []error) {
+	manifests, errs := plugin.Discover(roots)
+	disabled := pluginstore.DisabledFromLock(lockPath)
+	return slices.DeleteFunc(manifests, func(m plugin.Manifest) bool {
+		return slices.Contains(disabled, m.Name)
+	}), errs
 }
 
 // BuiltinPlugins is the linked-in set: the six tools, the agent tool, /init, /compact,

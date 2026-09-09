@@ -7,6 +7,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/protocol"
 )
 
@@ -24,10 +25,15 @@ type conn struct {
 	greeted bool
 	asker   bool
 	// plugin is the caller class: the plugin's name on a connection the server itself
-	// handed out through Host.Connect (or, from Task 12, a spawned plugin's pipe), empty on
-	// every client connection. Only a plugin may append a note or name a parent session.
+	// handed out through Host.Connect, or a spawned plugin's stdio peer, empty on every
+	// client connection. Only a plugin may append a note or name a parent session.
 	// Written once before the serve loop starts and read only from that loop.
 	plugin string
+	// reg is the spawned plugin's adapter: what plugin.register_* and the plugin's own
+	// notifications are applied to. Nil on a client connection and on a linked plugin's
+	// Host.Connect connection, which registers through the Host instead. Written once
+	// before the serve loop starts.
+	reg plugin.Registrar
 
 	mu    sync.Mutex
 	queue []any
