@@ -85,7 +85,7 @@ func TestPrintText(t *testing.T) {
 	t.Chdir(t.TempDir())
 	fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
 	var out bytes.Buffer
-	code, err := runPrint(context.Background(), printOptions{Output: "text"}, "Reply with exactly: ok", testBuilder(t, fp), &out, io.Discard)
+	code, err := runPrint(context.Background(), printOptions{Output: "text"}, dialOptions{}, "Reply with exactly: ok", testBuilder(t, fp), &out, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -102,7 +102,7 @@ func TestPrintJSON(t *testing.T) {
 	t.Chdir(t.TempDir())
 	fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
 	var out bytes.Buffer
-	code, err := runPrint(context.Background(), printOptions{Output: "json"}, "hi", testBuilder(t, fp), &out, io.Discard)
+	code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{}, "hi", testBuilder(t, fp), &out, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -125,7 +125,7 @@ func TestPrintStreamJSON(t *testing.T) {
 	t.Chdir(t.TempDir())
 	fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
 	var out bytes.Buffer
-	code, err := runPrint(context.Background(), printOptions{Output: "stream-json"}, "hi", testBuilder(t, fp), &out, io.Discard)
+	code, err := runPrint(context.Background(), printOptions{Output: "stream-json"}, dialOptions{}, "hi", testBuilder(t, fp), &out, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -156,7 +156,7 @@ func TestPrintToolRoundTrip(t *testing.T) {
 		say("done"),
 	}}
 	var out bytes.Buffer
-	code, err := runPrint(context.Background(), printOptions{Output: "text"}, "list files", testBuilder(t, fp), &out, io.Discard)
+	code, err := runPrint(context.Background(), printOptions{Output: "text"}, dialOptions{}, "list files", testBuilder(t, fp), &out, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -178,10 +178,10 @@ func TestPrintContinueReusesSession(t *testing.T) {
 	fp := &fakeProvider{script: [][]provider.Part{say("one"), say("two")}}
 	build := testBuilder(t, fp)
 	var out1, out2 bytes.Buffer
-	if code, err := runPrint(context.Background(), printOptions{Output: "json"}, "first", build, &out1, io.Discard); err != nil || code != 0 {
+	if code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{}, "first", build, &out1, io.Discard); err != nil || code != 0 {
 		t.Fatalf("first: code %d err %v", code, err)
 	}
-	if code, err := runPrint(context.Background(), printOptions{Output: "json", Continue: true}, "second", build, &out2, io.Discard); err != nil || code != 0 {
+	if code, err := runPrint(context.Background(), printOptions{Output: "json", Continue: true}, dialOptions{}, "second", build, &out2, io.Discard); err != nil || code != 0 {
 		t.Fatalf("second: code %d err %v", code, err)
 	}
 	var r1, r2 printResult
@@ -211,7 +211,7 @@ func TestPrintContinueWithNoSession(t *testing.T) {
 	t.Chdir(t.TempDir())
 	fp := &fakeProvider{}
 	var errb bytes.Buffer
-	code, _ := runPrint(context.Background(), printOptions{Output: "text", Continue: true}, "x", testBuilder(t, fp), io.Discard, &errb)
+	code, _ := runPrint(context.Background(), printOptions{Output: "text", Continue: true}, dialOptions{}, "x", testBuilder(t, fp), io.Discard, &errb)
 	if code != 2 || !strings.Contains(errb.String(), "no session") {
 		t.Fatalf("code %d stderr %q", code, errb.String())
 	}
@@ -222,7 +222,7 @@ func TestPrintSlashCommand(t *testing.T) {
 	fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
 	build := testBuilder(t, fp, helloCommandPlugin{})
 	var out bytes.Buffer
-	code, err := runPrint(context.Background(), printOptions{Output: "text"}, "/hello there", build, &out, io.Discard)
+	code, err := runPrint(context.Background(), printOptions{Output: "text"}, dialOptions{}, "/hello there", build, &out, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -238,7 +238,7 @@ func TestPrintUnknownSlashCommand(t *testing.T) {
 	t.Chdir(t.TempDir())
 	fp := &fakeProvider{}
 	var errb bytes.Buffer
-	code, _ := runPrint(context.Background(), printOptions{Output: "text"}, "/nope", testBuilder(t, fp), io.Discard, &errb)
+	code, _ := runPrint(context.Background(), printOptions{Output: "text"}, dialOptions{}, "/nope", testBuilder(t, fp), io.Discard, &errb)
 	if code != 2 || !strings.Contains(errb.String(), "unknown command /nope") {
 		t.Fatalf("code %d stderr %q", code, errb.String())
 	}
@@ -257,7 +257,7 @@ func TestPrintNoActionCommandCompletesWithoutWaiting(t *testing.T) {
 	var code int
 	var err error
 	go func() {
-		code, err = runPrint(context.Background(), printOptions{Output: "text"}, "/noop", build, &out, io.Discard)
+		code, err = runPrint(context.Background(), printOptions{Output: "text"}, dialOptions{}, "/noop", build, &out, io.Discard)
 		close(done)
 	}()
 	select {
@@ -281,7 +281,7 @@ func TestPrintNoActionCommandJSON(t *testing.T) {
 	fp := &fakeProvider{}
 	build := testBuilder(t, fp, noopCommandPlugin{})
 	var out bytes.Buffer
-	code, err := runPrint(context.Background(), printOptions{Output: "json"}, "/noop", build, &out, io.Discard)
+	code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{}, "/noop", build, &out, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -310,7 +310,7 @@ func TestPrintCancelReturns130(t *testing.T) {
 	var code int
 	var err error
 	go func() {
-		code, err = runPrint(ctx, printOptions{Output: "text"}, "hi", build, &out, io.Discard)
+		code, err = runPrint(ctx, printOptions{Output: "text"}, dialOptions{}, "hi", build, &out, io.Discard)
 		close(done)
 	}()
 	select {
@@ -327,7 +327,7 @@ func TestPrintProviderFailure(t *testing.T) {
 	t.Chdir(t.TempDir())
 	fp := &fakeProvider{fail: &provider.Error{Class: session.ErrProvider, Status: 500, Message: "boom"}}
 	var errb bytes.Buffer
-	code, _ := runPrint(context.Background(), printOptions{Output: "text"}, "hi", testBuilder(t, fp), io.Discard, &errb)
+	code, _ := runPrint(context.Background(), printOptions{Output: "text"}, dialOptions{}, "hi", testBuilder(t, fp), io.Discard, &errb)
 	if code != 1 || !strings.Contains(errb.String(), "boom") {
 		t.Fatalf("code %d stderr %q", code, errb.String())
 	}
@@ -378,7 +378,7 @@ func TestPrintReleasesTheSessionLock(t *testing.T) {
 	fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
 	build := testBuilder(t, fp)
 	var out bytes.Buffer
-	code, err := runPrint(context.Background(), printOptions{Output: "json"}, "hi", build, &out, io.Discard)
+	code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{}, "hi", build, &out, io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("code %d err %v", code, err)
 	}
@@ -405,34 +405,25 @@ func TestPrintReleasesTheSessionLock(t *testing.T) {
 // A subagent's child session is opened on the same workspace as its parent and is newer, so
 // the newest session for a directory is a child whenever the last thing the user ran used the
 // agent tool. --continue means the session the user was in, never the one a tool opened
-// underneath it.
-func TestNewestForSkipsChildSessions(t *testing.T) {
+// underneath it. The rule lives on the summaries, so it is the one rule an embedded client
+// reading the store and an attached one reading session.list both apply.
+func TestNewestInSkipsChildSessions(t *testing.T) {
 	root := t.TempDir()
 	st, err := session.OpenStore(filepath.Join(t.TempDir(), "sessions"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	parent := openTestSession(t, st, root)
-	child, err := session.Open(st, session.SessionOpened{
-		SchemaVersion:   1,
-		RudyVersion:     "test",
-		Workspace:       session.Workspace{Root: root, ProjectID: "local/" + filepath.Base(root)},
-		Model:           session.ModelRef{Provider: "fake", Model: "m"},
-		Thinking:        session.ThinkingOff,
-		Mode:            session.ModeOff,
-		Agent:           "default",
-		ParentSessionID: parent.ID().String(),
-		ParentToolUseID: "agent_0_abc",
-	})
+	child := openChildSession(t, st, root, parent.ID().String())
+	list, err := st.List()
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = child.Close() })
-	got, err := newestFor(st, root)
+	got, err := newestIn(list, root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != parent.ID().String() {
-		t.Fatalf("newestFor = %s, want the parent %s, not the child %s", got, parent.ID(), child.ID())
+		t.Fatalf("newestIn = %s, want the parent %s, not the child %s", got, parent.ID(), child.ID())
 	}
 }

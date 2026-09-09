@@ -125,7 +125,11 @@ func testBuilderOver(t *testing.T, fp *fakeProvider, over map[string]any, extra 
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
-	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+	// The runtime dir is not under base: it holds the default socket, a unix path is 104
+	// bytes, and t.TempDir() spends most of that on the test's own name before the socket is
+	// named. Every client probes that path now, so a fixture that cannot be dialed would be
+	// a probe failure rather than the empty runtime dir it is meant to be.
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t))
 	plugins := append(BuiltinTools(), fakePlugin{fp})
 	plugins = append(plugins, extra...)
 	overrides := map[string]any{
@@ -327,7 +331,11 @@ func TestBuildFailsFastWhenRefreshTimesOutWithNoSnapshot(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
-	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+	// The runtime dir is not under base: it holds the default socket, a unix path is 104
+	// bytes, and t.TempDir() spends most of that on the test's own name before the socket is
+	// named. Every client probes that path now, so a fixture that cannot be dialed would be
+	// a probe failure rather than the empty runtime dir it is meant to be.
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t))
 	var stderr bytes.Buffer
 	start := time.Now()
 	_, err := Build(context.Background(), BuildOptions{
@@ -364,7 +372,11 @@ func TestBuildWarnsAndSucceedsWhenRefreshTimesOutWithASnapshot(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
-	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+	// The runtime dir is not under base: it holds the default socket, a unix path is 104
+	// bytes, and t.TempDir() spends most of that on the test's own name before the socket is
+	// named. Every client probes that path now, so a fixture that cannot be dialed would be
+	// a probe failure rather than the empty runtime dir it is meant to be.
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t))
 	cacheDir := filepath.Join(base, "cache", "rudy")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -410,7 +422,11 @@ func TestBuildFailsWithNoModels(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
 	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
-	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+	// The runtime dir is not under base: it holds the default socket, a unix path is 104
+	// bytes, and t.TempDir() spends most of that on the test's own name before the socket is
+	// named. Every client probes that path now, so a fixture that cannot be dialed would be
+	// a probe failure rather than the empty runtime dir it is meant to be.
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t))
 	_, err := Build(context.Background(), BuildOptions{
 		Version:   "test",
 		Overrides: map[string]any{"default.provider": "none", "default.model": "m"},

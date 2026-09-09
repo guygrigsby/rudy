@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/tui/app"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
@@ -27,18 +28,17 @@ type look struct {
 }
 
 // resolveFunc is how one command decides which session the client opens on, given a
-// client that has already said hello. Root, sessions resume and sessions fork differ in
+// connection that has already said hello. Root, sessions resume and sessions fork differ in
 // this one step and in nothing else.
-type resolveFunc func(ctx context.Context, client *protocol.Client, b *Built, cwd string) (protocol.SessionInfo, int, error)
+type resolveFunc func(ctx context.Context, d *dialed, cwd string) (protocol.SessionInfo, int, error)
 
-// clientRun is everything the launcher needs: the wiring, a connection that has already
-// said hello, the resolved look and the session to draw.
+// clientRun is everything the launcher needs: the greeted connection and the config and
+// version that came with it, the resolved look and the session to draw.
 type clientRun struct {
-	built  *Built
-	client *protocol.Client
-	look   look
-	info   protocol.SessionInfo
-	cwd    string
+	dial *dialed
+	look look
+	info protocol.SessionInfo
+	cwd  string
 	// prompt is the positional words of `rudy <prompt>`, seeded into the editor as a
 	// draft. Empty for every command that takes no prompt.
 	prompt string
@@ -57,8 +57,8 @@ var launchTUI launchFunc = launchApp
 // --continue names, with --model, --mode and --thinking applied to it. source names the
 // flag or verb the session id came from, for the error a bad one gets.
 func resumeWith(o printOptions, source string) resolveFunc {
-	return func(ctx context.Context, client *protocol.Client, b *Built, cwd string) (protocol.SessionInfo, int, error) {
-		return openOrResume(ctx, client, b, o, cwd, source)
+	return func(ctx context.Context, d *dialed, cwd string) (protocol.SessionInfo, int, error) {
+		return openOrResume(ctx, d, o, cwd, source)
 	}
 }
 
@@ -67,7 +67,7 @@ func resumeWith(o printOptions, source string) resolveFunc {
 // (internal/server, forkAt), so a command racing on the same session cannot leave the fork
 // one entry stale.
 func forkAt(id, at string) resolveFunc {
-	return func(ctx context.Context, client *protocol.Client, b *Built, cwd string) (protocol.SessionInfo, int, error) {
+	return func(ctx context.Context, d *dialed, cwd string) (protocol.SessionInfo, int, error) {
 		var info protocol.SessionInfo
 		if _, err := ulid.Parse(id); err != nil {
 			return info, 2, fmt.Errorf("%q is not a session id", id)
@@ -77,21 +77,27 @@ func forkAt(id, at string) resolveFunc {
 				return info, 2, fmt.Errorf("--at %q is not an entry id", at)
 			}
 		}
-		if err := client.Call(ctx, protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: id, AtEntryID: at}, &info); err != nil {
+		if err := d.Client.Call(ctx, protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: id, AtEntryID: at}, &info); err != nil {
+			// A fork reads the parent, so a parent another rudy holds is the same lock and
+			// the same answer: the socket that process is serving.
+			if hint := heldElsewhere(id, err); hint != nil {
+				return info, 1, hint
+			}
 			return info, 1, fmt.Errorf("fork %s: %w", id, err)
 		}
 		return info, 0, nil
 	}
 }
 
-// runTUI opens the client on an embedded server and returns the process exit code: 0 the
-// client exited, 1 failed, 2 usage. Every failure is printed here rather than returned,
-// so the three commands that draw the client report one the same way.
+// runTUI opens the client on the server dial reached, a running daemon or one this process
+// starts, and returns the process exit code: 0 the client exited, 1 failed, 2 usage. Every
+// failure is printed here rather than returned, so the three commands that draw the client
+// report one the same way.
 //
-// The order matters. The terminal is checked before anything is built, so a piped run
-// costs no plugin load; the theme and the keys are resolved before the connection, so a
+// The order matters. The terminal is checked before anything is built or dialed, so a piped
+// run costs no plugin load; the theme and the keys are resolved before the session, so a
 // configuration error never leaves a session open behind a client that cannot draw.
-func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch launchFunc, prompt string, stderr io.Writer) int {
+func runTUI(ctx context.Context, build buildFunc, dopts dialOptions, resolve resolveFunc, launch launchFunc, prompt string, stderr io.Writer) int {
 	// The TUI takes over the terminal; a pipe or a redirect means the caller wanted the
 	// headless client and did not say so.
 	if !stdinIsTerminal() {
@@ -104,31 +110,23 @@ func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch la
 	// Ctrl-C is a key (app.clear), not a signal.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	b, err := build(ctx, BuildOptions{Stderr: stderr})
+	d, code, err := dial(ctx, build, BuildOptions{Stderr: stderr}, dopts, "rudy-tui", true)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
-		return 1
+		return code
 	}
 	defer func() {
 		// stop() first, as --print does: it puts SIGINT back to its default disposition,
 		// so a second Ctrl-C during the shutdown kills the process instead of cancelling
 		// a context nothing is reading any more.
 		stop()
-		shutdownCtx, done := context.WithTimeout(context.Background(), clientShutdownBudget)
-		defer done()
-		_ = b.Close(shutdownCtx)
+		d.Close()
 	}()
-	lk, err := loadLook(b)
+	lk, err := loadLook(d.Paths, d.Config)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 2
 	}
-	client, closeConn, err := serveInMemory(b, "rudy-tui", true)
-	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return 1
-	}
-	defer closeConn()
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -137,12 +135,12 @@ func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch la
 	}
 	// A background context on purpose, as --print does: the session has to be opened and
 	// closed even once ctx is the one a signal cancelled.
-	info, code, err := resolve(context.Background(), client, b, cwd)
+	info, code, err := resolve(context.Background(), d, cwd)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return code
 	}
-	run := clientRun{built: b, client: client, look: lk, info: info, cwd: cwd, prompt: prompt, stderr: stderr}
+	run := clientRun{dial: d, look: lk, info: info, cwd: cwd, prompt: prompt, stderr: stderr}
 	switch err := launch(ctx, run); {
 	case err == nil:
 		return 0
@@ -177,12 +175,12 @@ func tuiExit(code int) error {
 // every action id and key spelling it refused, so a second copy of the path here would
 // only repeat what the message already says, and would name a themes/default.toml that
 // does not exist when the built-in theme is the one carrying a bad role override.
-func loadLook(b *Built) (look, error) {
-	th, err := theme.Load(filepath.Join(b.Paths.Config, "themes"), b.Config.UI.Theme["name"], b.Config.UI.Theme)
+func loadLook(paths config.Paths, cfg *config.Config) (look, error) {
+	th, err := theme.Load(filepath.Join(paths.Config, "themes"), cfg.UI.Theme["name"], cfg.UI.Theme)
 	if err != nil {
 		return look{}, err
 	}
-	table, err := keys.New(b.Config.Keys)
+	table, err := keys.New(cfg.Keys)
 	if err != nil {
 		return look{}, err
 	}
@@ -193,19 +191,19 @@ func loadLook(b *Built) (look, error) {
 // the Bubble Tea program, which owns the terminal until it returns.
 func launchApp(ctx context.Context, r clientRun) error {
 	var reg protocol.RegistryListResult
-	if err := r.client.Call(context.Background(), protocol.MethodRegistryList, nil, &reg); err != nil {
+	if err := r.dial.Client.Call(context.Background(), protocol.MethodRegistryList, nil, &reg); err != nil {
 		// A registry the client could not read costs the context percent and the cost cell,
 		// not the session: the server already resolved the model the session opened on.
 		_, _ = fmt.Fprintln(r.stderr, "rudy: registry.list:", err)
 	}
 	return app.Run(ctx, app.Options{
-		Config:  r.built.Config,
+		Config:  r.dial.Config,
 		Theme:   r.look.theme,
 		Keys:    r.look.keys,
-		Client:  r.client,
+		Client:  r.dial.Client,
 		Session: r.info,
 		Models:  reg.Models,
-		Version: r.built.Version,
+		Version: r.dial.Version,
 		Cwd:     r.cwd,
 		Prompt:  r.prompt,
 	})

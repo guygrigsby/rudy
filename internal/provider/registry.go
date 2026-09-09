@@ -162,9 +162,14 @@ func (r *Registry) Models() []Model {
 }
 
 // Resolve finds a model by "provider:id" or by a bare id that is unique across providers.
-func (r *Registry) Resolve(spec string) (Model, error) {
+func (r *Registry) Resolve(spec string) (Model, error) { return ResolveIn(r.Models(), spec) }
+
+// ResolveIn is Resolve's rule over a plain slice, for a caller holding a registry listing
+// rather than a registry: a client attached to rudy serve reads the models over registry.list
+// and has to spell "provider:id" and a unique bare id the same way the server does.
+func ResolveIn(models []Model, spec string) (Model, error) {
 	if ref, ok := session.ParseModelRef(spec); ok {
-		for _, m := range r.Models() {
+		for _, m := range models {
 			if m.Ref == ref {
 				return m, nil
 			}
@@ -172,7 +177,7 @@ func (r *Registry) Resolve(spec string) (Model, error) {
 		return Model{}, fmt.Errorf("%w: %s", ErrUnknownModel, spec)
 	}
 	var matches []Model
-	for _, m := range r.Models() {
+	for _, m := range models {
 		if m.Ref.Model == spec {
 			matches = append(matches, m)
 		}

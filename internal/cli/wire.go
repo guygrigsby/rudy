@@ -89,17 +89,9 @@ func notices(w io.Writer) func(string) {
 // failure after the server exists shuts it back down: it holds a context, loaded plugins and
 // their connections, and a caller that got an error will never call Shutdown itself.
 func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
-	env := o.Env
-	if env == nil {
-		env = os.Getenv
-	}
-	home := o.Home
-	if home == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("home directory: %w", err)
-		}
-		home = h
+	env, home, err := envAndHome(o)
+	if err != nil {
+		return nil, err
 	}
 	stderr := o.Stderr
 	if stderr == nil {

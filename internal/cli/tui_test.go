@@ -163,13 +163,13 @@ func TestTUIDialDeclaresAsker(t *testing.T) {
 			Content:   []session.Block{session.TextBlock("run it")},
 			Source:    session.SourceTyped,
 		}
-		if err := r.client.Call(context.Background(), protocol.MethodSessionSubmit, params, &res); err != nil {
+		if err := r.dial.Client.Call(context.Background(), protocol.MethodSessionSubmit, params, &res); err != nil {
 			return err
 		}
 		deadline := time.After(10 * time.Second)
 		for {
 			select {
-			case n, ok := <-r.client.Notifications():
+			case n, ok := <-r.dial.Client.Notifications():
 				if !ok {
 					return errors.New("server closed the connection")
 				}
@@ -185,7 +185,7 @@ func TestTUIDialDeclaresAsker(t *testing.T) {
 						SessionID: r.info.SessionID, ToolUseID: asked.ToolUseID,
 						Decision: session.Deny, Scope: session.ScopeOnce, Reason: "asker",
 					}
-					if err := r.client.Call(context.Background(), protocol.MethodSessionAnswer, answer, nil); err != nil {
+					if err := r.dial.Client.Call(context.Background(), protocol.MethodSessionAnswer, answer, nil); err != nil {
 						return err
 					}
 				case protocol.NotifyTurnState:

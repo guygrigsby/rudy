@@ -61,6 +61,8 @@ var stdinIsTerminal = func() bool {
 func registerPrint(root *cobra.Command, build buildFunc) {
 	var headless bool
 	var o printOptions
+	var d dialOptions
+	registerDialFlags(root, &d)
 	f := root.Flags()
 	f.BoolVarP(&headless, "print", "p", false, "run one prompt headless and print the result")
 	f.StringVar(&o.Output, "output", "text", "text, json or stream-json")
@@ -73,7 +75,7 @@ func registerPrint(root *cobra.Command, build buildFunc) {
 	root.RunE = func(cmd *cobra.Command, args []string) error {
 		stderr := cmd.ErrOrStderr()
 		if !headless {
-			return tuiExit(runTUI(cmd.Context(), build, resumeWith(o, "--resume"), launchTUI, strings.Join(args, " "), stderr))
+			return tuiExit(runTUI(cmd.Context(), build, d, resumeWith(o, "--resume"), launchTUI, strings.Join(args, " "), stderr))
 		}
 		switch o.Output {
 		case "text", "json", "stream-json":
@@ -90,7 +92,7 @@ func registerPrint(root *cobra.Command, build buildFunc) {
 			_, _ = fmt.Fprintln(stderr, "no prompt: pass it as an argument or on stdin")
 			return ExitError{2}
 		}
-		code, err := runPrint(cmd.Context(), o, prompt, build, cmd.OutOrStdout(), stderr)
+		code, err := runPrint(cmd.Context(), o, d, prompt, build, cmd.OutOrStdout(), stderr)
 		if err != nil {
 			_, _ = fmt.Fprintln(stderr, err)
 			if code == 0 {
@@ -128,14 +130,15 @@ func readPrompt(args []string, stdin io.Reader, tty bool) (string, error) {
 	}
 }
 
-// runPrint runs one turn against an embedded server and prints it. It returns the process
-// exit code: 0 completed, 1 failed, 2 usage, 130 interrupted.
-func runPrint(ctx context.Context, o printOptions, prompt string, build buildFunc, stdout, stderr io.Writer) (int, error) {
+// runPrint runs one turn against the server dial reached, a running daemon or one this
+// process starts, and prints it. It returns the process exit code: 0 completed, 1 failed,
+// 2 usage, 130 interrupted.
+func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt string, build buildFunc, stdout, stderr io.Writer) (int, error) {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	b, err := build(ctx, BuildOptions{Stderr: stderr})
+	d, code, err := dial(ctx, build, BuildOptions{Stderr: stderr}, dopts, "rudy-print", false)
 	if err != nil {
-		return 1, err
+		return code, err
 	}
 	defer func() {
 		// stop() first, before anything that waits: it puts SIGINT back to its default
@@ -143,15 +146,8 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 		// handler is still installed a second one only cancels a context nothing is reading
 		// any more, and the operator watches a plugin's close budget run out in silence.
 		stop()
-		shutdownCtx, done := context.WithTimeout(context.Background(), clientShutdownBudget)
-		defer done()
-		_ = b.Close(shutdownCtx)
+		d.Close()
 	}()
-	client, closeConn, err := serveInMemory(b, "rudy-print", false)
-	if err != nil {
-		return 1, err
-	}
-	defer closeConn()
 
 	// Calls use a background context so an interrupt can still be delivered after ctx ends.
 	bg := context.Background()
@@ -159,7 +155,7 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 	if err != nil {
 		return 1, err
 	}
-	info, code, err := openOrResume(bg, client, b, o, cwd, "--resume")
+	info, code, err := openOrResume(bg, d, o, cwd, "--resume")
 	if err != nil {
 		// Printed here, not just returned: runPrint is called directly (bypassing
 		// registerPrint's own error printing) by tests and, once the TUI exists, other
@@ -168,7 +164,7 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 		return code, nil
 	}
 
-	turnID, code, err := submit(bg, client, info.SessionID, prompt, stdout, stderr)
+	turnID, code, err := submit(bg, d.Client, info.SessionID, prompt, stdout, stderr)
 	if err != nil || code != 0 {
 		return code, err
 	}
@@ -190,10 +186,10 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 		select {
 		case <-ctx.Done():
 			ictx, done := context.WithTimeout(bg, 5*time.Second)
-			_ = client.Call(ictx, protocol.MethodSessionInterrupt, protocol.SessionInterruptParams{SessionID: info.SessionID, How: session.InterruptCancel}, nil)
+			_ = d.Client.Call(ictx, protocol.MethodSessionInterrupt, protocol.SessionInterruptParams{SessionID: info.SessionID, How: session.InterruptCancel}, nil)
 			done()
 			return 130, nil
-		case n, ok := <-client.Notifications():
+		case n, ok := <-d.Client.Notifications():
 			if !ok {
 				return 1, errors.New("server closed the connection")
 			}
@@ -209,7 +205,7 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 			if !finished {
 				continue
 			}
-			return out.finish(o, b, info, stdout, stderr)
+			return out.finish(bg, o, d, info, stdout, stderr)
 		}
 	}
 }
@@ -314,7 +310,7 @@ func (t *turnOutput) observe(n protocol.Notification) (bool, error) {
 }
 
 // finish prints the result in the requested shape and returns the exit code.
-func (t *turnOutput) finish(o printOptions, b *Built, info protocol.SessionInfo, stdout, stderr io.Writer) (int, error) {
+func (t *turnOutput) finish(ctx context.Context, o printOptions, d *dialed, info protocol.SessionInfo, stdout, stderr io.Writer) (int, error) {
 	if t.state == "failed" {
 		_, _ = fmt.Fprintf(stderr, "turn failed (%s, %d retries): %s\n", t.failure.Class, t.failure.Retries, t.failure.Message)
 		return 1, nil
@@ -326,7 +322,7 @@ func (t *turnOutput) finish(o printOptions, b *Built, info protocol.SessionInfo,
 		}
 	case "json":
 		cost := ""
-		if m, err := b.Registry.Resolve(info.Model.String()); err == nil {
+		if m, err := d.resolve(ctx, info.Model.String()); err == nil {
 			if c, known := m.Pricing.Cost(t.usage); known {
 				cost = c
 			}

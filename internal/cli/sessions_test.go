@@ -29,6 +29,28 @@ func openTestSession(t *testing.T, st *session.Store, root string) *session.Sess
 	return s
 }
 
+// openChildSession opens the session a subagent's tool call would: same workspace as its
+// parent, newer than it, and a child. It is the trap --continue has to step over.
+func openChildSession(t *testing.T, st *session.Store, root, parentID string) *session.Session {
+	t.Helper()
+	s, err := session.Open(st, session.SessionOpened{
+		SchemaVersion:   1,
+		RudyVersion:     "test",
+		Workspace:       session.Workspace{Root: root, ProjectID: "local/" + filepath.Base(root)},
+		Model:           session.ModelRef{Provider: "fake", Model: "m"},
+		Thinking:        session.ThinkingOff,
+		Mode:            session.ModeOff,
+		Agent:           "default",
+		ParentSessionID: parentID,
+		ParentToolUseID: "agent_0_abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
 func TestRenderSessionsNewestFirst(t *testing.T) {
 	st, err := session.OpenStore(filepath.Join(t.TempDir(), "sessions"))
 	if err != nil {

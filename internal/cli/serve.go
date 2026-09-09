@@ -164,6 +164,18 @@ func serveSocket(socket string, o BuildOptions) (string, error) {
 	if socket != "" {
 		return socket, nil
 	}
+	env, home, err := envAndHome(o)
+	if err != nil {
+		return "", err
+	}
+	return config.XDG(env, home).Socket(), nil
+}
+
+// envAndHome defaults the two options every XDG resolution starts from, the way Build does.
+// Every caller that resolves a path off the options goes through this, so a command whose
+// options name their own environment cannot get one answer here and another one inside the
+// build it is about to run.
+func envAndHome(o BuildOptions) (func(string) string, string, error) {
 	env := o.Env
 	if env == nil {
 		env = os.Getenv
@@ -172,11 +184,11 @@ func serveSocket(socket string, o BuildOptions) (string, error) {
 	if home == "" {
 		h, err := os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("home directory: %w", err)
+			return nil, "", fmt.Errorf("home directory: %w", err)
 		}
 		home = h
 	}
-	return config.XDG(env, home).Socket(), nil
+	return env, home, nil
 }
 
 // accept hands every connection the listener admits to the server, each on its own

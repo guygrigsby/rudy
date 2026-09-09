@@ -37,25 +37,29 @@ func newSessionsCommand(build buildFunc) *cobra.Command {
 			return renderSessions(cmd.OutOrStdout(), summaries)
 		},
 	}
+	var resumeDial dialOptions
 	resume := &cobra.Command{
 		Use:   "resume <session id>",
 		Short: "open the client on an existing session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stderr := cmd.ErrOrStderr()
-			return tuiExit(runTUI(cmd.Context(), build, resumeWith(printOptions{Resume: args[0]}, "sessions resume"), launchTUI, "", stderr))
+			return tuiExit(runTUI(cmd.Context(), build, resumeDial, resumeWith(printOptions{Resume: args[0]}, "sessions resume"), launchTUI, "", stderr))
 		},
 	}
+	registerDialFlags(resume, &resumeDial)
 	var at string
+	var forkDial dialOptions
 	fork := &cobra.Command{
 		Use:   "fork <session id>",
 		Short: "open the client on a fork of an existing session",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stderr := cmd.ErrOrStderr()
-			return tuiExit(runTUI(cmd.Context(), build, forkAt(args[0], at), launchTUI, "", stderr))
+			return tuiExit(runTUI(cmd.Context(), build, forkDial, forkAt(args[0], at), launchTUI, "", stderr))
 		},
 	}
+	registerDialFlags(fork, &forkDial)
 	fork.Flags().StringVar(&at, "at", "", "entry id to fork at; the newest entry by default")
 	cmd.AddCommand(list, resume, fork)
 	return cmd
