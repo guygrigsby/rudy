@@ -121,8 +121,9 @@ type queued struct {
 }
 
 // queueConn is the Incoming half of a Peer: a Conn whose Recv pops the queue the reader
-// fills and whose Send writes to the shared Conn. The queue is unbounded, in arrival order,
-// so the reader never blocks behind a slow consumer.
+// fills and whose Send writes to the shared Conn. The queue is in arrival order and the
+// reader never blocks behind a slow consumer; it is capped at maxIncoming, past which the
+// reader ends the connection rather than buffering a peer's whole output.
 type queueConn struct {
 	out     Conn
 	closeFn func() error

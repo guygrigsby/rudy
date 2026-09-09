@@ -37,6 +37,23 @@ func TestLoadFirstWinsAndErrors(t *testing.T) {
 	}
 }
 
+// TestLoadSkipsDotDirectories: a skills root is a directory on disk like any other, and .git
+// or an editor's backup directory sitting in it is not a skill however complete its contents
+// look.
+func TestLoadSkipsDotDirectories(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, root, "deploy", "name: deploy\ndescription: Ship it")
+	writeSkill(t, root, ".git", "name: git\ndescription: not a skill")
+	writeSkill(t, root, ".deploy.bak", "name: deploy\ndescription: an old copy")
+	got, errs := Load([]string{root})
+	if len(errs) != 0 {
+		t.Fatalf("errs %v", errs)
+	}
+	if len(got) != 1 || got[0].Name != "deploy" || got[0].Description != "Ship it" {
+		t.Errorf("skills %+v, want the one real skill", got)
+	}
+}
+
 func TestMigrateNeverOverwrites(t *testing.T) {
 	from1, from2, to := t.TempDir(), t.TempDir(), t.TempDir()
 	writeSkill(t, from1, "deploy", "name: deploy\ndescription: one")

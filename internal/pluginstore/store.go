@@ -440,7 +440,11 @@ func stageSource(ctx context.Context, source, stage string) (isClone bool, err e
 			return false, nil
 		}
 	}
-	if _, err := runGit(ctx, "clone", "--depth", "1", source, stage); err != nil {
+	// -- before the source: it is whatever the operator typed, and a value starting with a
+	// dash would otherwise be read as an option to git rather than as a repository. The other
+	// git calls here take no operator-supplied positional (fetch names the constant origin,
+	// reset and rev-parse take a revision, where -- would mean a pathspec instead).
+	if _, err := runGit(ctx, "clone", "--depth", "1", "--", source, stage); err != nil {
 		return false, err
 	}
 	return true, nil

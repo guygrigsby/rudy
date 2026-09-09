@@ -35,8 +35,9 @@ const (
 )
 
 // ServerConfig is one [servers.<name>] table. Name is the table key, not a field of it, so
-// it is filled on read and never written. Values in Env and Headers are secret references
-// resolved like providers.<name>.auth: "env:NAME" or "cache:KEY".
+// it is filled on read and never written. Values in Env and Headers may be secret references
+// resolved like providers.<name>.auth ("env:NAME" or "cache:KEY") or plain literals, which
+// are used as written.
 type ServerConfig struct {
 	Name      string            `toml:"-"`
 	Transport Transport         `toml:"transport"`

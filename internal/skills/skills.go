@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	yaml "go.yaml.in/yaml/v3"
 
@@ -31,7 +32,8 @@ type header struct {
 	AllowedTools *[]string `yaml:"allowed-tools"`
 }
 
-// Load reads every <root>/<name>/SKILL.md, in root order; the first skill for a name wins,
+// Load reads every <root>/<name>/SKILL.md, skipping dot-prefixed directories, in root order;
+// the first skill for a name wins,
 // so a workspace skill never replaces a user skill of the same name (or the reverse,
 // depending on the order the caller passes). A subdirectory that fails to parse is reported
 // in errs and skipped: one broken skill never costs the caller the rest. A root that does
@@ -49,7 +51,10 @@ func Load(roots []string) ([]Skill, []error) {
 			continue
 		}
 		for _, ent := range ents {
-			if !ent.IsDir() {
+			// A dot-prefixed directory is never a skill: .git, .DS_Store and an editor's
+			// backup directory all sit in a skills root, and reading one is at best wasted
+			// work and at worst a stray SKILL.md loaded from something nobody installed.
+			if !ent.IsDir() || strings.HasPrefix(ent.Name(), ".") {
 				continue
 			}
 			dir := filepath.Join(root, ent.Name())
