@@ -16,8 +16,8 @@ func register(t *testing.T, h *plugintest.Host) map[string]plugin.Command {
 	if err := New().Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.RegisteredCommands) != 4 {
-		t.Fatalf("registered %d commands, want 4: %+v", len(h.RegisteredCommands), h.RegisteredCommands)
+	if len(h.RegisteredCommands) != 5 {
+		t.Fatalf("registered %d commands, want 5: %+v", len(h.RegisteredCommands), h.RegisteredCommands)
 	}
 	byName := map[string]plugin.Command{}
 	for _, c := range h.RegisteredCommands {
@@ -59,10 +59,32 @@ func TestHelpCommandListsTheRegistryInOrder(t *testing.T) {
 	}
 	want := "/model  Switch this session's model: /model <provider:id or unique id>\n" +
 		"/help  List the slash commands\n" +
+		"/rename  Name this session: /rename <name>\n" +
 		"/fork  Fork this session at an entry: /fork [entry id], default the newest\n" +
 		"/plugins  List loaded plugins and their state"
 	if n.Text != want {
 		t.Fatalf("/help text =\n%s\nwant\n%s", n.Text, want)
+	}
+}
+
+// TestRenameCommand is /rename's own half: the trimmed name as a SetTitle, and the usage
+// notice when there is nothing to name it.
+func TestRenameCommand(t *testing.T) {
+	cmds := register(t, &plugintest.Host{Name: "commands"})
+	act, err := cmds["rename"].Run(context.Background(), plugin.CommandCall{Args: "  the flaky fork test "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := act.(plugin.SetTitle)
+	if !ok || st.Title != "the flaky fork test" {
+		t.Fatalf("action %#v", act)
+	}
+	act, err = cmds["rename"].Run(context.Background(), plugin.CommandCall{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := act.(plugin.Notice); !ok || n.Text != "usage: /rename <name>" {
+		t.Fatalf("no name is a usage notice, got %#v", act)
 	}
 }
 
