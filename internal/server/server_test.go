@@ -17,6 +17,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/server"
@@ -27,20 +28,23 @@ import (
 // scriptProvider answers odd calls with a tool_use for "danger" and even calls with "done".
 // When block is non-nil it streams one delta and then waits for ctx or block.
 type scriptProvider struct {
-	mu      sync.Mutex
-	calls   int
-	block   chan struct{}
-	systems []string // the system prompt of every request, in order
+	mu       sync.Mutex
+	calls    int
+	block    chan struct{}
+	textOnly bool               // answer every call with text, never a tool_use
+	reqs     []provider.Request // every request, in order
 }
 
-func (p *scriptProvider) lastSystem() string {
+func (p *scriptProvider) lastRequest() provider.Request {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.systems) == 0 {
-		return ""
+	if len(p.reqs) == 0 {
+		return provider.Request{}
 	}
-	return p.systems[len(p.systems)-1]
+	return p.reqs[len(p.reqs)-1]
 }
+
+func (p *scriptProvider) lastSystem() string { return p.lastRequest().System }
 
 func (p *scriptProvider) Name() string { return "fake" }
 
@@ -57,7 +61,8 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 	p.mu.Lock()
 	p.calls++
 	n := p.calls
-	p.systems = append(p.systems, req.System)
+	p.reqs = append(p.reqs, req)
+	textOnly := p.textOnly
 	p.mu.Unlock()
 	if p.block != nil {
 		if err := emit(provider.Part{Type: provider.PartTextDelta, Text: "thinking"}); err != nil {
@@ -70,7 +75,7 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 		}
 	}
 	var parts []provider.Part
-	if n%2 == 1 {
+	if n%2 == 1 && !textOnly {
 		parts = []provider.Part{
 			{Type: provider.PartTextDelta, Text: "Looking."},
 			{Type: provider.PartToolUseStart, ID: "tu" + itoa(n), Name: "danger"},
@@ -1411,5 +1416,147 @@ func TestAppendNoteRefusedFromAClient(t *testing.T) {
 	}, &server.EntryIDResult{})
 	if got := code(t, err); got != protocol.CodeUnauthorized {
 		t.Fatalf("code %d (%v)", got, err)
+	}
+}
+
+// runTurn submits one message and waits for the turn to complete.
+func runTurn(t *testing.T, cl *protocol.Client, sid, text string) {
+	t.Helper()
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: sid, Content: []session.Block{session.TextBlock(text)}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+}
+
+// lastCompaction is the newest compaction entry the connection was told about.
+func lastCompaction(t *testing.T, cl *protocol.Client) session.Entry {
+	t.Helper()
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.Entry.Kind == session.KindCompaction
+	})
+	es := entries(t, ns)
+	return es[len(es)-1]
+}
+
+func TestSessionCompactOnAnIdleSession(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	h := newHarness(t, prov)
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	for range 3 {
+		runTurn(t, cl, info.SessionID, "go")
+	}
+	var res server.EntryIDResult
+	if err := cl.Call(ctx, protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}, &res); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if res.EntryID == "" {
+		t.Fatal("empty entry id")
+	}
+	e := lastCompaction(t, cl)
+	if e.ID.String() != res.EntryID {
+		t.Fatalf("broadcast entry %s, answered %s", e.ID, res.EntryID)
+	}
+	c := e.Payload.(session.Compaction)
+	if c.Summary == "" || c.Usage.Output == 0 || c.Model != info.Model {
+		t.Fatalf("compaction %+v", c)
+	}
+	if !strings.Contains(prov.lastSystem(), "summarize") {
+		t.Fatalf("the summary request must carry the summary system prompt, got %q", prov.lastSystem())
+	}
+	if req := prov.lastRequest(); len(req.Tools) != 0 {
+		t.Fatalf("the summary request must offer no tools: %+v", req.Tools)
+	}
+	// Nothing has been said since, so a second compaction has fewer than two entries to cover.
+	var again server.EntryIDResult
+	if err := cl.Call(ctx, protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}, &again); err != nil {
+		t.Fatalf("second compact: %v", err)
+	}
+	if again.EntryID != "" {
+		t.Fatalf("second compact entry id = %q, want empty", again.EntryID)
+	}
+}
+
+func TestSessionCompactRefusedDuringActiveTurn(t *testing.T) {
+	prov := &scriptProvider{textOnly: true, block: make(chan struct{})}
+	h := newHarness(t, prov)
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, cl, func(n protocol.Notification) bool { return n.Method == protocol.NotifyStreamDelta })
+	var res server.EntryIDResult
+	err := cl.Call(ctx, protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}, &res)
+	var pe *protocol.Error
+	if !errorsAs(err, &pe) || pe.Code != protocol.CodeConflict {
+		t.Fatalf("compact during active turn err = %v, want CodeConflict", err)
+	}
+	close(prov.block)
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+}
+
+func TestCompactCommandThroughCommandRun(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	h := newHarnessWith(t, prov, compactcmd.New())
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	for range 3 {
+		runTurn(t, cl, info.SessionID, "go")
+	}
+	var res protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "compact", Args: "focus on decisions",
+	}, &res); err != nil {
+		t.Fatalf("/compact: %v", err)
+	}
+	if res.Notice != "compacted 6 entries" || res.TurnID != "" {
+		t.Fatalf("result %+v", res)
+	}
+	msgs := prov.lastRequest().Messages
+	if len(msgs) == 0 || !strings.Contains(msgs[len(msgs)-1].Content[0].Text, "focus on decisions") {
+		t.Fatalf("instructions must reach the summary request: %+v", msgs)
+	}
+	e := lastCompaction(t, cl)
+	if e.Payload.(session.Compaction).Summary == "" {
+		t.Fatal("empty summary")
+	}
+	// Nothing left to cover, so the command says so instead of asking the model again.
+	var again protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "compact",
+	}, &again); err != nil {
+		t.Fatal(err)
+	}
+	if again.Notice != "nothing to compact" {
+		t.Fatalf("second /compact notice %q", again.Notice)
 	}
 }

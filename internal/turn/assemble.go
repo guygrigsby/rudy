@@ -24,24 +24,34 @@ func Assemble(s *session.Session, tools []tool.Tool, system string, maxTokens in
 	for _, t := range tools {
 		req.Tools = append(req.Tools, provider.ToolDef{Name: t.Name, Description: t.Description, Schema: t.Schema})
 	}
-	for _, e := range s.RequestContext() {
+	req.Messages = messagesOf(s.RequestContext(), overrides)
+	return req
+}
+
+// messagesOf is the entry to message conversion: the compaction summary as a user message,
+// the conversation entries as themselves, everything else skipped. Both the turn's request
+// and the Compactor's summary request are built from it, so the model reads a compacted
+// conversation the same way in each.
+func messagesOf(entries []session.Entry, overrides map[string][]session.Block) []provider.Message {
+	var out []provider.Message
+	for _, e := range entries {
 		switch p := e.Payload.(type) {
 		case session.Compaction:
-			req.Messages = append(req.Messages, provider.Message{
+			out = append(out, provider.Message{
 				Role:    provider.RoleUser,
 				Content: []session.Block{session.TextBlock("Summary of the conversation so far:\n" + p.Summary)},
 			})
 		case session.UserMessage:
-			req.Messages = append(req.Messages, provider.Message{Role: provider.RoleUser, Content: p.Content})
+			out = append(out, provider.Message{Role: provider.RoleUser, Content: p.Content})
 		case session.AssistantMessage:
-			req.Messages = append(req.Messages, provider.Message{Role: provider.RoleAssistant, Content: p.Content})
+			out = append(out, provider.Message{Role: provider.RoleAssistant, Content: p.Content})
 		case session.ToolResult:
 			content := p.Content
 			if over, ok := overrides[p.ToolUseID]; ok {
 				content = over
 			}
-			req.Messages = append(req.Messages, provider.Message{Role: provider.RoleToolResult, Content: content, ToolUseID: p.ToolUseID})
+			out = append(out, provider.Message{Role: provider.RoleToolResult, Content: content, ToolUseID: p.ToolUseID})
 		}
 	}
-	return req
+	return out
 }

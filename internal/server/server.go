@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -292,6 +294,8 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 		return s.handleSetThinking(req.Params)
 	case protocol.MethodSessionSetTitle:
 		return s.handleSetTitle(req.Params)
+	case protocol.MethodSessionCompact:
+		return s.handleCompact(ctx, req.Params)
 	case protocol.MethodRegistryList:
 		return protocol.RegistryListResult{Models: s.d.Registry.Models()}, nil
 	case protocol.MethodRegistryRefresh:
@@ -501,6 +505,76 @@ func (s *Server) handleSetTitle(raw json.RawMessage) (any, *protocol.Error) {
 	})
 }
 
+func (s *Server) handleCompact(ctx context.Context, raw json.RawMessage) (any, *protocol.Error) {
+	var p protocol.SessionCompactParams
+	if e := decode(raw, &p); e != nil {
+		return nil, e
+	}
+	ls, e := s.lookup(p.SessionID)
+	if e != nil {
+		return nil, e
+	}
+	entry, _, cerr := s.compact(ctx, ls, p.Instructions)
+	if cerr != nil {
+		return nil, cerr
+	}
+	// The zero entry is not a failure: it is a session with fewer than two entries to cover,
+	// and an empty entry_id is how the contract says so.
+	if entry.ID.IsZero() {
+		return EntryIDResult{}, nil
+	}
+	return EntryIDResult{EntryID: entry.ID.String()}, nil
+}
+
+// compact summarizes the session now, through the Compactor a turn uses, and returns the
+// compaction entry (the zero Entry when there was nothing to cover) with the number of
+// conversation entries it covered. session.compact and /compact are both this call, so an
+// explicit compaction covers what an automatic one would and fires the same hook.
+//
+// ls.mu is held across the whole Compact call, deliberately, and this is the one long call
+// under it: the summary is a provider request and the entries it covers are decided from the
+// log, so nothing may append between the decision and the compaction that records it. Holding
+// mu is exactly what stops a turn from starting underneath. No Runner method is called while
+// it is held, and the active-turn check reads the mirrored state, as liveSession's lock
+// discipline requires.
+func (s *Server) compact(ctx context.Context, ls *liveSession, instructions string) (session.Entry, int, *protocol.Error) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.closed {
+		return session.Entry{}, 0, perr(protocol.CodeNotFound, "session closed")
+	}
+	st, _ := ls.mirroredState()
+	if ls.runner != nil && isActive(st) {
+		return session.Entry{}, 0, perr(protocol.CodeConflict, "a turn is active")
+	}
+	prov, ok := s.d.Registry.Provider(ls.model.Ref.Provider)
+	if !ok {
+		return session.Entry{}, 0, perr(protocol.CodeUnavailable, "provider not loaded: "+ls.model.Ref.Provider)
+	}
+	n := len(turn.Cover(ls.sess, ulid.ULID{}))
+	e, err := s.compactor(prov, ls.model).Compact(ctx, ls.sess, ulid.ULID{}, instructions)
+	if err != nil {
+		return session.Entry{}, 0, protocol.ErrorFrom(err)
+	}
+	if e.ID.IsZero() {
+		return session.Entry{}, 0, nil
+	}
+	// Synced here, unlike the other entries the server appends: no turn is coming to rest
+	// behind this one, and a compaction is a provider call already paid for and already
+	// broadcast. A crash before the next turn would charge for it twice. A sync that fails
+	// can only be logged, since the compaction itself succeeded.
+	if err := ls.sess.Sync(); err != nil {
+		log.Printf("server: sync session log at compaction: %v", err)
+	}
+	ls.mirror(e)
+	return e, n, nil
+}
+
+// compactor is the Compactor the turn loop and session.compact share.
+func (s *Server) compactor(prov provider.Provider, m provider.Model) *turn.ModelCompactor {
+	return &turn.ModelCompactor{Provider: prov, Model: m, Hooks: s.hookFirer(), MaxTokens: s.d.Config.MaxTokens}
+}
+
 // handleAppendNote is the plugin caller class's one write into a session log. A client
 // connection has no business asserting a note came from a plugin, so it is refused before
 // the params are even decoded.
@@ -554,6 +628,17 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 	case plugin.Notice:
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: a.Text})
 		return protocol.CommandRunResult{Notice: a.Text}, nil
+	case plugin.Compact:
+		e2, n, cerr := s.compact(ctx, ls, a.Instructions)
+		if cerr != nil {
+			return nil, cerr
+		}
+		notice := "nothing to compact"
+		if !e2.ID.IsZero() {
+			notice = fmt.Sprintf("compacted %d entries", n)
+		}
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
+		return protocol.CommandRunResult{Notice: notice}, nil
 	default:
 		return protocol.CommandRunResult{}, nil
 	}
@@ -1018,6 +1103,8 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		System:      turn.SystemPrompt(view.Workspace, s.d.Version) + ls.hookContextSuffixLocked(),
 		MaxTokens:   s.d.Config.MaxTokens,
 		Hooks:       s.hookFirer(),
+		Compactor:   s.compactor(prov, ls.model),
+		CompactAt:   s.d.Config.Sessions.CompactAt,
 		ToolTimeout: time.Duration(s.d.Config.ToolTimeoutMS) * time.Millisecond,
 		Overrides:   ls.overrides,
 	})

@@ -192,20 +192,28 @@ func (ls *liveSession) subscribeLocked(cn *conn) ([]session.Entry, protocol.Sess
 	return entries, info
 }
 
+// mirror records an entry appended to the session by something other than a turn and sends it
+// to the subscribers, which is what the runner's Observer does for the entries a turn appends.
+// Self-locking (it takes obsMu); safe whether or not the caller holds mu, which nests outside
+// it. Every server-side append ends here, so the mirror and the broadcast can never disagree
+// about what landed.
+func (ls *liveSession) mirror(e session.Entry) {
+	ls.obsMu.Lock()
+	ls.entries = append(ls.entries, e)
+	ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e})
+	ls.obsMu.Unlock()
+}
+
 // appendAndBroadcastLocked appends an entry the server produces directly. The caller must
 // already have confirmed, under mu, that no turn is active: this is the one place outside a
-// turn that calls sess.Append. Caller holds mu; this takes obsMu itself to keep the entries
-// mirror and conns list in step, consistent with the mu-outer, obsMu-inner order everywhere
-// else.
+// turn that calls sess.Append. Caller holds mu; mirror takes obsMu itself, consistent with the
+// mu-outer, obsMu-inner order everywhere else.
 func (ls *liveSession) appendAndBroadcastLocked(p session.Payload) (session.Entry, error) {
 	e, err := ls.sess.Append(p)
 	if err != nil {
 		return session.Entry{}, err
 	}
-	ls.obsMu.Lock()
-	ls.entries = append(ls.entries, e)
-	ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e})
-	ls.obsMu.Unlock()
+	ls.mirror(e)
 	return e, nil
 }
 
@@ -218,10 +226,7 @@ func (ls *liveSession) appendNote(owner, text string, role session.NoteRole) (se
 	if err != nil {
 		return session.Entry{}, err
 	}
-	ls.obsMu.Lock()
-	ls.entries = append(ls.entries, e)
-	ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e})
-	ls.obsMu.Unlock()
+	ls.mirror(e)
 	return e, nil
 }
 

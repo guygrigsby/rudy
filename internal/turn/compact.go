@@ -1,0 +1,133 @@
+package turn
+
+import (
+	"context"
+	"slices"
+	"strings"
+
+	"github.com/oklog/ulid/v2"
+
+	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/provider"
+	"github.com/guygrigsby/rudy/internal/session"
+)
+
+// summarySystem is the whole instruction the summary request carries. It asks for prose plus
+// the concrete things a continuation needs, because a summary that keeps only the narrative
+// loses the file paths and commands the next step depends on.
+const summarySystem = "You summarize a coding session so the assistant can continue it. Write the summary in plain prose, then a list of every file path, command, decision and open task mentioned. Keep tool inputs and outputs that a next step depends on. Do not invent."
+
+// ModelCompactor is the Compactor: it asks the before_compaction hook for a summary and, when
+// no handler has one (or the caller gave instructions, which skip the hook), asks the model.
+// It is a domain service of the turn, not a plugin: an automatic compaction and an explicit
+// session.compact are the same code, so they cover the same entries and fire the same hook.
+type ModelCompactor struct {
+	Provider  provider.Provider
+	Model     provider.Model
+	Hooks     HookFirer // nil means no hooks
+	MaxTokens int
+}
+
+// isConversation reports whether an entry is one a compaction covers. The rest of the log,
+// the decisions, the mode changes, the notes, is not conversation the model ever saw.
+func isConversation(e session.Entry) bool {
+	switch e.Kind {
+	case session.KindUserMessage, session.KindAssistantMessage, session.KindToolResult, session.KindCompaction:
+		return true
+	}
+	return false
+}
+
+// Cover is what a compaction of s before `before` would summarize: the conversation entries of
+// the request context that precede it, in log order. A zero `before` covers the whole request
+// context. Fewer than two entries is nothing worth compacting.
+//
+// Exported because the server answers /compact with the number of entries it covered, and the
+// count has to be this set, not a second opinion about what a compaction covers.
+func Cover(s *session.Session, before ulid.ULID) []session.Entry {
+	var cover []session.Entry
+	for _, e := range s.RequestContext() {
+		if !before.IsZero() && e.ID.Compare(before) >= 0 {
+			break
+		}
+		if isConversation(e) {
+			cover = append(cover, e)
+		}
+	}
+	return cover
+}
+
+// Compact summarizes everything before `before` and appends the compaction. It returns the
+// zero Entry and nil when there is nothing worth covering, which is not an error: a session
+// too short to compact is the normal answer to an early /compact.
+func (c *ModelCompactor) Compact(ctx context.Context, s *session.Session, before ulid.ULID, instructions string) (session.Entry, error) {
+	cover := Cover(s, before)
+	if len(cover) < 2 {
+		return session.Entry{}, nil
+	}
+	first, last := cover[0], cover[len(cover)-1]
+	summary, usage := "", session.Usage{}
+	// Instructions skip the hook entirely: the caller said what this summary is for, and a
+	// handler's canned summary would answer a different question.
+	if instructions == "" && c.Hooks != nil {
+		for _, res := range c.Hooks.Fire(ctx, plugin.HookCall{Point: plugin.HookBeforeCompaction, SessionID: s.ID().String(), Payload: &plugin.BeforeCompactionPayload{
+			SessionID: s.ID().String(), FirstEntryID: first.ID.String(), LastEntryID: last.ID.String(), PromptTokens: promptTokensOf(cover), ContextWindow: c.Model.ContextWindow,
+		}}) {
+			if r, ok := res.(*plugin.BeforeCompactionResult); ok && r.Summary != "" {
+				summary = r.Summary
+				break
+			}
+		}
+	}
+	if summary == "" {
+		var err error
+		summary, usage, err = c.summarize(ctx, s, cover, instructions)
+		if err != nil {
+			return session.Entry{}, err
+		}
+	}
+	return s.Append(session.Compaction{Summary: summary, FirstEntryID: first.ID, LastEntryID: last.ID, Model: c.Model.Ref, Usage: usage})
+}
+
+// summarize sends the covered entries as the conversation and asks for the summary as a final
+// user message. No tools are offered: the model is reading, not working. Thinking is off, so
+// the budget goes to the summary itself.
+func (c *ModelCompactor) summarize(ctx context.Context, s *session.Session, cover []session.Entry, instructions string) (string, session.Usage, error) {
+	req := provider.Request{Model: c.Model.Ref, System: summarySystem, Thinking: session.ThinkingOff, MaxTokens: c.MaxTokens, SessionID: s.ID()}
+	req.Messages = messagesOf(cover, nil)
+	ask := "Summarize the conversation above for a continuation of this session."
+	if instructions != "" {
+		ask += " Instructions: " + instructions
+	}
+	req.Messages = append(req.Messages, provider.Message{Role: provider.RoleUser, Content: []session.Block{session.TextBlock(ask)}})
+	var b strings.Builder
+	var usage session.Usage
+	err := c.Provider.Complete(ctx, req, func(p provider.Part) error {
+		switch p.Type {
+		case provider.PartTextDelta:
+			b.WriteString(p.Text)
+		case provider.PartUsage:
+			usage = usage.Add(p.Usage)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", usage, err
+	}
+	if strings.TrimSpace(b.String()) == "" {
+		return "", usage, &provider.Error{Class: session.ErrProvider, Message: "empty summary"}
+	}
+	return b.String(), usage, nil
+}
+
+// promptTokensOf is what the last request over these entries cost to send: the newest
+// assistant message's prompt tokens, cached ones included. Zero when nothing in cover came
+// back from a provider.
+func promptTokensOf(cover []session.Entry) int64 {
+	for _, e := range slices.Backward(cover) {
+		if am, ok := e.Payload.(session.AssistantMessage); ok {
+			return am.Usage.Input + am.Usage.CacheRead + am.Usage.CacheWrite
+		}
+	}
+	return 0
+}

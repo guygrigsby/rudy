@@ -3,8 +3,11 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
+
+	"github.com/oklog/ulid/v2"
 )
 
 func opened() SessionOpened {
@@ -305,5 +308,36 @@ func TestAppendIsSafeForTwoGoroutines(t *testing.T) {
 	wg.Wait()
 	if n := len(s.Entries()); n != 101 {
 		t.Errorf("entries %d", n)
+	}
+}
+
+// testAssistant is a plain text reply, the shape a conversation is made of.
+func testAssistant(text string) AssistantMessage {
+	return AssistantMessage{
+		Model: ModelRef{"aperture", "cline-pass/kimi-k3"}, Thinking: ThinkingHigh,
+		Content: []Block{TextBlock(text)}, StopReason: StopEndTurn, StopReasonRaw: "stop",
+	}
+}
+
+func TestRequestContextKeepsTheUncoveredTail(t *testing.T) {
+	_, s := newSession(t)
+	u1 := mustAppend(t, s, UserMessage{Source: SourceTyped, Content: []Block{TextBlock("one")}})
+	a1 := mustAppend(t, s, testAssistant("ok"))
+	u2 := mustAppend(t, s, UserMessage{Source: SourceTyped, Content: []Block{TextBlock("two")}})
+	a2 := mustAppend(t, s, testAssistant("still here"))
+	c := mustAppend(t, s, Compaction{Summary: "sum", FirstEntryID: u1.ID, LastEntryID: a1.ID, Model: s.Model(), Usage: Usage{Input: 1}})
+	got := s.RequestContext()
+	var ids []ulid.ULID
+	for _, e := range got {
+		ids = append(ids, e.ID)
+	}
+	want := []ulid.ULID{c.ID, u2.ID, a2.ID}
+	if !reflect.DeepEqual(ids, want) {
+		t.Errorf("request context %v\nwant %v", ids, want)
+	}
+	// A later compaction covering the tail replaces the earlier one entirely.
+	c2 := mustAppend(t, s, Compaction{Summary: "sum2", FirstEntryID: u1.ID, LastEntryID: a2.ID, Model: s.Model()})
+	if got := s.RequestContext(); len(got) != 1 || got[0].ID != c2.ID {
+		t.Errorf("second compaction: %d entries", len(got))
 	}
 }

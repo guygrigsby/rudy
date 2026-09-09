@@ -938,12 +938,33 @@ func TestMalformedToolInputIsAnErrorResult(t *testing.T) {
 // table, standing in for a plugin registry's handlers.
 type recordingHooks struct {
 	calls   []plugin.HookCall
+	fired   []fireCtx // what the context looked like at each fire, in the same order
 	results map[plugin.HookPoint][]any
 }
 
+// fireCtx is the state of the context at the moment of a fire, recorded then rather than kept:
+// a fire's context is cancelled again as soon as it returns, so a test reading it afterwards
+// would see every fire as dead.
+type fireCtx struct {
+	err      error
+	deadline bool
+}
+
 func (h *recordingHooks) Fire(ctx context.Context, c plugin.HookCall) []any {
+	_, hasDeadline := ctx.Deadline()
 	h.calls = append(h.calls, c)
+	h.fired = append(h.fired, fireCtx{err: ctx.Err(), deadline: hasDeadline})
 	return h.results[c.Point]
+}
+
+// firedAt is the context state of the first fire of point, and whether it fired at all.
+func (h *recordingHooks) firedAt(point plugin.HookPoint) (fireCtx, bool) {
+	for i, c := range h.calls {
+		if c.Point == point {
+			return h.fired[i], true
+		}
+	}
+	return fireCtx{}, false
 }
 
 func (h *recordingHooks) points() []plugin.HookPoint {
@@ -1227,5 +1248,46 @@ func TestRunnerSharesTheServerOverrideMap(t *testing.T) {
 	got, ok := shared["tu1"]
 	if !ok || got[0].Text != "REDACTED" {
 		t.Errorf("shared map holds %v", shared)
+	}
+}
+
+// cancelOnDelta cancels the turn as soon as the provider has streamed anything, so the cancel
+// lands mid-stream where the runner appends the partial assistant message.
+type cancelOnDelta struct {
+	*recorder
+	once   sync.Once
+	cancel context.CancelFunc
+}
+
+func (o *cancelOnDelta) Delta(id string, p provider.Part) {
+	o.recorder.Delta(id, p)
+	o.once.Do(o.cancel)
+}
+
+// TestCancelledTurnStillFiresAfterResponse covers the hooks on the cancel paths: the
+// interrupted assistant_message and the killed tool_result are appended with the turn's own
+// context, which is already done, and a handler handed a dead context is skipped by the
+// HookRunner with a false "timed out" notice. The fire has to happen on a live, bounded
+// context instead.
+func TestCancelledTurnStillFiresAfterResponse(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	p := &scripted{scripts: [][]provider.Part{{text("partial"), {Type: pause}}}, release: make(chan struct{})}
+	hooks := &recordingHooks{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	obs := &cancelOnDelta{recorder: &recorder{}, cancel: cancel}
+	r := NewRunner(Config{Session: s, Provider: p, Model: provider.Model{Ref: s.Model()}, Tools: toolSet{}, Gate: gate.New(nil), Observer: obs, MaxTokens: 10, Hooks: hooks})
+	if err := r.Run(ctx, userMsg(session.SourceTyped, "hi")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %v, want context canceled", err)
+	}
+	f, ok := hooks.firedAt(plugin.HookAfterResponse)
+	if !ok {
+		t.Fatalf("after_response never fired: %v", hooks.points())
+	}
+	if f.err != nil {
+		t.Errorf("after_response fired on a dead context: %v", f.err)
+	}
+	if !f.deadline {
+		t.Error("the replacement context must be bounded")
 	}
 }

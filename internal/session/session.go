@@ -376,8 +376,10 @@ func (s *Session) Allowances() []Matcher {
 	return out
 }
 
-// RequestContext is the last compaction entry followed by everything after
-// it, or every entry when there is no compaction.
+// RequestContext is what the next request is built from: the newest compaction, then every
+// entry after the last one it covers, in log order. A compaction is appended after the
+// entries it summarizes, so the entries between its LastEntryID and itself, the turn that was
+// running when it happened, are kept. Without a compaction it is every entry.
 func (s *Session) RequestContext() []Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -386,10 +388,21 @@ func (s *Session) RequestContext() []Entry {
 
 func (s *Session) requestContextLocked() []Entry {
 	all := s.entriesLocked()
-	for i, e := range slices.Backward(all) {
-		if e.Kind == KindCompaction {
-			return all[i:]
+	for _, e := range slices.Backward(all) {
+		c, ok := e.Payload.(Compaction)
+		if !ok {
+			continue
 		}
+		out := []Entry{e}
+		for _, x := range all {
+			// Every other compaction is dropped, not only the ones before this one: an older
+			// compaction sitting in the uncovered tail is one this summary already subsumes,
+			// and a request carries exactly one summary, the newest.
+			if x.ID.Compare(c.LastEntryID) > 0 && x.Kind != KindCompaction {
+				out = append(out, x)
+			}
+		}
+		return out
 	}
 	return all
 }

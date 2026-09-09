@@ -49,7 +49,7 @@ Entity, aggregate root. One conversation over one workspace, persisted as an app
 
 - `Append(Entry) error` writes one entry to `entries.jsonl`, fsyncs and returns. Refuses an entry whose kind or ordering violates an invariant below.
 - `Fork(atEntryID) (Session, error)` creates a new Session whose first local entry is a `fork_point` naming this session and `atEntryID`.
-- `RequestContext() []Entry` returns the entries the next completion sees: everything after the last `compaction` entry, with that compaction's summary prepended as context. Derived, never stored.
+- `RequestContext() []Entry` returns the entries the next completion sees: the newest `compaction` entry, then every entry after the last one it covers, in log order, with older compactions dropped. The entries between a compaction's `last_entry_id` and the compaction itself, the turn that was running when it happened, are kept. Every entry when there is no compaction. Derived, never stored.
 - `Model() ModelRef` returns the ref from the most recent `session_opened` or `model_change`.
 - `Mode() PermissionMode` returns the mode from the most recent `session_opened` or `mode_change`.
 - `ThinkingLevel() ThinkingLevel` returns the level from the most recent `session_opened` or a thinking change.

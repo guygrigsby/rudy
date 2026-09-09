@@ -278,9 +278,20 @@ func (r *Runner) ids() (sessionID, turnID string) {
 // fire runs one hook point's handlers, or nothing at all when no hook runner is wired. The
 // HookRunner already bounds, isolates and reports each handler, so there is nothing to
 // handle here: a hook that failed is simply absent from the results.
+//
+// A cancelled turn still has hooks to deliver: after_response on the interrupted message and
+// after_tool on the killed result both fire on paths where ctx is already done, and a handler
+// handed a dead context is skipped by the HookRunner with a false "timed out" notice. Those
+// fires get a context that is not cancelled, bounded the way one handler is bounded, so the
+// hook sees the entry the log saw.
 func (r *Runner) fire(ctx context.Context, point plugin.HookPoint, payload any) []any {
 	if r.cfg.Hooks == nil {
 		return nil
+	}
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), plugin.DefaultHookTimeout)
+		defer cancel()
 	}
 	sid, tid := r.ids()
 	return r.cfg.Hooks.Fire(ctx, plugin.HookCall{Point: point, SessionID: sid, TurnID: tid, Payload: payload})
@@ -320,6 +331,7 @@ func (r *Runner) loop(ctx context.Context) error {
 		if _, err := r.appendAssistant(ctx, am); err != nil {
 			return r.fail(session.ErrInternal, err)
 		}
+		r.maybeCompact(ctx, am)
 
 		var toolUses []session.Block
 		for _, b := range am.Content {
@@ -641,6 +653,37 @@ func (r *Runner) refuse(ctx context.Context, dec session.PermissionDecision, out
 		Content:   []session.Block{session.TextBlock(text)},
 	})
 	return err
+}
+
+// maybeCompact compacts the session when the prompt tokens the provider just reported reach
+// the configured fraction of the model's context window. The message the model answered is
+// what says how full the window is, so the check belongs here, right after it was appended
+// and before the next request is assembled.
+//
+// The current turn is left uncovered: `before` is the turn's own user_message, so the summary
+// never swallows the exchange still in flight. The Compactor appends through the session
+// rather than through r.append, so the entry is announced here.
+func (r *Runner) maybeCompact(ctx context.Context, am session.AssistantMessage) {
+	if r.cfg.Compactor == nil || r.cfg.CompactAt <= 0 || r.cfg.Model.ContextWindow <= 0 {
+		return
+	}
+	prompt := am.Usage.Input + am.Usage.CacheRead + am.Usage.CacheWrite
+	if float64(prompt) < r.cfg.CompactAt*float64(r.cfg.Model.ContextWindow) {
+		return
+	}
+	r.mu.Lock()
+	before := r.turn
+	r.mu.Unlock()
+	ce, err := r.cfg.Compactor.Compact(ctx, r.cfg.Session, before, "")
+	if err != nil {
+		// A compaction that failed is not a turn that failed: the turn continues with the
+		// context it already has, and the next response over the threshold tries again.
+		log.Printf("turn: compaction: %v", err)
+		return
+	}
+	if !ce.ID.IsZero() {
+		r.cfg.Observer.EntryAppended(ce)
+	}
 }
 
 // appendAssistant appends an assistant_message, counts its usage toward the turn and fires

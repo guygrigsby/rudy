@@ -58,10 +58,15 @@ type SubmitPrompt struct{ Text string }
 // Notice shows text to the client without touching the session log.
 type Notice struct{ Text string }
 
+// Compact has the server compact the session now, through the same Compactor a turn uses.
+// Instructions steer the summary and skip the before_compaction hook.
+type Compact struct{ Instructions string }
+
 type NoAction struct{}
 
 func (SubmitPrompt) isAction() {}
 func (Notice) isAction()       {}
+func (Compact) isAction()      {}
 func (NoAction) isAction()     {}
 
 type CommandCall struct {

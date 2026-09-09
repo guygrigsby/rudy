@@ -22,6 +22,7 @@ const (
 	MethodSessionSetMode     = "session.set_mode"
 	MethodSessionSetThinking = "session.set_thinking"
 	MethodSessionSetTitle    = "session.set_title"
+	MethodSessionCompact     = "session.compact"
 	MethodRegistryList       = "registry.list"
 	MethodRegistryRefresh    = "registry.refresh"
 	MethodCommandRun         = "command.run"
@@ -200,6 +201,14 @@ type SessionSetThinkingParams struct {
 type SessionSetTitleParams struct {
 	SessionID string `json:"session_id"`
 	Title     string `json:"title"`
+}
+
+// SessionCompactParams asks for a compaction now. Instructions steer the model's summary and
+// skip the before_compaction hook: a caller who said what the summary is for does not want a
+// handler answering a different question.
+type SessionCompactParams struct {
+	SessionID    string `json:"session_id"`
+	Instructions string `json:"instructions,omitempty"`
 }
 
 type RegistryListResult struct {

@@ -12,6 +12,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
 	openaichatplugin "github.com/guygrigsby/rudy/internal/plugins/openaichat"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/bash"
@@ -177,11 +178,12 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 	return session.OpenStore(filepath.Join(paths.Data, "sessions"))
 }
 
-// BuiltinPlugins is the linked-in set: the six tools, /init and the openai_chat providers.
+// BuiltinPlugins is the linked-in set: the six tools, /init, /compact and the openai_chat
+// providers.
 func BuiltinPlugins(cfg *config.Config, httpc *httpx.Client, home string, env func(string) string) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
-	return append(BuiltinTools(), initcmd.New(), openaichatplugin.New(cfg.Providers, httpc, resolve))
+	return append(BuiltinTools(), initcmd.New(), compactcmd.New(), openaichatplugin.New(cfg.Providers, httpc, resolve))
 }
 
 // BuiltinTools is the six tool plugins alone, for tests that supply their own provider.
