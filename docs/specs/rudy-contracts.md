@@ -486,7 +486,7 @@ rudy-k0.27).
 | `ui.notices.max` | int | 3 | notice lines the client draws under the transcript, newest first; `0` draws none |
 | `ui.theme.name` | string | `default` | a file under `themes/` or the built-in |
 | `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes |
-| `keys.<action id>` | string or [string] | pi defaults | pi's namespaced action ids; a value replaces the default for that action; `[]` unbinds |
+| `keys.<action id>` | string or [string] | pi defaults | one of the ids ADR 0013 decision 5 lists; a value replaces the default for that action; `[]` unbinds; an unknown id or an unparseable key is a load error naming it |
 | `providers.<name>.wire` | `anthropic_messages`, `openai_chat`, `custom` | required | `custom` is a provider a plugin serves over `provider.complete`; the two codec wires are the linked provider plugins |
 | `providers.<name>.base_url` | string | required | |
 | `providers.<name>.auth` | string | `` | `env:NAME` reads the environment; `cache:KEY` reads a `KEY=value` line from the 1Password cache file; empty means no auth header |

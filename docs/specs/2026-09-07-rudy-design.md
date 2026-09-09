@@ -266,10 +266,12 @@ the config decides whether and where it shows. No plugin can clear another's.
 A header is a slot a plugin or the config adds; a startup banner renders once.
 
 Keys are pi's defaults under pi's action ids in a `[keys]` table, so an existing
-`keybindings.json` translates one to one and `rudy keys migrate pi` does it.
-vim normal and insert in the prompt via vimbubble ported to bubbles v2, whose
-public cursor API removes the reflect-and-unsafe hack. Emacs editing keys apply
-in insert mode.
+`keybindings.json` translates one to one and `rudy keys migrate pi` does it. The
+ids rudy binds are the closed set ADR 0013 decision 5 lists; an id outside it, or
+a key string that does not parse, is a load error naming it and the client does
+not open. vim normal and insert in the prompt via vimbubble ported to bubbles v2,
+whose public cursor API removes the reflect-and-unsafe hack. Emacs editing keys
+apply in insert mode.
 
 Esc: in insert goes to normal and is consumed, in visual goes to normal. In
 normal with a turn running, once interrupts the current step now, keeping what

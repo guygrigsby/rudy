@@ -1,6 +1,6 @@
 # 13. The TUI wave: an embedded client over the protocol, rows from entries, inline scrollback
 
-- Status: Accepted
+- Status: Accepted, implemented 2026-09-09
 - Date: 2026-09-09
 - Deciders: Guy Grigsby
 
@@ -104,6 +104,11 @@ the plan for the client surfaced decisions ADR 0006 leaves open:
   can. Documented in the design's Client section.
 - Two local `replace` directives now (memory-go, vimbubble v2) until both
   are pushed; `make check` needs both sibling checkouts.
+- A standing permission question takes `y`, `a` and `n` ahead of the editor's
+  mode, so the answer lands in vim normal mode as well as in insert. A
+  divergence from ADR 0006's Esc layering, where the mode reads a key first,
+  accepted because an answer the turn is waiting on must never be swallowed by
+  a mode. Esc still answers deny, which is the one key both layers agree on.
 
 ## Alternatives considered
 

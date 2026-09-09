@@ -504,6 +504,28 @@ func TestNoticesFromTheServerAndFromAFailedPlugin(t *testing.T) {
 	}
 }
 
+// TestACommandsNoticeIsDrawnOnce pins the one copy. The server sends a command's notice
+// to every attached client as a notice notification and answers command.run with the same
+// string, so a client that drew both put every command's notice on screen twice, which is
+// what /model did on the real path. The answer is still read, for the command names /help
+// carries in its own.
+func TestACommandsNoticeIsDrawnOnce(t *testing.T) {
+	h := newHarness(t, nil)
+	const notice = "/help  List the slash commands\n/plugins  List loaded plugins and their state"
+	h.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: levelInfo, Text: notice})
+	res, err := json.Marshal(protocol.CommandRunResult{Notice: notice})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runAll(t, h.update(CallResultMsg{Method: protocol.MethodCommandRun, Name: helpCommand, Result: res}))
+	if len(h.m.notices) != 1 {
+		t.Errorf("the notification drew the notice, the answer must not draw it again: %+v", h.m.notices)
+	}
+	if !slices.Contains(h.m.commands, "plugins") {
+		t.Errorf("the answer is still read for the command names: %v", h.m.commands)
+	}
+}
+
 func TestNoticesAndTheLiveRegionStayInsideTheFrame(t *testing.T) {
 	h := newHarness(t, nil)
 	h.update(tea.WindowSizeMsg{Width: 80, Height: 12})

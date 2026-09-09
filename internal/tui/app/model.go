@@ -491,11 +491,12 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		if !m.result(r, &res) {
 			return nil
 		}
-		if res.Notice != "" {
-			m.note(levelInfo, res.Notice)
-			if r.Name == helpCommand {
-				m.commands = helpCommands(res.Notice)
-			}
+		// The notice is read, not drawn: the server sends the same text to every attached
+		// client as a notice notification, which is what put it on screen, and a second
+		// copy from the answer would draw every command's notice twice. The field is for
+		// a caller that does not subscribe, which is what the headless printer is.
+		if res.Notice != "" && r.Name == helpCommand {
+			m.commands = helpCommands(res.Notice)
 		}
 		if res.SessionID != "" {
 			// The command opened another session, which is what a fork is. The server
