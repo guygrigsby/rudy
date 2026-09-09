@@ -485,8 +485,8 @@ func TestTheListenerHoldsItsLockUntilClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	// A second handle on the same lock file, taken while the listener is alive, watches the
-	// lock itself rather than the file name: Close unlinks the name, and the lock outlives it.
+	// A second handle on the same lock file, taken while the listener is alive, is what every
+	// other server gets: the file is never removed, so the lock is always on this one inode.
 	f, err := os.OpenFile(path+".lock", os.O_RDWR, 0)
 	if err != nil {
 		t.Fatalf("open lock: %v", err)
@@ -501,9 +501,12 @@ func TestTheListenerHoldsItsLockUntilClose(t *testing.T) {
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatalf("close left the lock held: %v", err)
 	}
+	if _, err := os.Lstat(path + ".lock"); err != nil {
+		t.Fatalf("lock file after close: %v, want it kept so the next server locks this inode", err)
+	}
 }
 
-func TestCloseRemovesTheSocketAndTheLock(t *testing.T) {
+func TestCloseRemovesTheSocketAndKeepsTheLockFile(t *testing.T) {
 	path := filepath.Join(sockDir(t), "s.sock")
 	l, err := ListenUnix(path)
 	if err != nil {
@@ -515,13 +518,14 @@ func TestCloseRemovesTheSocketAndTheLock(t *testing.T) {
 	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("socket after close: %v, want it gone", err)
 	}
-	if _, err := os.Lstat(path + ".lock"); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("lock after close: %v, want it gone", err)
+	if _, err := os.Lstat(path + ".lock"); err != nil {
+		t.Errorf("lock file after close: %v, want it kept", err)
 	}
 	if err := l.Close(); err != nil {
 		t.Errorf("second close: %v, want nothing to do", err)
 	}
-	// The lock came off with it, so the path is there to be taken again.
+	// The lock came off with the socket, so the path is there to be taken again, and the next
+	// server takes it on the lock file this one left behind.
 	again, err := ListenUnix(path)
 	if err != nil {
 		t.Fatalf("listen again: %v", err)

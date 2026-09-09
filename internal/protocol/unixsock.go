@@ -98,7 +98,12 @@ func ListenUnix(path string) (*Listener, error) {
 	return &Listener{ln: ln, lock: lock, path: path}, nil
 }
 
-// lockPath is the lock that goes with a socket, in the same 0700 directory.
+// lockPath is the lock that goes with a socket, in the same 0700 directory. The file is
+// created once and never removed, not even by Close: a flock is held on an inode, not on a
+// name, so a lock file that comes and goes is a lock two servers can hold at once. One
+// server opening the file just before another unlinks it would take the lock on the inode
+// nobody can reach any more, while a third creates a fresh file and takes that one. An empty
+// 0600 file for the life of the installation is the price of the lock meaning one thing.
 func lockPath(path string) string { return path + ".lock" }
 
 // takeLock takes the socket's lock without waiting. The lock, not the socket file, is what
@@ -192,12 +197,13 @@ func (l *Listener) Accept() (Conn, error) {
 // Addr is the address the listener is bound to, for logging.
 func (l *Listener) Addr() net.Addr { return l.ln.Addr() }
 
-// Close stops accepting, removes the socket and the lock file and then gives up the lock, in
-// that order: the next server to take the lock finds the path already clear.
+// Close stops accepting, removes the socket and then gives up the lock, in that order: the
+// next server to take the lock finds the path already clear. The lock file itself stays; see
+// lockPath for why removing it would be the one way to let two servers hold the lock.
 func (l *Listener) Close() error {
 	l.closeOnce.Do(func() {
 		err := l.ln.Close()
-		err = errors.Join(err, remove(l.path), remove(lockPath(l.path)))
+		err = errors.Join(err, remove(l.path))
 		// Closing the file is what releases the flock.
 		l.closeErr = errors.Join(err, l.lock.Close())
 	})
