@@ -36,6 +36,7 @@ type Deps struct {
 	Plugins  *plugin.Registry
 	Gate     *gate.Gate
 	Hooks    *plugin.HookRunner // nil means no hooks fire
+	Socket   string             // the socket a locked session's unavailable error names
 }
 
 // EntryIDResult answers session.set_model, set_mode, set_thinking, set_title and
@@ -255,7 +256,14 @@ func perr(code int, msg string) *protocol.Error {
 // Load's other realistic failure, a session id with no log at all, does not wrap any sentinel
 // ErrorFrom recognizes and falls through to its generic CodeInternal; that case is remapped
 // here to CodeNotFound, since a resume or fork of a session that never existed is exactly that.
-func loadErr(err error) *protocol.Error {
+//
+// ErrLocked gets one thing the generic mapping does not: the socket a second process should
+// attach through instead of opening its own store on the same session. Every other
+// CodeUnavailable stays data-less.
+func loadErr(err error, socket string) *protocol.Error {
+	if errors.Is(err, session.ErrLocked) {
+		return protocol.NewError(protocol.CodeUnavailable, err.Error(), map[string]string{"socket": socket})
+	}
 	pe := protocol.ErrorFrom(err)
 	if pe.Code == protocol.CodeInternal {
 		return perr(protocol.CodeNotFound, err.Error())
@@ -1227,7 +1235,7 @@ func (s *Server) loadCold(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Erro
 func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Error) {
 	sess, err := session.Load(s.d.Store, sid)
 	if err != nil {
-		return nil, loadErr(err)
+		return nil, loadErr(err, s.d.Socket)
 	}
 	m, rerr := s.d.Registry.Resolve(sess.Model().String())
 	if rerr != nil {

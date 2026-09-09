@@ -132,6 +132,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		Plugins:  plugins,
 		Gate:     g,
 		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
+		Socket:   paths.Socket(),
 	})
 	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv}
 	defer func() {

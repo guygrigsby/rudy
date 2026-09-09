@@ -71,3 +71,35 @@ func TestEnvelopes(t *testing.T) {
 		t.Fatalf("error response %s", b)
 	}
 }
+
+// TestErrorData round-trips an *Error through JSON the way a Response really arrives on the
+// client: Data goes in as the typed value NewError was built with and comes back out as
+// map[string]any, so ErrorData has to decode that map into v rather than type-assert it.
+func TestErrorData(t *testing.T) {
+	built := NewError(CodeUnavailable, "locked", map[string]string{"socket": "/tmp/rudy.sock"})
+	raw, err := json.Marshal(NewErrorResponse(json.RawMessage("1"), built))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp Response
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatal(err)
+	}
+
+	var data struct {
+		Socket string `json:"socket"`
+	}
+	if !ErrorData(resp.Error, &data) {
+		t.Fatal("ErrorData found nothing on a round-tripped error that carries data")
+	}
+	if data.Socket != "/tmp/rudy.sock" {
+		t.Fatalf("socket = %q, want /tmp/rudy.sock", data.Socket)
+	}
+
+	if ErrorData(errors.New("not a protocol.Error"), &data) {
+		t.Fatal("ErrorData found data behind an error with no *Error in its chain")
+	}
+	if ErrorData(NewError(CodeInternal, "no data", nil), &data) {
+		t.Fatal("ErrorData found data on an *Error that carries none")
+	}
+}

@@ -236,14 +236,22 @@ func testConfig() *config.Config {
 // providers from what Load committed.
 func newServerWith(t *testing.T, cfg *config.Config, plugins ...plugin.Plugin) (*server.Server, *session.Store) {
 	t.Helper()
+	return newServerAt(t, cfg, filepath.Join(t.TempDir(), "sessions"), "", plugins...)
+}
+
+// newServerAt is newServerWith with the session store directory and Deps.Socket pinned:
+// TestALockedSessionNamesTheSocket needs two servers sharing one store directory, the way two
+// rudy processes contending for the same session would, each still answering with its own
+// socket.
+func newServerAt(t *testing.T, cfg *config.Config, storeDir, socket string, plugins ...plugin.Plugin) (*server.Server, *session.Store) {
+	t.Helper()
 	ctx := context.Background()
-	dir := t.TempDir()
-	store, err := session.OpenStore(filepath.Join(dir, "sessions"))
+	store, err := session.OpenStore(storeDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	preg := plugin.NewRegistry(nil, func(string) {})
-	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"))
+	reg := provider.NewRegistry(filepath.Join(t.TempDir(), "registry.json"))
 	srv := server.New(server.Deps{
 		Version:  "test",
 		Config:   cfg,
@@ -252,6 +260,7 @@ func newServerWith(t *testing.T, cfg *config.Config, plugins ...plugin.Plugin) (
 		Plugins:  preg,
 		Gate:     gate.New(nil),
 		Hooks:    plugin.NewHookRunner(preg, 5*time.Second, func(string) {}),
+		Socket:   socket,
 	})
 	services := srv.PluginServices()
 	services.ProvidersChanged = func(ps []provider.Provider) { reg.SetProviders(ps...) }
@@ -1029,6 +1038,46 @@ func TestConcurrentColdResume(t *testing.T) {
 			}
 			return seen >= 3
 		})
+	}
+}
+
+// TestALockedSessionNamesTheSocket: two Server instances over one store directory is how two
+// rudy processes racing the same session on disk look. The first opens and holds the session's
+// flock live; the second's resume hits session.ErrLocked through session.Load and comes back
+// unavailable. That error has to name the socket a client should attach through instead of
+// retrying its own embedded server, and that socket is the resuming server's own Deps.Socket
+// (in real wiring the one default socket every process on the machine was built with, from
+// config.Paths.Socket()), not something it would have to somehow learn from the session lock.
+func TestALockedSessionNamesTheSocket(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig()
+
+	srvA, _ := newServerAt(t, cfg, dir, "/tmp/rudy-a.sock", &fakePlugin{prov: &scriptProvider{}})
+	clA := dialAs(t, srvA, false)
+	var info protocol.SessionInfo
+	if err := clA.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: t.TempDir()}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	srvB, _ := newServerAt(t, cfg, dir, "/tmp/rudy-b.sock", &fakePlugin{prov: &scriptProvider{}})
+	clB := dialAs(t, srvB, false)
+	var resumed protocol.SessionInfo
+	err := clB.Call(context.Background(), protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &resumed)
+	var pe *protocol.Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("resume of a locked session = %v, want *protocol.Error", err)
+	}
+	if pe.Code != protocol.CodeUnavailable {
+		t.Fatalf("code = %d, want CodeUnavailable", pe.Code)
+	}
+	var data struct {
+		Socket string `json:"socket"`
+	}
+	if !protocol.ErrorData(pe, &data) {
+		t.Fatalf("no data on %+v", pe)
+	}
+	if data.Socket != "/tmp/rudy-b.sock" {
+		t.Fatalf("socket = %q, want the resuming server's own socket", data.Socket)
 	}
 }
 

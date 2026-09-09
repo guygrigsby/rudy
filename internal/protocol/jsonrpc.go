@@ -65,6 +65,22 @@ func NewError(code int, msg string, data any) *Error {
 	return &Error{Code: code, Message: msg, Data: data}
 }
 
+// ErrorData finds a *Error in err's chain with errors.As and decodes its Data into v. Data is
+// any (a map[string]any once it has crossed the wire and back), so this round-trips it through
+// JSON rather than type-asserting; it reports false when err carries no *Error or that Error
+// has no data.
+func ErrorData(err error, v any) bool {
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Data == nil {
+		return false
+	}
+	b, merr := json.Marshal(pe.Data)
+	if merr != nil {
+		return false
+	}
+	return json.Unmarshal(b, v) == nil
+}
+
 // ErrorFrom maps a Go error to the taxonomy. An *Error passes through unchanged.
 func ErrorFrom(err error) *Error {
 	var pe *Error

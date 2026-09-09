@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"maps"
 	"os"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
@@ -162,6 +164,63 @@ func TestBuildLoadsPluginsAndRegistry(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(b.Paths.Cache, "registry.json")); err != nil {
 		t.Fatalf("snapshot not written: %v", err)
+	}
+}
+
+// TestBuildWiresTheServerSocketFromPaths: wire.go sets server.Deps.Socket from
+// paths.Socket(), the only place a Server ever learns which socket it was built with. Two
+// Build() calls over the same XDG roots are two rudy processes finding the same session
+// store on disk; the second one resuming a session the first still holds live gets the
+// unavailable error named after the second server's own socket, proving the value flowed
+// from Build's paths through to the server rather than staying its zero value.
+func TestBuildWiresTheServerSocketFromPaths(t *testing.T) {
+	fp := &fakeProvider{}
+	build := testBuilder(t, fp)
+	ctx := context.Background()
+
+	b1, err := build(ctx, io.Discard)
+	if err != nil {
+		t.Fatalf("Build (1): %v", err)
+	}
+	defer func() { _ = b1.Server.Shutdown(context.Background()) }()
+	cl1, close1, err := serveInMemory(b1, "test", false)
+	if err != nil {
+		t.Fatalf("serveInMemory (1): %v", err)
+	}
+	defer close1()
+	var info protocol.SessionInfo
+	if err := cl1.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: t.TempDir()}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	b2, err := build(ctx, io.Discard)
+	if err != nil {
+		t.Fatalf("Build (2): %v", err)
+	}
+	defer func() { _ = b2.Server.Shutdown(context.Background()) }()
+	cl2, close2, err := serveInMemory(b2, "test", false)
+	if err != nil {
+		t.Fatalf("serveInMemory (2): %v", err)
+	}
+	defer close2()
+
+	var resumed protocol.SessionInfo
+	err = cl2.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &resumed)
+	var pe *protocol.Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("resume of a locked session = %v, want *protocol.Error", err)
+	}
+	if pe.Code != protocol.CodeUnavailable {
+		t.Fatalf("code = %d, want CodeUnavailable", pe.Code)
+	}
+	var data struct {
+		Socket string `json:"socket"`
+	}
+	if !protocol.ErrorData(pe, &data) {
+		t.Fatalf("no data on %+v", pe)
+	}
+	if data.Socket != b2.Paths.Socket() {
+		t.Fatalf("socket = %q, want %q (the resuming Build's own paths.Socket())", data.Socket, b2.Paths.Socket())
 	}
 }
 
