@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -23,6 +25,22 @@ func sockDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
+}
+
+// rawListen binds a socket the way a server that knows nothing of the lock would, for the
+// tests about what ListenUnix does when it finds one.
+func rawListen(t *testing.T, path string) *net.UnixListener {
+	t.Helper()
+	addr, err := net.ResolveUnixAddr("unix", path)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	l, err := net.ListenUnix("unix", addr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	return l
 }
 
 // staleSocket leaves a socket file with no server behind it, the way a server that was
@@ -43,9 +61,22 @@ func staleSocket(t *testing.T, path string) {
 	}
 }
 
+// holdLock takes the socket's lock the way another server holds it.
+func holdLock(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("open lock: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+}
+
 func TestListenCreatesAPrivateDirAndSocket(t *testing.T) {
-	// Umask 0 is the case the two chmods exist for: MkdirAll and bind both take the umask off
-	// the mode they are given, so the modes here are the harness's doing and not the shell's.
+	// Umask 0 is the case the chmods exist for: MkdirAll and bind both take the umask off the
+	// mode they are given, so the modes here are the harness's doing and not the shell's.
 	old := syscall.Umask(0)
 	t.Cleanup(func() { syscall.Umask(old) })
 
@@ -93,7 +124,40 @@ func TestListenCreatesAPrivateDirAndSocket(t *testing.T) {
 			if got := si.Mode().Perm(); got != 0o600 {
 				t.Errorf("socket mode = %o, want 600", got)
 			}
+			li, err := os.Lstat(path + ".lock")
+			if err != nil {
+				t.Fatalf("stat lock: %v", err)
+			}
+			if got := li.Mode().Perm(); got != 0o600 {
+				t.Errorf("lock mode = %o, want 600", got)
+			}
+			if got := l.Addr().String(); got != path {
+				t.Errorf("addr = %q, want %q", got, path)
+			}
 		})
+	}
+}
+
+func TestListenRefusesASymlinkedDir(t *testing.T) {
+	base := sockDir(t)
+	real := filepath.Join(base, "real")
+	if err := os.Mkdir(real, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	l, err := ListenUnix(filepath.Join(link, "s.sock"))
+	if err == nil {
+		_ = l.Close()
+		t.Fatal("listen bound a socket under a symlinked dir")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("err = %v, want it to name the symlink", err)
+	}
+	if _, err := os.Lstat(filepath.Join(real, "s.sock")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a socket was bound through the link: %v", err)
 	}
 }
 
@@ -130,28 +194,88 @@ func TestListenReplacesAStaleSocket(t *testing.T) {
 }
 
 func TestListenRefusesABusySocket(t *testing.T) {
-	path := filepath.Join(sockDir(t), "s.sock")
-	first, err := ListenUnix(path)
-	if err != nil {
-		t.Fatalf("first listen: %v", err)
+	cases := []struct {
+		name  string
+		serve func(t *testing.T, path string)
+	}{
+		// The lock is the answer when the server on the path is one of ours.
+		{"a server of ours holds the path", func(t *testing.T, path string) {
+			l, err := ListenUnix(path)
+			if err != nil {
+				t.Fatalf("first listen: %v", err)
+			}
+			t.Cleanup(func() { _ = l.Close() })
+		}},
+		// The probe is the answer when it is not: an answering socket is a served socket
+		// whoever bound it.
+		{"a socket answers with no lock held", func(t *testing.T, path string) { rawListen(t, path) }},
 	}
-	defer func() { _ = first.Close() }()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(sockDir(t), "s.sock")
+			tc.serve(t, path)
+			second, err := ListenUnix(path)
+			if err == nil {
+				_ = second.Close()
+				t.Fatal("second listen took a socket a server is on")
+			}
+			if !errors.Is(err, ErrSocketBusy) {
+				t.Fatalf("err = %v, want ErrSocketBusy", err)
+			}
+			// The refusal leaves the first server's socket where it was.
+			si, err := os.Lstat(path)
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			if si.Mode()&os.ModeSocket == 0 {
+				t.Fatalf("%s is %v, want the first server's socket", path, si.Mode())
+			}
+		})
+	}
+}
 
-	second, err := ListenUnix(path)
+func TestListenRefusesALockedPath(t *testing.T) {
+	// Two servers starting at once find the same dead socket. Without the lock both remove it
+	// and both bind, and the clients divide between them.
+	path := filepath.Join(sockDir(t), "s.sock")
+	staleSocket(t, path)
+	holdLock(t, path)
+
+	l, err := ListenUnix(path)
 	if err == nil {
-		_ = second.Close()
-		t.Fatal("second listen took a socket a server is on")
+		_ = l.Close()
+		t.Fatal("listen bound a path another server holds the lock on")
 	}
 	if !errors.Is(err, ErrSocketBusy) {
 		t.Fatalf("err = %v, want ErrSocketBusy", err)
 	}
-	// The refusal leaves the first server's socket where it was.
-	si, err := os.Lstat(path)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("the stale socket was removed under a lock we do not hold: %v", err)
 	}
-	if si.Mode()&os.ModeSocket == 0 {
-		t.Fatalf("%s is %v, want the first server's socket", path, si.Mode())
+}
+
+func TestListenKeepsAPathItCannotProbe(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root connects to a socket whatever its mode")
+	}
+	// A probe that neither answers nor refuses says nothing about whether a server is there,
+	// and a path that might still be served is not one to delete.
+	path := filepath.Join(sockDir(t), "s.sock")
+	rawListen(t, path)
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	l, err := ListenUnix(path)
+	if err == nil {
+		_ = l.Close()
+		t.Fatal("listen took a path it could not probe")
+	}
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("err = %v, want the probe's own EACCES", err)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("the socket was removed on a probe that proved nothing: %v", err)
 	}
 }
 
@@ -185,7 +309,7 @@ func TestDialReportsNoServer(t *testing.T) {
 	})
 }
 
-func TestAcceptPeerAdmitsTheOwner(t *testing.T) {
+func TestAcceptAdmitsTheOwner(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	path := filepath.Join(sockDir(t), "s.sock")
@@ -205,7 +329,7 @@ func TestAcceptPeerAdmitsTheOwner(t *testing.T) {
 		dials <- dialed{conn: c, err: err}
 	}()
 
-	server, err := AcceptPeer(l)
+	server, err := l.Accept()
 	if err != nil {
 		t.Fatalf("accept: %v", err)
 	}
@@ -249,11 +373,7 @@ func TestAcceptPeerAdmitsTheOwner(t *testing.T) {
 
 func TestPeerUIDIsTheCaller(t *testing.T) {
 	path := filepath.Join(sockDir(t), "s.sock")
-	l, err := ListenUnix(path)
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer func() { _ = l.Close() }()
+	l := rawListen(t, path)
 
 	type dialed struct {
 		conn net.Conn
@@ -265,7 +385,7 @@ func TestPeerUIDIsTheCaller(t *testing.T) {
 		dials <- dialed{conn: c, err: err}
 	}()
 
-	raw, err := l.Accept()
+	raw, err := l.AcceptUnix()
 	if err != nil {
 		t.Fatalf("accept: %v", err)
 	}
@@ -275,11 +395,8 @@ func TestPeerUIDIsTheCaller(t *testing.T) {
 		t.Fatalf("dial: %v", d.err)
 	}
 	defer func() { _ = d.conn.Close() }()
-	uc, ok := raw.(*net.UnixConn)
-	if !ok {
-		t.Fatalf("accepted a %T, want *net.UnixConn", raw)
-	}
-	uid, err := PeerUID(uc)
+
+	uid, err := PeerUID(raw)
 	if err != nil {
 		t.Fatalf("peer uid: %v", err)
 	}
@@ -288,7 +405,7 @@ func TestPeerUIDIsTheCaller(t *testing.T) {
 	}
 }
 
-func TestAcceptPeerRefusesAnotherUID(t *testing.T) {
+func TestAcceptRefusesAnotherUID(t *testing.T) {
 	cases := []struct {
 		name  string
 		check func(*net.UnixConn) (int, error)
@@ -322,7 +439,7 @@ func TestAcceptPeerRefusesAnotherUID(t *testing.T) {
 				dials <- dialed{conn: c, err: err}
 			}()
 
-			conn, err := AcceptPeer(l)
+			conn, err := l.Accept()
 			if err == nil {
 				_ = conn.Close()
 				t.Fatal("accept admitted the peer")
@@ -348,7 +465,7 @@ func TestAcceptPeerRefusesAnotherUID(t *testing.T) {
 	}
 }
 
-func TestAcceptPeerPassesUpAClosedListener(t *testing.T) {
+func TestAcceptPassesUpAClosedListener(t *testing.T) {
 	path := filepath.Join(sockDir(t), "s.sock")
 	l, err := ListenUnix(path)
 	if err != nil {
@@ -357,29 +474,59 @@ func TestAcceptPeerPassesUpAClosedListener(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if _, err := AcceptPeer(l); !errors.Is(err, net.ErrClosed) {
+	if _, err := l.Accept(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("err = %v, want net.ErrClosed so the accept loop ends", err)
 	}
 }
 
-// oneConnListener hands AcceptPeer a connection that is not a unix socket, which is the one
-// way its peer check has nothing to ask the kernel about.
-type oneConnListener struct{ c net.Conn }
-
-func (o oneConnListener) Accept() (net.Conn, error) { return o.c, nil }
-func (o oneConnListener) Close() error              { return nil }
-func (o oneConnListener) Addr() net.Addr            { return &net.UnixAddr{Name: "test", Net: "unix"} }
-
-func TestAcceptPeerRefusesANonUnixConn(t *testing.T) {
-	server, client := net.Pipe()
-	defer func() { _ = client.Close() }()
-	conn, err := AcceptPeer(oneConnListener{c: server})
-	if err == nil {
-		_ = conn.Close()
-		t.Fatal("accept admitted a connection with no peer credentials")
+func TestTheListenerHoldsItsLockUntilClose(t *testing.T) {
+	path := filepath.Join(sockDir(t), "s.sock")
+	l, err := ListenUnix(path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-	// The connection is closed, not left open unchecked.
-	if err := server.SetReadDeadline(time.Now().Add(time.Second)); err == nil {
-		t.Fatal("the connection was left open")
+	// A second handle on the same lock file, taken while the listener is alive, watches the
+	// lock itself rather than the file name: Close unlinks the name, and the lock outlives it.
+	f, err := os.OpenFile(path+".lock", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open lock: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		t.Fatal("the lock was free while the listener was serving")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("close left the lock held: %v", err)
+	}
+}
+
+func TestCloseRemovesTheSocketAndTheLock(t *testing.T) {
+	path := filepath.Join(sockDir(t), "s.sock")
+	l, err := ListenUnix(path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("socket after close: %v, want it gone", err)
+	}
+	if _, err := os.Lstat(path + ".lock"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("lock after close: %v, want it gone", err)
+	}
+	if err := l.Close(); err != nil {
+		t.Errorf("second close: %v, want nothing to do", err)
+	}
+	// The lock came off with it, so the path is there to be taken again.
+	again, err := ListenUnix(path)
+	if err != nil {
+		t.Fatalf("listen again: %v", err)
+	}
+	if err := again.Close(); err != nil {
+		t.Fatalf("close again: %v", err)
 	}
 }
