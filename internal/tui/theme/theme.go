@@ -17,6 +17,8 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	lipgloss "charm.land/lipgloss/v2"
+
+	"github.com/guygrigsby/rudy/internal/config"
 )
 
 // Role names one of the eleven paintable theme roles.
@@ -50,13 +52,6 @@ const codeKey = "code"
 // chromaPrefix is code's required value prefix: "chroma:<style>".
 const chromaPrefix = "chroma:"
 
-// defaultChromaStyle is the harness's compiled-in default chroma style, "tokyonight"
-// from docs/specs/2026-09-07-rudy-design.md. The pinned chroma v2.27.0 only registers
-// variant names (tokyonight-night, tokyonight-storm, tokyonight-moon, tokyonight-day),
-// not this bare design name, so it is accepted here regardless of styles.Names(); any
-// other theme's code value must be a name styles.Names() actually returns.
-const defaultChromaStyle = "tokyonight"
-
 // legalKeys are the twelve keys a theme file (or an overrides map) may set: the eleven
 // color roles plus code.
 var legalKeys = func() map[string]bool {
@@ -67,24 +62,6 @@ var legalKeys = func() map[string]bool {
 	return m
 }()
 
-// defaultRaw is the design's default screen theme (2026-09-07-rudy-design.md,
-// [ui.theme]), the single source both Default and Load(dir, "default", ...) resolve
-// from.
-var defaultRaw = map[string]string{
-	"accent":    "#7aa2f7",
-	"text":      "#c0caf5",
-	"muted":     "#565f89",
-	"user":      "accent",
-	"assistant": "text",
-	"tool":      "muted",
-	"success":   "#9ece6a",
-	"error":     "#f7768e",
-	"warning":   "#e0af68",
-	"diff_add":  "success",
-	"diff_del":  "error",
-	codeKey:     chromaPrefix + defaultChromaStyle,
-}
-
 // Theme is a fully resolved set of roles: Colors for the eleven paintable roles,
 // Chroma for the code role's style name (without the "chroma:" prefix).
 type Theme struct {
@@ -93,29 +70,31 @@ type Theme struct {
 	Chroma string
 }
 
-// Default is the design's built-in theme, ui.theme.name == "default".
+// Default is the design's built-in theme, ui.theme.name == "default", resolved from
+// config.ThemeDefaults so the twelve values live in exactly one place.
 func Default() Theme {
-	th, err := resolve("default", defaultRaw)
+	th, err := resolve("default", config.ThemeDefaults())
 	if err != nil {
-		// defaultRaw is a compile-time constant covered by TestDefaultResolvesEveryRole;
-		// resolve only fails on bad input, which this is not.
+		// config.ThemeDefaults is a compile-time constant covered by
+		// TestDefaultResolvesEveryRole; resolve only fails on bad input, which this
+		// is not.
 		panic("theme: built-in default is invalid: " + err.Error())
 	}
 	return th
 }
 
 // Load resolves the theme named name. For name == "default" it starts from the same
-// raw table Default builds from; for any other name it parses <dir>/<name>.toml, where
-// only the twelve legal keys are allowed and a role missing from the file takes the
-// built-in default (the contract's "every one required in a theme file or the built-in
-// default applies" read as: a file gap falls back rather than errors, an unrecognized
-// key does not). overrides then applies on top of either, at the same twelve-key
-// legality, and typically comes from ui.theme.<role> in config.toml.
+// config.ThemeDefaults table Default builds from; for any other name it parses
+// <dir>/<name>.toml, where only the twelve legal keys are allowed and a role missing
+// from the file takes the built-in default (the contract's "every one required in a
+// theme file or the built-in default applies" read as: a file gap falls back rather
+// than errors, an unrecognized key does not). overrides then applies on top of either,
+// at the same twelve-key legality, and typically comes straight from config.Config's
+// ui.theme table (config.UIConfig.Theme), which also carries a "name" key theme roles
+// have no use for; Load ignores that one key rather than erroring, since the name
+// argument is already authoritative over which theme is loading.
 func Load(dir, name string, overrides map[string]string) (Theme, error) {
-	raw := make(map[string]string, len(defaultRaw))
-	for k, v := range defaultRaw {
-		raw[k] = v
-	}
+	raw := config.ThemeDefaults()
 	if name != "default" {
 		file := filepath.Join(dir, name+".toml")
 		body, err := os.ReadFile(file)
@@ -134,6 +113,9 @@ func Load(dir, name string, overrides map[string]string) (Theme, error) {
 		}
 	}
 	for k, v := range overrides {
+		if k == "name" {
+			continue
+		}
 		if !legalKeys[k] {
 			return Theme{}, fmt.Errorf("theme: unknown role %q", k)
 		}
@@ -179,12 +161,8 @@ func resolve(name string, raw map[string]string) (Theme, error) {
 	return Theme{Name: name, Colors: colors, Chroma: chromaName}, nil
 }
 
-// validChromaStyle reports whether name is the harness's own default or a style
-// styles.Names() actually registers.
+// validChromaStyle reports whether styles.Names() registers name.
 func validChromaStyle(name string) bool {
-	if name == defaultChromaStyle {
-		return true
-	}
 	for _, n := range styles.Names() {
 		if n == name {
 			return true

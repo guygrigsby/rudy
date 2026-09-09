@@ -255,7 +255,7 @@ error = "#f7768e"
 warning = "#e0af68"
 diff_add = "success"
 diff_del = "error"
-code = "chroma:tokyonight"
+code = "chroma:tokyonight-night"
 ```
 
 Slots have owners. A status item or widget is registered by a named plugin and

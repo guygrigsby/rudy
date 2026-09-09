@@ -309,7 +309,7 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	if !reflect.DeepEqual(c.UI.Status.Items, want) {
 		t.Errorf("status %v", c.UI.Status.Items)
 	}
-	if c.UI.Theme["name"] != "default" || c.UI.Theme["accent"] != "#7aa2f7" || c.UI.Theme["code"] != "chroma:tokyonight" {
+	if c.UI.Theme["name"] != "default" || c.UI.Theme["accent"] != "#7aa2f7" || c.UI.Theme["code"] != "chroma:tokyonight-night" {
 		t.Errorf("theme %v", c.UI.Theme)
 	}
 	if len(c.Keys) != 0 {
@@ -332,6 +332,68 @@ model = "m"
 	}
 	if v, ok := c.Keys["app.session.fork"]; !ok || len(v) != 0 {
 		t.Errorf("unbound must be present and empty: %v", c.Keys)
+	}
+}
+
+func TestUIThemePartialTableKeepsDefaults(t *testing.T) {
+	c := loadFile(t, `
+[default]
+provider = "p"
+model = "m"
+[ui.theme]
+name = "custom"
+`)
+	if c.UI.Theme["name"] != "custom" {
+		t.Errorf("name %q, want custom", c.UI.Theme["name"])
+	}
+	want := config.ThemeDefaults()
+	want["name"] = "custom"
+	if !reflect.DeepEqual(c.UI.Theme, want) {
+		t.Errorf("theme %v, want %v", c.UI.Theme, want)
+	}
+}
+
+func TestDoublePressMSAlias(t *testing.T) {
+	cases := map[string]struct {
+		body string
+		want int
+	}{
+		"alias only": {
+			body: `
+[default]
+provider = "p"
+model = "m"
+[ui]
+double_press_ms = 750
+`,
+			want: 750,
+		},
+		"canonical wins over alias": {
+			body: `
+[default]
+provider = "p"
+model = "m"
+[permissions]
+double_press_ms = 900
+[ui]
+double_press_ms = 750
+`,
+			want: 900,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := loadFile(t, tc.body)
+			if c.Permissions.DoublePressMS != tc.want {
+				t.Errorf("double_press_ms = %d, want %d", c.Permissions.DoublePressMS, tc.want)
+			}
+		})
+	}
+	// The alias also applies when ui.double_press_ms arrives as an override rather than
+	// from the file, exercising the overrides branch of the same check.
+	c := loadWith(t, map[string]any{"default.provider": "p", "default.model": "m", "ui.double_press_ms": 750})
+	if c.Permissions.DoublePressMS != 750 {
+		t.Errorf("override alias: double_press_ms = %d, want 750", c.Permissions.DoublePressMS)
 	}
 }
 

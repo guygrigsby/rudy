@@ -47,8 +47,8 @@ type StatusConfig struct {
 }
 
 // UIConfig is the [ui] table. Theme holds ui.theme.name plus role overrides, merged
-// over the built-in theme defaults by hand in Load since viper replaces a nested
-// default table wholesale rather than merging it key by key with a partial file table.
+// over ThemeDefaults by hand in Load since viper replaces a nested default table
+// wholesale rather than merging it key by key with a partial file table.
 type UIConfig struct {
 	Render     string            `mapstructure:"render"`
 	Vim        bool              `mapstructure:"vim"`
@@ -59,12 +59,16 @@ type UIConfig struct {
 	Theme      map[string]string `mapstructure:"theme"`
 }
 
-// uiThemeDefaults are ui.theme's built-in values: the design's default screen theme
-// (docs/specs/2026-09-07-rudy-design.md, [ui.theme]). Kept out of Defaults() because
-// viper replaces a nested default table wholesale the moment the file sets any key
-// under the same table, instead of merging it key by key; Load merges these by hand.
-var uiThemeDefaults = map[string]string{
-	"name":      "default",
+// themeDefaults are the design's twelve ui.theme role values
+// (docs/specs/2026-09-07-rudy-design.md, [ui.theme]): the eleven color roles plus code.
+// ThemeDefaults is the one exported copy of this data; internal/tui/theme.Default and
+// Load's built-in "default" theme resolve from it too, so it lives here once rather
+// than once per package. Kept out of Defaults() (and so out of viper's SetDefault)
+// because viper replaces a nested default table wholesale the moment the file sets any
+// key under the same table, instead of merging it key by key; Load merges these by
+// hand, in ui.theme's case alongside the "name" key, which is config's alone (a theme
+// file has no use for it).
+var themeDefaults = map[string]string{
 	"accent":    "#7aa2f7",
 	"text":      "#c0caf5",
 	"muted":     "#565f89",
@@ -76,7 +80,16 @@ var uiThemeDefaults = map[string]string{
 	"warning":   "#e0af68",
 	"diff_add":  "success",
 	"diff_del":  "error",
-	"code":      "chroma:tokyonight",
+	"code":      "chroma:tokyonight-night",
+}
+
+// ThemeDefaults is the design's twelve ui.theme role values, a fresh copy each call.
+func ThemeDefaults() map[string]string {
+	out := make(map[string]string, len(themeDefaults))
+	for k, v := range themeDefaults {
+		out[k] = v
+	}
+	return out
 }
 
 // MemoryConfig is the [memory] table.
@@ -217,10 +230,8 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 	c.PluginsDisabled = v.GetStringSlice("plugins.disabled")
 	// ui.theme is a table of strings (name plus role overrides); merge the file's and
 	// overrides' values over the built-in defaults by hand, see uiThemeDefaults.
-	c.UI.Theme = make(map[string]string, len(uiThemeDefaults))
-	for k, val := range uiThemeDefaults {
-		c.UI.Theme[k] = val
-	}
+	c.UI.Theme = ThemeDefaults()
+	c.UI.Theme["name"] = "default"
 	for k, val := range v.GetStringMapString("ui.theme") {
 		c.UI.Theme[k] = val
 	}

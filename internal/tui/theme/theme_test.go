@@ -14,7 +14,7 @@ func TestDefaultResolvesEveryRole(t *testing.T) {
 			t.Errorf("role %s unresolved", r)
 		}
 	}
-	if th.Chroma != "tokyonight" || th.Name != "default" {
+	if th.Chroma != "tokyonight-night" || th.Name != "default" {
 		t.Errorf("%+v", th)
 	}
 	if th.Colors[RoleUser] != th.Colors[RoleAccent] || th.Colors[RoleDiffAdd] != th.Colors[RoleSuccess] {
@@ -38,6 +38,22 @@ func TestLoadFileAndOverrides(t *testing.T) {
 	}
 	if _, err := Load("testdata", "default", map[string]string{"user": "assistant", "assistant": "user"}); err == nil {
 		t.Error("cycle must error")
+	}
+}
+
+func TestLoadIgnoresNameInOverrides(t *testing.T) {
+	// config.Config.UI.Theme, the usual overrides source, carries a "name" key of its
+	// own; Load's name argument is authoritative over which theme is loading, so a
+	// stray "name" entry in overrides must not error and must not rename the result.
+	th, err := Load("testdata", "tokyonight", map[string]string{"name": "bogus", "accent": "#ff0000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if th.Name != "tokyonight" {
+		t.Errorf("name %q, want tokyonight", th.Name)
+	}
+	if th.Colors[RoleAccent] != lipgloss.Color("#ff0000") {
+		t.Errorf("accent override lost: %+v", th.Colors)
 	}
 }
 
