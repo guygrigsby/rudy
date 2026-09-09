@@ -200,6 +200,32 @@ func TestCommitReturnsAndRemovesTheTurn(t *testing.T) {
 	}
 }
 
+func TestASteerMessageStaysInTheTurnItContinues(t *testing.T) {
+	tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2, UserPrefix: "›", BlockGap: 1}, theme.Default())
+	u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+	tr.Apply(u)
+	tr.Apply(entry(t, session.AssistantMessage{Model: ref, Thinking: session.ThinkingOff, StopReason: session.StopInterrupted, Content: []session.Block{session.TextBlock("Half an answer")}}))
+	// The server keeps the turn under the id of the user_message that started it, so a
+	// steer message and everything after it belong to that turn, not to a new one.
+	steer := entry(t, session.UserMessage{Source: session.SourceSteer, Content: []session.Block{session.TextBlock("other approach")}})
+	tr.Apply(steer)
+	tr.Apply(entry(t, session.TurnInterrupted{TurnID: u.ID, How: session.InterruptCancel}))
+	for _, r := range tr.Rows() {
+		if r.TurnID != u.ID.String() {
+			t.Fatalf("row %q is in turn %q, not %q", r.Key, r.TurnID, u.ID)
+		}
+	}
+	joined := ansi.Strip(strings.Join(tr.Commit(u.ID.String()), "\n"))
+	for _, want := range []string{"go", "Half an answer", "other approach", "interrupted (cancel)"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the whole turn commits at once, %q is missing from %q", want, joined)
+		}
+	}
+	if rows := tr.Rows(); len(rows) != 0 {
+		t.Errorf("nothing of the turn is left: %+v", rows)
+	}
+}
+
 func TestToggleExpandsOnlyToolRows(t *testing.T) {
 	tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2}, theme.Default())
 	u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})

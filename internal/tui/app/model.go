@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"slices"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
@@ -116,8 +117,9 @@ type Model struct {
 	widgets []protocol.Widget
 	notices []notice
 
-	turnID    string
-	turnState string
+	// turn is what the client knows about the turn in flight: the server's own state
+	// mirrored, the question standing on screen and what Esc does next (turn.go).
+	turn turnControl
 
 	// models is the registry as this client last saw it, and model is the session's own
 	// entry in it, for the context percent and the cost. A model the registry does not
@@ -136,7 +138,7 @@ type Model struct {
 
 	// disconnected is set once the server is gone. Editing still works, so a draft can be
 	// read back and copied out; what stops is anything that needs the server, which is
-	// submitting (Task 7 owns it) and the calls a picker makes (Task 8).
+	// submitting and the calls a picker makes (Task 8).
 	disconnected bool
 }
 
@@ -243,7 +245,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // notification dispatches one server notification by method. It returns a command for the
-// methods that need one (Task 7's inline commit hangs off turn.state); the folding itself
+// methods that need one (the inline commit hangs off turn.state); the folding itself
 // happens here, on the update loop.
 func (m *Model) notification(n protocol.Notification) tea.Cmd {
 	switch n.Method {
@@ -260,12 +262,12 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 	case protocol.NotifyTurnState:
 		var p protocol.TurnStateChanged
 		if m.decode(n, &p) {
-			m.turnID, m.turnState = p.TurnID, p.State
+			return m.turnChanged(p)
 		}
 	case protocol.NotifyPermissionRequested:
 		var p protocol.PermissionRequested
 		if m.decode(n, &p) {
-			m.tr.Prompt(p)
+			m.requested(p)
 		}
 	case protocol.NotifyNotice:
 		var p protocol.NoticeParams
@@ -316,7 +318,7 @@ func (m *Model) entry(e session.Entry) tea.Cmd {
 	case session.PermissionDecision:
 		// The question has been answered, by this client or by a hook or the gate, so
 		// the row standing in its place goes.
-		m.tr.Answered(p.ToolUseID)
+		m.answered(p.ToolUseID)
 	case session.ModelChange:
 		return m.setModel(p.Model)
 	case session.ModeChange:
@@ -329,25 +331,54 @@ func (m *Model) entry(e session.Entry) tea.Cmd {
 	return nil
 }
 
-// callResult folds one server answer in. registry.list is the only call this file makes;
-// Tasks 7 and 8 add their methods' cases beside it.
+// callResult folds one server answer in. A call whose answer says nothing this model
+// reads (session.interrupt, session.answer) has no case: a failure is already a notice
+// above, and the turn's own notifications carry the rest. Task 8 adds the pickers'
+// methods beside these.
 func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 	if r.Err != nil {
 		m.note(levelError, r.Method+": "+r.Err.Error())
 		return nil
 	}
-	if r.Method == protocol.MethodRegistryList {
+	switch r.Method {
+	case protocol.MethodRegistryList:
 		var res protocol.RegistryListResult
-		if err := json.Unmarshal(r.Result, &res); err != nil {
-			m.note(levelError, r.Method+": "+err.Error())
+		if !m.result(r, &res) {
 			return nil
 		}
 		m.models = res.Models
 		// Not setModel: the refresh is the answer to a model-not-found, and a model the
 		// fresh registry still lacks must not ask for it again.
 		m.model = pickModel(res.Models, m.session.Model)
+	case protocol.MethodSessionSubmit:
+		var res protocol.SessionSubmitResult
+		if !m.result(r, &res) {
+			return nil
+		}
+		m.started(res.TurnID)
+	case protocol.MethodCommandRun:
+		var res protocol.CommandRunResult
+		if !m.result(r, &res) {
+			return nil
+		}
+		if res.Notice != "" {
+			m.note(levelInfo, res.Notice)
+		}
+		// A command that opened another session (a fork) answers with its id; switching
+		// to it is Task 8's, with the rest of the session actions.
+		m.started(res.TurnID)
 	}
 	return nil
+}
+
+// result decodes one call's answer, turning a shape this client cannot read into a notice
+// the way a malformed notification becomes one.
+func (m *Model) result(r CallResultMsg, v any) bool {
+	if err := json.Unmarshal(r.Result, v); err != nil {
+		m.note(levelError, r.Method+": "+err.Error())
+		return false
+	}
+	return true
 }
 
 // note appends a notice, oldest falling off past maxNotices.
@@ -391,12 +422,35 @@ func (m *Model) resize(w, h int) {
 	}
 }
 
-// key routes one key press: the key table's actions first, the editor last. An action
-// that does not apply falls through to the next one the key is bound to, which is what
-// lets ctrl+d exit on an empty editor and delete forward on a full one.
+// key routes one key press in the order the design gives it: a standing permission
+// question first, then a picker (Task 8), then the key table's actions, then the editor.
+// An action that does not apply falls through to the next one the key is bound to, which
+// is what lets ctrl+d exit on an empty editor and delete forward on a full one.
 func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
-	for _, a := range m.keys.Match(tea.Key(k)) {
+	if cmd, answered := m.answer(k); answered {
+		return cmd
+	}
+	actions := m.keys.Match(tea.Key(k))
+	if !slices.Contains(actions, keys.AppInterrupt) {
+		// The double press that cancels is two Esc presses in a row: anything else in
+		// between ends the pair, so a steer message typed and sent between them leaves
+		// the next Esc meaning steer again rather than cancel.
+		m.turn.lastEsc = time.Time{}
+	}
+	for _, a := range actions {
 		switch a {
+		case keys.AppInterrupt:
+			if cmd, handled := m.interrupt(); handled {
+				return cmd
+			}
+		case keys.TUIInputSubmit:
+			return m.submit()
+		case keys.AppMessageFollowUp:
+			m.ed.Enqueue()
+			return nil
+		case keys.AppMessageDequeue:
+			m.ed.Restore()
+			return nil
 		case keys.AppExit:
 			if m.ed.Empty() {
 				return tea.Quit
@@ -412,10 +466,9 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 			// The editor's own key map binds the same action, so the press falls through
 			// to it below rather than being handled twice.
 		default:
-			// Every other action belongs to a later step of this wave: app.interrupt,
-			// tui.input.submit and the queue in Task 7, the pickers and the model,
-			// thinking and session actions in Task 8. Until they land the key reaches the
-			// editor, which is what an unbound key does.
+			// Every other action belongs to Task 8: the pickers and the model, thinking
+			// and session actions. Until they land the key reaches the editor, which is
+			// what an unbound key does.
 		}
 	}
 	return m.ed.Update(k)

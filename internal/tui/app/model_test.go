@@ -3,12 +3,15 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +25,8 @@ import (
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tool"
+	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
@@ -302,8 +307,8 @@ func TestStreamDeltaFeedsTheLiveRowAndTurnStateMirrors(t *testing.T) {
 	h := newHarness(t, nil)
 	turn := session.NewID().String()
 	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: h.m.session.SessionID, TurnID: turn, State: "streaming"})
-	if h.m.turnState != "streaming" || h.m.turnID != turn {
-		t.Fatalf("turn %q %q", h.m.turnState, h.m.turnID)
+	if h.m.turn.state != stateStreaming || h.m.turn.turnID != turn {
+		t.Fatalf("turn %q %q", h.m.turn.state, h.m.turn.turnID)
 	}
 	for _, text := range []string{"Looking ", "at the test."} {
 		h.notify(protocol.NotifyStreamDelta, protocol.StreamDelta{
@@ -524,7 +529,7 @@ func TestDisconnectedNoticesAndRefusesInput(t *testing.T) {
 		t.Errorf("no notice in %q", h.view())
 	}
 	// Editing still works: a draft that cannot be sent is still a draft to read back and
-	// copy out. What refuses is submitting, which Task 7 owns.
+	// copy out. What refuses is submitting (see turn_test.go).
 	h.typeText("nope")
 	if h.m.ed.Text() != "nope" {
 		t.Errorf("editing must keep working while disconnected: %q", h.m.ed.Text())
@@ -691,42 +696,145 @@ func TestModelAndModeChangesMoveTheStatusLine(t *testing.T) {
 // The rest of the file is the same model over a real server, so the protocol the app
 // speaks is the one the server answers rather than a test's idea of it.
 
-type fakeProvider struct{ text string }
+// scripted is what the fake provider streams: one step per completion the server asks
+// for, cycling once the steps run out so a turn that steers and resumes, and a second
+// turn after this one, get the same script again.
+type scripted []step
 
-func (fakeProvider) Name() string { return "fake" }
+// step emits one completion. id is unique per completion, for the tool_use a step calls.
+type step func(ctx context.Context, id string, emit func(provider.Part) error) error
+
+// text is a step that answers with one text block.
+func text(s string) step {
+	return func(_ context.Context, _ string, emit func(provider.Part) error) error {
+		if err := emit(provider.Part{Type: provider.PartTextDelta, Text: s}); err != nil {
+			return err
+		}
+		return stop(emit, session.StopEndTurn)
+	}
+}
+
+// slowText is a step that streams one delta and then holds the turn open for d, or until
+// the turn is interrupted, whichever comes first. It is what lets a test press a key
+// while a turn is genuinely running.
+func slowText(s string, d time.Duration) step {
+	return func(ctx context.Context, _ string, emit func(provider.Part) error) error {
+		if err := emit(provider.Part{Type: provider.PartTextDelta, Text: s}); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+		return stop(emit, session.StopEndTurn)
+	}
+}
+
+// toolCall is a step that calls one tool with input verbatim.
+func toolCall(name, input string) step {
+	return func(_ context.Context, id string, emit func(provider.Part) error) error {
+		for _, part := range []provider.Part{
+			{Type: provider.PartToolUseStart, ID: id, Name: name},
+			{Type: provider.PartToolUseDelta, ID: id, Text: input},
+			{Type: provider.PartToolUseEnd, ID: id},
+		} {
+			if err := emit(part); err != nil {
+				return err
+			}
+		}
+		return stop(emit, session.StopToolUse)
+	}
+}
+
+// stop ends a step with the usage and stop reason every completion carries.
+func stop(emit func(provider.Part) error, reason session.StopReason) error {
+	if err := emit(provider.Part{Type: provider.PartUsage, Usage: session.Usage{Input: 10, Output: 2}}); err != nil {
+		return err
+	}
+	return emit(provider.Part{Type: provider.PartStop, StopReason: reason, StopReasonRaw: string(reason)})
+}
+
+// fakeProvider runs a script. The server calls Complete from the turn goroutine, so the
+// step counter is guarded: two turns in one test share this provider.
+type fakeProvider struct {
+	mu     sync.Mutex
+	script scripted
+	calls  int
+}
+
+func (*fakeProvider) Name() string { return "fake" }
 
 // ListModels carries a second model the client's own snapshot does not, so a change to it
 // is the model-not-found the registry refresh answers.
-func (fakeProvider) ListModels(context.Context) ([]provider.Model, error) {
+func (*fakeProvider) ListModels(context.Context) ([]provider.Model, error) {
 	return append(testModels(), provider.Model{
 		Ref: testRef2, DisplayName: "Fake 2", ContextWindow: 200000,
 	}), nil
 }
 
-func (p fakeProvider) Complete(_ context.Context, _ provider.Request, emit func(provider.Part) error) error {
-	for _, part := range []provider.Part{
-		{Type: provider.PartTextDelta, Text: p.text},
-		{Type: provider.PartUsage, Usage: session.Usage{Input: 10, Output: 2}},
-		{Type: provider.PartStop, StopReason: session.StopEndTurn, StopReasonRaw: "stop"},
-	} {
-		if err := emit(part); err != nil {
-			return err
-		}
-	}
-	return nil
+func (p *fakeProvider) Complete(ctx context.Context, _ provider.Request, emit func(provider.Part) error) error {
+	p.mu.Lock()
+	n := p.calls
+	p.calls++
+	s := p.script[n%len(p.script)]
+	p.mu.Unlock()
+	return s(ctx, fmt.Sprintf("call%d", n+1), emit)
 }
 
-type fakePlugin struct{ text string }
+// fakePlugin registers everything a turn in these tests can reach: the scripted provider,
+// one unsafe tool and one safe one (so a test chooses whether the gate asks), and two
+// commands, one that answers with a notice and one that submits a prompt.
+type fakePlugin struct{ provider *fakeProvider }
 
 func (fakePlugin) Name() string { return "fake" }
 
 func (f fakePlugin) Init(_ context.Context, h plugin.Host) error {
-	return h.RegisterProvider(fakeProvider(f))
+	if err := h.RegisterProvider(f.provider); err != nil {
+		return err
+	}
+	if err := h.RegisterTool(fakeTool("bash", tool.Unsafe)); err != nil {
+		return err
+	}
+	if err := h.RegisterTool(fakeTool("read", tool.Safe)); err != nil {
+		return err
+	}
+	if err := h.RegisterCommand(plugin.Command{
+		Name: "notice", Description: "answer with a notice",
+		Run: func(_ context.Context, call plugin.CommandCall) (plugin.Action, error) {
+			return plugin.Notice{Text: "noticed: " + call.Args}, nil
+		},
+	}); err != nil {
+		return err
+	}
+	return h.RegisterCommand(plugin.Command{
+		Name: "ask", Description: "submit a prompt",
+		Run: func(_ context.Context, call plugin.CommandCall) (plugin.Action, error) {
+			return plugin.SubmitPrompt{Text: call.Args}, nil
+		},
+	})
+}
+
+// fakeTool answers with what it was asked to do, so a committed tool row has a preview to
+// show and a test can see that the tool actually ran.
+func fakeTool(name string, safety tool.Safety) tool.Tool {
+	return tool.Tool{
+		Name: name, Description: name, Safety: safety,
+		Schema: json.RawMessage(`{"type":"object"}`),
+		Invoke: func(_ context.Context, call tool.Call) (tool.Result, error) {
+			var in struct {
+				Command string `json:"command"`
+				Path    string `json:"path"`
+			}
+			_ = json.Unmarshal(call.Input, &in)
+			return tool.Result{Content: []session.Block{session.TextBlock("ran " + in.Command + in.Path)}}, nil
+		},
+	}
 }
 
 // newServerHarness wires a server the way internal/cli does, dials it as an asking client
 // and opens a session on a temp workspace.
-func newServerHarness(t *testing.T, text string) (*protocol.Client, protocol.SessionInfo) {
+func newServerHarness(t *testing.T, script scripted) (*protocol.Client, protocol.SessionInfo) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -750,7 +858,7 @@ func newServerHarness(t *testing.T, text string) (*protocol.Client, protocol.Ses
 	services := srv.PluginServices()
 	services.ProvidersChanged = func(ps []provider.Provider) { reg.SetProviders(ps...) }
 	preg.SetServices(services)
-	preg.Load(ctx, fakePlugin{text: text})
+	preg.Load(ctx, fakePlugin{provider: &fakeProvider{script: script}})
 	reg.SetProviders(preg.Providers()...)
 	if err := reg.Refresh(ctx); err != nil {
 		t.Fatal(err)
@@ -775,8 +883,231 @@ func newServerHarness(t *testing.T, text string) (*protocol.Client, protocol.Ses
 	return cl, info
 }
 
+// appHarness is the model driven the way the program drives it: every command Update
+// returns is run, in a goroutine of its own, and every message that comes back is fed to
+// Update. The notification pump is one of those commands, so notifications arrive in
+// order and one at a time, exactly as they do in a run, and a test waits on what the
+// server actually said rather than on a sleep.
+type appHarness struct {
+	t *testing.T
+	m *Model
+	// msgs is the program's message queue: every command's result lands here and the
+	// test goroutine is the only thing that takes them out and folds them in.
+	msgs chan tea.Msg
+	// prints is what tea.Println was asked to write above the program, which in inline
+	// rendering is the committed transcript.
+	prints []string
+	// log is every entry the server announced, for a test that has to check what was
+	// recorded rather than what was drawn. The client never appends one.
+	log []session.Entry
+	// rested counts the turns that reached a resting state, by turn id.
+	rested map[string]bool
+}
+
+func newAppHarness(t *testing.T, script scripted) *appHarness {
+	t.Helper()
+	return newAppHarnessWith(t, script, nil)
+}
+
+// newAppHarnessWith is newAppHarness with a last word on the client's config, for the
+// tests that turn on altscreen or shorten the double-press window.
+func newAppHarnessWith(t *testing.T, script scripted, over func(*config.Config)) *appHarness {
+	t.Helper()
+	cl, info := newServerHarness(t, script)
+	cfg := testConfig(t, nil)
+	if over != nil {
+		over(cfg)
+	}
+	m := New(Options{
+		Config: cfg, Theme: theme.Default(), Keys: keys.Default(),
+		Client: cl, Session: info, Models: testModels(), Version: "test",
+		Cwd: info.Workspace.Root, Workspace: "rudy main",
+	})
+	h := &appHarness{
+		t: t, m: m,
+		msgs:   make(chan tea.Msg, 256),
+		rested: make(map[string]bool),
+	}
+	h.dispatch(tea.WindowSizeMsg{Width: 80, Height: 24})
+	// Init's other commands (the editor's cursor blink, a registry refresh) are not what
+	// this harness is about; the pump is, and it is what a program arms first.
+	h.exec(pump(cl))
+	return h
+}
+
+// exec runs one command off the update loop, the way the program does, and queues what it
+// returns. A batch fans out into one goroutine per command. A queue that has filled up
+// drops rather than parking a goroutine forever: nothing here produces 256 pending
+// messages, so a full queue means the test is already over.
+func (h *appHarness) exec(cmd tea.Cmd) {
+	if cmd == nil {
+		return
+	}
+	go func() {
+		msg := cmd()
+		if msg == nil {
+			return
+		}
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, c := range batch {
+				h.exec(c)
+			}
+			return
+		}
+		select {
+		case h.msgs <- msg:
+		default:
+		}
+	}()
+}
+
+// dispatch folds one message in and runs whatever it produced.
+func (h *appHarness) dispatch(msg tea.Msg) {
+	h.t.Helper()
+	h.record(msg)
+	next, cmd := h.m.Update(msg)
+	if next != h.m {
+		h.t.Fatalf("Update returned another model: %T", next)
+	}
+	h.exec(cmd)
+}
+
+// record keeps what a test asks about later: the lines tea.Println was given, the entries
+// the server announced and the turns that came to rest.
+//
+// printLineMessage is unexported in bubbletea, so it is recognized by type name and read
+// through reflect: reflect.Value.String is the one getter that does not refuse an
+// unexported field, which is enough to see what the program was asked to print.
+func (h *appHarness) record(msg tea.Msg) {
+	if strings.Contains(fmt.Sprintf("%T", msg), "printLine") {
+		v := reflect.ValueOf(msg)
+		for i := range v.NumField() {
+			if v.Field(i).Kind() == reflect.String {
+				h.prints = append(h.prints, v.Field(i).String())
+			}
+		}
+		return
+	}
+	n, ok := msg.(NotificationMsg)
+	if !ok {
+		return
+	}
+	switch n.Method {
+	case protocol.NotifyEntryAppended:
+		var p protocol.EntryAppended
+		if err := json.Unmarshal(n.Params, &p); err != nil {
+			h.t.Fatalf("entry.appended: %v", err)
+		}
+		h.log = append(h.log, p.Entry)
+	case protocol.NotifyTurnState:
+		var p protocol.TurnStateChanged
+		if err := json.Unmarshal(n.Params, &p); err != nil {
+			h.t.Fatalf("turn.state: %v", err)
+		}
+		switch p.State {
+		case stateCompleted, stateFailed, stateIdle:
+			h.rested[p.TurnID] = true
+		}
+	}
+}
+
+// settle folds in every message already waiting, without blocking on one that is not.
+func (h *appHarness) settle() {
+	h.t.Helper()
+	for {
+		select {
+		case msg := <-h.msgs:
+			h.dispatch(msg)
+		default:
+			return
+		}
+	}
+}
+
+// wait folds messages in until ok reports the state the test is waiting for, or fails
+// after testTimeout naming what never happened.
+func (h *appHarness) wait(what string, ok func() bool) {
+	h.t.Helper()
+	deadline := time.Now().Add(testTimeout)
+	for !ok() {
+		left := time.Until(deadline)
+		if left <= 0 {
+			h.t.Fatalf("waited %s for %s; turn %q %q\n%s", testTimeout, what, h.m.turn.state, h.m.turn.turnID, h.view())
+		}
+		timer := time.NewTimer(left)
+		select {
+		case msg := <-h.msgs:
+			timer.Stop()
+			h.dispatch(msg)
+		case <-timer.C:
+		}
+	}
+}
+
+// waitTurn waits for the mirrored turn state to be want, the server's own vocabulary.
+func (h *appHarness) waitTurn(want string) {
+	h.t.Helper()
+	h.wait("turn state "+want, func() bool { return h.m.turn.state == want })
+}
+
+// waitTurnCount waits until n turns have come to rest.
+func (h *appHarness) waitTurnCount(n int) {
+	h.t.Helper()
+	h.wait(fmt.Sprintf("%d rested turns", n), func() bool { return len(h.rested) >= n })
+}
+
+// waitPrinted waits until what has been committed to scrollback carries sub. A commit is
+// a command like any other: the turn resting is what starts it, and the print lands a
+// message later, so a test waits for the print rather than for the state that caused it.
+func (h *appHarness) waitPrinted(sub string) {
+	h.t.Helper()
+	h.wait("the print of "+strconv.Quote(sub), func() bool { return strings.Contains(h.printed(), sub) })
+}
+
+// waitFor waits until the view says what the test is looking for.
+func (h *appHarness) waitFor(what string, ok func(view string) bool) {
+	h.t.Helper()
+	h.wait(what, func() bool { return ok(h.view()) })
+}
+
+// press sends one key by the spelling the [keys] grammar uses and folds in whatever came
+// back at once.
+func (h *appHarness) press(spelling string) {
+	h.t.Helper()
+	k, err := keys.Parse(spelling)
+	if err != nil {
+		h.t.Fatalf("key %q: %v", spelling, err)
+	}
+	h.dispatch(tea.KeyPressMsg(k))
+	h.settle()
+}
+
+// typeText types s into the editor, leaving normal mode first the way a user would: a
+// test that steered a turn left the editor in normal, where letters are vim verbs.
+func (h *appHarness) typeText(s string) {
+	h.t.Helper()
+	if h.m.ed.Mode() == input.ModeNormal {
+		h.dispatch(tea.KeyPressMsg{Code: 'i', Text: "i"})
+	}
+	for _, r := range s {
+		h.dispatch(tea.KeyPressMsg{Code: r, Text: string(r)})
+	}
+	h.settle()
+}
+
+// view is the frame as drawn, styling stripped: what the user reads.
+func (h *appHarness) view() string { return ansi.Strip(h.m.View().Content) }
+
+// printed is everything committed to scrollback so far, styling stripped.
+func (h *appHarness) printed() string { return ansi.Strip(strings.Join(h.prints, "\n")) }
+
+func (h *appHarness) editor() *input.Editor { return h.m.ed }
+
+// entries are the log entries the server announced, in order.
+func (h *appHarness) entries() []session.Entry { return h.log }
+
 func TestModelChangeToAnUnknownModelRefreshesTheRegistry(t *testing.T) {
-	cl, info := newServerHarness(t, "ok")
+	cl, info := newServerHarness(t, scripted{text("ok")})
 	m := New(Options{
 		Config: testConfig(t, nil), Theme: theme.Default(), Keys: keys.Default(),
 		Client: cl, Session: info, Models: testModels(), Version: "test",
@@ -811,41 +1142,24 @@ func TestModelChangeToAnUnknownModelRefreshesTheRegistry(t *testing.T) {
 	}
 }
 
+// TestAgainstARealServerATurnBecomesRows is the whole path in altscreen, where a rested
+// turn's rows stay where they are: what the server said becomes rows and usage. Inline
+// commits the same rows to scrollback instead, which turn_test.go covers.
 func TestAgainstARealServerATurnBecomesRows(t *testing.T) {
-	cl, info := newServerHarness(t, "Looking at the test first.")
-	m := New(Options{
-		Config: testConfig(t, nil), Theme: theme.Default(), Keys: keys.Default(),
-		Client: cl, Session: info, Models: testModels(), Version: "test", Cwd: info.Workspace.Root,
-		Workspace: "rudy main",
+	h := newAppHarnessWith(t, scripted{text("Looking at the test first.")}, func(c *config.Config) {
+		c.UI.Render = renderAltscreen
 	})
-	if _, cmd := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24}); cmd != nil {
-		t.Fatal("a resize needs no command")
-	}
-	msg := runCmd(t, m.call(protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
-		SessionID: info.SessionID,
-		Content:   []session.Block{session.TextBlock("fix the flaky fork test")},
-		Source:    session.SourceTyped,
-	}))
-	res, ok := msg.(CallResultMsg)
-	if !ok || res.Err != nil {
-		t.Fatalf("submit %v %+v", ok, msg)
-	}
-	deadline := time.Now().Add(testTimeout)
-	for m.turnState != "completed" {
-		if time.Now().After(deadline) {
-			t.Fatalf("turn stuck in %q after\n%s", m.turnState, m.View().Content)
-		}
-		n, ok := runCmd(t, pump(cl)).(NotificationMsg)
-		if !ok {
-			t.Fatal("the pump stopped early")
-		}
-		m.Update(n)
-	}
-	v := ansi.Strip(m.View().Content)
+	h.typeText("fix the flaky fork test")
+	h.press("enter")
+	h.waitTurn(stateCompleted)
+	v := h.view()
 	if !strings.Contains(v, "fix the flaky fork test") || !strings.Contains(v, "Looking at the test first.") {
 		t.Fatalf("view %q", v)
 	}
-	if m.usage != (session.Usage{Input: 10, Output: 2}) {
-		t.Errorf("usage %+v", m.usage)
+	if got := h.printed(); got != "" {
+		t.Errorf("altscreen prints nothing to scrollback, printed %q", got)
+	}
+	if h.m.usage != (session.Usage{Input: 10, Output: 2}) {
+		t.Errorf("usage %+v", h.m.usage)
 	}
 }

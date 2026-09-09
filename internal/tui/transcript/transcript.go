@@ -78,9 +78,17 @@ func (t *Transcript) Toggle(key string) bool {
 func (t *Transcript) Apply(e session.Entry) []string {
 	switch p := e.Payload.(type) {
 	case session.UserMessage:
-		t.turn, t.liveTurn = e.ID.String(), ""
+		// A steer message continues the turn it was sent into rather than opening one:
+		// the server keeps a steered turn under the id of the user_message that started
+		// it, so this row and everything appended after it commit with that turn. A
+		// steer arriving with no turn in hand (a log replayed from the middle of one)
+		// starts one, since there is nothing else to hang it on.
+		if p.Source != session.SourceSteer || t.turn == "" {
+			t.turn = e.ID.String()
+		}
+		t.liveTurn = ""
 		return t.addOnce(&Row{
-			Key: e.ID.String(), Kind: RowUser, TurnID: e.ID.String(),
+			Key: e.ID.String(), Kind: RowUser, TurnID: t.turn,
 			Entry: e, Text: session.TextOf(p.Content),
 		})
 	case session.AssistantMessage:
