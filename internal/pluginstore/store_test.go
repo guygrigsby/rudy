@@ -425,3 +425,151 @@ func TestDisabledFromLockKeepsItsBehavior(t *testing.T) {
 		t.Fatal("DisabledFromLock on a corrupt lock: want an error")
 	}
 }
+
+// TestInstallRefusesAPathTraversingManifestName covers fix round 1 finding 1: a manifest
+// naming itself with "../" must never let Install rename a checkout outside Root/plugins.
+// plugin.ReadManifest is what actually refuses the name; this confirms Install surfaces
+// that refusal cleanly, with no stage left behind and nothing landed outside the tree the
+// traversal pointed at.
+func TestInstallRefusesAPathTraversingManifestName(t *testing.T) {
+	dir := t.TempDir()
+	body := "name = \"../../somewhere/evil\"\nversion = \"0.1.0\"\nprotocol_version = 1\ncommand = \"hello\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "plugin.toml"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	s := New(root)
+
+	_, _, err := s.Install(context.Background(), dir, time.Now())
+	if err == nil {
+		t.Fatal("Install with a path-traversing manifest name: want an error")
+	}
+	ents, rerr := os.ReadDir(filepath.Join(root, "plugins"))
+	if rerr == nil && len(ents) != 0 {
+		t.Fatalf("plugins dir = %v, want no leftover stage or checkout", ents)
+	}
+	// The directory the traversal named, two levels above Root/plugins, must not exist.
+	outside := filepath.Join(root, "plugins", "..", "..", "somewhere")
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("stat %s = %v, want not exist", outside, err)
+	}
+	locked, err := s.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locked) != 0 {
+		t.Fatalf("lock = %+v, want no entry recorded", locked)
+	}
+}
+
+// TestInstallRecordsARelativePathSourceAsAbsolute covers fix round 1 finding 2: Update reads
+// Installed.Source back later, possibly from a different working directory, so a relative
+// local path source must be resolved to absolute before it is written to the lock.
+func TestInstallRecordsARelativePathSourceAsAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "plugin.toml"), []byte(helloManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(dir)
+	base := filepath.Base(dir)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(parent); err != nil {
+		t.Fatal(err)
+	}
+
+	// The expected value is computed the same way Install resolves it (filepath.Abs of the
+	// same relative string, from the same cwd) rather than independently from dir: macOS
+	// resolves symlinks (/tmp, /var/folders/...) into os.Getwd() after a Chdir, so a value
+	// computed from dir before the Chdir is not always byte-identical to one computed after
+	// it, even though both name the same directory.
+	wantAbs, err := filepath.Abs("./" + base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	s := New(root)
+	inst, _, err := s.Install(context.Background(), "./"+base, time.Now())
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if !filepath.IsAbs(inst.Source) || inst.Source != wantAbs {
+		t.Fatalf("Source = %q, want the absolute path %q", inst.Source, wantAbs)
+	}
+	locked, err := s.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locked["hello"].Source != wantAbs {
+		t.Fatalf("lock Source = %q, want %q", locked["hello"].Source, wantAbs)
+	}
+
+	// A second commit's worth of change to the source, then Update from a cwd that has
+	// nothing to do with the relative path Install saw: it must still find the source,
+	// because the lock holds an absolute path now.
+	if err := os.WriteFile(filepath.Join(dir, "plugin.toml"), []byte(helloManifest+"# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.Update(context.Background(), "hello", time.Now())
+	if err != nil {
+		t.Fatalf("Update from a different cwd: %v", err)
+	}
+	if updated.Commit != "" {
+		t.Fatalf("Commit = %q, want empty for a path source", updated.Commit)
+	}
+	b, err := os.ReadFile(filepath.Join(root, "plugins", "hello", "plugin.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "# v2") {
+		t.Fatal("Update from a different cwd did not re-copy the source")
+	}
+}
+
+// TestNewSweepsStaleInstallAndUpdateStages covers fix round 1 finding 3: a stage a crashed
+// process never cleaned up must not accumulate forever.
+func TestNewSweepsStaleInstallAndUpdateStages(t *testing.T) {
+	root := t.TempDir()
+	pluginsDir := filepath.Join(root, "plugins")
+	stale1 := filepath.Join(pluginsDir, ".install-abc123")
+	stale2 := filepath.Join(pluginsDir, ".update-xyz789")
+	kept := filepath.Join(pluginsDir, "hello")
+	for _, d := range []string{stale1, stale2, kept} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	New(root)
+
+	if _, err := os.Stat(stale1); !os.IsNotExist(err) {
+		t.Fatalf(".install- stage stat = %v, want swept", err)
+	}
+	if _, err := os.Stat(stale2); !os.IsNotExist(err) {
+		t.Fatalf(".update- stage stat = %v, want swept", err)
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Fatalf("real checkout was swept: %v", err)
+	}
+}
+
+// TestNewToleratesAMissingPluginsDirectory covers the common case the sweep must not
+// disturb: a fresh XDG data root with nothing installed yet.
+func TestNewToleratesAMissingPluginsDirectory(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	if s.Root != root {
+		t.Fatalf("Root = %q, want %q", s.Root, root)
+	}
+	if _, err := os.Stat(filepath.Join(root, "plugins")); !os.IsNotExist(err) {
+		t.Fatalf("plugins dir stat = %v, want still not exist", err)
+	}
+}

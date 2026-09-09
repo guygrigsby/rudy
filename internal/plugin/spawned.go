@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -39,8 +40,21 @@ type Manifest struct {
 // ManifestFile is the name every plugin directory carries.
 const ManifestFile = "plugin.toml"
 
+// manifestNameRe is the whole character set a manifest name may use: no ".", "/" or
+// whitespace, so a name can never carry a path segment. rudy plugin install turns a
+// manifest's name straight into a directory name (Root/plugins/<name>), so this is not
+// merely cosmetic: a name that fails this cannot walk the checkout outside Root/plugins.
+var manifestNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
 // ReadManifest reads dir/plugin.toml. A manifest with no name or no command is refused: both
-// are what the server needs before it can run anything.
+// are what the server needs before it can run anything. The name is further refused unless
+// it matches manifestNameRe and equals its own filepath.Base: the second condition is
+// implied by the first (the regexp already excludes "/" and "."), but it is cheap and it
+// says directly what the check is for, which is what a future edit to the regexp would
+// otherwise have to rediscover by reasoning about it. Both rudy's own Discover, which also
+// checks the name against the directory it was found in, and rudy plugin Install, whose
+// stage directory's name is a random temp name and never checked against the manifest,
+// share this one validation.
 func ReadManifest(dir string) (Manifest, error) {
 	path := filepath.Join(dir, ManifestFile)
 	b, err := os.ReadFile(path)
@@ -53,6 +67,9 @@ func ReadManifest(dir string) (Manifest, error) {
 	}
 	if m.Name == "" {
 		return Manifest{}, fmt.Errorf("plugin: %s: name is empty", path)
+	}
+	if !manifestNameRe.MatchString(m.Name) || m.Name != filepath.Base(m.Name) {
+		return Manifest{}, fmt.Errorf("plugin: %s: name %q must match %s", path, m.Name, manifestNameRe.String())
 	}
 	if m.Command == "" {
 		return Manifest{}, fmt.Errorf("plugin: %s: command is empty", path)

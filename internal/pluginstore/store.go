@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -41,12 +42,38 @@ type lockFile struct {
 // at Root/plugins/<name>, the lock at Root/plugins.lock.toml.
 type Store struct{ Root string }
 
-// New is a Store over root, normally $XDG_DATA_HOME/rudy.
-func New(root string) *Store { return &Store{Root: root} }
+// New is a Store over root, normally $XDG_DATA_HOME/rudy. Any install or update stage a
+// prior process crashed before cleaning up (Root/plugins/.install-* or .update-*) is swept
+// immediately: a stage is scratch space claimed nowhere else, so leaving it once found would
+// only let it accumulate forever.
+func New(root string) *Store {
+	s := &Store{Root: root}
+	s.sweepStages()
+	return s
+}
 
 func (s *Store) lockPath() string               { return filepath.Join(s.Root, LockFile) }
 func (s *Store) pluginsDir() string             { return filepath.Join(s.Root, "plugins") }
 func (s *Store) checkoutDir(name string) string { return filepath.Join(s.pluginsDir(), name) }
+
+// sweepStages removes every leftover .install-* and .update-* directory under
+// Root/plugins. A missing plugins directory means nothing has ever been installed, not
+// something to sweep; any other read failure is left for the next real operation to report,
+// since sweeping is best-effort clean-up, not the thing New's caller is asking for.
+func (s *Store) sweepStages() {
+	ents, err := os.ReadDir(s.pluginsDir())
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), ".install-") || strings.HasPrefix(e.Name(), ".update-") {
+			_ = os.RemoveAll(filepath.Join(s.pluginsDir(), e.Name()))
+		}
+	}
+}
 
 // Read is every entry the lock holds, keyed by name with Name filled in. A missing lock is
 // empty, not an error: nothing has been installed yet.
@@ -157,6 +184,10 @@ func notInstalled(name string) error { return fmt.Errorf("no plugin named %s", n
 // the stage's random one. Every error path removes the stage: a failed install leaves no
 // checkout and no lock entry behind.
 func (s *Store) Install(ctx context.Context, source string, now time.Time) (Installed, plugin.Manifest, error) {
+	recorded, err := resolveSource(source)
+	if err != nil {
+		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
+	}
 	if err := os.MkdirAll(s.pluginsDir(), 0o700); err != nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
 	}
@@ -171,13 +202,13 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 		}
 	}()
 
-	isClone, err := stageSource(ctx, source, stage)
+	isClone, err := stageSource(ctx, recorded, stage)
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, err
 	}
 	m, err := plugin.ReadManifest(stage)
 	if err != nil {
-		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %s: %w", source, err)
+		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %s: %w", recorded, err)
 	}
 
 	locked, err := s.Read()
@@ -188,6 +219,13 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("%s is already installed", m.Name)
 	}
 	dest := s.checkoutDir(m.Name)
+	// Defense in depth: plugin.ReadManifest already refuses a name that could steer dest
+	// outside pluginsDir(), so this can only trip if that validation is ever weakened or
+	// bypassed. Better an install refused here than a rename that lands outside the plugins
+	// directory Uninstall later os.RemoveAll's by name.
+	if filepath.Dir(filepath.Clean(dest)) != filepath.Clean(s.pluginsDir()) {
+		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: refusing to install %q outside %s", m.Name, s.pluginsDir())
+	}
 	if _, err := os.Stat(dest); err == nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("%s is already installed", m.Name)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -206,7 +244,7 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 	keep = true
 	m.Dir = dest
 
-	inst := Installed{Name: m.Name, Source: source, Commit: commit, InstalledAt: now, Enabled: true}
+	inst := Installed{Name: m.Name, Source: recorded, Commit: commit, InstalledAt: now, Enabled: true}
 	locked[m.Name] = inst
 	if err := s.Write(locked); err != nil {
 		// The checkout landed but the lock did not record it: leaving it behind would be a
@@ -312,6 +350,31 @@ func (s *Store) recopy(source, dir string) error {
 	}
 	keep = true
 	return nil
+}
+
+// sourceSchemeRe matches an explicit URL scheme (https://, git://, ssh://, file://, ...);
+// sourceSCPRe matches the scp-like shorthand git itself accepts (user@host:path, with no
+// scheme). Either means source names a remote endpoint, not a filesystem path.
+var (
+	sourceSchemeRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)
+	sourceSCPRe    = regexp.MustCompile(`^[^@/\s]+@[^:/\s]+:`)
+)
+
+// isRemoteSource reports whether source names a remote git endpoint rather than a
+// filesystem path.
+func isRemoteSource(source string) bool {
+	return sourceSchemeRe.MatchString(source) || sourceSCPRe.MatchString(source)
+}
+
+// resolveSource is what Install records as Installed.Source. A remote endpoint is recorded
+// verbatim: there is no filesystem path in it to resolve. Anything else is a local path, and
+// is made absolute before it is written to the lock, since a relative path is read back by
+// Update, which has no reason to run from the same working directory Install did.
+func resolveSource(source string) (string, error) {
+	if isRemoteSource(source) {
+		return source, nil
+	}
+	return filepath.Abs(source)
 }
 
 // stageSource fills stage (already created, empty) with source's contents: a directory with
