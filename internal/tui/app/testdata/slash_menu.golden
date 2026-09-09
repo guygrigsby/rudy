@@ -1,0 +1,30 @@
+ [38;2;122;162;247m› fix the flaky fork test[m                                                                          
+                                                                                                    
+   [38;2;192;202;245mLooking at the test[m[38;2;192;202;245m first.[m                                                                       
+                                                                                                    
+ [38;2;86;95;137m▸ bash  go test ./internal/session -run TestFork -count=3[m                                          
+     [38;2;247;118;142m--- FAIL: TestFork (0.01s)[m                                                                     
+     [38;2;247;118;142mfork_test.go:41: want 3 entries, got 2[m                                                         
+ [38;2;86;95;137m▸ edit  internal/session/fork.go[m                                                                   
+     [38;2;247;118;142m-    entries := s.entries[:at][m                                                                 
+     [38;2;158;206;106m+    entries := s.entries[:at+1][m                                                               
+                                                                                                    
+   [38;2;192;202;245mOff by one in the slice bound. Fixed and[m[38;2;192;202;245m green.[m                                                  
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+
+[38;2;122;162;247m> /model  Switch this session's model: /model <provider:id or unique id>[m
+[38;2;86;95;137m  /help  List the slash commands[m
+[38;2;86;95;137m  /fork  Fork this session at an entry: /fork [entry id], default the newest[m
+[38;2;86;95;137m  /plugins  List loaded plugins and their state[m
+[38;2;86;95;137m  /exit  Close the client; a session on a running rudy serve keeps its place[m
+[38;2;86;95;137m  /quit  Close the client, the same as /exit[m
+[38;2;192;202;245m[38;2;122;162;247m ┃ [m[m[38;2;192;202;245m/[m[38;2;192;202;245m[7;38;2;122;162;247m [m[m[38;2;192;202;245m[m[38;2;192;202;245m                                                                                               [m
+ [38;2;122;162;247mINSERT[m  [38;2;86;95;137mfake:m1[m  [38;2;86;95;137mstrict[m  [38;2;86;95;137m42%[m  [38;2;86;95;137m$0.08[m  [38;2;86;95;137mrudy main*[m

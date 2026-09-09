@@ -1,7 +1,6 @@
 package app
 
 import (
-	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -149,6 +148,11 @@ func (m *Model) sendQueued() tea.Cmd {
 // when the turn rested.
 func (m *Model) sendTyped(text string) tea.Cmd {
 	if name, args, ok := commandIn(text); ok {
+		if localCommand(name) {
+			// The client's own, never the server's: quitting ends this program and leaves
+			// a daemon and its session alone (ADR 0015 decision 3).
+			return tea.Quit
+		}
 		return m.callNamed(protocol.MethodCommandRun, name, protocol.CommandRunParams{
 			SessionID: m.session.SessionID,
 			Name:      name,
@@ -156,68 +160,6 @@ func (m *Model) sendTyped(text string) tea.Cmd {
 		})
 	}
 	return m.submitText(text, session.SourceTyped)
-}
-
-// helpCommand is the command whose notice lists the others.
-const helpCommand = "help"
-
-// complete finishes the command name a draft opens with, and reports whether it did. The
-// protocol gives a client no list of commands (there is no command.list, and command.run
-// takes a name rather than answering with one), so /help's notice is the discovery
-// surface: what it named last is what completes here, and a client that has never run it
-// completes nothing. A draft that is not a lone slash word is not a command name yet and
-// is left to the editor.
-func (m *Model) complete() bool {
-	name, args, ok := commandIn(m.ed.Text())
-	if !ok || args != "" || strings.ContainsFunc(m.ed.Text(), unicode.IsSpace) {
-		return false
-	}
-	var match []string
-	for _, c := range m.commands {
-		if strings.HasPrefix(c, name) {
-			match = append(match, c)
-		}
-	}
-	// The longest prefix every candidate shares: one candidate completes the whole name,
-	// several complete as far as they agree, which is what a shell does and what lets a
-	// second tab, after another letter, get further.
-	grown := commonPrefix(match)
-	if len(grown) <= len(name) {
-		return false
-	}
-	m.ed.SetText("/" + grown)
-	return true
-}
-
-// commonPrefix is the longest prefix all of ss share, "" for none.
-func commonPrefix(ss []string) string {
-	if len(ss) == 0 {
-		return ""
-	}
-	out := ss[0]
-	for _, s := range ss[1:] {
-		for !strings.HasPrefix(s, out) {
-			out = out[:len(out)-1]
-		}
-	}
-	return out
-}
-
-// helpCommands are the names a /help notice listed: every line it draws opens with the
-// command's own "/name". A line that does not is not a command and is skipped, so a
-// notice that grows a header or a footer costs nothing.
-func helpCommands(notice string) []string {
-	var out []string
-	for _, line := range strings.Split(notice, "\n") {
-		f := strings.Fields(line)
-		if len(f) == 0 || !strings.HasPrefix(f[0], "/") {
-			continue
-		}
-		if name := strings.TrimPrefix(f[0], "/"); name != "" && !slices.Contains(out, name) {
-			out = append(out, name)
-		}
-	}
-	return out
 }
 
 // lateRows commits a row that arrived after its turn had already gone to scrollback: a

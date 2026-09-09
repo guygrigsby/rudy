@@ -83,9 +83,11 @@ longer be expanded.
    for that draft. No new action ids: the closed set of ADR 0013
    decision 5 stands.
 
-   Enter completes rather than submits while the menu is up, so the
-   command a user is choosing is never run half-typed. A second Enter
-   submits it, which is what a completed name and no menu means.
+   Enter completes a name that is still a prefix, so a command is never
+   run half-typed, and submits one already whole, so a command typed out
+   in full still runs on one press. A completion leaves the name and the
+   space an argument goes after, which is also what closes the menu: a
+   draft past the name is no longer a name.
 
 ## Consequences
 

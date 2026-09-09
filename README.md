@@ -65,8 +65,8 @@ asks where its row will be: `y` allows once, `a` for the session, `n` and Esc
 deny.
 
 Typing `/` lists the commands above the editor with what each does, filtered as
-you type. The arrows move the selection, tab or Enter completes the name, Esc
-dismisses it.
+you type. The arrows move the selection, tab completes the name, Esc dismisses
+the list. Enter completes a half-typed name and runs a whole one.
 
 Every render choice is a config field under `[ui]` with a default, listed in
 `docs/specs/rudy-contracts.md`; `ui.render = "inline"` swaps the full screen for

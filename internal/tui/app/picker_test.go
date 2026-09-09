@@ -335,29 +335,88 @@ func TestSlashForkSwitchesToTheForkOnce(t *testing.T) {
 	}
 }
 
-func TestTabCompletesFromTheHelpNotice(t *testing.T) {
-	h := newAppHarness(t, scripted{text("done")})
-	h.typeText("/pl")
+// TestASlashDraftListsTheCommands is the menu ADR 0015 decision 4 describes: what
+// command.list answered, filtered as the draft grows, with what each command does beside
+// it. The editor keeps the keyboard the whole time, which is what lets the draft go on
+// being typed under the list.
+func TestASlashDraftListsTheCommands(t *testing.T) {
+	h := newAppHarnessWith(t, scripted{text("done")}, altscreen)
+	h.wait("the command list", func() bool { return commandNamed(h.m.commands, "plugins") })
+	h.typeText("/")
+	view := ansi.Strip(h.view())
+	for _, want := range []string{"/plugins", "List loaded plugins and their state", "/exit"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("a slash draft lists %q:\n%s", want, view)
+		}
+	}
+	if got := h.editor().Text(); got != "/" {
+		t.Errorf("the menu is a completion, not a picker: the draft is still being typed, editor holds %q", got)
+	}
+	h.typeText("pl")
+	view = ansi.Strip(h.view())
+	if !strings.Contains(view, "/plugins") || strings.Contains(view, "/fork") {
+		t.Errorf("the list filters to what the draft matches:\n%s", view)
+	}
+	// A draft past the name is an argument, which has no completion source.
+	h.typeText("ugins x")
+	if strings.Contains(ansi.Strip(h.view()), "List loaded plugins") {
+		t.Errorf("an argument closes the menu:\n%s", ansi.Strip(h.view()))
+	}
+}
+
+// TestTheMenuCompletesAndSubmits pins the three keys a menu takes and the one it does not:
+// tab and Enter complete a name that is still a prefix, the arrows move the selection, and
+// Enter on a name already complete is the submit it always was, so a command typed out in
+// full still runs on one press.
+func TestTheMenuCompletesAndSubmits(t *testing.T) {
+	h := newAppHarnessWith(t, scripted{text("done")}, altscreen)
+	h.wait("the command list", func() bool { return commandNamed(h.m.commands, "notice") })
+	// /notice and /note both match, listed in the order they were registered.
+	h.typeText("/not")
 	h.press("tab")
-	if got := h.editor().Text(); got != "/pl" {
-		t.Fatalf("with no /help notice yet there is nothing to complete from, editor holds %q", got)
+	if got := h.editor().Text(); got != "/notice " {
+		t.Fatalf("tab completes the selected row and the space an argument goes after, editor holds %q", got)
 	}
 	h.editor().Clear()
-	h.typeText("/help")
+	h.typeText("/not")
+	h.press("down")
 	h.press("enter")
-	h.wait("the command list", func() bool { return slices.Contains(h.m.commands, "plugins") })
-	h.typeText("/pl")
-	h.press("tab")
-	if got := h.editor().Text(); got != "/plugins" {
-		t.Errorf("one candidate completes the name, editor holds %q", got)
+	if got := h.editor().Text(); got != "/note " {
+		t.Fatalf("the arrows move the selection Enter completes, editor holds %q", got)
 	}
 	h.editor().Clear()
-	// Several candidates complete only as far as they agree: /note and /notice.
-	h.typeText("/no")
-	h.press("tab")
-	if got := h.editor().Text(); got != "/not" {
-		t.Errorf("several candidates complete to what they share, editor holds %q", got)
+	h.typeText("/notice hello there")
+	h.press("enter")
+	h.wait("the notice the command answered with", func() bool {
+		return strings.Contains(ansi.Strip(h.view()), "noticed: hello there")
+	})
+}
+
+// TestEscDismissesTheMenuForThatDraftOnly: the menu is dismissed, not turned off. Another
+// letter is another draft, and the list belongs to the draft.
+func TestEscDismissesTheMenuForThatDraftOnly(t *testing.T) {
+	h := newAppHarnessWith(t, scripted{text("done")}, altscreen)
+	h.wait("the command list", func() bool { return commandNamed(h.m.commands, "plugins") })
+	h.typeText("/pl")
+	if !strings.Contains(ansi.Strip(h.view()), "/plugins") {
+		t.Fatalf("the menu stands:\n%s", ansi.Strip(h.view()))
 	}
+	h.press("escape")
+	if strings.Contains(ansi.Strip(h.view()), "List loaded plugins") {
+		t.Errorf("escape dismisses the menu:\n%s", ansi.Strip(h.view()))
+	}
+	if got := h.editor().Text(); got != "/pl" {
+		t.Errorf("a dismissal leaves the draft alone, editor holds %q", got)
+	}
+	h.typeText("u")
+	if !strings.Contains(ansi.Strip(h.view()), "List loaded plugins") {
+		t.Errorf("another letter is another draft, and the menu belongs to the draft:\n%s", ansi.Strip(h.view()))
+	}
+}
+
+// commandNamed reports whether the client has been told about a command by this name.
+func commandNamed(cmds []protocol.CommandInfo, name string) bool {
+	return slices.ContainsFunc(cmds, func(c protocol.CommandInfo) bool { return c.Name == name })
 }
 
 // TestASwitchHoldsTheReplayUntilItsAnswer pins the order the contract gives a switch: the

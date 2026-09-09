@@ -510,8 +510,7 @@ func TestNoticesFromTheServerAndFromAFailedPlugin(t *testing.T) {
 // TestACommandsNoticeIsDrawnOnce pins the one copy. The server sends a command's notice
 // to every attached client as a notice notification and answers command.run with the same
 // string, so a client that drew both put every command's notice on screen twice, which is
-// what /model did on the real path. The answer is still read, for the command names /help
-// carries in its own.
+// what /model did on the real path.
 func TestACommandsNoticeIsDrawnOnce(t *testing.T) {
 	h := newHarness(t, nil)
 	const notice = "/help  List the slash commands\n/plugins  List loaded plugins and their state"
@@ -520,12 +519,9 @@ func TestACommandsNoticeIsDrawnOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runAll(t, h.update(CallResultMsg{Method: protocol.MethodCommandRun, Name: helpCommand, Result: res}))
+	runAll(t, h.update(CallResultMsg{Method: protocol.MethodCommandRun, Name: "help", Result: res}))
 	if len(h.m.notices) != 1 {
 		t.Errorf("the notification drew the notice, the answer must not draw it again: %+v", h.m.notices)
-	}
-	if !slices.Contains(h.m.commands, "plugins") {
-		t.Errorf("the answer is still read for the command names: %v", h.m.commands)
 	}
 }
 
@@ -1031,8 +1027,11 @@ func newAppHarnessWith(t *testing.T, script scripted, over func(*config.Config))
 	}
 	h.dispatch(tea.WindowSizeMsg{Width: 80, Height: 24})
 	// Init's other commands (the editor's cursor blink, a registry refresh) are not what
-	// this harness is about; the pump is, and it is what a program arms first.
+	// this harness is about; the pump is, and it is what a program arms first. The command
+	// list is the other one a run asks for on connect, and the slash menu is empty without
+	// it, so the harness asks too.
 	h.exec(pump(cl))
+	h.exec(m.call(protocol.MethodCommandList, nil))
 	return h
 }
 

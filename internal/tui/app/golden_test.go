@@ -239,6 +239,25 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 	}))
 }
 
+// TestGoldenSlashMenu pins the completion above the editor: what command.list answered
+// with what each command does, the keyboard's row accented, the client's own two under the
+// registered ones, and the draft still in the editor under it all (ADR 0015 decision 4).
+func TestGoldenSlashMenu(t *testing.T) {
+	golden(t, "slash_menu", screen(t, nil, func(tm *teatest.TestModel, _ string) {
+		list, err := json.Marshal(protocol.CommandListResult{Commands: []protocol.CommandInfo{
+			{Name: "model", Description: "Switch this session's model: /model <provider:id or unique id>"},
+			{Name: "help", Description: "List the slash commands"},
+			{Name: "fork", Description: "Fork this session at an entry: /fork [entry id], default the newest"},
+			{Name: "plugins", Description: "List loaded plugins and their state"},
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tm.Send(CallResultMsg{Method: protocol.MethodCommandList, Result: list})
+		tm.Send(tea.KeyPressMsg{Code: '/', Text: "/"})
+	}))
+}
+
 // TestGoldenWidgetsAndStatus pins a plugin's status item and its widgets where config put
 // them: the header widget in the header slot ui.layout.slots added, the hint above the
 // editor, and the memory:servers cell in the place ui.status.items gave it.

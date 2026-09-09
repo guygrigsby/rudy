@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/guygrigsby/rudy/internal/config"
@@ -389,6 +390,48 @@ func TestAltscreenKeepsRowsExpandable(t *testing.T) {
 				t.Fatalf("ctrl+o expands the newest tool row: %v %v", tools[0].Expanded, tools[1].Expanded)
 			}
 		})
+	}
+}
+
+// TestSlashExitQuitsTheClient is ADR 0015 decision 3: /exit is the client's own, so it
+// never reaches the wire. Attached to a running rudy serve the daemon and the session are
+// left exactly as they were, which is what nothing being sent means.
+func TestSlashExitQuitsTheClient(t *testing.T) {
+	for _, name := range []string{"/exit", "/quit"} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			h.typeText(name)
+			// Enter completes while the menu stands and submits once the name is whole,
+			// which /exit and /quit both are by the time they have been typed out.
+			if _, ok := runCmd(t, h.press("enter")).(tea.QuitMsg); !ok {
+				t.Fatalf("%s quits the client", name)
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			for _, r := range h.reqs {
+				if r.Method == protocol.MethodCommandRun {
+					t.Errorf("%s is the client's own and asks the server nothing: %s", name, r.Params)
+				}
+			}
+		})
+	}
+}
+
+// TestAnUnknownSlashWordStillReachesTheServer keeps the client's two commands from
+// becoming a filter: everything else is the server's, unknown names included, so its
+// "unknown command" is what the user reads.
+func TestAnUnknownSlashWordStillReachesTheServer(t *testing.T) {
+	h := newHarness(t, nil)
+	h.typeText("/nosuchcommand")
+	runCmd(t, h.press("enter"))
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var ran bool
+	for _, r := range h.reqs {
+		ran = ran || r.Method == protocol.MethodCommandRun
+	}
+	if !ran {
+		t.Errorf("an unknown command is the server's to refuse: %+v", h.reqs)
 	}
 }
 

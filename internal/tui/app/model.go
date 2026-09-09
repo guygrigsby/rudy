@@ -137,9 +137,13 @@ type Model struct {
 	// pick is the picker standing in the editor's place, nil when none is up. While one
 	// stands it owns the keyboard (picker.go).
 	pick *picker
-	// commands are the command names the last /help notice listed, which is the only
-	// list of commands a client is given: tab completes a slash word from these.
-	commands []string
+	// commands are what the slash menu lists: command.list's answer in registration
+	// order, then the two the client answers itself (slash.go). Asked once on connect,
+	// since nothing registers a command after its plugin has answered plugin.init.
+	commands []protocol.CommandInfo
+	// menu is the slash menu's own state, which is only ever a selection and a dismissal:
+	// what it lists comes from the draft.
+	menu menuState
 	// switching is the session switch waiting for its answer, nil when none is. It holds
 	// the session being left and the notifications that arrived while it was in flight,
 	// which for a resume, an open and a fork are the new session's replay: the server
@@ -203,10 +207,13 @@ func New(o Options) *Model {
 		status:       make(map[string]protocol.StatusItem),
 		seen:         make(map[string]bool),
 		showThinking: cfg.UI.Transcript.Thinking == thinkingShown,
-		workspace:    o.Workspace,
-		wsFixed:      o.Workspace != "",
-		width:        defaultWidth,
-		height:       defaultHeight,
+		// The client's own are there from the first keystroke; command.list's answer is
+		// prepended to them when it lands.
+		commands:  clientCommands,
+		workspace: o.Workspace,
+		wsFixed:   o.Workspace != "",
+		width:     defaultWidth,
+		height:    defaultHeight,
 	}
 	m.tr = m.newTranscript()
 	m.ed = input.New(cfg.UI.Vim, o.Theme, defaultWidth, table)
@@ -254,7 +261,7 @@ func pickModel(models []provider.Model, ref session.ModelRef) provider.Model {
 // caller's snapshot does not list also asks for the registry, through the same setModel
 // every later change goes through.
 func (m *Model) Init() tea.Cmd {
-	return tea.Batch(pump(m.cl), m.ed.Focus(), m.setModel(m.session.Model))
+	return tea.Batch(pump(m.cl), m.ed.Focus(), m.setModel(m.session.Model), m.call(protocol.MethodCommandList, nil))
 }
 
 // setModel takes ref as the session's model and finds it in the registry snapshot. One
@@ -503,18 +510,25 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 			return nil
 		}
 		return m.started(res.TurnID)
+	case protocol.MethodCommandList:
+		var res protocol.CommandListResult
+		if !m.result(r, &res) {
+			return nil
+		}
+		// Registered first, the client's own under them: what a menu lists in the order it
+		// lists them, and a plugin that registered exit or quit is shadowed by the client's
+		// (ADR 0015 decision 3), so its row is the one nobody can reach.
+		m.commands = append(slices.Clone(res.Commands), clientCommands...)
 	case protocol.MethodCommandRun:
 		var res protocol.CommandRunResult
 		if !m.result(r, &res) {
 			return nil
 		}
-		// The notice is read, not drawn: the server sends the same text to every attached
-		// client as a notice notification, which is what put it on screen, and a second
-		// copy from the answer would draw every command's notice twice. The field is for
-		// a caller that does not subscribe, which is what the headless printer is.
-		if res.Notice != "" && r.Name == helpCommand {
-			m.commands = helpCommands(res.Notice)
-		}
+		// The notice the answer carries is read, not drawn: the server sends the same text
+		// to every attached client as a notice notification, which is what put it on
+		// screen, and a second copy from the answer would draw every command's notice
+		// twice. The field is for a caller that does not subscribe, which is what the
+		// headless printer is.
 		if res.SessionID != "" {
 			// The command opened another session, which is what a fork is. The server
 			// has already attached this connection to it, so the switch drops that
@@ -904,6 +918,11 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 	if cmd, answered := m.answer(k); answered {
 		return cmd
 	}
+	// The slash menu takes the keys a list reads and leaves the rest to the editor, so the
+	// draft it completes goes on being typed while it stands (ADR 0015 decision 4).
+	if m.menuKey(k) {
+		return nil
+	}
 	actions := m.keys.Match(tea.Key(k))
 	if !slices.Contains(actions, keys.AppInterrupt) {
 		// The double press that cancels is two Esc presses in a row: anything else in
@@ -970,12 +989,6 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 			// terminal's own scrollback, so the key falls through to the editor, which is
 			// where pageUp and home are bound as well.
 			if m.scroll(a) {
-				return nil
-			}
-		case keys.TUIInputTab:
-			// A tab that completed nothing is the editor's, which is what indents a
-			// draft that is not a command.
-			if m.complete() {
 				return nil
 			}
 		case keys.TUIInputNewLine:
@@ -1149,6 +1162,7 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 			}
 			blocks = append(blocks,
 				m.widgetLines(protocol.SlotAboveEditor),
+				m.menuLines(),
 				editor,
 				m.widgetLines(protocol.SlotBelowEditor),
 			)
