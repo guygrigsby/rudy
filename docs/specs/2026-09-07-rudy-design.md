@@ -242,6 +242,9 @@ style = "text"
 [ui.status]
 items = ["vim_mode", "model", "permission_mode", "context", "cost", "workspace"]
 
+[ui.notices]
+max = 3
+
 [ui.theme]
 name = "default"
 accent = "#7aa2f7"

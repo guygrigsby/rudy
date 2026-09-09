@@ -46,6 +46,13 @@ type StatusConfig struct {
 	Items []string `mapstructure:"items"`
 }
 
+// NoticesConfig is the [ui.notices] table. Max is how many notice lines the client draws,
+// newest first: a notice is chrome under the transcript and must never push the editor
+// off the frame, so the count is a config field like every other render choice.
+type NoticesConfig struct {
+	Max int `mapstructure:"max"`
+}
+
 // UIConfig is the [ui] table. Theme holds ui.theme.name plus role overrides, merged
 // over ThemeDefaults by hand in Load since viper replaces a nested default table
 // wholesale rather than merging it key by key with a partial file table.
@@ -56,6 +63,7 @@ type UIConfig struct {
 	Transcript TranscriptConfig  `mapstructure:"transcript"`
 	Diff       DiffConfig        `mapstructure:"diff"`
 	Status     StatusConfig      `mapstructure:"status"`
+	Notices    NoticesConfig     `mapstructure:"notices"`
 	Theme      map[string]string `mapstructure:"theme"`
 }
 
@@ -179,6 +187,7 @@ func Defaults() map[string]any {
 		"ui.transcript.block_gap":          1,
 		"ui.diff.style":                    "text",
 		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace"},
+		"ui.notices.max":                   3,
 	}
 }
 
@@ -443,6 +452,9 @@ func (c *Config) validateUI() []error {
 	}
 	if c.UI.Transcript.ToolPreviewLines < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.transcript.tool_preview_lines %d must be zero or positive", c.UI.Transcript.ToolPreviewLines))
+	}
+	if c.UI.Notices.Max < 0 {
+		errs = append(errs, fmt.Errorf("config: ui.notices.max %d must be zero or positive", c.UI.Notices.Max))
 	}
 	seenSlots := map[string]bool{}
 	for _, s := range c.UI.Layout.Slots {

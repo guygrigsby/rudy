@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,10 @@ func TestMain(m *testing.M) {
 
 const testTimeout = 5 * time.Second
 
-var testRef = session.ModelRef{Provider: "fake", Model: "m1"}
+var (
+	testRef  = session.ModelRef{Provider: "fake", Model: "m1"}
+	testRef2 = session.ModelRef{Provider: "fake", Model: "m2"}
+)
 
 // testModels is the registry the app is handed: one model, priced, with a round context
 // window so a percent is exact.
@@ -381,6 +385,22 @@ func TestWidgetsAndStatusFillTheirSlots(t *testing.T) {
 	if strings.Contains(ansi.Strip(h.view()), "never drawn") {
 		t.Error("a status item the config did not place must not render")
 	}
+	// A widget with nothing in it takes no line: emptying is how a plugin clears one.
+	h.notify(protocol.NotifyWidgetUpdated, protocol.Widget{
+		Owner: "skills", Key: "count", Slot: protocol.SlotBelowEditor, Content: nil,
+	})
+	before := len(lines)
+	if now := len(h.lines()); now != before-1 {
+		t.Fatalf("an emptied widget must leave no blank line: %d lines, was %d\n%s", now, before, h.view())
+	}
+	if strings.Contains(ansi.Strip(h.view()), "12 skills") {
+		t.Error("an emptied widget must go")
+	}
+	h.notify(protocol.NotifyWidgetUpdated, protocol.Widget{
+		Owner: "skills", Key: "count", Slot: protocol.SlotBelowEditor,
+		Content: []protocol.Span{{Text: "12 skills", Role: "muted"}},
+	})
+
 	// A widget replaces its own, keyed owner and key, and never another owner's.
 	h.notify(protocol.NotifyWidgetUpdated, protocol.Widget{
 		Owner: "memory", Key: "hint", Slot: protocol.SlotAboveEditor,
@@ -420,6 +440,63 @@ func TestNoticesFromTheServerAndFromAFailedPlugin(t *testing.T) {
 	}
 }
 
+func TestNoticesAndTheLiveRegionStayInsideTheFrame(t *testing.T) {
+	h := newHarness(t, nil)
+	h.update(tea.WindowSizeMsg{Width: 80, Height: 12})
+	for range 30 {
+		h.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "chatter"})
+	}
+	h.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "the newest one"})
+	lines := h.lines()
+	if len(lines) > 12 {
+		t.Fatalf("%d lines over a 12 row frame:\n%s", len(lines), h.view())
+	}
+	notices := 0
+	for _, l := range lines {
+		if strings.Contains(ansi.Strip(l), "chatter") {
+			notices++
+		}
+	}
+	// ui.notices.max is 3 by default, and the newest is the one kept.
+	if notices != 2 || !strings.Contains(ansi.Strip(h.view()), "the newest one") {
+		t.Fatalf("%d chatter lines in\n%s", notices, h.view())
+	}
+	if !strings.Contains(ansi.Strip(h.view()), "strict") {
+		t.Errorf("the status line must survive a run of notices:\n%s", h.view())
+	}
+
+	long := newHarness(t, nil)
+	long.update(tea.WindowSizeMsg{Width: 80, Height: 8})
+	for i := range 20 {
+		long.appended(session.UserMessage{
+			Source:  session.SourceTyped,
+			Content: []session.Block{session.TextBlock("line " + strconv.Itoa(i))},
+		})
+	}
+	lines = long.lines()
+	if len(lines) > 8 {
+		t.Fatalf("%d lines over an 8 row frame:\n%s", len(lines), long.view())
+	}
+	v := ansi.Strip(long.view())
+	if !strings.Contains(v, "line 19") {
+		t.Errorf("the newest lines are the ones kept:\n%s", long.view())
+	}
+	if strings.Contains(v, "line 0") {
+		t.Errorf("the oldest lines drop first:\n%s", long.view())
+	}
+	if !strings.Contains(v, "strict") {
+		t.Errorf("the status line must survive a long turn:\n%s", long.view())
+	}
+}
+
+func TestNoticesMaxZeroDrawsNone(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.notices.max": 0})
+	h.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "chatter"})
+	if strings.Contains(ansi.Strip(h.view()), "chatter") {
+		t.Fatalf("ui.notices.max 0 draws none:\n%s", h.view())
+	}
+}
+
 func TestWindowSizeResizesTheTranscriptAndTheEditor(t *testing.T) {
 	h := newHarness(t, nil)
 	h.appended(session.UserMessage{Source: session.SourceTyped, Content: []session.Block{
@@ -446,10 +523,13 @@ func TestDisconnectedNoticesAndRefusesInput(t *testing.T) {
 	if !strings.Contains(ansi.Strip(h.view()), "disconnected") {
 		t.Errorf("no notice in %q", h.view())
 	}
+	// Editing still works: a draft that cannot be sent is still a draft to read back and
+	// copy out. What refuses is submitting, which Task 7 owns.
 	h.typeText("nope")
-	if h.m.ed.Text() != "" {
-		t.Errorf("input must not reach a server that is gone: %q", h.m.ed.Text())
+	if h.m.ed.Text() != "nope" {
+		t.Errorf("editing must keep working while disconnected: %q", h.m.ed.Text())
 	}
+	h.press("ctrl+c")
 	if _, ok := runCmd(t, h.press("ctrl+d")).(tea.QuitMsg); !ok {
 		t.Error("the exit key still works while disconnected")
 	}
@@ -499,31 +579,52 @@ func TestNewLineReachesTheEditor(t *testing.T) {
 }
 
 func TestMouseClickTogglesTheToolRowUnderIt(t *testing.T) {
-	h := newHarness(t, nil)
-	h.appended(session.AssistantMessage{
-		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
-		Content: []session.Block{session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`))},
-	})
-	h.appended(session.ToolResult{
-		ToolUseID: "t1", Outcome: session.OutcomeOK, DurationMS: 3,
-		Content: []session.Block{session.TextBlock("a\nb\nc\nd\ne\nf")},
-	})
-	y := -1
-	for i, l := range h.lines() {
-		if strings.Contains(ansi.Strip(l), "▸ bash") {
-			y = i
-		}
-	}
-	if y < 0 {
-		t.Fatalf("no tool row in\n%s", h.view())
-	}
-	h.update(tea.MouseClickMsg{X: 2, Y: y, Button: tea.MouseLeft})
-	if rows := h.m.tr.Rows(); len(rows) != 1 || !rows[0].Expanded {
-		t.Fatalf("click did not expand: %+v", rows)
-	}
-	h.update(tea.MouseClickMsg{X: 2, Y: y, Button: tea.MouseLeft})
-	if rows := h.m.tr.Rows(); rows[0].Expanded {
-		t.Fatal("a second click collapses")
+	// The terminal reports a click from the top of the screen. Altscreen owns the whole
+	// screen; inline anchors its frame at the bottom, so the same row of the frame is a
+	// different terminal row in each mode, and the test aims where the user's pointer
+	// would actually be.
+	for _, render := range []string{"inline", "altscreen"} {
+		t.Run(render, func(t *testing.T) {
+			h := newHarness(t, map[string]any{"ui.render": render})
+			h.appended(session.AssistantMessage{
+				Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+				Content: []session.Block{session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`))},
+			})
+			h.appended(session.ToolResult{
+				ToolUseID: "t1", Outcome: session.OutcomeOK, DurationMS: 3,
+				Content: []session.Block{session.TextBlock("a\nb\nc\nd\ne\nf")},
+			})
+			lines := h.lines()
+			row := -1
+			for i, l := range lines {
+				if strings.Contains(ansi.Strip(l), "▸ bash") {
+					row = i
+				}
+			}
+			if row < 0 {
+				t.Fatalf("no tool row in\n%s", h.view())
+			}
+			y := row
+			if render == "inline" {
+				y += h.m.height - len(lines)
+			}
+			h.update(tea.MouseClickMsg{X: 2, Y: y, Button: tea.MouseLeft})
+			if rows := h.m.tr.Rows(); len(rows) != 1 || !rows[0].Expanded {
+				t.Fatalf("click at terminal row %d (frame row %d) did not expand: %+v", y, row, rows)
+			}
+			h.update(tea.MouseClickMsg{X: 2, Y: y, Button: tea.MouseLeft})
+			if rows := h.m.tr.Rows(); rows[0].Expanded {
+				t.Fatal("a second click collapses")
+			}
+			// A click above an inline frame landed in scrollback, which this client does
+			// not own and must not act on.
+			if render == "inline" {
+				h.update(tea.MouseClickMsg{X: 2, Y: 0, Button: tea.MouseLeft})
+				if rows := h.m.tr.Rows(); rows[0].Expanded {
+					t.Fatal("a click above the frame must do nothing")
+				}
+			}
+		})
 	}
 }
 
@@ -582,7 +683,7 @@ func TestModelAndModeChangesMoveTheStatusLine(t *testing.T) {
 	h.appended(session.ModelChange{Model: session.ModelRef{Provider: "fake", Model: "m2"}})
 	h.appended(session.ModeChange{Mode: session.ModePermissive})
 	got := ansi.Strip(h.m.statusLine())
-	if got != "m2  permissive" {
+	if got != "fake:m2  permissive" {
 		t.Fatalf("status %q", got)
 	}
 }
@@ -594,7 +695,13 @@ type fakeProvider struct{ text string }
 
 func (fakeProvider) Name() string { return "fake" }
 
-func (fakeProvider) ListModels(context.Context) ([]provider.Model, error) { return testModels(), nil }
+// ListModels carries a second model the client's own snapshot does not, so a change to it
+// is the model-not-found the registry refresh answers.
+func (fakeProvider) ListModels(context.Context) ([]provider.Model, error) {
+	return append(testModels(), provider.Model{
+		Ref: testRef2, DisplayName: "Fake 2", ContextWindow: 200000,
+	}), nil
+}
 
 func (p fakeProvider) Complete(_ context.Context, _ provider.Request, emit func(provider.Part) error) error {
 	for _, part := range []provider.Part{
@@ -666,6 +773,42 @@ func newServerHarness(t *testing.T, text string) (*protocol.Client, protocol.Ses
 		t.Fatalf("open: %v", err)
 	}
 	return cl, info
+}
+
+func TestModelChangeToAnUnknownModelRefreshesTheRegistry(t *testing.T) {
+	cl, info := newServerHarness(t, "ok")
+	m := New(Options{
+		Config: testConfig(t, nil), Theme: theme.Default(), Keys: keys.Default(),
+		Client: cl, Session: info, Models: testModels(), Version: "test",
+		Cwd: info.Workspace.Root, Workspace: "rudy main",
+	})
+	params, err := json.Marshal(protocol.EntryAppended{
+		SessionID: info.SessionID, Entry: entry(t, session.ModelChange{Model: testRef2}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := m.notification(protocol.Notification{Method: protocol.NotifyEntryAppended, Params: params})
+	if cmd == nil {
+		t.Fatal("a model the snapshot does not carry must refresh the registry")
+	}
+	if m.model.ContextWindow != 0 {
+		t.Fatalf("the model is unknown until the refresh answers: %+v", m.model)
+	}
+	res, ok := runCmd(t, cmd).(CallResultMsg)
+	if !ok || res.Err != nil || res.Method != protocol.MethodRegistryList {
+		t.Fatalf("registry.list %v %+v", ok, res)
+	}
+	m.Update(res)
+	if m.model.Ref != testRef2 || m.model.ContextWindow != 200000 {
+		t.Fatalf("model %+v", m.model)
+	}
+	// A model the fresh registry still does not carry must not ask again, or a bad id
+	// would loop the client against the server for the rest of the session.
+	m.session.Model = session.ModelRef{Provider: "fake", Model: "never"}
+	if again := m.callResult(res); again != nil {
+		t.Error("a refresh that did not help must not refresh again")
+	}
 }
 
 func TestAgainstARealServerATurnBecomesRows(t *testing.T) {

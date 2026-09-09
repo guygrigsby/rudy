@@ -483,6 +483,7 @@ rudy-k0.27).
 | `ui.transcript.block_gap` | int | 1 | blank lines between assistant blocks |
 | `ui.diff.style` | `text`, `background` | `text` | |
 | `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "context", "cost", "workspace"]` | built-in keys plus `plugin:key` for plugin items |
+| `ui.notices.max` | int | 3 | notice lines the client draws under the transcript, newest first; `0` draws none |
 | `ui.theme.name` | string | `default` | a file under `themes/` or the built-in |
 | `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes |
 | `keys.<action id>` | string or [string] | pi defaults | pi's namespaced action ids; a value replaces the default for that action; `[]` unbinds |

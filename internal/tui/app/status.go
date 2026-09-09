@@ -53,7 +53,9 @@ func (m *Model) statusItem(id string) string {
 	case itemVimMode:
 		return m.styled(theme.RoleAccent, vimMode(m.ed.Mode()))
 	case itemModel:
-		return m.styled(theme.RoleMuted, m.session.Model.Model)
+		// The canonical form, "provider:model": two providers can carry the same model
+		// id, and the picker and every log entry name one this way.
+		return m.styled(theme.RoleMuted, m.session.Model.String())
 	case itemPermissionMode:
 		return m.styled(theme.RoleMuted, string(m.session.Mode))
 	case itemContext:

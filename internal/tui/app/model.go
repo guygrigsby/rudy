@@ -2,7 +2,7 @@
 // drawing the slots ui.layout.slots names and nothing else.
 //
 // The client speaks the protocol and only the protocol. Nothing here appends an entry,
-// reaches into the session store or imports internal/server: what is on screen is what
+// reaches into the session store or links the server package: what is on screen is what
 // the server said, folded into a transcript, a status line, widgets and notices. Every
 // render choice is a config field, every plugin's status item and widget is keyed by its
 // owner so no plugin can clear another's, and nothing draws that ui.layout.slots and
@@ -134,8 +134,9 @@ type Model struct {
 	width     int
 	height    int
 
-	// disconnected is set once the server is gone. Nothing typed can reach it then, so
-	// keys stop at the exit.
+	// disconnected is set once the server is gone. Editing still works, so a draft can be
+	// read back and copied out; what stops is anything that needs the server, which is
+	// submitting (Task 7 owns it) and the calls a picker makes (Task 8).
 	disconnected bool
 }
 
@@ -190,14 +191,23 @@ func pickModel(models []provider.Model, ref session.ModelRef) provider.Model {
 }
 
 // Init arms the notification pump and focuses the editor. A session whose model the
-// caller's registry does not list also asks for the registry: the design refreshes on
-// session open, picker open and model-not-found, never on a timer.
+// caller's snapshot does not list also asks for the registry, through the same setModel
+// every later change goes through.
 func (m *Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{pump(m.cl), m.ed.Focus()}
-	if m.model.Ref != m.session.Model {
-		cmds = append(cmds, m.call(protocol.MethodRegistryList, nil))
+	return tea.Batch(pump(m.cl), m.ed.Focus(), m.setModel(m.session.Model))
+}
+
+// setModel takes ref as the session's model and finds it in the registry snapshot. One
+// the snapshot does not carry asks the server for a fresh registry rather than leaving
+// the context percent and the cost blank for the rest of the session: the design
+// refreshes on session open, picker open and model-not-found, never on a timer.
+func (m *Model) setModel(ref session.ModelRef) tea.Cmd {
+	m.session.Model = ref
+	m.model = pickModel(m.models, ref)
+	if m.model.Ref == ref {
+		return nil
 	}
-	return tea.Batch(cmds...)
+	return m.call(protocol.MethodRegistryList, nil)
 }
 
 // Update folds one message in. A notification re-arms the pump, so exactly one is in
@@ -240,7 +250,7 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 	case protocol.NotifyEntryAppended:
 		var p protocol.EntryAppended
 		if m.decode(n, &p) {
-			m.entry(p.Entry)
+			return m.entry(p.Entry)
 		}
 	case protocol.NotifyStreamDelta:
 		var p protocol.StreamDelta
@@ -295,7 +305,9 @@ func (m *Model) decode(n protocol.Notification, v any) bool {
 
 // entry folds one appended entry in: the transcript takes what is on screen, and the rest
 // of the model takes what only it reads, the usage totals and the session's own changes.
-func (m *Model) entry(e session.Entry) {
+// A model change the registry snapshot cannot explain returns the command that refreshes
+// it.
+func (m *Model) entry(e session.Entry) tea.Cmd {
 	m.tr.Apply(e)
 	switch p := e.Payload.(type) {
 	case session.AssistantMessage:
@@ -306,8 +318,7 @@ func (m *Model) entry(e session.Entry) {
 		// the row standing in its place goes.
 		m.tr.Answered(p.ToolUseID)
 	case session.ModelChange:
-		m.session.Model = p.Model
-		m.model = pickModel(m.models, p.Model)
+		return m.setModel(p.Model)
 	case session.ModeChange:
 		m.session.Mode = p.Mode
 	case session.ThinkingChange:
@@ -315,6 +326,7 @@ func (m *Model) entry(e session.Entry) {
 	case session.TitleChange:
 		m.session.Title = p.Title
 	}
+	return nil
 }
 
 // callResult folds one server answer in. registry.list is the only call this file makes;
@@ -331,6 +343,8 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 			return nil
 		}
 		m.models = res.Models
+		// Not setModel: the refresh is the answer to a model-not-found, and a model the
+		// fresh registry still lacks must not ask for it again.
 		m.model = pickModel(res.Models, m.session.Model)
 	}
 	return nil
@@ -381,16 +395,7 @@ func (m *Model) resize(w, h int) {
 // that does not apply falls through to the next one the key is bound to, which is what
 // lets ctrl+d exit on an empty editor and delete forward on a full one.
 func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
-	matched := m.keys.Match(tea.Key(k))
-	if m.disconnected {
-		// Nothing typed can reach a server that is gone, and a draft that cannot be sent
-		// is worse than no draft. Only the exit still answers.
-		if slices.Contains(matched, keys.AppExit) {
-			return tea.Quit
-		}
-		return nil
-	}
-	for _, a := range matched {
+	for _, a := range m.keys.Match(tea.Key(k)) {
 		switch a {
 		case keys.AppExit:
 			if m.ed.Empty() {
@@ -432,8 +437,19 @@ func (m *Model) expandNewestTool() bool {
 // click toggles the tool row the pointer landed on. The layout the last View drew says
 // which row owns which line, so a click lands where the user aimed however many widgets,
 // notices or header lines sit above the transcript.
+//
+// y is where the terminal saw the pointer, counted from the top of the screen. Altscreen
+// owns the whole screen, so the two agree; inline anchors its frame at the bottom, so the
+// frame's first line is at height minus the frame's own height and a click above that
+// landed in scrollback, which this client does not own.
 func (m *Model) click(y int) {
-	_, rowAt := m.compose()
+	lines, rowAt := m.compose()
+	if m.cfg.UI.Render != renderAltscreen {
+		y -= m.height - len(lines)
+		if y < 0 {
+			return
+		}
+	}
 	if r := rowAt[y]; r != nil {
 		// Toggle ignores anything that is not a tool row, which is every other row a
 		// click can land on.
@@ -532,6 +548,12 @@ func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 	laid := m.tr.Layout()
 	notices := m.noticeLines()
 	if m.cfg.UI.Render != renderAltscreen {
+		// The live region is what the frame has left once the other slots have taken
+		// theirs. A turn that outgrew it keeps its newest lines: the oldest have already
+		// been read, and the editor and the status line must stay on screen.
+		if keep := max(h-len(notices), 0); len(laid) > keep {
+			laid = laid[len(laid)-keep:]
+		}
 		lines := make([]string, 0, len(laid)+len(notices))
 		rows := make([]*transcript.Row, 0, len(laid))
 		for _, l := range laid {
@@ -564,10 +586,16 @@ var noticeRoles = map[string]theme.Role{
 	levelError: theme.RoleError,
 }
 
-// noticeLines are the notices, drawn under the transcript in the region the client owns.
-// They are display-only: a notice never reaches the log, so it is held here rather than
-// folded into the transcript as a row that a commit would print into scrollback.
+// noticeLines are the notices, drawn under the transcript in the region the client owns,
+// the newest ui.notices.max lines of them. They are display-only: a notice never reaches
+// the log, so it is held here rather than folded into the transcript as a row that a
+// commit would print into scrollback, and it is bounded here so a run of them can never
+// push the editor off the frame.
 func (m *Model) noticeLines() []string {
+	limit := m.cfg.UI.Notices.Max
+	if limit <= 0 {
+		return nil
+	}
 	var out []string
 	for _, n := range m.notices {
 		role, ok := noticeRoles[n.level]
@@ -575,6 +603,9 @@ func (m *Model) noticeLines() []string {
 			role = theme.RoleText
 		}
 		out = append(out, m.tr.Wrap(role, n.text)...)
+	}
+	if len(out) > limit {
+		out = out[len(out)-limit:]
 	}
 	return out
 }
@@ -584,8 +615,14 @@ func (m *Model) noticeLines() []string {
 func (m *Model) widgetLines(slot protocol.WidgetSlot) []string {
 	var out []string
 	for _, w := range m.widgets {
-		if w.Slot == slot {
-			out = append(out, m.clamp(renderSpans(m.th, w.Content)))
+		if w.Slot != slot {
+			continue
+		}
+		// A widget with nothing to say takes no line, the way a status item with nothing
+		// to say takes no cell: a plugin clears its widget by emptying it, and a blank
+		// line in a slot is not what clearing looks like.
+		if s := m.clamp(renderSpans(m.th, w.Content)); s != "" {
+			out = append(out, s)
 		}
 	}
 	return out

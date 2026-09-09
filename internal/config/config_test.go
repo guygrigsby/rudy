@@ -309,6 +309,9 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	if !reflect.DeepEqual(c.UI.Status.Items, want) {
 		t.Errorf("status %v", c.UI.Status.Items)
 	}
+	if c.UI.Notices.Max != 3 {
+		t.Errorf("notices %+v", c.UI.Notices)
+	}
 	if c.UI.Theme["name"] != "default" || c.UI.Theme["accent"] != "#7aa2f7" || c.UI.Theme["code"] != "chroma:tokyonight-night" {
 		t.Errorf("theme %v", c.UI.Theme)
 	}
@@ -403,6 +406,7 @@ func TestUIValidation(t *testing.T) {
 		"thinking":      {"ui.transcript.thinking": "maybe"},
 		"diff":          {"ui.diff.style": "neon"},
 		"preview":       {"ui.transcript.tool_preview_lines": -1},
+		"notices":       {"ui.notices.max": -1},
 		"slots missing": {"ui.layout.slots": []string{"transcript", "status"}},
 		"slots unknown": {"ui.layout.slots": []string{"transcript", "input", "status", "sidebar"}},
 		"slots twice":   {"ui.layout.slots": []string{"transcript", "input", "status", "input"}},
