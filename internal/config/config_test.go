@@ -262,6 +262,106 @@ observe_after_tokens = 10
 	}
 }
 
+// tempPaths is a bare temp XDG config root: no file, so Load runs on defaults and
+// overrides alone.
+func tempPaths(t *testing.T) config.Paths {
+	t.Helper()
+	return config.Paths{Config: t.TempDir()}
+}
+
+// loadWith loads with no config.toml present, only overrides, failing the test on error.
+func loadWith(t *testing.T, overrides map[string]any) *config.Config {
+	t.Helper()
+	c, err := config.Load(tempPaths(t), overrides)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// loadFile writes body as config.toml under a temp root and loads it, failing the test
+// on error.
+func loadFile(t *testing.T, body string) *config.Config {
+	t.Helper()
+	c, err := config.Load(writeConfig(t, body), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
+	c := loadWith(t, map[string]any{"default.provider": "p", "default.model": "m"})
+	if c.UI.Render != "inline" || !c.UI.Vim || c.Permissions.DoublePressMS != 500 {
+		t.Errorf("ui %+v", c.UI)
+	}
+	if !reflect.DeepEqual(c.UI.Layout.Slots, []string{"transcript", "input", "status"}) {
+		t.Errorf("slots %v", c.UI.Layout.Slots)
+	}
+	tr := c.UI.Transcript
+	if !tr.ToolCollapsed || tr.ToolPreviewLines != 2 || tr.Thinking != "hidden" || tr.UserPrefix != "›" || tr.BlockGap != 1 {
+		t.Errorf("transcript %+v", tr)
+	}
+	if c.UI.Diff.Style != "text" {
+		t.Errorf("diff %+v", c.UI.Diff)
+	}
+	want := []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace"}
+	if !reflect.DeepEqual(c.UI.Status.Items, want) {
+		t.Errorf("status %v", c.UI.Status.Items)
+	}
+	if c.UI.Theme["name"] != "default" || c.UI.Theme["accent"] != "#7aa2f7" || c.UI.Theme["code"] != "chroma:tokyonight" {
+		t.Errorf("theme %v", c.UI.Theme)
+	}
+	if len(c.Keys) != 0 {
+		t.Errorf("keys %v", c.Keys)
+	}
+}
+
+func TestKeysTableReadsStringsAndLists(t *testing.T) {
+	c := loadFile(t, `
+[default]
+provider = "p"
+model = "m"
+[keys]
+"app.interrupt" = "ctrl+g"
+"app.model.select" = ["ctrl+l", "f2"]
+"app.session.fork" = []
+`)
+	if !reflect.DeepEqual(c.Keys["app.interrupt"], []string{"ctrl+g"}) || !reflect.DeepEqual(c.Keys["app.model.select"], []string{"ctrl+l", "f2"}) {
+		t.Errorf("keys %v", c.Keys)
+	}
+	if v, ok := c.Keys["app.session.fork"]; !ok || len(v) != 0 {
+		t.Errorf("unbound must be present and empty: %v", c.Keys)
+	}
+}
+
+func TestUIValidation(t *testing.T) {
+	for name, over := range map[string]map[string]any{
+		"render":        {"ui.render": "split"},
+		"thinking":      {"ui.transcript.thinking": "maybe"},
+		"diff":          {"ui.diff.style": "neon"},
+		"preview":       {"ui.transcript.tool_preview_lines": -1},
+		"slots missing": {"ui.layout.slots": []string{"transcript", "status"}},
+		"slots unknown": {"ui.layout.slots": []string{"transcript", "input", "status", "sidebar"}},
+		"slots twice":   {"ui.layout.slots": []string{"transcript", "input", "status", "input"}},
+		"status item":   {"ui.status.items": []string{"model", "weather"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := map[string]any{"default.provider": "p", "default.model": "m"}
+			for k, v := range over {
+				m[k] = v
+			}
+			if _, err := config.Load(tempPaths(t), m); err == nil {
+				t.Error("want error")
+			}
+		})
+	}
+	m := map[string]any{"default.provider": "p", "default.model": "m", "ui.status.items": []string{"model", "memory:servers"}}
+	if _, err := config.Load(tempPaths(t), m); err != nil {
+		t.Errorf("plugin:key status item must load: %v", err)
+	}
+}
+
 func TestWaveValidation(t *testing.T) {
 	home := t.TempDir()
 	paths := config.XDG(func(string) string { return "" }, home)

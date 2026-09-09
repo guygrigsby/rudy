@@ -22,6 +22,63 @@ type ProviderConfig struct {
 	Dialect string            `mapstructure:"dialect"`  // "" or clinepass; clinepass requires wire == openai_chat
 }
 
+// LayoutConfig is the [ui.layout] table.
+type LayoutConfig struct {
+	Slots []string `mapstructure:"slots"`
+}
+
+// TranscriptConfig is the [ui.transcript] table.
+type TranscriptConfig struct {
+	ToolCollapsed    bool   `mapstructure:"tool_collapsed"`
+	ToolPreviewLines int    `mapstructure:"tool_preview_lines"`
+	Thinking         string `mapstructure:"thinking"`
+	UserPrefix       string `mapstructure:"user_prefix"`
+	BlockGap         int    `mapstructure:"block_gap"`
+}
+
+// DiffConfig is the [ui.diff] table.
+type DiffConfig struct {
+	Style string `mapstructure:"style"`
+}
+
+// StatusConfig is the [ui.status] table.
+type StatusConfig struct {
+	Items []string `mapstructure:"items"`
+}
+
+// UIConfig is the [ui] table. Theme holds ui.theme.name plus role overrides, merged
+// over the built-in theme defaults by hand in Load since viper replaces a nested
+// default table wholesale rather than merging it key by key with a partial file table.
+type UIConfig struct {
+	Render     string            `mapstructure:"render"`
+	Vim        bool              `mapstructure:"vim"`
+	Layout     LayoutConfig      `mapstructure:"layout"`
+	Transcript TranscriptConfig  `mapstructure:"transcript"`
+	Diff       DiffConfig        `mapstructure:"diff"`
+	Status     StatusConfig      `mapstructure:"status"`
+	Theme      map[string]string `mapstructure:"theme"`
+}
+
+// uiThemeDefaults are ui.theme's built-in values: the design's default screen theme
+// (docs/specs/2026-09-07-rudy-design.md, [ui.theme]). Kept out of Defaults() because
+// viper replaces a nested default table wholesale the moment the file sets any key
+// under the same table, instead of merging it key by key; Load merges these by hand.
+var uiThemeDefaults = map[string]string{
+	"name":      "default",
+	"accent":    "#7aa2f7",
+	"text":      "#c0caf5",
+	"muted":     "#565f89",
+	"user":      "accent",
+	"assistant": "text",
+	"tool":      "muted",
+	"success":   "#9ece6a",
+	"error":     "#f7768e",
+	"warning":   "#e0af68",
+	"diff_add":  "success",
+	"diff_del":  "error",
+	"code":      "chroma:tokyonight",
+}
+
 // MemoryConfig is the [memory] table.
 type MemoryConfig struct {
 	Dir          string         `mapstructure:"dir"`
@@ -41,8 +98,9 @@ type Config struct {
 	HookTimeoutMS int    `mapstructure:"hook_timeout_ms"`
 	ToolTimeoutMS int    `mapstructure:"tool_timeout_ms"`
 	Permissions   struct {
-		Mode      string   `mapstructure:"mode"`
-		Dangerous []string `mapstructure:"dangerous"`
+		Mode          string   `mapstructure:"mode"`
+		Dangerous     []string `mapstructure:"dangerous"`
+		DoublePressMS int      `mapstructure:"double_press_ms"`
 	} `mapstructure:"permissions"`
 	Sessions struct {
 		Dir       string  `mapstructure:"dir"`
@@ -62,7 +120,12 @@ type Config struct {
 	MCP    struct {
 		ConnectTimeoutMS int `mapstructure:"connect_timeout_ms"`
 	} `mapstructure:"mcp"`
-	MaxTokens int `mapstructure:"max_tokens"`
+	MaxTokens int      `mapstructure:"max_tokens"`
+	UI        UIConfig `mapstructure:"ui"`
+	// Keys is the [keys] table: pi action id to bound keys. Filled by hand from the raw
+	// TOML, like Plugins above, because viper lowercases map keys and pi's action ids
+	// are case-sensitive (app.model.cycleForward).
+	Keys map[string][]string `mapstructure:"-"`
 	// ConfigDir is paths.Config, filled by Load. Anything that reads a file next to
 	// config.toml (agent definitions) has the Config but not the Paths.
 	ConfigDir string `mapstructure:"-"`
@@ -72,26 +135,37 @@ type Config struct {
 // Keys with empty defaults exist so RUDY_* environment variables can set them.
 func Defaults() map[string]any {
 	return map[string]any{
-		"default.provider": "",
-		"default.model":    "",
-		"default.thinking": "high",
-		"agent":            "default",
-		"hook_timeout_ms":  5000,
-		"tool_timeout_ms":  600000,
-		"permissions.mode": "strict",
+		"default.provider":            "",
+		"default.model":               "",
+		"default.thinking":            "high",
+		"agent":                       "default",
+		"hook_timeout_ms":             5000,
+		"tool_timeout_ms":             600000,
+		"permissions.mode":            "strict",
+		"permissions.double_press_ms": 500,
 		"permissions.dangerous": []string{
 			"rm -rf", "rm -r", "git push --force", "git push -f", "git reset --hard",
 			"git clean", "sudo", "chmod -R", "chown -R", "mkfs", "dd",
 		},
-		"sessions.dir":           "", // filled from paths.Data when still empty after Load
-		"sessions.compact_at":    0.8,
-		"skills.dirs":            []string{"~/.agents/skills", ".agents/skills"},
-		"skills.migrate_from":    []string{"~/.claude/skills", "~/.pi/agent/skills"},
-		"memory.dir":             "~/.agents/memory",
-		"memory.enabled":         true,
-		"memory.summary_model":   "",
-		"mcp.connect_timeout_ms": 10000,
-		"max_tokens":             8192,
+		"sessions.dir":                     "", // filled from paths.Data when still empty after Load
+		"sessions.compact_at":              0.8,
+		"skills.dirs":                      []string{"~/.agents/skills", ".agents/skills"},
+		"skills.migrate_from":              []string{"~/.claude/skills", "~/.pi/agent/skills"},
+		"memory.dir":                       "~/.agents/memory",
+		"memory.enabled":                   true,
+		"memory.summary_model":             "",
+		"mcp.connect_timeout_ms":           10000,
+		"max_tokens":                       8192,
+		"ui.render":                        "inline",
+		"ui.vim":                           true,
+		"ui.layout.slots":                  []string{"transcript", "input", "status"},
+		"ui.transcript.tool_collapsed":     true,
+		"ui.transcript.tool_preview_lines": 2,
+		"ui.transcript.thinking":           "hidden",
+		"ui.transcript.user_prefix":        "›",
+		"ui.transcript.block_gap":          1,
+		"ui.diff.style":                    "text",
+		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace"},
 	}
 }
 
@@ -141,6 +215,33 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 		}
 	}
 	c.PluginsDisabled = v.GetStringSlice("plugins.disabled")
+	// ui.theme is a table of strings (name plus role overrides); merge the file's and
+	// overrides' values over the built-in defaults by hand, see uiThemeDefaults.
+	c.UI.Theme = make(map[string]string, len(uiThemeDefaults))
+	for k, val := range uiThemeDefaults {
+		c.UI.Theme[k] = val
+	}
+	for k, val := range v.GetStringMapString("ui.theme") {
+		c.UI.Theme[k] = val
+	}
+	// permissions.double_press_ms is the contract's canonical key; the design also
+	// shows it under [ui], so that spelling is accepted as an alias when the canonical
+	// key is absent from both the file and overrides.
+	permSet := isSetIn(overrides, "permissions.double_press_ms") || (fileExists && v.InConfig("permissions.double_press_ms"))
+	uiAliasSet := isSetIn(overrides, "ui.double_press_ms") || (fileExists && v.InConfig("ui.double_press_ms"))
+	if !permSet && uiAliasSet {
+		c.Permissions.DoublePressMS = v.GetInt("ui.double_press_ms")
+	}
+	// keys is read from the raw TOML, not through viper: viper lowercases every map key
+	// it reads, which would corrupt pi's case-sensitive action ids (app.model.cycleForward).
+	c.Keys = map[string][]string{}
+	if fileExists {
+		keys, err := parseKeysTable(body)
+		if err != nil {
+			return nil, err
+		}
+		c.Keys = keys
+	}
 	c.ConfigDir = paths.Config
 	if c.Sessions.Dir == "" {
 		c.Sessions.Dir = filepath.Join(paths.Data, "sessions")
@@ -169,6 +270,59 @@ func ExpandHome(p, home string) string {
 		return filepath.Join(home, p[2:])
 	}
 	return p
+}
+
+// isSetIn reports whether overrides sets key directly, used to test whether an alias
+// key (ui.double_press_ms) should be read at all: an explicit override or file value
+// for the canonical key always wins.
+func isSetIn(overrides map[string]any, key string) bool {
+	_, ok := overrides[key]
+	return ok
+}
+
+// parseKeysTable reads the [keys] table straight from the raw TOML, the way
+// restoreHeaderCase does for header casing, since viper lowercases every map key it
+// reads and pi's action ids are case-sensitive (app.model.cycleForward). A string value
+// becomes a one-element list, a list of strings stays a list, an empty list stays
+// present and empty (it unbinds the action), and anything else is an error naming the
+// action id.
+func parseKeysTable(body []byte) (map[string][]string, error) {
+	var raw struct {
+		Keys map[string]any `toml:"keys"`
+	}
+	if err := toml.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("config: keys: %w", err)
+	}
+	keys := make(map[string][]string, len(raw.Keys))
+	var errs []error
+	for action, val := range raw.Keys {
+		switch bound := val.(type) {
+		case string:
+			keys[action] = []string{bound}
+		case []any:
+			list := make([]string, 0, len(bound))
+			ok := true
+			for _, item := range bound {
+				s, isStr := item.(string)
+				if !isStr {
+					ok = false
+					break
+				}
+				list = append(list, s)
+			}
+			if !ok {
+				errs = append(errs, fmt.Errorf("config: keys.%s must be a string or a list of strings", action))
+				continue
+			}
+			keys[action] = list
+		default:
+			errs = append(errs, fmt.Errorf("config: keys.%s must be a string or a list of strings", action))
+		}
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
+	}
+	return keys, nil
 }
 
 // restoreHeaderCase re-parses the raw TOML to recover the original casing of
@@ -244,5 +398,66 @@ func (c *Config) validate() error {
 	if c.MaxTokens <= 0 {
 		errs = append(errs, fmt.Errorf("config: max_tokens %d must be positive", c.MaxTokens))
 	}
+	errs = append(errs, c.validateUI()...)
 	return errors.Join(errs...)
+}
+
+// validRenders, validThinking and validDiffStyles gate the matching ui.* enums.
+var validRenders = map[string]bool{"inline": true, "altscreen": true}
+var validThinking = map[string]bool{"hidden": true, "shown": true}
+var validDiffStyles = map[string]bool{"text": true, "background": true}
+
+// legalSlots are ui.layout.slots' legal entries; transcript, input and status are each
+// required exactly once, header is optional.
+var legalSlots = map[string]bool{"header": true, "transcript": true, "input": true, "status": true}
+var requiredSlots = []string{"transcript", "input", "status"}
+
+// builtinStatusItems are ui.status.items' six built-in keys; anything else must be a
+// non-empty "<plugin>:<key>" pair.
+var builtinStatusItems = map[string]bool{
+	"vim_mode": true, "model": true, "permission_mode": true,
+	"context": true, "cost": true, "workspace": true,
+}
+
+func (c *Config) validateUI() []error {
+	var errs []error
+	if !validRenders[c.UI.Render] {
+		errs = append(errs, fmt.Errorf("config: ui.render %q is not inline or altscreen", c.UI.Render))
+	}
+	if !validThinking[c.UI.Transcript.Thinking] {
+		errs = append(errs, fmt.Errorf("config: ui.transcript.thinking %q is not hidden or shown", c.UI.Transcript.Thinking))
+	}
+	if !validDiffStyles[c.UI.Diff.Style] {
+		errs = append(errs, fmt.Errorf("config: ui.diff.style %q is not text or background", c.UI.Diff.Style))
+	}
+	if c.UI.Transcript.ToolPreviewLines < 0 {
+		errs = append(errs, fmt.Errorf("config: ui.transcript.tool_preview_lines %d must be zero or positive", c.UI.Transcript.ToolPreviewLines))
+	}
+	seenSlots := map[string]bool{}
+	for _, s := range c.UI.Layout.Slots {
+		if !legalSlots[s] {
+			errs = append(errs, fmt.Errorf("config: ui.layout.slots %q is not header, transcript, input or status", s))
+			continue
+		}
+		if seenSlots[s] {
+			errs = append(errs, fmt.Errorf("config: ui.layout.slots repeats %q", s))
+			continue
+		}
+		seenSlots[s] = true
+	}
+	for _, req := range requiredSlots {
+		if !seenSlots[req] {
+			errs = append(errs, fmt.Errorf("config: ui.layout.slots is missing %q", req))
+		}
+	}
+	for _, item := range c.UI.Status.Items {
+		if builtinStatusItems[item] {
+			continue
+		}
+		plugin, key, ok := strings.Cut(item, ":")
+		if !ok || plugin == "" || key == "" {
+			errs = append(errs, fmt.Errorf("config: ui.status.items %q is not a built-in item or plugin:key", item))
+		}
+	}
+	return errs
 }
