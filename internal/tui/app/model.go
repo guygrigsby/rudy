@@ -135,6 +135,19 @@ type Model struct {
 	// which for a resume, an open and a fork are the new session's replay: the server
 	// sends every entry before the answer that names the session they belong to.
 	switching *switchPending
+	// replaying is set while a switch folds the log it held, so the per-turn commit
+	// inline rendering does is left to the one ordered print at the end of it.
+	replaying bool
+	// seen are the entries already folded into this session, so a log the server replays
+	// twice leaves one row and one usage total. Emptied by a switch, with the transcript.
+	seen map[string]bool
+	// awaitLog is set from a switch until the head of the new session's log arrives, so
+	// the transcript is never built from the middle of a replay (see entry).
+	awaitLog bool
+	// showThinking is ui.transcript.thinking, overridable in memory by
+	// app.thinking.toggle. It lives here rather than in cfg because the config is shared
+	// with the server and is read, never written.
+	showThinking bool
 
 	// models is the registry as this client last saw it, and model is the session's own
 	// entry in it, for the context percent and the cost. A model the registry does not
@@ -170,18 +183,20 @@ func New(o Options) *Model {
 	}
 	cfg := o.Config
 	m := &Model{
-		cfg:       cfg,
-		th:        o.Theme,
-		keys:      table,
-		cl:        o.Client,
-		cwd:       o.Cwd,
-		session:   o.Session,
-		models:    o.Models,
-		status:    make(map[string]protocol.StatusItem),
-		workspace: o.Workspace,
-		wsFixed:   o.Workspace != "",
-		width:     defaultWidth,
-		height:    defaultHeight,
+		cfg:          cfg,
+		th:           o.Theme,
+		keys:         table,
+		cl:           o.Client,
+		cwd:          o.Cwd,
+		session:      o.Session,
+		models:       o.Models,
+		status:       make(map[string]protocol.StatusItem),
+		seen:         make(map[string]bool),
+		showThinking: cfg.UI.Transcript.Thinking == thinkingShown,
+		workspace:    o.Workspace,
+		wsFixed:      o.Workspace != "",
+		width:        defaultWidth,
+		height:       defaultHeight,
 	}
 	m.tr = m.newTranscript()
 	m.ed = input.New(cfg.UI.Vim, o.Theme, defaultWidth, table)
@@ -195,15 +210,15 @@ func New(o Options) *Model {
 
 // newTranscript is an empty transcript at the current width and render config. It is one
 // function because a session switch builds a second one and the two must not drift: what
-// the client draws must not depend on which session it happens to be on. ShowThinking is
-// read here rather than pinned at New, so a switch keeps whatever app.thinking.toggle
-// last said.
+// the client draws must not depend on which session it happens to be on. ShowThinking
+// comes from the model rather than from config, so a switch keeps whatever
+// app.thinking.toggle last said.
 func (m *Model) newTranscript() *transcript.Transcript {
 	return transcript.New(transcript.Options{
 		Width:            m.width,
 		ToolCollapsed:    m.cfg.UI.Transcript.ToolCollapsed,
 		ToolPreviewLines: m.cfg.UI.Transcript.ToolPreviewLines,
-		ShowThinking:     m.cfg.UI.Transcript.Thinking == thinkingShown,
+		ShowThinking:     m.showThinking,
 		UserPrefix:       m.cfg.UI.Transcript.UserPrefix,
 		BlockGap:         m.cfg.UI.Transcript.BlockGap,
 		DiffBackground:   m.cfg.UI.Diff.Style == diffBackground,
@@ -359,9 +374,42 @@ func (m *Model) decode(n protocol.Notification, v any) bool {
 // A model change the registry snapshot cannot explain returns the command that refreshes
 // it.
 func (m *Model) entry(e session.Entry) tea.Cmd {
+	// An entry is folded once per session however many times the server sends it. The
+	// transcript dedupes its rows by key, but the usage totals, the commit and the
+	// status line have no key to dedupe by, and a log does arrive twice: a fork the
+	// server attached to this connection and this client then re-attached to replays it
+	// once for each attachment.
+	switch e.Payload.(type) {
+	case session.SessionOpened, session.ForkPoint:
+		// A log starts here. The server sends one of these only at the head of a replay
+		// (they are the only entries a log's first line may be), so this is where a
+		// switched-to session's transcript begins.
+		m.awaitLog = false
+	}
+	if m.awaitLog {
+		// Waiting for that head. A fork a command opened is attached and replayed by the
+		// server and then re-attached and replayed again by this client, and the first of
+		// those two copies may already be part way past when the switch takes effect.
+		// Folding from the middle of it would put an answer above its own question, so
+		// the middle is dropped and the next copy taken from its head. Notifications
+		// arrive in the order the server sent them, so a head is always followed by the
+		// whole of its own copy.
+		return nil
+	}
+	id := e.ID.String()
+	if m.seen[id] {
+		return nil
+	}
+	m.seen[id] = true
 	added := m.tr.Apply(e)
 	var cmd tea.Cmd
 	switch p := e.Payload.(type) {
+	case session.UserMessage:
+		// A user message opens a turn, and inline rendering keeps only the newest one in
+		// the live region: what came before it has rested (a turn that had not would
+		// still be the one this message is being added to) and belongs in scrollback.
+		// This is what commits a replayed log turn by turn as it folds.
+		cmd = m.commitTurns(m.tr.Turn())
 	case session.AssistantMessage:
 		m.usage = m.usage.Add(p.Usage)
 		m.lastPrompt = p.Usage.Input + p.Usage.CacheRead + p.Usage.CacheWrite
@@ -406,6 +454,12 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		if m.pick != nil && m.pick.kind == pickerModel {
 			m.pick.setRows(modelRows(m.models))
 		}
+	case protocol.MethodSessionSetThinking:
+		// Nothing on screen carries the thinking level, so the change says so itself.
+		// From the answer rather than from the thinking_change entry: a level this
+		// client did not set, and a log replayed on a resume, must not post a notice
+		// about a change that is not news.
+		m.note(levelInfo, "thinking: "+r.Name)
 	case protocol.MethodSessionList:
 		var res protocol.SessionListResult
 		if !m.result(r, &res) {
@@ -439,7 +493,15 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 			// The command opened another session, which is what a fork is. The server
 			// has already attached this connection to it, so the switch drops that
 			// attachment and takes it again through a resume (see resumeSession).
-			return m.resumeSession(res.SessionID)
+			if cmd := m.resumeSession(res.SessionID); cmd != nil {
+				return cmd
+			}
+			if res.SessionID != m.session.SessionID {
+				// The switch was refused (another one is in flight, or the connection
+				// is gone). The fork the server opened and attached is nobody's now, so
+				// it is let go rather than left held for the life of the connection.
+				return m.call(protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: res.SessionID})
+			}
 		}
 		m.started(res.TurnID)
 	}
@@ -575,18 +637,25 @@ func (m *Model) startSwitch(cmd tea.Cmd) tea.Cmd {
 	if m.switching != nil {
 		// One at a time: two in flight and the buffered replays would interleave with no
 		// way to tell whose was whose until both had answered.
+		m.note(levelWarn, "a session switch is already in flight")
 		return nil
 	}
 	m.switching = &switchPending{from: m.session.SessionID}
 	return cmd
 }
 
-// switched takes the session a switch answered with. Everything the old session put on
-// screen goes, everything the connection holds stays: a fresh transcript, no turn, no
-// usage and no plugin state, the registry kept, the model and the workspace recomputed.
+// switched takes the session a switch answered with. What the old session put on screen
+// goes, what belongs to the connection rather than to the session stays: a fresh
+// transcript, no turn and no usage, the registry, the plugins' status items and widgets
+// kept (nothing re-sends those but a hello), the model and the workspace recomputed. The
+// queue goes back into the draft: messages queued behind the old session's turn were
+// meant for that session, and nothing may send them to this one.
+//
 // The new session's replay was held while the call was in flight and is folded in here,
-// where there is a transcript for it to land in, and the session that was left is closed
-// last, once there is somewhere else to be.
+// where there is a transcript for it to land in; inline rendering then commits every
+// replayed turn to scrollback in one ordered print, leaving the live region to what
+// happens next. The session that was left is closed last, once there is somewhere else
+// to be.
 func (m *Model) switched(info protocol.SessionInfo) tea.Cmd {
 	sw := m.switching
 	m.switching = nil
@@ -594,8 +663,9 @@ func (m *Model) switched(info protocol.SessionInfo) tea.Cmd {
 	m.tr = m.newTranscript()
 	m.turn = turnControl{}
 	m.usage, m.lastPrompt = session.Usage{}, 0
-	m.status = make(map[string]protocol.StatusItem)
-	m.widgets = nil
+	m.seen = make(map[string]bool)
+	m.awaitLog = true
+	m.ed.Restore()
 	m.model = pickModel(m.models, info.Model)
 	if !m.wsFixed {
 		m.workspace = detectWorkspace(info.Workspace.GitRoot, m.cwd)
@@ -604,11 +674,42 @@ func (m *Model) switched(info protocol.SessionInfo) tea.Cmd {
 	if sw == nil {
 		return nil
 	}
+	// The fold's own commits are suppressed and done once here instead: two prints from
+	// one update are two commands, and a tea.Batch does not order them. What is left
+	// live is the newest replayed turn, the same bound the launch-time replay of a
+	// resumed session keeps; the next user message commits it like any other.
+	m.replaying = true
 	cmds := []tea.Cmd{m.replayBuffered(sw.buffer, info.SessionID)}
+	m.replaying = false
+	cmds = append(cmds, m.commitTurns(m.tr.Turn()))
 	if sw.from != "" && sw.from != info.SessionID {
 		cmds = append(cmds, m.call(protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: sw.from}))
 	}
 	return tea.Batch(cmds...)
+}
+
+// commitTurns prints every turn on screen but keep to the terminal's own scrollback,
+// oldest first, and takes those rows out of the live region. It is inline rendering's
+// only shape: altscreen keeps every row where it is and scrolls them.
+//
+// One print for all of them rather than one per turn, because two commands from one
+// update are not ordered against each other. keep is the turn the live region is left
+// with, or "" for none, which is never a turn id.
+func (m *Model) commitTurns(keep string) tea.Cmd {
+	if !m.inline() || m.replaying {
+		return nil
+	}
+	var lines []string
+	for _, id := range m.tr.Turns() {
+		if id == keep {
+			continue
+		}
+		lines = append(lines, m.tr.Commit(id)...)
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return tea.Println(strings.Join(lines, "\n"))
 }
 
 // abortSwitch is a switch that failed: what was held belongs to the session the client
@@ -671,30 +772,28 @@ var thinkingLevels = []session.ThinkingLevel{
 	session.ThinkingOff, session.ThinkingLow, session.ThinkingMedium, session.ThinkingHigh,
 }
 
-// cycleThinking asks for the next thinking level. As with the model, the status follows
-// the thinking_change entry rather than this call.
+// cycleThinking asks for the next thinking level. Nothing on screen is named for the
+// level, so the answer says what it set (see the session.set_thinking arm of callResult);
+// the entry is what moves the session's own value.
 func (m *Model) cycleThinking() tea.Cmd {
 	if m.offline() {
 		return nil
 	}
 	i := slices.Index(thinkingLevels, m.session.Thinking)
-	return m.call(protocol.MethodSessionSetThinking, protocol.SessionSetThinkingParams{
+	next := thinkingLevels[(i+1)%len(thinkingLevels)]
+	return m.callNamed(protocol.MethodSessionSetThinking, string(next), protocol.SessionSetThinkingParams{
 		SessionID: m.session.SessionID,
-		Thinking:  thinkingLevels[(i+1)%len(thinkingLevels)],
+		Thinking:  next,
 	})
 }
 
-// toggleThinking flips whether thinking text is drawn, for this run only: ui.transcript.
-// thinking is a config value overridden in memory, and config.toml is read, never written
-// by the harness. It is the client's own view of the log, not the session's level, so it
-// asks the server nothing.
+// toggleThinking flips whether thinking text is drawn, for this run only: it overrides
+// ui.transcript.thinking in this model, never in the config, which is shared with the
+// server and is read and not written. It is the client's own view of the log, not the
+// session's level, so it asks the server nothing.
 func (m *Model) toggleThinking() {
-	show := m.cfg.UI.Transcript.Thinking != thinkingShown
-	m.cfg.UI.Transcript.Thinking = thinkingHidden
-	if show {
-		m.cfg.UI.Transcript.Thinking = thinkingShown
-	}
-	m.tr.SetShowThinking(show)
+	m.showThinking = !m.showThinking
+	m.tr.SetShowThinking(m.showThinking)
 }
 
 // offline reports that nothing can be asked of the server, and says so. Every action that

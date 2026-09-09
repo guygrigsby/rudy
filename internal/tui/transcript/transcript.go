@@ -56,6 +56,23 @@ func New(o Options, th theme.Theme) *Transcript {
 // a caller may read them and set Expanded, and must not reorder the slice.
 func (t *Transcript) Rows() []*Row { return slices.Clone(t.rows) }
 
+// Turn is the turn rows are being added to: the nearest preceding user_message, or ""
+// before the first one. A steer message continues the turn it was sent into, so this is
+// not always the last entry's own id.
+func (t *Transcript) Turn() string { return t.turn }
+
+// Turns are the turn ids on screen, oldest first, one entry per turn. It is what lets a
+// client commit the turns behind the one in flight without knowing how rows are keyed.
+func (t *Transcript) Turns() []string {
+	var out []string
+	for _, r := range t.rows {
+		if !slices.Contains(out, r.TurnID) {
+			out = append(out, r.TurnID)
+		}
+	}
+	return out
+}
+
 // SetShowThinking changes whether a model's thinking text becomes a row, for the rows
 // built from here on. Rows already on screen keep what they were built with and rows
 // already committed to scrollback cannot be redrawn at all, so this reads forward only:

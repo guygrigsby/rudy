@@ -1025,20 +1025,29 @@ func (h *appHarness) dispatch(msg tea.Msg) {
 	h.exec(cmd)
 }
 
-// record keeps what a test asks about later: the lines tea.Println was given, the entries
-// the server announced and the turns that came to rest.
+// printLine is the text a tea.Println command produced, false for any other message.
 //
 // printLineMessage is unexported in bubbletea, so it is recognized by type name and read
 // through reflect: reflect.Value.String is the one getter that does not refuse an
 // unexported field, which is enough to see what the program was asked to print.
-func (h *appHarness) record(msg tea.Msg) {
-	if strings.Contains(fmt.Sprintf("%T", msg), "printLine") {
-		v := reflect.ValueOf(msg)
-		for i := range v.NumField() {
-			if v.Field(i).Kind() == reflect.String {
-				h.prints = append(h.prints, v.Field(i).String())
-			}
+func printLine(msg tea.Msg) (string, bool) {
+	if !strings.Contains(fmt.Sprintf("%T", msg), "printLine") {
+		return "", false
+	}
+	v := reflect.ValueOf(msg)
+	for i := range v.NumField() {
+		if v.Field(i).Kind() == reflect.String {
+			return v.Field(i).String(), true
 		}
+	}
+	return "", false
+}
+
+// record keeps what a test asks about later: the lines tea.Println was given, the entries
+// the server announced and the turns that came to rest.
+func (h *appHarness) record(msg tea.Msg) {
+	if line, ok := printLine(msg); ok {
+		h.prints = append(h.prints, line)
 		return
 	}
 	n, ok := msg.(NotificationMsg)

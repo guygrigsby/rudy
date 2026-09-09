@@ -15,6 +15,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
+	"github.com/guygrigsby/rudy/internal/tui/transcript"
 )
 
 // sessionKeys binds the three session actions, which pi leaves unbound: a user binds them
@@ -44,6 +45,46 @@ func (h *appHarness) filter(s string) {
 		h.dispatch(tea.KeyPressMsg{Code: r, Text: string(r)})
 	}
 	h.settle()
+}
+
+// printedFrom is what a batch of messages asked tea.Println to write, in order.
+func printedFrom(msgs []tea.Msg) string {
+	var out []string
+	for _, msg := range msgs {
+		if line, ok := printLine(msg); ok {
+			out = append(out, line)
+		}
+	}
+	return ansi.Strip(strings.Join(out, "\n"))
+}
+
+// fold folds one appended entry straight into the model, without the pump command Update
+// batches beside it: a test that runs what an entry produced must not run the pump too,
+// which waits for a notification that is not coming.
+func (h *harness) fold(p session.Payload) tea.Cmd {
+	h.t.Helper()
+	params, err := json.Marshal(protocol.EntryAppended{
+		SessionID: h.m.session.SessionID, Entry: entry(h.t, p),
+	})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return h.m.notification(protocol.Notification{Method: protocol.NotifyEntryAppended, Params: params})
+}
+
+// opened is the head every replay starts with: a log's first line is session_opened or
+// fork_point, and a switched-to session's transcript begins there.
+func opened() session.SessionOpened {
+	return session.SessionOpened{
+		SchemaVersion: 1, RudyVersion: "test",
+		Workspace: session.Workspace{Root: "/w"},
+		Model:     testRef, Thinking: session.ThinkingOff, Mode: session.ModeStrict, Agent: "default",
+	}
+}
+
+// printedSince is what has been committed to scrollback since the print at index i.
+func (h *appHarness) printedSince(i int) string {
+	return ansi.Strip(strings.Join(h.prints[i:], "\n"))
 }
 
 // sent are the params of every request the pipe harness recorded for method, in order.
@@ -146,13 +187,15 @@ func TestThinkingCyclesThroughTheLevels(t *testing.T) {
 	for _, want := range []session.ThinkingLevel{session.ThinkingLow, session.ThinkingMedium, session.ThinkingHigh, session.ThinkingOff} {
 		h.press("shift+tab")
 		h.wait("thinking "+string(want), func() bool { return h.m.session.Thinking == want })
+		// Nothing on screen carries the level, so the answer says what it set.
+		h.waitFor("the notice", func(v string) bool { return strings.Contains(v, "thinking: "+string(want)) })
 	}
 }
 
 func TestThinkingToggleShowsThinkingWithoutWritingConfig(t *testing.T) {
 	h := newHarness(t, nil)
-	if h.m.cfg.UI.Transcript.Thinking != thinkingHidden {
-		t.Fatalf("the default is hidden, got %q", h.m.cfg.UI.Transcript.Thinking)
+	if h.m.showThinking {
+		t.Fatal("the default is hidden")
 	}
 	h.appended(session.AssistantMessage{
 		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
@@ -162,8 +205,11 @@ func TestThinkingToggleShowsThinkingWithoutWritingConfig(t *testing.T) {
 		t.Fatalf("thinking is hidden by config:\n%s", h.view())
 	}
 	h.press("ctrl+t")
-	if h.m.cfg.UI.Transcript.Thinking != thinkingShown {
-		t.Fatalf("the toggle flips the config value in memory, got %q", h.m.cfg.UI.Transcript.Thinking)
+	if !h.m.showThinking {
+		t.Fatal("the toggle flips the override the transcript is built from")
+	}
+	if h.m.cfg.UI.Transcript.Thinking != thinkingHidden {
+		t.Errorf("the config is shared with the server and is never written, it says %q", h.m.cfg.UI.Transcript.Thinking)
 	}
 	h.appended(session.AssistantMessage{
 		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
@@ -173,8 +219,8 @@ func TestThinkingToggleShowsThinkingWithoutWritingConfig(t *testing.T) {
 		t.Errorf("thinking shows from the toggle on:\n%s", h.view())
 	}
 	h.press("ctrl+t")
-	if h.m.cfg.UI.Transcript.Thinking != thinkingHidden {
-		t.Errorf("the toggle flips back, got %q", h.m.cfg.UI.Transcript.Thinking)
+	if h.m.showThinking {
+		t.Error("the toggle flips back")
 	}
 	// Nothing asks the server: the level the session thinks at is app.thinking.cycle's,
 	// and what the transcript draws is the client's own view of the log.
@@ -309,17 +355,23 @@ func TestTabCompletesFromTheHelpNotice(t *testing.T) {
 // new session's entries arrive before the answer that names it, so they have to be held
 // until there is a transcript for them to land in.
 func TestASwitchHoldsTheReplayUntilItsAnswer(t *testing.T) {
-	h := newHarness(t, nil)
+	// Altscreen, so what a switch rebuilt is what the view says: inline commits a
+	// replayed turn to scrollback, which TestAnInlineSwitchCommitsTheReplay reads.
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
 	h.m.keys = sessionKeys(t)
 	old := h.m.session.SessionID
 	h.appended(session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("in the old session")}})
+	h.typeText("queued for the old session")
+	h.m.ed.Enqueue()
 	h.press("ctrl+n")
 
 	next := session.NewID().String()
-	h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{
-		SessionID: next,
-		Entry:     entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("in the new session")}}),
-	})
+	for _, p := range []session.Payload{
+		opened(),
+		session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("in the new session")}},
+	} {
+		h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: next, Entry: entry(t, p)})
+	}
 	v := ansi.Strip(h.view())
 	if !strings.Contains(v, "in the old session") || strings.Contains(v, "in the new session") {
 		t.Fatalf("the replay is held while the switch is in flight:\n%s", v)
@@ -339,6 +391,11 @@ func TestASwitchHoldsTheReplayUntilItsAnswer(t *testing.T) {
 	}
 	if h.m.session.SessionID != next {
 		t.Errorf("the session is the new one, got %q", h.m.session.SessionID)
+	}
+	// A message queued behind the old session's turn was meant for that session: it comes
+	// back as an editable draft rather than draining into this one.
+	if len(h.m.ed.Queue()) != 0 || h.m.ed.Text() != "queued for the old session" {
+		t.Errorf("the queue crosses no switch: draft %q queue %q", h.m.ed.Text(), h.m.ed.Queue())
 	}
 	// The session that was left is still attached until its close lands, and what it says
 	// in the meantime is not what is on screen.
@@ -404,7 +461,328 @@ func TestPickerActionsWhileDisconnectedSaySo(t *testing.T) {
 	if got := ansi.Strip(h.view()); !strings.Contains(got, "not connected") {
 		t.Errorf("a refused action says why:\n%s", got)
 	}
-	if got := len(h.sent(protocol.MethodRegistryRefresh)) + len(h.sent(protocol.MethodSessionSetModel)); got != 0 {
-		t.Errorf("nothing was asked of a server that is gone: %d calls", got)
+	var calls int
+	for _, method := range []string{
+		protocol.MethodRegistryRefresh, protocol.MethodSessionSetModel, protocol.MethodSessionSetThinking,
+		protocol.MethodSessionOpen, protocol.MethodSessionFork, protocol.MethodSessionList,
+	} {
+		calls += len(h.sent(method))
+	}
+	if calls != 0 {
+		t.Errorf("nothing was asked of a server that is gone: %d calls", calls)
+	}
+}
+
+// TestStatusAndWidgetsSurviveASwitch pins what a switch keeps: a plugin's status item and
+// its widget belong to the connection, not to the session, and nothing re-sends them but
+// a hello.
+func TestStatusAndWidgetsSurviveASwitch(t *testing.T) {
+	h := newHarness(t, map[string]any{
+		"ui.render":       renderAltscreen,
+		"ui.layout.slots": []string{"header", "transcript", "input", "status"},
+		"ui.status.items": []string{"model", "memory:tokens"},
+	})
+	h.m.keys = sessionKeys(t)
+	h.notify(protocol.NotifyStatusUpdated, protocol.StatusUpdated{Items: []protocol.StatusItem{
+		{Owner: "memory", Key: "tokens", Content: []protocol.Span{{Text: "12 notes", Role: "muted"}}},
+	}})
+	h.notify(protocol.NotifyWidgetUpdated, protocol.Widget{
+		Owner: "memory", Key: "banner", Slot: protocol.SlotHeader,
+		Content: []protocol.Span{{Text: "project memory on", Role: "muted"}},
+	})
+	h.press("ctrl+n")
+	next := session.NewID().String()
+	res, err := json.Marshal(protocol.SessionInfo{
+		SessionID: next, Workspace: session.Workspace{Root: "/w"},
+		Model: testRef, Mode: session.ModeStrict, Thinking: session.ThinkingOff,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runAll(t, h.update(CallResultMsg{Method: protocol.MethodSessionOpen, Result: res}))
+	v := ansi.Strip(h.view())
+	if !strings.Contains(v, "12 notes") {
+		t.Errorf("a plugin's status item survives a switch, nothing re-sends it:\n%s", v)
+	}
+	if !strings.Contains(v, "project memory on") {
+		t.Errorf("a plugin's widget survives a switch:\n%s", v)
+	}
+}
+
+// TestForkReplaysTheLogOnce pins the count a double replay would break: the server
+// attaches the fork a /fork opened and replays it, and this client closes that
+// attachment and resumes, which replays it again. Rows dedupe by key; a usage total has
+// no key, so the entry itself is folded once.
+func TestForkReplaysTheLogOnce(t *testing.T) {
+	h := newAppHarnessWith(t, scripted{text("first answer")}, altscreen)
+	first := h.m.session.SessionID
+	h.typeText("fix the flaky fork test")
+	h.press("enter")
+	h.waitTurn(stateCompleted)
+	if h.m.usage != (session.Usage{Input: 10, Output: 2}) {
+		t.Fatalf("one turn, one completion: %+v", h.m.usage)
+	}
+	h.typeText("/fork")
+	h.press("enter")
+	h.wait("the fork", func() bool { return h.m.session.SessionID != first })
+	h.waitFor("the fork's replay", func(v string) bool { return strings.Contains(v, "first answer") })
+	if h.m.usage != (session.Usage{Input: 10, Output: 2}) {
+		t.Errorf("the fork's log is priced once however many times it was replayed: %+v", h.m.usage)
+	}
+	if got := rowKinds(h.m.tr.Rows()); !slices.Equal(got, []transcript.RowKind{transcript.RowUser, transcript.RowAssistant}) {
+		t.Errorf("one row per entry: %v", got)
+	}
+}
+
+// TestAnInlineSwitchCommitsTheReplay pins inline rendering's half of a switch: a replayed
+// log goes to the terminal's own scrollback turn by turn, in order, and what is left in
+// the live region is the newest turn, which the next user message commits like any other.
+// The bound is one turn, whether the replay came with a switch or at launch.
+func TestAnInlineSwitchCommitsTheReplay(t *testing.T) {
+	h := newAppHarness(t, scripted{text("first answer"), text("second answer")})
+	h.m.keys = sessionKeys(t)
+	first := h.m.session.SessionID
+	h.typeText("first question")
+	h.press("enter")
+	h.waitTurn(stateCompleted)
+	h.waitPrinted("first answer")
+	h.typeText("second question")
+	h.press("enter")
+	h.waitTurnCount(2)
+	h.waitPrinted("second answer")
+
+	at := len(h.prints)
+	h.press("ctrl+y")
+	h.wait("the fork", func() bool { return h.m.session.SessionID != first })
+	h.wait("the replay's first turn", func() bool { return strings.Contains(h.printedSince(at), "first answer") })
+	got := h.printedSince(at)
+	if strings.Contains(got, "second question") {
+		t.Errorf("the newest replayed turn stays live:\n%s", got)
+	}
+	if v := h.view(); strings.Contains(v, "first question") {
+		t.Errorf("a committed turn leaves the live region:\n%s", v)
+	}
+	h.waitFor("the newest turn, live", func(v string) bool { return strings.Contains(v, "second answer") })
+
+	// The next user message commits it, the way it commits any turn before the one it
+	// starts, and then the live region holds only what was just typed.
+	at = len(h.prints)
+	h.typeText("third question")
+	h.press("enter")
+	h.wait("the last replayed turn", func() bool { return strings.Contains(h.printedSince(at), "second answer") })
+	one, two := strings.Index(h.printed(), "first question"), strings.Index(h.printed(), "second question")
+	if one < 0 || two < 0 || one > two {
+		t.Errorf("the turns reach scrollback in the order they were logged:\n%s", h.printed())
+	}
+	if v := h.view(); strings.Contains(v, "second answer") || !strings.Contains(v, "third question") {
+		t.Errorf("the live region is what happens next:\n%s", v)
+	}
+}
+
+// TestAnInlineReplayCommitsEachTurnAsTheNextStarts is the same rule where no switch is in
+// flight: the launch-time replay of a resumed session (rudy --resume, Task 9). Every turn
+// but the newest goes to scrollback as the next one starts, so what stands in the live
+// region is bounded by one turn.
+func TestAnInlineReplayCommitsEachTurnAsTheNextStarts(t *testing.T) {
+	h := newHarness(t, nil) // inline is the default
+	h.fold(session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("first question")}})
+	h.fold(session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
+		Content: []session.Block{session.TextBlock("first answer")},
+	})
+	if got := printedFrom(runAll(t, h.fold(session.UserMessage{
+		Source: session.SourceTyped, Content: []session.Block{session.TextBlock("second question")},
+	}))); !strings.Contains(got, "first question") || !strings.Contains(got, "first answer") {
+		t.Fatalf("the turn before the one starting is committed:\n%s", got)
+	} else if strings.Contains(got, "second question") {
+		t.Errorf("the turn that just started stays live:\n%s", got)
+	}
+	v := ansi.Strip(h.view())
+	if strings.Contains(v, "first question") || strings.Contains(v, "first answer") {
+		t.Errorf("a committed turn leaves the live region:\n%s", v)
+	}
+	if !strings.Contains(v, "second question") {
+		t.Errorf("the newest turn is what the live region holds:\n%s", v)
+	}
+}
+
+// TestASecondSwitchIsRefusedAndItsForkLetGo pins what happens to a fork that arrives
+// while another switch is in flight: it is nobody's, and holding it for the life of the
+// connection would keep a session open that nothing draws.
+func TestASecondSwitchIsRefusedAndItsForkLetGo(t *testing.T) {
+	h := newHarness(t, nil)
+	h.m.keys = sessionKeys(t)
+	h.press("ctrl+n")
+	orphan := session.NewID().String()
+	res, err := json.Marshal(protocol.CommandRunResult{SessionID: orphan, Notice: "forked to " + orphan})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runAll(t, h.update(CallResultMsg{Method: protocol.MethodCommandRun, Name: "fork", Result: res}))
+	if got := ansi.Strip(h.view()); !strings.Contains(got, "a session switch is already in flight") {
+		t.Errorf("a refused switch says so:\n%s", got)
+	}
+	var closed []string
+	for _, raw := range h.sent(protocol.MethodSessionClose) {
+		var p protocol.SessionCloseParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		closed = append(closed, p.SessionID)
+	}
+	if !slices.Contains(closed, orphan) {
+		t.Errorf("the fork nobody took is closed, closed %v", closed)
+	}
+}
+
+// TestAPickerTakesTheKeysAQuestionWants pins the order of the two things that own the
+// keyboard: while a picker is up it takes y, a and n as filter text, and the question is
+// still standing when it closes.
+func TestAPickerTakesTheKeysAQuestionWants(t *testing.T) {
+	h := newAppHarness(t, scripted{toolCall("bash", `{"command":"go test ./..."}`), text("done")})
+	h.typeText("run the tests")
+	h.press("enter")
+	h.waitFor("the question", func(v string) bool { return strings.Contains(v, "allow once [y]") })
+	h.press("ctrl+l")
+	h.press("y")
+	if h.m.pick == nil || h.m.pick.filter != "y" {
+		t.Fatalf("the picker takes the key the question wanted: picker %+v", h.m.pick)
+	}
+	if h.m.turn.prompt == nil {
+		t.Error("the question was not answered by a key the picker took")
+	}
+	h.press("escape")
+	if h.m.pick != nil {
+		t.Fatal("escape closes the picker")
+	}
+	if h.m.turn.prompt == nil {
+		t.Fatal("the question the picker hid is still standing")
+	}
+	h.press("y")
+	h.waitTurn(stateCompleted)
+	if dec := findDecision(t, h.entries(), "bash"); dec.Decision != session.Allow {
+		t.Errorf("decision %+v", dec)
+	}
+}
+
+func TestSessionRowsTagForksAndChildren(t *testing.T) {
+	at := time.Date(2026, 9, 9, 14, 3, 0, 0, time.UTC)
+	rows := sessionRows([]session.Summary{
+		{ID: session.NewID(), OpenedAt: at, Workspace: session.Workspace{Root: "/w"}, Model: testRef, Forked: true, ParentSessionID: session.NewID().String()},
+		{ID: session.NewID(), OpenedAt: at, Workspace: session.Workspace{Root: "/w"}, Model: testRef, ParentSessionID: session.NewID().String()},
+		{ID: session.NewID(), OpenedAt: at, Workspace: session.Workspace{Root: "/w"}, Model: testRef},
+	})
+	for i, want := range []string{"fork child", "child", "/w  fake:m1"} {
+		if !strings.HasSuffix(rows[i].text, want) {
+			t.Errorf("row %d is %q, want it to end %q", i, rows[i].text, want)
+		}
+	}
+	if !strings.HasPrefix(rows[0].text, at.Local().Format("2006-01-02 15:04")) {
+		t.Errorf("a row opens with when the session was opened: %q", rows[0].text)
+	}
+}
+
+// TestAnEntryIsFoldedOnce pins the rule TestForkReplaysTheLogOnce depends on, where the
+// ordering is the test's own: a log the server sends twice (the fork it attached and this
+// client re-attached to) leaves one row and one usage total. The transcript dedupes its
+// rows by key; the usage has no key, so the entry itself is folded once.
+func TestAnEntryIsFoldedOnce(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	e := entry(t, session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
+		Content: []session.Block{session.TextBlock("counted once")},
+		Usage:   session.Usage{Input: 10, Output: 2},
+	})
+	for range 2 {
+		h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: h.m.session.SessionID, Entry: e})
+	}
+	if h.m.usage != (session.Usage{Input: 10, Output: 2}) {
+		t.Errorf("a replayed entry is priced once: %+v", h.m.usage)
+	}
+	if got := len(h.m.tr.Rows()); got != 1 {
+		t.Errorf("and draws one row, got %d", got)
+	}
+}
+
+// TestASwitchCommitsWhatItHeld is the switch's own half of the inline commit, where the
+// whole replay was held and the fold's per-turn commits are suppressed: the answer prints
+// every turn but the newest, in one ordered block.
+func TestASwitchCommitsWhatItHeld(t *testing.T) {
+	h := newHarness(t, nil) // inline is the default
+	h.m.keys = sessionKeys(t)
+	h.press("ctrl+n")
+	next := session.NewID().String()
+	for _, p := range []session.Payload{
+		opened(),
+		session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("first question")}},
+		session.AssistantMessage{
+			Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
+			Content: []session.Block{session.TextBlock("first answer")},
+		},
+		session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("second question")}},
+	} {
+		h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: next, Entry: entry(t, p)})
+	}
+	res, err := json.Marshal(protocol.SessionInfo{
+		SessionID: next, Workspace: session.Workspace{Root: "/w"},
+		Model: testRef, Mode: session.ModeStrict, Thinking: session.ThinkingOff,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := printedFrom(runAll(t, h.update(CallResultMsg{Method: protocol.MethodSessionOpen, Result: res})))
+	if !strings.Contains(got, "first question") || !strings.Contains(got, "first answer") {
+		t.Fatalf("the held replay is committed turn by turn:\n%s", got)
+	}
+	if strings.Contains(got, "second question") {
+		t.Errorf("the newest turn stays live:\n%s", got)
+	}
+	if v := ansi.Strip(h.view()); strings.Contains(v, "first question") || !strings.Contains(v, "second question") {
+		t.Errorf("the live region holds the newest turn and nothing before it:\n%s", v)
+	}
+}
+
+// TestASwitchWaitsForTheHeadOfTheLog pins where a switched-to session's transcript
+// begins. A fork a command opened is replayed twice, once for the attachment the server
+// made and once for the one this client takes, and the switch can land part way through
+// the first copy. Folding from there would put an answer above its own question, so the
+// remains of that copy are dropped and the next copy is taken from its head.
+func TestASwitchWaitsForTheHeadOfTheLog(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	h.m.keys = sessionKeys(t)
+	h.press("ctrl+n")
+	next := session.NewID().String()
+	answer := entry(t, session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
+		Content: []session.Block{session.TextBlock("the answer")},
+		Usage:   session.Usage{Input: 10, Output: 2},
+	})
+	question := entry(t, session.UserMessage{
+		Source: session.SourceTyped, Content: []session.Block{session.TextBlock("the question")},
+	})
+	// What is left of the first copy when the switch takes effect: no head, and the
+	// answer without the question it belongs to.
+	h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: next, Entry: answer})
+	res, err := json.Marshal(protocol.SessionInfo{
+		SessionID: next, Workspace: session.Workspace{Root: "/w"},
+		Model: testRef, Mode: session.ModeStrict, Thinking: session.ThinkingOff,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runAll(t, h.update(CallResultMsg{Method: protocol.MethodSessionResume, Result: res}))
+	if got := len(h.m.tr.Rows()); got != 0 {
+		t.Fatalf("nothing is folded before the head of the log, got %d rows", got)
+	}
+	// The second copy, from the head.
+	h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: next, Entry: entry(t, opened())})
+	for _, e := range []session.Entry{question, answer} {
+		h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: next, Entry: e})
+	}
+	if got := rowKinds(h.m.tr.Rows()); !slices.Equal(got, []transcript.RowKind{transcript.RowUser, transcript.RowAssistant}) {
+		t.Errorf("the log reads in the order it was written: %v", got)
+	}
+	if h.m.usage != (session.Usage{Input: 10, Output: 2}) {
+		t.Errorf("and is priced once: %+v", h.m.usage)
 	}
 }

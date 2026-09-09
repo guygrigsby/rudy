@@ -304,9 +304,10 @@ func (m *Model) interrupt() (cmd tea.Cmd, handled bool) {
 		}
 		return nil, true
 	}
-	// Idle: closing a picker or a selection is Task 8's, and until then Esc is the
-	// editor's own. It arms nothing, or a turn that starts by itself (the queue draining
-	// into a new turn) would read the next Esc as a double press and cancel it.
+	// Idle: a picker takes Esc before any of this (Model.key), so what reaches here with
+	// no turn to interrupt is the editor's own. It arms nothing, or a turn that starts by
+	// itself (the queue draining into a new turn) would read the next Esc as a double
+	// press and cancel it.
 	return nil, false
 }
 
