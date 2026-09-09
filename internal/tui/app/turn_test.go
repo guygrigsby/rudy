@@ -413,7 +413,12 @@ func TestUnknownCommandNotices(t *testing.T) {
 	h := newAppHarness(t, scripted{text("done")})
 	h.typeText("/nope")
 	h.press("enter")
-	h.waitFor("the refusal", func(v string) bool { return strings.Contains(v, "command.run") })
+	// The server's own words, with neither the method nor the JSON-RPC code in front of
+	// them: what came back is the command the user typed.
+	h.waitFor("the refusal", func(v string) bool { return strings.Contains(v, "unknown command /nope") })
+	if strings.Contains(h.view(), "command.run") {
+		t.Errorf("a command's refusal names the command, not the method:\n%s", h.view())
+	}
 	if h.m.turn.state != "" {
 		t.Errorf("no turn started: %q", h.m.turn.state)
 	}

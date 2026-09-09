@@ -13,7 +13,9 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"time"
@@ -36,6 +38,7 @@ import (
 const (
 	renderAltscreen = "altscreen"
 	thinkingShown   = "shown"
+	thinkingHidden  = "hidden"
 	diffBackground  = "background"
 
 	slotHeader     = "header"
@@ -121,6 +124,18 @@ type Model struct {
 	// mirrored, the question standing on screen and what Esc does next (turn.go).
 	turn turnControl
 
+	// pick is the picker standing in the editor's place, nil when none is up. While one
+	// stands it owns the keyboard (picker.go).
+	pick *picker
+	// commands are the command names the last /help notice listed, which is the only
+	// list of commands a client is given: tab completes a slash word from these.
+	commands []string
+	// switching is the session switch waiting for its answer, nil when none is. It holds
+	// the session being left and the notifications that arrived while it was in flight,
+	// which for a resume, an open and a fork are the new session's replay: the server
+	// sends every entry before the answer that names the session they belong to.
+	switching *switchPending
+
 	// models is the registry as this client last saw it, and model is the session's own
 	// entry in it, for the context percent and the cost. A model the registry does not
 	// know leaves model zero, and both items go quiet rather than guessing.
@@ -133,8 +148,12 @@ type Model struct {
 	lastPrompt int64
 
 	workspace string
-	width     int
-	height    int
+	// wsFixed is Options.Workspace having been set: that caller owns the workspace item
+	// for the life of the client, a session switch included. Without it the item is read
+	// from git in the new session's own root.
+	wsFixed bool
+	width   int
+	height  int
 
 	// disconnected is set once the server is gone. Editing still works, so a draft can be
 	// read back and copied out; what stops is anything that needs the server, which is
@@ -160,18 +179,11 @@ func New(o Options) *Model {
 		models:    o.Models,
 		status:    make(map[string]protocol.StatusItem),
 		workspace: o.Workspace,
+		wsFixed:   o.Workspace != "",
 		width:     defaultWidth,
 		height:    defaultHeight,
 	}
-	m.tr = transcript.New(transcript.Options{
-		Width:            defaultWidth,
-		ToolCollapsed:    cfg.UI.Transcript.ToolCollapsed,
-		ToolPreviewLines: cfg.UI.Transcript.ToolPreviewLines,
-		ShowThinking:     cfg.UI.Transcript.Thinking == thinkingShown,
-		UserPrefix:       cfg.UI.Transcript.UserPrefix,
-		BlockGap:         cfg.UI.Transcript.BlockGap,
-		DiffBackground:   cfg.UI.Diff.Style == diffBackground,
-	}, o.Theme)
+	m.tr = m.newTranscript()
 	m.ed = input.New(cfg.UI.Vim, o.Theme, defaultWidth, table)
 	m.vp = viewport.New(viewport.WithWidth(defaultWidth), viewport.WithHeight(defaultHeight))
 	m.model = pickModel(m.models, m.session.Model)
@@ -179,6 +191,23 @@ func New(o Options) *Model {
 		m.workspace = detectWorkspace(m.session.Workspace.GitRoot, m.cwd)
 	}
 	return m
+}
+
+// newTranscript is an empty transcript at the current width and render config. It is one
+// function because a session switch builds a second one and the two must not drift: what
+// the client draws must not depend on which session it happens to be on. ShowThinking is
+// read here rather than pinned at New, so a switch keeps whatever app.thinking.toggle
+// last said.
+func (m *Model) newTranscript() *transcript.Transcript {
+	return transcript.New(transcript.Options{
+		Width:            m.width,
+		ToolCollapsed:    m.cfg.UI.Transcript.ToolCollapsed,
+		ToolPreviewLines: m.cfg.UI.Transcript.ToolPreviewLines,
+		ShowThinking:     m.cfg.UI.Transcript.Thinking == thinkingShown,
+		UserPrefix:       m.cfg.UI.Transcript.UserPrefix,
+		BlockGap:         m.cfg.UI.Transcript.BlockGap,
+		DiffBackground:   m.cfg.UI.Diff.Style == diffBackground,
+	}, m.th)
 }
 
 // pickModel is the registry's entry for ref, or the zero model when the registry has no
@@ -248,6 +277,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // methods that need one (the inline commit hangs off turn.state); the folding itself
 // happens here, on the update loop.
 func (m *Model) notification(n protocol.Notification) tea.Cmd {
+	if sessionScoped(n.Method) {
+		switch sid := sessionOf(n); {
+		case m.switching != nil:
+			// A switch in flight: which session these belong to is not settled until the
+			// answer names it. The new session's whole log arrives this way, ahead of the
+			// answer (docs/specs/rudy-contracts.md: session.open, session.resume and
+			// session.fork replay their entries first and return once the replay
+			// finishes), so folding them now would put them in the transcript the switch
+			// is about to throw away.
+			m.switching.buffer = append(m.switching.buffer, n)
+			return nil
+		case sid != "" && sid != m.session.SessionID:
+			// Another session's, which is not the one on screen: a client that has just
+			// switched stays attached to the session it left until its close lands, and
+			// the answer that switched it overtakes what was sent before it (a
+			// notification arrives one per update, an answer in a single message), so
+			// the two cross. One that names no session is nobody else's and is folded.
+			return nil
+		}
+	}
 	switch n.Method {
 	case protocol.NotifyEntryAppended:
 		var p protocol.EntryAppended
@@ -335,25 +384,17 @@ func (m *Model) entry(e session.Entry) tea.Cmd {
 }
 
 // callResult folds one server answer in. A call whose answer says nothing this model
-// reads (session.interrupt, session.answer) has no case: a failure is already a notice
-// above, and the turn's own notifications carry the rest. Task 8 adds the pickers'
-// methods beside these.
+// reads (session.interrupt, session.answer, session.close) has no case: a failure is
+// already a notice above, and the turn's own notifications carry the rest.
 func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 	if r.Err != nil {
-		if r.Method == protocol.MethodSessionAnswer {
-			// The question came down when the answer went out and the server never got
-			// it: put it back rather than leave the turn waiting on a decision with
-			// nothing on screen to make it with.
-			m.reask()
-		}
-		m.note(levelError, r.Method+": "+r.Err.Error())
-		return nil
+		return m.callFailed(r)
 	}
 	switch r.Method {
 	case protocol.MethodSessionAnswer:
 		// The server has the decision; nothing is left to put back.
 		m.turn.asked = nil
-	case protocol.MethodRegistryList:
+	case protocol.MethodRegistryList, protocol.MethodRegistryRefresh:
 		var res protocol.RegistryListResult
 		if !m.result(r, &res) {
 			return nil
@@ -362,6 +403,21 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		// Not setModel: the refresh is the answer to a model-not-found, and a model the
 		// fresh registry still lacks must not ask for it again.
 		m.model = pickModel(res.Models, m.session.Model)
+		if m.pick != nil && m.pick.kind == pickerModel {
+			m.pick.setRows(modelRows(m.models))
+		}
+	case protocol.MethodSessionList:
+		var res protocol.SessionListResult
+		if !m.result(r, &res) {
+			return nil
+		}
+		m.openSessionPicker(res.Sessions)
+	case protocol.MethodSessionOpen, protocol.MethodSessionResume, protocol.MethodSessionFork:
+		var info protocol.SessionInfo
+		if !m.result(r, &info) {
+			return nil
+		}
+		return m.switched(info)
 	case protocol.MethodSessionSubmit:
 		var res protocol.SessionSubmitResult
 		if !m.result(r, &res) {
@@ -375,12 +431,281 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		}
 		if res.Notice != "" {
 			m.note(levelInfo, res.Notice)
+			if r.Name == helpCommand {
+				m.commands = helpCommands(res.Notice)
+			}
 		}
-		// A command that opened another session (a fork) answers with its id; switching
-		// to it is Task 8's, with the rest of the session actions.
+		if res.SessionID != "" {
+			// The command opened another session, which is what a fork is. The server
+			// has already attached this connection to it, so the switch drops that
+			// attachment and takes it again through a resume (see resumeSession).
+			return m.resumeSession(res.SessionID)
+		}
 		m.started(res.TurnID)
 	}
 	return nil
+}
+
+// callFailed is one call that came back an error. Every failure is a notice, and the two
+// that leave the client holding something have to put it back: an answer that never
+// reached the server, and a session switch whose new session never opened.
+func (m *Model) callFailed(r CallResultMsg) tea.Cmd {
+	var cmd tea.Cmd
+	switch {
+	case r.Method == protocol.MethodSessionAnswer:
+		// The question came down when the answer went out and the server never got it:
+		// put it back rather than leave the turn waiting on a decision with nothing on
+		// screen to make it with.
+		m.reask()
+	case switchMethod(r.Method):
+		// The session that was being left is still here and still attached: nothing was
+		// closed, and what arrived while the switch was in flight was its own.
+		cmd = m.abortSwitch()
+	}
+	if r.Method == protocol.MethodCommandRun {
+		// A command's failure is the server's own words, which is what the user typed
+		// come back at them ("unknown command /x"). The method and the JSON-RPC code in
+		// front of it would say nothing they can act on.
+		m.note(levelError, serverMessage(r.Err))
+		return cmd
+	}
+	m.note(levelError, r.Method+": "+r.Err.Error())
+	return cmd
+}
+
+// serverMessage is the message a server error carries, or the whole error for one that
+// never reached the server.
+func serverMessage(err error) string {
+	var pe *protocol.Error
+	if errors.As(err, &pe) {
+		return pe.Message
+	}
+	return err.Error()
+}
+
+// switchPending is a session switch waiting for its answer: the session being left, which
+// is closed only once the new one is in hand, and the session-scoped notifications that
+// arrived in the meantime.
+type switchPending struct {
+	from   string
+	buffer []protocol.Notification
+}
+
+// switchMethod reports whether a method's answer is a session to switch to.
+func switchMethod(method string) bool {
+	switch method {
+	case protocol.MethodSessionOpen, protocol.MethodSessionResume, protocol.MethodSessionFork:
+		return true
+	}
+	return false
+}
+
+// sessionScoped reports whether a notification belongs to one session rather than to the
+// connection. These are the ones a switch has to hold: the rest (a notice, a status line,
+// a widget, a plugin's state) are the process's and are folded whatever session is on.
+func sessionScoped(method string) bool {
+	switch method {
+	case protocol.NotifyEntryAppended, protocol.NotifyStreamDelta,
+		protocol.NotifyTurnState, protocol.NotifyPermissionRequested:
+		return true
+	}
+	return false
+}
+
+// sessionOf is the session a notification names, or "" for one that names none.
+func sessionOf(n protocol.Notification) string {
+	var p struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(n.Params, &p); err != nil {
+		return ""
+	}
+	return p.SessionID
+}
+
+// newSession opens a session on the same directory this client was started in.
+func (m *Model) newSession() tea.Cmd {
+	return m.startSwitch(m.call(protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: m.cwd}))
+}
+
+// forkSession forks the current session at its newest entry and switches to the fork,
+// which is what an empty at_entry_id asks for.
+func (m *Model) forkSession() tea.Cmd {
+	return m.startSwitch(m.call(protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: m.session.SessionID}))
+}
+
+// listSessions asks for the sessions the resume picker is built from.
+func (m *Model) listSessions() tea.Cmd {
+	if m.offline() {
+		return nil
+	}
+	return m.call(protocol.MethodSessionList, nil)
+}
+
+// resumeSession switches to id, dropping first whatever attachment this client already
+// holds to it. The server attaches the fork a /fork command opened to the connection that
+// ran the command and replays it there before answering, so resuming that fork without
+// the close would subscribe the same connection to it twice and every later entry would
+// arrive, and be counted, twice. The two calls travel on one command, which is what puts
+// the close on the wire ahead of the resume; a close of a session this client does not
+// hold is answered not_found and ignored.
+func (m *Model) resumeSession(id string) tea.Cmd {
+	if id == m.session.SessionID {
+		m.note(levelInfo, "already in this session")
+		return nil
+	}
+	c := m.cl
+	return m.startSwitch(func() tea.Msg {
+		ctx := context.Background()
+		_ = c.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: id}, nil)
+		var raw json.RawMessage
+		err := c.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: id}, &raw)
+		return CallResultMsg{Method: protocol.MethodSessionResume, Result: raw, Err: err}
+	})
+}
+
+// startSwitch runs the call that opens the session to switch to and starts holding the
+// notifications that arrive until it answers. The session being left is not closed here:
+// a switch that fails leaves the client exactly where it was, which it could not do if
+// the way out had already been given up.
+func (m *Model) startSwitch(cmd tea.Cmd) tea.Cmd {
+	if m.offline() {
+		return nil
+	}
+	if m.switching != nil {
+		// One at a time: two in flight and the buffered replays would interleave with no
+		// way to tell whose was whose until both had answered.
+		return nil
+	}
+	m.switching = &switchPending{from: m.session.SessionID}
+	return cmd
+}
+
+// switched takes the session a switch answered with. Everything the old session put on
+// screen goes, everything the connection holds stays: a fresh transcript, no turn, no
+// usage and no plugin state, the registry kept, the model and the workspace recomputed.
+// The new session's replay was held while the call was in flight and is folded in here,
+// where there is a transcript for it to land in, and the session that was left is closed
+// last, once there is somewhere else to be.
+func (m *Model) switched(info protocol.SessionInfo) tea.Cmd {
+	sw := m.switching
+	m.switching = nil
+	m.session = info
+	m.tr = m.newTranscript()
+	m.turn = turnControl{}
+	m.usage, m.lastPrompt = session.Usage{}, 0
+	m.status = make(map[string]protocol.StatusItem)
+	m.widgets = nil
+	m.model = pickModel(m.models, info.Model)
+	if !m.wsFixed {
+		m.workspace = detectWorkspace(info.Workspace.GitRoot, m.cwd)
+	}
+	m.note(levelInfo, "switched to session "+info.SessionID)
+	if sw == nil {
+		return nil
+	}
+	cmds := []tea.Cmd{m.replayBuffered(sw.buffer, info.SessionID)}
+	if sw.from != "" && sw.from != info.SessionID {
+		cmds = append(cmds, m.call(protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: sw.from}))
+	}
+	return tea.Batch(cmds...)
+}
+
+// abortSwitch is a switch that failed: what was held belongs to the session the client
+// never left, so it is folded in now rather than dropped.
+func (m *Model) abortSwitch() tea.Cmd {
+	sw := m.switching
+	m.switching = nil
+	if sw == nil {
+		return nil
+	}
+	return m.replayBuffered(sw.buffer, m.session.SessionID)
+}
+
+// replayBuffered folds the held notifications that belong to session sid, in the order
+// they arrived. The rest named the session being left and are moot: it is closed, and its
+// rows are not the ones on screen.
+func (m *Model) replayBuffered(ns []protocol.Notification, sid string) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, n := range ns {
+		if sessionOf(n) != sid {
+			continue
+		}
+		cmds = append(cmds, m.notification(n))
+	}
+	return tea.Batch(cmds...)
+}
+
+// setSessionModel asks the server to change the session's model. The status line does not
+// move here: the model_change entry the server appends is what moves it, the same entry
+// another client's change would arrive as.
+func (m *Model) setSessionModel(ref session.ModelRef) tea.Cmd {
+	if m.offline() {
+		return nil
+	}
+	return m.call(protocol.MethodSessionSetModel, protocol.SessionSetModelParams{
+		SessionID: m.session.SessionID,
+		Model:     ref.String(),
+	})
+}
+
+// cycleModel steps d models through the registry from the session's own, wrapping at both
+// ends. A model the registry does not carry starts the walk at the first entry rather
+// than nowhere.
+func (m *Model) cycleModel(d int) tea.Cmd {
+	n := len(m.models)
+	if n == 0 {
+		m.note(levelWarn, "the registry has no models")
+		return nil
+	}
+	next := 0
+	if i := slices.IndexFunc(m.models, func(mo provider.Model) bool { return mo.Ref == m.session.Model }); i >= 0 {
+		next = ((i+d)%n + n) % n
+	}
+	return m.setSessionModel(m.models[next].Ref)
+}
+
+// thinkingLevels is the cycle app.thinking.cycle steps through, in the order the domain
+// model lists them.
+var thinkingLevels = []session.ThinkingLevel{
+	session.ThinkingOff, session.ThinkingLow, session.ThinkingMedium, session.ThinkingHigh,
+}
+
+// cycleThinking asks for the next thinking level. As with the model, the status follows
+// the thinking_change entry rather than this call.
+func (m *Model) cycleThinking() tea.Cmd {
+	if m.offline() {
+		return nil
+	}
+	i := slices.Index(thinkingLevels, m.session.Thinking)
+	return m.call(protocol.MethodSessionSetThinking, protocol.SessionSetThinkingParams{
+		SessionID: m.session.SessionID,
+		Thinking:  thinkingLevels[(i+1)%len(thinkingLevels)],
+	})
+}
+
+// toggleThinking flips whether thinking text is drawn, for this run only: ui.transcript.
+// thinking is a config value overridden in memory, and config.toml is read, never written
+// by the harness. It is the client's own view of the log, not the session's level, so it
+// asks the server nothing.
+func (m *Model) toggleThinking() {
+	show := m.cfg.UI.Transcript.Thinking != thinkingShown
+	m.cfg.UI.Transcript.Thinking = thinkingHidden
+	if show {
+		m.cfg.UI.Transcript.Thinking = thinkingShown
+	}
+	m.tr.SetShowThinking(show)
+}
+
+// offline reports that nothing can be asked of the server, and says so. Every action that
+// needs a call goes through it: a picker, a cycle and a switch all do nothing while the
+// connection is gone, and say why rather than looking stuck.
+func (m *Model) offline() bool {
+	if !m.disconnected {
+		return false
+	}
+	m.note(levelError, "not connected")
+	return true
 }
 
 // result decodes one call's answer, turning a shape this client cannot read into a notice
@@ -439,11 +764,17 @@ func (m *Model) resize(w, h int) {
 	}
 }
 
-// key routes one key press in the order the design gives it: a standing permission
-// question first, then a picker (Task 8), then the key table's actions, then the editor.
-// An action that does not apply falls through to the next one the key is bound to, which
-// is what lets ctrl+d exit on an empty editor and delete forward on a full one.
+// key routes one key press in the order the design gives it: a picker while one is up,
+// then a standing permission question, then the key table's actions, then the editor. An
+// action that does not apply falls through to the next one the key is bound to, which is
+// what lets ctrl+d exit on an empty editor and delete forward on a full one.
+//
+// A picker takes every key, a question's y, a and n included: it is what the keyboard is
+// pointed at while it stands, and a question it hid is still standing when it closes.
 func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
+	if m.pick != nil {
+		return m.pickerKey(k)
+	}
 	if cmd, answered := m.answer(k); answered {
 		return cmd
 	}
@@ -484,13 +815,35 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 			if m.expandNewestTool() {
 				return nil
 			}
+		case keys.AppModelSelect:
+			return m.openModelPicker()
+		case keys.AppModelCycleForward:
+			return m.cycleModel(1)
+		case keys.AppModelCycleBackward:
+			return m.cycleModel(-1)
+		case keys.AppThinkingCycle:
+			return m.cycleThinking()
+		case keys.AppThinkingToggle:
+			m.toggleThinking()
+			return nil
+		case keys.AppSessionNew:
+			return m.newSession()
+		case keys.AppSessionFork:
+			return m.forkSession()
+		case keys.AppSessionResume:
+			return m.listSessions()
+		case keys.TUIInputTab:
+			// A tab that completed nothing is the editor's, which is what indents a
+			// draft that is not a command.
+			if m.complete() {
+				return nil
+			}
 		case keys.TUIInputNewLine:
 			// The editor's own key map binds the same action, so the press falls through
 			// to it below rather than being handled twice.
 		default:
-			// Every other action belongs to Task 8: the pickers and the model, thinking
-			// and session actions. Until they land the key reaches the editor, which is
-			// what an unbound key does.
+			// Every other action is the editor's own or nothing this client binds; the
+			// key reaches the editor below, which is what an unbound key does.
 		}
 	}
 	return m.ed.Update(k)
@@ -575,9 +928,15 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 			at = len(blocks)
 			blocks = append(blocks, nil)
 		case slotInput:
+			// A picker stands where the editor is, not over it: it is what the keyboard
+			// is pointed at, and the draft it hides is still there when it closes.
+			editor := strings.Split(m.ed.View(), "\n")
+			if m.pick != nil {
+				editor = m.pickerView()
+			}
 			blocks = append(blocks,
 				m.widgetLines(protocol.SlotAboveEditor),
-				strings.Split(m.ed.View(), "\n"),
+				editor,
 				m.widgetLines(protocol.SlotBelowEditor),
 			)
 		case slotStatus:

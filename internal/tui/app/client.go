@@ -22,6 +22,10 @@ type DisconnectedMsg struct{ Err error }
 // else may touch it. Result is the raw result, which the case for the method decodes.
 type CallResultMsg struct {
 	Method string
+	// Name is what the call was about when the method alone does not say: the command a
+	// command.run ran. The answer does not carry it, and a client that has to know which
+	// answer was /help's cannot read it back off the wire.
+	Name   string
 	Result json.RawMessage
 	Err    error
 }
@@ -44,10 +48,16 @@ func pump(c *protocol.Client) tea.Cmd {
 // a call outlives the keystroke that started it, and the client's Close is what ends a
 // call the program no longer wants.
 func (m *Model) call(method string, params any) tea.Cmd {
+	return m.callNamed(method, "", params)
+}
+
+// callNamed is call carrying what the call is about into its answer (see
+// CallResultMsg.Name).
+func (m *Model) callNamed(method, name string, params any) tea.Cmd {
 	c := m.cl
 	return func() tea.Msg {
 		var raw json.RawMessage
 		err := c.Call(context.Background(), method, params, &raw)
-		return CallResultMsg{Method: method, Result: raw, Err: err}
+		return CallResultMsg{Method: method, Name: name, Result: raw, Err: err}
 	}
 }

@@ -56,6 +56,12 @@ func New(o Options, th theme.Theme) *Transcript {
 // a caller may read them and set Expanded, and must not reorder the slice.
 func (t *Transcript) Rows() []*Row { return slices.Clone(t.rows) }
 
+// SetShowThinking changes whether a model's thinking text becomes a row, for the rows
+// built from here on. Rows already on screen keep what they were built with and rows
+// already committed to scrollback cannot be redrawn at all, so this reads forward only:
+// turning thinking on shows the next block the model thinks, not the ones it already did.
+func (t *Transcript) SetShowThinking(show bool) { t.opts.ShowThinking = show }
+
 // SetWidth changes the width rows render to.
 func (t *Transcript) SetWidth(w int) {
 	if w == t.opts.Width {

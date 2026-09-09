@@ -21,6 +21,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/server"
@@ -907,7 +908,10 @@ func newServerHarness(t *testing.T, script scripted) (*protocol.Client, protocol
 	services := srv.PluginServices()
 	services.ProvidersChanged = func(ps []provider.Provider) { reg.SetProviders(ps...) }
 	preg.SetServices(services)
-	preg.Load(ctx, fakePlugin{provider: &fakeProvider{script: script}})
+	// The kernel's own slash commands beside the fake ones, so /help, /fork and /model
+	// answer here the way they do in a run: they are how a client discovers commands and
+	// how a command opens another session.
+	preg.Load(ctx, fakePlugin{provider: &fakeProvider{script: script}}, commands.New())
 	reg.SetProviders(preg.Providers()...)
 	if err := reg.Refresh(ctx); err != nil {
 		t.Fatal(err)
