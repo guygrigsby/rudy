@@ -314,6 +314,10 @@ type SessionOpened struct {
 	Thinking      ThinkingLevel `json:"thinking"`
 	Mode          Mode          `json:"mode"`
 	Agent         string        `json:"agent"` // "default" when none
+	// ParentSessionID and ParentToolUseID name the tool_use a child session answers. Both
+	// empty is a root session; a pass 1 line without the keys loads as one.
+	ParentSessionID string `json:"parent_session_id"`
+	ParentToolUseID string `json:"parent_tool_use_id"`
 }
 
 type ForkPoint struct {
@@ -442,6 +446,14 @@ func Validate(p Payload) error {
 	case SessionOpened:
 		if v.SchemaVersion < 1 || v.RudyVersion == "" || v.Workspace.Root == "" || v.Model == (ModelRef{}) || !v.Thinking.Valid() || !v.Mode.Valid() || v.Agent == "" {
 			return errors.New("session_opened: incomplete")
+		}
+		if (v.ParentSessionID == "") != (v.ParentToolUseID == "") {
+			return errors.New("session_opened: parent session and tool_use are both set or both empty")
+		}
+		if v.ParentSessionID != "" {
+			if _, err := ulid.ParseStrict(v.ParentSessionID); err != nil {
+				return fmt.Errorf("session_opened: parent_session_id: %w", err)
+			}
 		}
 	case ForkPoint:
 		if v.ParentSessionID.IsZero() || v.ParentEntryID.IsZero() {

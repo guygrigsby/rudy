@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +21,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
+	"github.com/guygrigsby/rudy/internal/plugins/subagents"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/server"
@@ -184,49 +188,68 @@ func newHarness(t *testing.T, prov *scriptProvider) *harness {
 // exercises, a fire that finds nothing and returns.
 func newHarnessWith(t *testing.T, prov *scriptProvider, extra ...plugin.Plugin) *harness {
 	t.Helper()
-	ctx := context.Background()
-	dir := t.TempDir()
-	store, err := session.OpenStore(filepath.Join(dir, "sessions"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	fp := &fakePlugin{prov: prov}
-	plugins := plugin.NewRegistry(nil, func(string) {})
-	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"))
+	srv, _ := newServerWith(t, testConfig(), append([]plugin.Plugin{fp}, extra...)...)
+	return &harness{srv: srv, ws: t.TempDir(), fp: fp}
+}
+
+// testConfig is what every server test starts from: the fake provider's one model, strict
+// permissions, no tool timeout.
+func testConfig() *config.Config {
 	cfg := &config.Config{}
 	cfg.Default.Provider = "fake"
 	cfg.Default.Model = "m1"
 	cfg.Default.Thinking = "off"
 	cfg.Permissions.Mode = "strict"
 	cfg.MaxTokens = 1000
+	return cfg
+}
+
+// newServerWith wires a server in wire.go's order and returns it with its store: the server
+// exists before Load so a plugin's Host can reach it, and the provider registry takes its
+// providers from what Load committed.
+func newServerWith(t *testing.T, cfg *config.Config, plugins ...plugin.Plugin) (*server.Server, *session.Store) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := session.OpenStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preg := plugin.NewRegistry(nil, func(string) {})
+	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"))
 	srv := server.New(server.Deps{
 		Version:  "test",
 		Config:   cfg,
 		Store:    store,
 		Registry: reg,
-		Plugins:  plugins,
+		Plugins:  preg,
 		Gate:     gate.New(nil),
-		Hooks:    plugin.NewHookRunner(plugins, 5*time.Second, func(string) {}),
+		Hooks:    plugin.NewHookRunner(preg, 5*time.Second, func(string) {}),
 	})
-	// The wiring order wire.go uses: the server exists before Load so a plugin's Host can
-	// reach it, and the provider registry takes its providers from what Load committed.
 	services := srv.PluginServices()
 	services.ProvidersChanged = func(ps []provider.Provider) { reg.SetProviders(ps...) }
-	plugins.SetServices(services)
-	plugins.Load(ctx, append([]plugin.Plugin{fp}, extra...)...)
-	reg.SetProviders(plugins.Providers()...)
+	preg.SetServices(services)
+	preg.Load(ctx, plugins...)
+	reg.SetProviders(preg.Providers()...)
 	if err := reg.Refresh(ctx); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
-	return &harness{srv: srv, ws: t.TempDir(), fp: fp}
+	return srv, store
 }
 
 func (h *harness) dial(t *testing.T, asker bool) *protocol.Client {
 	t.Helper()
+	return dialAs(t, h.srv, asker)
+}
+
+// dialAs opens one connection to srv and greets it as a client of the given asker class.
+func dialAs(t *testing.T, srv *server.Server, asker bool) *protocol.Client {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	cc, sc := protocol.Pipe()
-	go func() { _ = h.srv.Serve(ctx, sc) }()
+	go func() { _ = srv.Serve(ctx, sc) }()
 	cl := protocol.NewClient(cc)
 	t.Cleanup(func() { _ = cl.Close(); cancel() })
 	var hr protocol.ClientHelloResult
@@ -696,16 +719,7 @@ func newLongTurnHarness(t *testing.T, toolCalls int) (*server.Server, string) {
 
 func dialRaw(t *testing.T, srv *server.Server) *protocol.Client {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	cc, sc := protocol.Pipe()
-	go func() { _ = srv.Serve(ctx, sc) }()
-	cl := protocol.NewClient(cc)
-	t.Cleanup(func() { _ = cl.Close(); cancel() })
-	var hr protocol.ClientHelloResult
-	if err := cl.Call(ctx, protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0"}, &hr); err != nil {
-		t.Fatalf("hello: %v", err)
-	}
-	return cl
+	return dialAs(t, srv, false)
 }
 
 // TestLongTurnConcurrentMutationNoDeadlock is the regression test for the AB-BA deadlock
@@ -1676,5 +1690,344 @@ func TestShutdownYieldsACompactionInFlight(t *testing.T) {
 	}
 	if err := prov.summaryOutcome(); err == nil {
 		t.Error("the summary request must end in cancellation, not in a summary")
+	}
+}
+
+// agentProvider scripts two sessions at once, by session id: the first session it sees (the
+// root) calls the agent tool and then answers with text; every other session (the child the
+// agent tool opened) calls the unsafe echo tool and then answers "child done".
+type agentProvider struct {
+	mu    sync.Mutex
+	root  ulid.ULID
+	calls map[ulid.ULID]int
+	reqs  map[ulid.ULID][]provider.Request
+}
+
+func (p *agentProvider) Name() string { return "fake" }
+
+func (p *agentProvider) ListModels(context.Context) ([]provider.Model, error) {
+	return []provider.Model{{
+		Ref:           session.ModelRef{Provider: "fake", Model: "m1"},
+		DisplayName:   "Fake 1",
+		ContextWindow: 100000,
+		Capabilities:  provider.Capabilities{Tools: true},
+	}}, nil
+}
+
+func (p *agentProvider) requestsFor(sid string) []provider.Request {
+	id, err := ulid.Parse(sid)
+	if err != nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]provider.Request(nil), p.reqs[id]...)
+}
+
+func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
+	p.mu.Lock()
+	if p.calls == nil {
+		p.calls, p.reqs = map[ulid.ULID]int{}, map[ulid.ULID][]provider.Request{}
+	}
+	if p.root.IsZero() {
+		p.root = req.SessionID
+	}
+	p.calls[req.SessionID]++
+	n := p.calls[req.SessionID]
+	p.reqs[req.SessionID] = append(p.reqs[req.SessionID], req)
+	root := req.SessionID == p.root
+	p.mu.Unlock()
+
+	call := func(id, name, input string) []provider.Part {
+		return []provider.Part{
+			{Type: provider.PartToolUseStart, ID: id, Name: name},
+			{Type: provider.PartToolUseDelta, ID: id, Text: input},
+			{Type: provider.PartToolUseEnd, ID: id},
+			{Type: provider.PartUsage, Usage: session.Usage{Input: 10, Output: 5}},
+			{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
+		}
+	}
+	answer := func(text string) []provider.Part {
+		return []provider.Part{
+			{Type: provider.PartTextDelta, Text: text},
+			{Type: provider.PartUsage, Usage: session.Usage{Input: 20, Output: 1}},
+			{Type: provider.PartStop, StopReason: session.StopEndTurn, StopReasonRaw: "stop"},
+		}
+	}
+	var parts []provider.Part
+	switch {
+	case root && n == 1:
+		parts = call("tu_agent", "agent", `{"agent":"explorer","prompt":"look"}`)
+	case root && n == 2:
+		parts = call("tu_agent2", "agent", `{"agent":"helper","prompt":"help"}`)
+	case root:
+		parts = answer("root done")
+	case n == 1:
+		parts = call("tu_echo", "echo", `{}`)
+	default:
+		parts = answer("child done")
+	}
+	for _, part := range parts {
+		if err := emit(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// echoPlugin is the agentProvider plus one unsafe tool the explorer definition allows and one
+// the definition leaves out, so the child's filtered tool set is observable.
+type echoPlugin struct {
+	prov *agentProvider
+	ran  int32
+}
+
+func (e *echoPlugin) Name() string { return "echo" }
+
+func (e *echoPlugin) Init(_ context.Context, h plugin.Host) error {
+	if err := h.RegisterProvider(e.prov); err != nil {
+		return err
+	}
+	err := h.RegisterTool(tool.Tool{
+		Name: "echo", Description: "an unsafe echo", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Unsafe,
+		Invoke: func(context.Context, tool.Call) (tool.Result, error) {
+			atomic.AddInt32(&e.ran, 1)
+			return tool.Result{Content: []session.Block{session.TextBlock("echoed")}}, nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+	return h.RegisterTool(tool.Tool{
+		Name: "bash", Description: "not in the explorer definition", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Unsafe,
+		Invoke: func(context.Context, tool.Call) (tool.Result, error) {
+			return tool.Result{Content: []session.Block{session.TextBlock("bashed")}}, nil
+		},
+	})
+}
+
+// capturingPlugin keeps its Host so a test can Connect as the plugin caller class itself.
+type capturingPlugin struct{ host plugin.Host }
+
+func (c *capturingPlugin) Name() string { return "capture" }
+
+func (c *capturingPlugin) Init(_ context.Context, h plugin.Host) error {
+	c.host = h
+	return nil
+}
+
+// completedOn stops a drain when the turn on sid reports itself completed.
+func completedOn(sid string) func(protocol.Notification) bool {
+	return func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.SessionID == sid && ts.State == "completed"
+	}
+}
+
+func toolNames(defs []provider.ToolDef) []string {
+	out := make([]string, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, d.Name)
+	}
+	return out
+}
+
+func TestChildSessionThroughThePluginClass(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, ".rudy", "agents"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	def := "---\ndescription: Read-only exploration of the workspace\ntools: [echo]\n---\nYou explore the repository and report.\n"
+	if err := os.WriteFile(filepath.Join(ws, ".rudy", "agents", "explorer.md"), []byte(def), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The helper names no tools, so its child gets every registered tool except the agent
+	// tool itself: that exception is what keeps subagent depth at one.
+	helper := "---\ndescription: A general helper\n---\nYou help.\n"
+	if err := os.WriteFile(filepath.Join(ws, ".rudy", "agents", "helper.md"), []byte(helper), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prov := &agentProvider{}
+	ep := &echoPlugin{prov: prov}
+	cp := &capturingPlugin{}
+	cfg := testConfig()
+	cfg.ConfigDir = t.TempDir()
+	srv, store := newServerWith(t, cfg, ep, cp, subagents.New(cfg.ConfigDir))
+
+	ctx := context.Background()
+	cl := dialAs(t, srv, true)
+	var info protocol.SessionInfo
+	if err := cl.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: ws}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	// The child's permission question reaches this connection, the root's asker, carrying the
+	// child's own session id.
+	var childSIDs []string
+	var childToolUse string
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		switch n.Method {
+		case protocol.NotifyPermissionRequested:
+			var pr protocol.PermissionRequested
+			_ = json.Unmarshal(n.Params, &pr)
+			if pr.Tool != "echo" {
+				t.Errorf("asked about %q, want echo", pr.Tool)
+			}
+			childSIDs = append(childSIDs, pr.SessionID)
+			childToolUse = pr.ToolUseID
+			go func() {
+				_ = cl.Call(ctx, protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
+					SessionID: pr.SessionID, ToolUseID: pr.ToolUseID,
+					Decision: session.Allow, Scope: session.ScopeOnce, Reason: "test allows",
+				}, &struct{}{})
+			}()
+		case protocol.NotifyTurnState:
+			var ts protocol.TurnStateChanged
+			_ = json.Unmarshal(n.Params, &ts)
+			return ts.SessionID == info.SessionID && ts.State == "completed"
+		}
+		return false
+	})
+	if len(childSIDs) != 2 {
+		t.Fatalf("child sessions asked for permission: %v", childSIDs)
+	}
+	childSID, helperSID := childSIDs[0], childSIDs[1]
+	if childSID == info.SessionID || helperSID == childSID {
+		t.Fatalf("child session ids %v alongside the root %s", childSIDs, info.SessionID)
+	}
+	if childToolUse != "tu_echo" {
+		t.Errorf("permission asked about tool_use %q", childToolUse)
+	}
+	if got := atomic.LoadInt32(&ep.ran); got != 2 {
+		t.Errorf("echo ran %d times", got)
+	}
+
+	// The child's log names its parent and its agent.
+	childID, err := ulid.Parse(childSID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childLog, err := session.ReadLog(store.Dir(childID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, ok := childLog[0].Payload.(session.SessionOpened)
+	if !ok {
+		t.Fatalf("child first entry is %s", childLog[0].Kind)
+	}
+	if opened.ParentSessionID != info.SessionID || opened.ParentToolUseID != "tu_agent" {
+		t.Errorf("child parent = %q/%q, want %q/tu_agent", opened.ParentSessionID, opened.ParentToolUseID, info.SessionID)
+	}
+	if opened.Agent != "explorer" {
+		t.Errorf("child agent = %q", opened.Agent)
+	}
+
+	// The child was offered the definition's tools only, under the definition's prompt.
+	creqs := prov.requestsFor(childSID)
+	if len(creqs) != 2 {
+		t.Fatalf("child made %d requests", len(creqs))
+	}
+	if names := toolNames(creqs[0].Tools); !reflect.DeepEqual(names, []string{"echo"}) {
+		t.Errorf("child tools = %v", names)
+	}
+	if !strings.HasPrefix(creqs[0].System, "You explore the repository and report.") {
+		t.Errorf("child system = %q", creqs[0].System)
+	}
+
+	// The helper child named no tools, so it was offered every registered tool and never
+	// the agent tool: a child cannot open a grandchild.
+	hreqs := prov.requestsFor(helperSID)
+	if len(hreqs) != 2 {
+		t.Fatalf("helper made %d requests", len(hreqs))
+	}
+	if names := toolNames(hreqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "bash"}) {
+		t.Errorf("helper tools = %v", names)
+	}
+
+	// The root's tool_result for the agent call carries the child's answer.
+	var result *session.ToolResult
+	for _, e := range entries(t, ns) {
+		if tr, ok := e.Payload.(session.ToolResult); ok && tr.ToolUseID == "tu_agent" {
+			result = &tr
+		}
+	}
+	if result == nil {
+		t.Fatal("no tool_result for the agent call")
+	}
+	if result.Outcome != session.OutcomeOK || len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, "child done") {
+		t.Errorf("agent result = %+v", result)
+	}
+
+	// A resumed child keeps its agent definition, re-resolved from the workspace on cold
+	// load since the definition is a file rather than part of the log, and it is still a
+	// child: no agent tool, whatever became of the session that spawned it.
+	var back protocol.SessionInfo
+	if err := cl.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: helperSID}, &back); err != nil {
+		t.Fatalf("resume child: %v", err)
+	}
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: helperSID, Content: []session.Block{session.TextBlock("again")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit to the resumed child: %v", err)
+	}
+	drain(t, cl, completedOn(helperSID))
+	hreqs = prov.requestsFor(helperSID)
+	if len(hreqs) != 3 {
+		t.Fatalf("helper made %d requests after the resume", len(hreqs))
+	}
+	if names := toolNames(hreqs[2].Tools); !reflect.DeepEqual(names, []string{"echo", "bash"}) {
+		t.Errorf("resumed child tools = %v", names)
+	}
+	if !strings.HasPrefix(hreqs[2].System, "You help.") {
+		t.Errorf("resumed child system = %q", hreqs[2].System)
+	}
+
+	// A resumed root session is no child: it runs the default agent and the whole tool set.
+	if err := cl.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{}); err != nil {
+		t.Fatalf("close root: %v", err)
+	}
+	if err := cl.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &back); err != nil {
+		t.Fatalf("resume root: %v", err)
+	}
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("more")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit to the resumed root: %v", err)
+	}
+	drain(t, cl, completedOn(info.SessionID))
+	rreqs := prov.requestsFor(info.SessionID)
+	if names := toolNames(rreqs[len(rreqs)-1].Tools); !slices.Contains(names, "agent") {
+		t.Errorf("resumed root tools = %v, want the agent tool among them", names)
+	}
+
+	// A parent naming a tool_use that is not pending is not_found, and a parent from a
+	// client connection is invalid_argument.
+	pcl, err := cp.host.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pcl.Close() }()
+	var pe *protocol.Error
+	err = pcl.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
+		Cwd: ws, Parent: &protocol.ParentRef{SessionID: info.SessionID, ToolUseID: "tu_gone"},
+	}, &protocol.SessionInfo{})
+	if !errorsAs(err, &pe) || pe.Code != protocol.CodeNotFound {
+		t.Errorf("open with a stale parent tool_use = %v, want not_found", err)
+	}
+	err = cl.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
+		Cwd: ws, Parent: &protocol.ParentRef{SessionID: info.SessionID, ToolUseID: "tu_agent"},
+	}, &protocol.SessionInfo{})
+	if !errorsAs(err, &pe) || pe.Code != protocol.CodeInvalidArgument {
+		t.Errorf("open with a parent from a client = %v, want invalid_argument", err)
 	}
 }

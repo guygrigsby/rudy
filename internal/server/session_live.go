@@ -68,6 +68,15 @@ type liveSession struct {
 	// are only touched on that runner's own goroutine (see turn.Config.Overrides).
 	overrides map[string][]session.Block
 
+	// The agent definition's effect on every turn this session runs, and the parent that
+	// opened it. All four are written by open (or coldLoadOne) before the session is
+	// shared, and never again, so startTurn reads them under the mu it already holds
+	// without any further synchronization.
+	tools    turn.Tools   // nil means every registered tool
+	system   string       // the agent definition's body; "" means the default base prompt
+	maxSteps int          // the definition's max_turns; zero means unlimited
+	parent   *liveSession // the session whose tool call opened this one; nil for a root
+
 	obsMu   sync.Mutex
 	entries []session.Entry
 	conns   []*conn
@@ -120,9 +129,10 @@ func (ls *liveSession) markStarting(turnID string) {
 
 // hookContextSuffixLocked is what the session_opened hooks added to this session's system
 // prompt, ready to append to it: one blank line, then the contexts a blank line apart, or
-// nothing at all when no handler returned any. Caller holds mu, which is what guards
-// hookContext; startTurn reads it while building the runner config in that same critical
-// section.
+// nothing at all when no handler returned any. Caller holds mu. hookContext itself needs no
+// lock: it is written before the session is shared (see fireSessionOpened) and only read
+// afterwards; the Locked name marks where startTurn reads it, in the critical section it
+// already holds.
 func (ls *liveSession) hookContextSuffixLocked() string {
 	if len(ls.hookContext) == 0 {
 		return ""
@@ -131,14 +141,24 @@ func (ls *liveSession) hookContextSuffixLocked() string {
 }
 
 // firstAsker is the connection a turn's permission questions route to: the first subscriber
-// whose hello declared asker, or nil when none has. Self-locking (takes obsMu).
+// whose hello declared asker, or, for a child session (whose only subscriber is the plugin
+// that opened it), its parent's. That is the binding: a subagent's unsafe tool is answered by
+// the human who is already answering for the session that spawned it. Self-locking (takes
+// obsMu); the walk up the parent chain takes each ancestor's obsMu in turn, never holding two
+// at once, and the chain is only ever one link long (a child has no agent tool to open a
+// grandchild with).
 func (ls *liveSession) firstAsker() *conn {
 	ls.obsMu.Lock()
-	defer ls.obsMu.Unlock()
 	for _, c := range ls.conns {
 		if c.asker {
+			ls.obsMu.Unlock()
 			return c
 		}
+	}
+	parent := ls.parent
+	ls.obsMu.Unlock()
+	if parent != nil {
+		return parent.firstAsker()
 	}
 	return nil
 }

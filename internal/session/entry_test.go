@@ -299,3 +299,47 @@ func TestPermissionDecisionInputIsByteExact(t *testing.T) {
 		t.Error("marshal accepted an input that is not JSON")
 	}
 }
+
+// testOpened is a valid root session_opened, for the tests that vary one field of it.
+func testOpened() SessionOpened {
+	return SessionOpened{
+		SchemaVersion: 1,
+		RudyVersion:   "0.1.0",
+		Workspace:     Workspace{Root: "/w"},
+		Model:         ModelRef{Provider: "p", Model: "m"},
+		Thinking:      ThinkingHigh,
+		Mode:          ModeStrict,
+		Agent:         "default",
+	}
+}
+
+func TestSessionOpenedParentFields(t *testing.T) {
+	good := testOpened()
+	good.ParentSessionID, good.ParentToolUseID = NewID().String(), "tu_1"
+	if err := Validate(good); err != nil {
+		t.Error(err)
+	}
+	half := testOpened()
+	half.ParentSessionID = NewID().String()
+	if err := Validate(half); err == nil {
+		t.Error("parent session without tool use accepted")
+	}
+	bad := testOpened()
+	bad.ParentSessionID, bad.ParentToolUseID = "not-a-ulid", "tu"
+	if err := Validate(bad); err == nil {
+		t.Error("bad parent id accepted")
+	}
+	// A pass 1 line without the parent keys still loads as a root session.
+	line := `{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":1,"rudy_version":"0.1.0","workspace":{"root":"/w","git_root":"","project_id":""},"model":{"provider":"p","model":"m"},"thinking":"high","mode":"strict","agent":"default"}`
+	var e Entry
+	if err := e.UnmarshalJSON([]byte(line)); err != nil {
+		t.Fatal(err)
+	}
+	if o := e.Payload.(SessionOpened); o.ParentSessionID != "" || o.ParentToolUseID != "" {
+		t.Errorf("parent fields %+v", o)
+	}
+	out, _ := e.MarshalJSON()
+	if !strings.Contains(string(out), `"parent_session_id":""`) {
+		t.Errorf("marshal must carry the empty parent fields: %s", out)
+	}
+}

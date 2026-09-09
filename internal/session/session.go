@@ -414,10 +414,16 @@ func (s *Session) PendingToolUses() []Block {
 	return s.pendingToolUsesLocked()
 }
 
-func (s *Session) pendingToolUsesLocked() []Block {
+func (s *Session) pendingToolUsesLocked() []Block { return PendingToolUsesIn(s.entriesLocked()) }
+
+// PendingToolUsesIn returns the tool_use blocks in entries that have no tool_result yet, in
+// order. It takes the entries rather than a Session so a caller holding only a mirror of a
+// live session's log (the server's, when a plugin names a parent tool_use) asks the same
+// question of the same rule.
+func PendingToolUsesIn(entries []Entry) []Block {
 	done := map[string]bool{}
 	var uses []Block
-	for _, e := range s.entriesLocked() {
+	for _, e := range entries {
 		switch v := e.Payload.(type) {
 		case AssistantMessage:
 			for _, b := range v.Content {

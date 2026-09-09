@@ -15,6 +15,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
 	openaichatplugin "github.com/guygrigsby/rudy/internal/plugins/openaichat"
+	"github.com/guygrigsby/rudy/internal/plugins/subagents"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/bash"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/edit"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/glob"
@@ -95,7 +96,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	plugins.Disable(cfg.PluginsDisabled...)
 	set := o.Plugins
 	if set == nil {
-		set = BuiltinPlugins(cfg, httpc, home, env)
+		set = BuiltinPlugins(cfg, paths, httpc, home, env)
 	}
 	if err := os.MkdirAll(paths.Cache, 0o700); err != nil {
 		return nil, fmt.Errorf("cache dir: %w", err)
@@ -170,20 +171,25 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	}, nil
 }
 
-// storeFromEnv opens the session store at its XDG data path without wiring the rest of the
-// server; commands that only read sessions (sessions list) use this instead of Build so they
-// pay for no plugin load or registry refresh.
+// storeFromEnv opens the session store without wiring the rest of the server; commands that
+// only read sessions (sessions list) use this instead of Build so they pay for no plugin load
+// or registry refresh. It goes through config.Load rather than straight to the XDG data path
+// so a configured sessions.dir is the one directory every command means by "sessions".
 func storeFromEnv(env func(string) string, home string) (*session.Store, error) {
 	paths := config.XDG(env, home)
-	return session.OpenStore(filepath.Join(paths.Data, "sessions"))
+	cfg, err := config.Load(paths, nil)
+	if err != nil {
+		return nil, err
+	}
+	return session.OpenStore(cfg.Sessions.Dir)
 }
 
-// BuiltinPlugins is the linked-in set: the six tools, /init, /compact and the openai_chat
-// providers.
-func BuiltinPlugins(cfg *config.Config, httpc *httpx.Client, home string, env func(string) string) []plugin.Plugin {
+// BuiltinPlugins is the linked-in set: the six tools, the agent tool, /init, /compact and the
+// openai_chat providers.
+func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
-	return append(BuiltinTools(), initcmd.New(), compactcmd.New(), openaichatplugin.New(cfg.Providers, httpc, resolve))
+	return append(BuiltinTools(), subagents.New(paths.Config), initcmd.New(), compactcmd.New(), openaichatplugin.New(cfg.Providers, httpc, resolve))
 }
 
 // BuiltinTools is the six tool plugins alone, for tests that supply their own provider.

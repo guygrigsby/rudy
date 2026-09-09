@@ -63,6 +63,9 @@ type Config struct {
 		ConnectTimeoutMS int `mapstructure:"connect_timeout_ms"`
 	} `mapstructure:"mcp"`
 	MaxTokens int `mapstructure:"max_tokens"`
+	// ConfigDir is paths.Config, filled by Load. Anything that reads a file next to
+	// config.toml (agent definitions) has the Config but not the Paths.
+	ConfigDir string `mapstructure:"-"`
 }
 
 // Defaults are the values in force when neither the file nor the environment sets a key.
@@ -138,6 +141,7 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 		}
 	}
 	c.PluginsDisabled = v.GetStringSlice("plugins.disabled")
+	c.ConfigDir = paths.Config
 	if c.Sessions.Dir == "" {
 		c.Sessions.Dir = filepath.Join(paths.Data, "sessions")
 	}

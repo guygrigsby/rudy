@@ -44,14 +44,19 @@ func newSessionsCommand() *cobra.Command {
 // renderSessions prints one row per session in the order Store.List returns them (newest first).
 func renderSessions(w io.Writer, summaries []session.Summary) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "ID\tOPENED\tWORKSPACE\tMODEL\tFORKED")
+	_, _ = fmt.Fprintln(tw, "ID\tOPENED\tWORKSPACE\tMODEL\tFORKED\tPARENT")
 	for _, s := range summaries {
 		forked := ""
 		if s.Forked {
 			forked = "yes"
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			s.ID.String(), s.OpenedAt.Local().Format("2006-01-02 15:04"), s.Workspace.Root, s.Model.String(), forked)
+		// A child session shows enough of its parent's id to find it in this same list.
+		parent := s.ParentSessionID
+		if len(parent) > 8 {
+			parent = parent[:8]
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			s.ID.String(), s.OpenedAt.Local().Format("2006-01-02 15:04"), s.Workspace.Root, s.Model.String(), forked, parent)
 	}
 	return tw.Flush()
 }

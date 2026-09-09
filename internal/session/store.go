@@ -37,6 +37,9 @@ type Summary struct {
 	Workspace Workspace
 	Model     ModelRef
 	Forked    bool
+	// ParentSessionID is the session whose tool call opened this one; empty means a root
+	// session. Children are listed like any other session.
+	ParentSessionID string
 }
 
 // List reads the first line of every session log, newest first. A fork's
@@ -63,6 +66,7 @@ func (st *Store) List() ([]Summary, error) {
 		switch p := first.Payload.(type) {
 		case SessionOpened:
 			sum.Workspace, sum.Model = p.Workspace, p.Model
+			sum.ParentSessionID = p.ParentSessionID
 		case ForkPoint:
 			sum.Forked = true
 			root, err := st.rootOpened(p, 0)

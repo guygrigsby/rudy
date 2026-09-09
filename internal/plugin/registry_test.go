@@ -429,3 +429,42 @@ func TestFailWithdrawsEverythingThePluginOwns(t *testing.T) {
 		t.Error("Fail did not report the status change")
 	}
 }
+
+func TestToolViewFiltersAllowAndDeny(t *testing.T) {
+	r, _ := newTestRegistry(nil)
+	r.Load(context.Background(), fakePlugin{"a", func(_ context.Context, h Host) error {
+		for _, n := range []string{"read", "bash", "agent"} {
+			if err := h.RegisterTool(namedTool(n)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}})
+	names := func(ts []tool.Tool) []string {
+		out := make([]string, 0, len(ts))
+		for _, t := range ts {
+			out = append(out, t.Name)
+		}
+		return out
+	}
+	// A nil allow list is every tool; the deny list still applies.
+	v := NewToolView(r, nil, []string{"agent"})
+	if got := names(v.Tools()); strings.Join(got, ",") != "read,bash" {
+		t.Errorf("nil allow = %v", got)
+	}
+	if _, ok := v.Tool("agent"); ok {
+		t.Error("denied tool resolved")
+	}
+	if _, ok := v.Tool("bash"); !ok {
+		t.Error("allowed tool did not resolve")
+	}
+	v = NewToolView(r, []string{"read", "agent"}, []string{"agent"})
+	if got := names(v.Tools()); strings.Join(got, ",") != "read" {
+		t.Errorf("allow minus deny = %v", got)
+	}
+	// An empty (non-nil) allow list is no tools at all.
+	v = NewToolView(r, []string{}, nil)
+	if got := v.Tools(); len(got) != 0 {
+		t.Errorf("empty allow = %v", names(got))
+	}
+}

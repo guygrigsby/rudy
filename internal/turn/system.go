@@ -21,6 +21,18 @@ func SystemPrompt(ws session.Workspace, version string) string {
 	b.WriteString("Prefer the edit tool over rewriting whole files. ")
 	b.WriteString("Run the tests before claiming work is done. ")
 	b.WriteString("Keep replies short and lead with the result.\n")
+	return SystemPromptWith(b.String(), ws)
+}
+
+// SystemPromptWith is base followed by the same AGENTS.md sections. An agent definition's
+// body replaces the base prompt and nothing else: a subagent still gets the workspace's
+// instructions, which are about the repository rather than about who is reading them.
+func SystemPromptWith(base string, ws session.Workspace) string {
+	var b strings.Builder
+	b.WriteString(base)
+	if !strings.HasSuffix(base, "\n") {
+		b.WriteString("\n")
+	}
 
 	paths := []string{filepath.Join(ws.Root, "AGENTS.md")}
 	if home, err := os.UserHomeDir(); err == nil {

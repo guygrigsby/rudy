@@ -352,6 +352,46 @@ func (r *Registry) Tool(name string) (tool.Tool, bool) {
 	return o.value, ok
 }
 
+// ToolView is a filtered view of a registry's tools: what one session may call. A session
+// opened under an agent definition sees the definition's list; a child session never sees the
+// agent tool, which is what keeps subagent depth at one. It reads the registry live, so a
+// provider or tool withdrawn after the session opened disappears from the view too.
+type ToolView struct {
+	reg   *Registry
+	allow []string // nil means every tool
+	deny  []string
+}
+
+// NewToolView returns a view of reg keeping only allow (nil means all) and never deny.
+func NewToolView(reg *Registry, allow, deny []string) *ToolView {
+	return &ToolView{reg: reg, allow: allow, deny: deny}
+}
+
+func (v *ToolView) permits(name string) bool {
+	if slices.Contains(v.deny, name) {
+		return false
+	}
+	return v.allow == nil || slices.Contains(v.allow, name)
+}
+
+func (v *ToolView) Tools() []tool.Tool {
+	all := v.reg.Tools()
+	out := make([]tool.Tool, 0, len(all))
+	for _, t := range all {
+		if v.permits(t.Name) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func (v *ToolView) Tool(name string) (tool.Tool, bool) {
+	if !v.permits(name) {
+		return tool.Tool{}, false
+	}
+	return v.reg.Tool(name)
+}
+
 func (r *Registry) Commands() []Command {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

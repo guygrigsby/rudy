@@ -1291,3 +1291,20 @@ func TestCancelledTurnStillFiresAfterResponse(t *testing.T) {
 		t.Error("the replacement context must be bounded")
 	}
 }
+
+func TestRunnerStepLimit(t *testing.T) {
+	// The model calls a tool forever; MaxSteps 3 ends the turn as failed after three requests.
+	call := func(id string) []provider.Part {
+		return append(toolCall(id, "echo", `{}`), usage(1, 1), stop(session.StopToolUse, "tool_calls"))
+	}
+	s, prov, tools := newTurnFixture(t, call("tu1"), call("tu2"), call("tu3"), call("tu4"))
+	r := NewRunner(Config{Session: s, Provider: prov, Model: provider.Model{Ref: s.Model()}, Tools: tools, Gate: gate.New(nil), MaxTokens: 10, MaxSteps: 3})
+	err := r.Run(context.Background(), session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+	if err == nil || r.State() != Failed || len(prov.requests) != 3 {
+		t.Errorf("err %v state %s requests %d", err, r.State(), len(prov.requests))
+	}
+	last := s.Entries()[len(s.Entries())-1].Payload.(session.TurnFailed)
+	if last.Class != session.ErrInternal || !strings.Contains(last.Message, "step limit 3 reached") {
+		t.Errorf("turn_failed %+v", last)
+	}
+}

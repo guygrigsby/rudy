@@ -298,7 +298,16 @@ func (r *Runner) fire(ctx context.Context, point plugin.HookPoint, payload any) 
 }
 
 func (r *Runner) loop(ctx context.Context) error {
+	steps := 0
 	for {
+		// The step limit is the agent definition's max_turns: a model that keeps calling
+		// tools ends the turn here rather than running until the context window or the
+		// caller's patience does. Counted before the request, so MaxSteps is exactly how
+		// many completions one turn may ask for.
+		steps++
+		if r.cfg.MaxSteps > 0 && steps > r.cfg.MaxSteps {
+			return r.fail(session.ErrInternal, fmt.Errorf("step limit %d reached", r.cfg.MaxSteps))
+		}
 		r.setState(Streaming)
 		am, err := r.stream(ctx)
 		if how := r.takeInterrupt(); how != "" {

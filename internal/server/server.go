@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -342,7 +344,7 @@ func (s *Server) handleClose(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 
 // handleSubmit starts a turn. A plugin connection may only submit to a session it opened or
 // attached itself: driving somebody else's session is not what the plugin caller class is
-// for, and a child session (Task 5) is exactly a session the plugin does hold.
+// for, and a child session is exactly a session the plugin does hold.
 func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
 	var p protocol.SessionSubmitParams
 	if e := decode(raw, &p); e != nil {
@@ -705,48 +707,136 @@ func (s *Server) setEntry(id string, kind session.Kind, f func(view protocol.Ses
 }
 
 func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Error) {
-	if p.Parent != nil {
-		if cn.plugin == "" {
-			return nil, perr(protocol.CodeInvalidArgument, "parent is for plugins")
-		}
-		return nil, perr(protocol.CodeNotFound, "child sessions arrive in Task 5")
-	}
 	ws, err := workspace.Detect(p.Cwd)
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, err.Error())
 	}
-	spec := p.Model
-	if spec == "" {
-		spec = s.d.Config.Default.Provider + ":" + s.d.Config.Default.Model
+	agentName := p.Agent
+	if agentName == "" {
+		agentName = s.d.Config.Agent
 	}
+	def, ok := s.resolveAgent(cn, ws, agentName)
+	if !ok {
+		return nil, perr(protocol.CodeNotFound, "unknown agent "+agentName)
+	}
+
+	// The parent, when there is one, decides what an unset model, mode or thinking level
+	// inherits, so it is resolved before any of them.
+	parent, perror := s.parentOf(cn, p.Parent)
+	if perror != nil {
+		return nil, perror
+	}
+	// What a child inherits from its parent: the parent's current values, not the ones it
+	// opened with. A root session inherits nothing, so these stay empty for it.
+	var fromParent struct{ model, mode, thinking string }
+	if parent != nil {
+		v := deriveInfo(parent.sess.ID(), parent.snapshotEntries())
+		fromParent.model, fromParent.mode, fromParent.thinking = v.Model.String(), string(v.Mode), string(v.Thinking)
+	}
+
+	spec := firstNonEmpty(p.Model, def.Model, fromParent.model, s.d.Config.Default.Provider+":"+s.d.Config.Default.Model)
 	m, err := s.d.Registry.Resolve(spec)
 	if err != nil {
 		return nil, perr(protocol.CodeNotFound, err.Error())
 	}
-	mode := session.Mode(p.Mode)
-	if mode == "" {
-		mode = session.Mode(s.d.Config.Permissions.Mode)
-	}
-	thinking := session.ThinkingLevel(p.Thinking)
-	if thinking == "" {
-		thinking = session.ThinkingLevel(s.d.Config.Default.Thinking)
-	}
+	mode := session.Mode(firstNonEmpty(p.Mode, fromParent.mode, s.d.Config.Permissions.Mode))
+	thinking := session.ThinkingLevel(firstNonEmpty(p.Thinking, string(def.Thinking), fromParent.thinking, s.d.Config.Default.Thinking))
 	if !mode.Valid() || !thinking.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "invalid mode or thinking level")
 	}
-	agent := p.Agent
-	if agent == "" {
-		agent = "default"
+	opened := session.SessionOpened{
+		SchemaVersion: 1, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
+		Thinking: thinking, Mode: mode, Agent: def.Name,
 	}
-	sess, err := session.Open(s.d.Store, session.SessionOpened{
-		SchemaVersion: 1, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref, Thinking: thinking, Mode: mode, Agent: agent,
-	})
+	if parent != nil {
+		opened.ParentSessionID, opened.ParentToolUseID = parent.sess.ID().String(), p.Parent.ToolUseID
+	}
+	sess, err := session.Open(s.d.Store, opened)
 	if err != nil {
 		return nil, protocol.ErrorFrom(err)
 	}
 	ls := newLive(sess, m)
+	ls.parent = parent
+	s.applyAgent(ls, def)
 	s.fireSessionOpened(s.ctx, ls, false)
 	return s.installAndAttach(cn, ls), nil
+}
+
+// firstNonEmpty is the first non-empty of vs, or "" when there is none: the resolution order
+// for a session's model, mode and thinking level (the request, then the agent definition,
+// then the parent, then config) written once instead of four times.
+func firstNonEmpty(vs ...string) string {
+	for _, v := range vs {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// resolveAgent reads the definitions visible to a session in ws (the user's, then the
+// workspace's, first name winning) and resolves one by name, telling cn about any file that
+// would not parse. Read per session rather than cached, so a definition edited between two
+// sessions takes effect on the second without a restart. ok is false only for a name no root
+// defines; "" and "default" always resolve.
+func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agentdef.Definition, bool) {
+	defs, errs := agentdef.Load([]string{
+		filepath.Join(s.d.Config.ConfigDir, "agents"),
+		filepath.Join(ws.Root, ".rudy", "agents"),
+	})
+	for _, e := range errs {
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: e.Error()})
+	}
+	return agentdef.Resolve(defs, name)
+}
+
+// applyAgent stamps a definition onto a session that is not yet shared: its tool view, its
+// system prompt and its step limit. A child never sees the agent tool, which is what keeps
+// subagent depth at one - with no tool to call, a child cannot open a grandchild, so no
+// further check is needed anywhere else.
+func (s *Server) applyAgent(ls *liveSession, def agentdef.Definition) {
+	var deny []string
+	if ls.parent != nil || openedAsChild(ls.entries) {
+		deny = []string{"agent"}
+	}
+	if def.Tools != nil || deny != nil {
+		ls.tools = plugin.NewToolView(s.d.Plugins, def.Tools, deny)
+	}
+	ls.system = def.Prompt
+	ls.maxSteps = def.MaxTurns
+}
+
+// openedAsChild reads child-ness off the log rather than off the live parent, which a
+// resumed session no longer has: a child resumed long after the session that spawned it is
+// gone is still a child, and still has no business opening one of its own.
+func openedAsChild(entries []session.Entry) bool {
+	if len(entries) == 0 {
+		return false
+	}
+	o, ok := entries[0].Payload.(session.SessionOpened)
+	return ok && o.ParentSessionID != ""
+}
+
+// parentOf resolves the parent a child session hangs off. Only a plugin may name one, and
+// only a tool_use that is still pending in a live session: that pending id is the capability,
+// since the only way to hold one is to be the plugin currently running that very tool call.
+func (s *Server) parentOf(cn *conn, ref *protocol.ParentRef) (*liveSession, *protocol.Error) {
+	if ref == nil {
+		return nil, nil
+	}
+	if cn.plugin == "" {
+		return nil, perr(protocol.CodeInvalidArgument, "parent is for plugins")
+	}
+	parent, e := s.lookup(ref.SessionID)
+	if e != nil {
+		return nil, e
+	}
+	for _, b := range session.PendingToolUsesIn(parent.snapshotEntries()) {
+		if b.ID == ref.ToolUseID {
+			return parent, nil
+		}
+	}
+	return nil, perr(protocol.CodeNotFound, "no pending tool_use "+ref.ToolUseID+" in "+ref.SessionID)
 }
 
 // resume attaches cn to sid, loading it from disk first when it is not already live. loadCold
@@ -874,6 +964,17 @@ func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.E
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "model not in registry: " + sess.Model().String()})
 	}
 	ls := newLive(sess, m)
+	// A resumed session runs under the same agent definition it was opened with, re-read
+	// from disk: the definition is a file, not part of the log. One that has since been
+	// deleted falls back to the default rather than refusing the resume, since the session's
+	// entries are still perfectly readable and a lost file is not the user's fault.
+	ws := deriveInfo(sess.ID(), ls.entries).Workspace
+	def, ok := s.resolveAgent(cn, ws, sess.Agent())
+	if !ok {
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "agent " + sess.Agent() + " is no longer defined; resuming under the default agent"})
+		def, _ = s.resolveAgent(cn, ws, "")
+	}
+	s.applyAgent(ls, def)
 	// Every path that brings a session back from disk goes through here, so this is where a
 	// resumed session gets its session_opened, once, whether the caller was resume or fork.
 	// Before the install, not after: loadCold checks s.live before s.loading, so a session
@@ -1108,16 +1209,29 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	}
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
 	first := &firstAppendSignal{Observer: &fanout{ls: ls, sid: sid}, started: make(chan session.Entry, 1), failed: make(chan struct{})}
+	// The agent definition's tool view, prompt and step limit, all written before this
+	// session was shared and read here under the mu this still holds, alongside hookContext
+	// (which is written the same way, see fireSessionOpened).
+	var tools turn.Tools = s.d.Plugins
+	if ls.tools != nil {
+		tools = ls.tools
+	}
+	// An agent definition's body replaces the base prompt; the workspace's AGENTS.md
+	// sections still follow it, which is what SystemPromptWith is for.
+	base := turn.SystemPrompt(view.Workspace, s.d.Version)
+	if ls.system != "" {
+		base = turn.SystemPromptWith(ls.system, view.Workspace)
+	}
 	r := turn.NewRunner(turn.Config{
-		Session:  ls.sess,
-		Provider: prov,
-		Model:    ls.model,
-		Tools:    s.d.Plugins,
-		Gate:     s.d.Gate,
-		Asker:    asker,
-		Observer: first,
-		// hookContext is guarded by ls.mu, which this still holds.
-		System:      turn.SystemPrompt(view.Workspace, s.d.Version) + ls.hookContextSuffixLocked(),
+		Session:     ls.sess,
+		Provider:    prov,
+		Model:       ls.model,
+		Tools:       tools,
+		Gate:        s.d.Gate,
+		Asker:       asker,
+		Observer:    first,
+		System:      base + ls.hookContextSuffixLocked(),
+		MaxSteps:    ls.maxSteps,
 		MaxTokens:   s.d.Config.MaxTokens,
 		Hooks:       s.hookFirer(),
 		Compactor:   s.compactorLocked(prov, ls),

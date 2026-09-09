@@ -196,6 +196,9 @@ func TestWaveDefaults(t *testing.T) {
 	if c.Sessions.Dir != filepath.Join(paths.Data, "sessions") {
 		t.Errorf("sessions.dir = %q", c.Sessions.Dir)
 	}
+	if c.ConfigDir != paths.Config {
+		t.Errorf("config dir = %q, want %q", c.ConfigDir, paths.Config)
+	}
 	if c.Memory.Dir != filepath.Join(home, ".agents", "memory") || !c.Memory.Enabled {
 		t.Errorf("memory: %+v", c.Memory)
 	}
