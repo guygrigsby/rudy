@@ -22,8 +22,9 @@ import (
 // serveShutdownBudget bounds the unwind of rudy serve. It is longer than the budget a
 // client run gets because a daemon can be holding several attached sessions with a turn
 // running in each, and every one of them has to record its turn_interrupted entry and close
-// its log before the process leaves.
-const serveShutdownBudget = 10 * time.Second
+// its log before the process leaves. A variable so a test can shrink it: what happens when
+// the budget runs out is behavior, and ten seconds of it is not a test.
+var serveShutdownBudget = 10 * time.Second
 
 // newServeCommand is the daemon: the same server the embedded client runs, on a unix socket
 // instead of an in-process pipe. It takes the same buildFunc every other command does, since
@@ -66,17 +67,34 @@ func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, 
 	// as by a Ctrl-C, and both mean the same thing here.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	socket, err := serveSocket(socket)
+	// One set of options for the socket and for the build, so the path this process listens
+	// on and the path its server names in a locked-session error cannot come apart.
+	o := BuildOptions{Stderr: stderr}
+	socket, err := serveSocket(socket, o)
 	if err != nil {
 		return 1, err
 	}
-	notice := func(text string) { _, _ = fmt.Fprintln(stderr, "rudy:", text) }
+	o.Socket = socket
+	notice := notices(stderr)
 
-	// The socket goes into the build: it is what a locked session names when it tells the
-	// second process to attach here instead of opening the same log twice, so it has to be
-	// the socket this process is actually about to serve on, not the default.
-	b, err := build(ctx, BuildOptions{Stderr: stderr, Socket: socket})
+	// The listen comes before the build: a socket another server holds is answered in
+	// milliseconds instead of after a plugin load and a registry refresh, and the lock the
+	// listener takes is held for the whole of this process's startup rather than from the
+	// moment it happens to finish wiring.
+	l, err := protocol.ListenUnix(socket)
 	if err != nil {
+		if errors.Is(err, protocol.ErrSocketBusy) {
+			_, _ = fmt.Fprintf(stderr, "a server is already serving %s\n", socket)
+			return 1, nil
+		}
+		return 1, err
+	}
+	b, err := build(ctx, o)
+	if err != nil {
+		// The socket is bound and locked by now, and nothing is going to serve it.
+		if cerr := l.Close(); cerr != nil {
+			notice(cerr.Error())
+		}
 		return 1, err
 	}
 	// unwind is the whole shutdown, in the order that keeps a second Ctrl-C useful: stop() puts
@@ -87,20 +105,19 @@ func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, 
 		stop()
 		shutdownCtx, done := context.WithTimeout(context.Background(), serveShutdownBudget)
 		defer done()
-		return b.Close(shutdownCtx)
-	}
-
-	l, err := protocol.ListenUnix(socket)
-	if err != nil {
-		_ = unwind()
-		if errors.Is(err, protocol.ErrSocketBusy) {
-			_, _ = fmt.Fprintf(stderr, "a server is already serving %s\n", socket)
-			return 1, nil
+		err := b.Close(shutdownCtx)
+		// Shutdown bounds its waits on the context it is given but reports only what closing
+		// the sessions produced, so a shutdown that gave up on a turn still writing comes
+		// back nil. The budget running out is the failure: turns were abandoned mid-flight
+		// and their logs end wherever the process did, which is not an exit 0.
+		if shutdownCtx.Err() != nil {
+			err = errors.Join(err, fmt.Errorf("shutdown ran past %s: %w", serveShutdownBudget, shutdownCtx.Err()))
 		}
-		return 1, err
+		return err
 	}
-	// Printed before the accept loop starts, and before anything dials: the listener is bound
-	// by now, so a client that reads this line can connect on the next one.
+	// Printed once there is a server behind the socket, not merely a bound one: a client
+	// that dialed on the strength of this line and then waited out a plugin load and a
+	// registry refresh in the backlog would be worse served than one that got no line yet.
 	notice("serving on " + socket)
 
 	// Every connection is served under a context of this one, so the signal that ends the
@@ -138,17 +155,28 @@ func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, 
 	return 0, nil
 }
 
-// serveSocket resolves an unset --socket to the default, the same path Build would have
-// handed the server: an operator who names no socket means the one every client probes.
-func serveSocket(socket string) (string, error) {
+// serveSocket resolves an unset --socket to the default, off the same environment and home
+// the build options carry and default the same way Build does. Reading os.Getenv here
+// instead would give a caller whose options name their own environment two different answers
+// for one socket: the one this process listens on and the one its server tells a client to
+// attach through.
+func serveSocket(socket string, o BuildOptions) (string, error) {
 	if socket != "" {
 		return socket, nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("home directory: %w", err)
+	env := o.Env
+	if env == nil {
+		env = os.Getenv
 	}
-	return config.XDG(os.Getenv, home).Socket(), nil
+	home := o.Home
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("home directory: %w", err)
+		}
+		home = h
+	}
+	return config.XDG(env, home).Socket(), nil
 }
 
 // accept hands every connection the listener admits to the server, each on its own

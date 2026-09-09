@@ -111,6 +111,19 @@ func waitServed(t *testing.T, done <-chan served, w *watcher) served {
 	}
 }
 
+// awaitLine blocks until the command says it is serving, or fails the test with whatever it
+// returned instead.
+func awaitLine(t *testing.T, w *watcher, done <-chan error) {
+	t.Helper()
+	select {
+	case <-w.seen:
+	case err := <-done:
+		t.Fatalf("rudy serve returned before it served: %v; stderr %q", err, w.String())
+	case <-time.After(serveTestBudget):
+		t.Fatalf("no serving line after %s; stderr %q", serveTestBudget, w.String())
+	}
+}
+
 // callCtx bounds one request. Nothing a test asks a served socket for should take longer
 // than the budget, and a bounded call is what turns a server that never answers into a
 // failure with a message instead of a package that runs to the timeout.
@@ -223,13 +236,7 @@ func TestServeCommandServesTheSocketFlag(t *testing.T) {
 	root.SetArgs([]string{"serve", "--socket", socket})
 	done := make(chan error, 1)
 	go func() { done <- root.ExecuteContext(ctx) }()
-	select {
-	case <-w.seen:
-	case err := <-done:
-		t.Fatalf("rudy serve returned before it served: %v; stderr %q", err, w.String())
-	case <-time.After(serveTestBudget):
-		t.Fatalf("no serving line after %s; stderr %q", serveTestBudget, w.String())
-	}
+	awaitLine(t, w, done)
 	if _, err := os.Stat(socket); err != nil {
 		t.Fatalf("nothing bound at --socket: %v", err)
 	}
@@ -269,6 +276,110 @@ func TestServeStopsOnASignal(t *testing.T) {
 	}
 }
 
+// shrinkShutdownBudget makes the shutdown budget too small to finish in, and puts it back
+// afterwards. What a daemon does when the budget runs out is behavior; ten seconds of
+// waiting for it is not a test.
+func shrinkShutdownBudget(t *testing.T) time.Duration {
+	t.Helper()
+	old := serveShutdownBudget
+	t.Cleanup(func() { serveShutdownBudget = old })
+	serveShutdownBudget = time.Nanosecond
+	return serveShutdownBudget
+}
+
+// TestServeOverBudgetShutdownExitsOne: Server.Shutdown bounds its wait on the context it is
+// given and reports only what closing the sessions produced, so a shutdown that abandoned a
+// turn still writing comes back nil. An operator whose daemon dropped work mid-flight has to
+// hear about it, in the exit code a service manager reads and in a line naming the budget.
+func TestServeOverBudgetShutdownExitsOne(t *testing.T) {
+	t.Chdir(t.TempDir())
+	budget := shrinkShutdownBudget(t)
+	build := testBuilder(t, &fakeProvider{block: true})
+	socket := filepath.Join(sockDir(t), "s")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := newWatcher("serving on " + socket)
+	root := newRoot("test", build)
+	root.SetOut(io.Discard)
+	root.SetErr(w)
+	root.SetArgs([]string{"serve", "--socket", socket})
+	done := make(chan error, 1)
+	go func() { done <- root.ExecuteContext(ctx) }()
+	awaitLine(t, w, done)
+
+	client, info := dialServe(t, socket)
+	awaitState(t, client, submitOne(t, client, info.SessionID, "hi"), "streaming")
+
+	cancel()
+	select {
+	case err := <-done:
+		if got := exitCode(t, err); got != 1 {
+			t.Fatalf("rudy serve = %d, want 1; stderr %q", got, w.String())
+		}
+	case <-time.After(serveTestBudget):
+		t.Fatalf("rudy serve did not return after %s; stderr %q", serveTestBudget, w.String())
+	}
+	if want := "shutdown ran past " + budget.String(); !strings.Contains(w.String(), want) {
+		t.Fatalf("stderr %q, want %q", w.String(), want)
+	}
+}
+
+// TestServeReleasesTheSocketWhenTheBuildFails: the listen now happens first, so a build that
+// fails after it leaves a bound socket and a held lock behind unless the failure path gives
+// them back. Nothing would serve that socket, and the next rudy would find the path busy for
+// as long as this process took to exit.
+func TestServeReleasesTheSocketWhenTheBuildFails(t *testing.T) {
+	socket := filepath.Join(sockDir(t), "s")
+	fail := func(context.Context, BuildOptions) (*Built, error) {
+		return nil, errors.New("no provider reachable")
+	}
+	var errb bytes.Buffer
+	code, err := runServe(context.Background(), fail, socket, io.Discard, &errb)
+	if code != 1 || err == nil {
+		t.Fatalf("runServe = %d, %v; want 1 and the build error", code, err)
+	}
+	if _, serr := os.Stat(socket); !errors.Is(serr, fs.ErrNotExist) {
+		t.Fatalf("the socket is still bound after a failed build: %v", serr)
+	}
+	l, lerr := protocol.ListenUnix(socket)
+	if lerr != nil {
+		t.Fatalf("the path is still locked after a failed build: %v", lerr)
+	}
+	_ = l.Close()
+}
+
+// TestServeSocketFollowsTheBuildOptions: the default socket is resolved off the same
+// environment and home the build runs under. Reading the process environment here instead
+// would have a command whose options name their own environment listen on one path and tell
+// its clients to attach through another, and under a test builder that is the developer's
+// own socket.
+func TestServeSocketFollowsTheBuildOptions(t *testing.T) {
+	base := t.TempDir()
+	run := filepath.Join(base, "run")
+	o := BuildOptions{
+		Env: func(key string) string {
+			if key == "XDG_RUNTIME_DIR" {
+				return run
+			}
+			return ""
+		},
+		Home: base,
+	}
+	got, err := serveSocket("", o)
+	if err != nil {
+		t.Fatalf("serveSocket: %v", err)
+	}
+	if want := filepath.Join(run, "rudy", "rudy.sock"); got != want {
+		t.Fatalf("default socket = %q, want %q", got, want)
+	}
+	// An operator who named a socket gets that one whatever the environment says.
+	named := filepath.Join(base, "named.sock")
+	if got, err := serveSocket(named, o); err != nil || got != named {
+		t.Fatalf("serveSocket(%q) = %q, %v", named, got, err)
+	}
+}
+
 // TestServeRefusesABusySocket: the socket is what makes one rudy the one every client
 // reaches, so a second server on the same path is refused rather than left to split the
 // client population between two stores.
@@ -281,8 +392,14 @@ func TestServeRefusesABusySocket(t *testing.T) {
 
 	done, w := startServe(t, ctx, build, socket)
 
+	// The second server is given a builder it must never call: a socket somebody else holds
+	// is answered before a plugin is loaded or a registry refreshed, not after.
+	refuse := func(context.Context, BuildOptions) (*Built, error) {
+		t.Error("rudy serve wired a server before it had the socket")
+		return nil, errors.New("must not build")
+	}
 	var errb bytes.Buffer
-	code, err := runServe(context.Background(), build, socket, io.Discard, &errb)
+	code, err := runServe(context.Background(), refuse, socket, io.Discard, &errb)
 	if code != 1 || err != nil {
 		t.Fatalf("second runServe = %d, %v; stderr %q", code, err, errb.String())
 	}

@@ -36,8 +36,9 @@ func newSkillsListCommand() *cobra.Command {
 				return err
 			}
 			got, errs := skills.Load(cfg.Skills.Dirs)
+			notice := notices(cmd.ErrOrStderr())
 			for _, e := range errs {
-				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "rudy:", e)
+				notice(e.Error())
 			}
 			return renderSkills(cmd.OutOrStdout(), got)
 		},

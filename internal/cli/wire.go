@@ -77,6 +77,14 @@ const shutdownBudget = 2 * time.Second
 // rest itself, so a test's socket still reaches the server it built.
 type buildFunc func(ctx context.Context, o BuildOptions) (*Built, error)
 
+// notices is the one place the harness's own prefix lives. Every line rudy writes about
+// itself rather than about a session goes through this: "rudy: <text>" on the writer the
+// command was given, so a plugin's failure and a daemon's accept error read the same in a
+// log and neither can drift from the other.
+func notices(w io.Writer) func(string) {
+	return func(text string) { _, _ = fmt.Fprintln(w, "rudy:", text) }
+}
+
 // Build wires config, store, plugins, registry, gate and server. It never writes config. A
 // failure after the server exists shuts it back down: it holds a context, loaded plugins and
 // their connections, and a caller that got an error will never call Shutdown itself.
@@ -113,7 +121,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		return nil, err
 	}
 	httpc := httpx.New(o.Version)
-	notice := func(text string) { _, _ = fmt.Fprintln(stderr, "rudy:", text) }
+	notice := notices(stderr)
 	plugins := plugin.NewRegistry(cfg.Plugins, notice)
 	plugins.Disable(cfg.PluginsDisabled...)
 	// The provider registry is built here rather than below because the memory plugin folds
