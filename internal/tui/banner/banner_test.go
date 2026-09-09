@@ -239,3 +239,22 @@ func TestTheWordmarkMaterializes(t *testing.T) {
 		}
 	}
 }
+
+// TestALongPathIsShortenedOnceToItsColumn: the workspace is shortened against the column
+// it lands in, so it is never elided from the left and then truncated on the right too.
+func TestALongPathIsShortenedOnceToItsColumn(t *testing.T) {
+	o := testOptions()
+	// Long enough that dropping the leading directories is not enough on its own: the
+	// candidate that fits the old fixed 60 columns is still wider than the column it lands
+	// in, which is what put an ellipsis at both ends of it.
+	o.Cwd = "/aaaa/bbbb/" + strings.Repeat("C", 50) + "/001"
+	body := strings.Join(render(t, o), "\n")
+	for _, l := range strings.Split(body, "\n") {
+		if strings.Count(l, "…") > 1 {
+			t.Errorf("one ellipsis, not two: %q", l)
+		}
+	}
+	if !strings.Contains(body, "001") {
+		t.Errorf("the directory's own name survives:\n%s", body)
+	}
+}

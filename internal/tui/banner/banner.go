@@ -46,7 +46,7 @@ func Render(o Options, th theme.Theme) []string {
 	if width <= 0 {
 		return nil
 	}
-	return layout(title(o.Version), left(o), right(o), width, th, theme.RoleAccent)
+	return layout(title(o.Version), left(o, leftWidth(width)), right(o), width, th, theme.RoleAccent)
 }
 
 // title is what the top border carries: the harness and the build, the way the box in the
@@ -60,7 +60,7 @@ func title(version string) string {
 
 // left is the greeting, the wordmark and the session's facts, each centered in its column.
 // The facts are the two a person checks before typing: what is answering, and where.
-func left(o Options) []cell {
+func left(o Options, w int) []cell {
 	out := []cell{
 		{text: Greeting(o.Now, o.Name), role: theme.RoleText, center: true},
 		line(),
@@ -75,7 +75,9 @@ func left(o Options) []cell {
 		out = append(out, cell{text: facts, role: theme.RoleText, center: true})
 	}
 	if o.Cwd != "" {
-		out = append(out, cell{text: ShortPath(o.Cwd, o.Home, 60), role: theme.RoleMuted, center: true})
+		// Shortened to the column it lands in, so a long path loses its leading directories
+		// rather than being shortened once and then truncated again on the right.
+		out = append(out, cell{text: ShortPath(o.Cwd, o.Home, w), role: theme.RoleMuted, center: true})
 	}
 	return out
 }

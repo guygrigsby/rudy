@@ -92,6 +92,21 @@ func columns(inner int) (left, right int) {
 	return left, right
 }
 
+// leftWidth is how many columns of text a left column cell gets at this box width, which
+// is what the workspace path is shortened against. layout does the same arithmetic to draw
+// it, so the two are one function rather than two guesses.
+func leftWidth(width int) int {
+	if width < framedWidth {
+		return width
+	}
+	inner := width - 2 - 2*pad
+	if width < twoColumnWidth {
+		return inner
+	}
+	lw, _ := columns(inner)
+	return lw
+}
+
 // layout is the box itself: a title in the top border, two columns of cells, and every
 // frame character in one role so the box reads as one object. Cells shorter than the box
 // are padded with blanks; a column with no cells at all draws as empty space.
