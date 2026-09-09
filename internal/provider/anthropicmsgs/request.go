@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
@@ -14,6 +13,12 @@ import (
 )
 
 var errImageUnsupported = errors.New("anthropicmsgs: image blocks are not supported in this plan")
+
+// errNothingToSend is buildMessage reporting a message with no block left to put on the wire.
+// buildParams drops such a message rather than sending it: the API refuses an assistant turn
+// with empty content, and since every later request replays the same log (a /compact summary
+// included), one such message would fail the rest of the session, not just this request.
+var errNothingToSend = errors.New("anthropicmsgs: message has no content to send")
 
 // Thinking budgets, in tokens. A request whose max_tokens does not leave room for the budget
 // is refused by the API, so headroom is added rather than sending a request that cannot work.
@@ -61,6 +66,9 @@ func buildParams(req provider.Request) (anthropic.MessageNewParams, error) {
 	}
 	for i, m := range req.Messages {
 		mp, err := buildMessage(m)
+		if errors.Is(err, errNothingToSend) {
+			continue
+		}
 		if err != nil {
 			return p, fmt.Errorf("anthropicmsgs: message %d: %w", i, err)
 		}
@@ -83,7 +91,9 @@ func thinkingBudget(l session.ThinkingLevel) int64 {
 
 // buildMessage turns one domain message into one Messages API turn. A tool result is a user
 // message of its own; several results in a row stay several consecutive user messages, which
-// the API combines into one turn.
+// the API combines into one turn. An assistant message left with no block at all is reported
+// as errNothingToSend for the caller to drop: the messages either side of it are still sent,
+// and two user messages left adjacent by the drop combine the same way.
 func buildMessage(m provider.Message) (anthropic.MessageParam, error) {
 	switch m.Role {
 	case provider.RoleUser:
@@ -120,53 +130,57 @@ func buildMessage(m provider.Message) (anthropic.MessageParam, error) {
 				return anthropic.MessageParam{}, fmt.Errorf("anthropicmsgs: block type %q in assistant message", b.Type)
 			}
 		}
+		if len(blocks) == 0 {
+			// Only reachable for an assistant message whose blocks were all unsigned
+			// thinking, which the loop above drops: a Ctrl-C during thinking at a high
+			// budget records exactly that. A message carrying a tool_use or any text
+			// still has a block here.
+			return anthropic.MessageParam{}, errNothingToSend
+		}
 		return anthropic.NewAssistantMessage(blocks...), nil
 	case provider.RoleToolResult:
 		text, err := textOf(m.Content)
 		if err != nil {
 			return anthropic.MessageParam{}, err
 		}
-		return anthropic.NewUserMessage(anthropic.NewToolResultBlock(m.ToolUseID, text, false)), nil
+		return anthropic.NewUserMessage(anthropic.NewToolResultBlock(m.ToolUseID, text, m.IsError)), nil
 	}
 	return anthropic.MessageParam{}, fmt.Errorf("anthropicmsgs: unknown role %q", m.Role)
 }
 
-// texts is the text of every block, and the one place user-side content is validated:
-// images are refused until the image plan lands, anything else is a bug upstream.
-func texts(blocks []session.Block) ([]string, error) {
-	out := make([]string, 0, len(blocks))
+// textOnly is the one place user-side content is validated: images are refused until the
+// image plan lands, anything else is a bug upstream. It is what the codec keeps of its own
+// while the joining itself is session.TextOf.
+func textOnly(blocks []session.Block) error {
 	for _, b := range blocks {
 		switch b.Type {
 		case session.BlockText:
-			out = append(out, b.Text)
 		case session.BlockImage:
-			return nil, errImageUnsupported
+			return errImageUnsupported
 		default:
-			return nil, fmt.Errorf("anthropicmsgs: block type %q not allowed here", b.Type)
+			return fmt.Errorf("anthropicmsgs: block type %q not allowed here", b.Type)
 		}
 	}
-	return out, nil
+	return nil
 }
 
 // contentBlocks maps user content one block to one block.
 func contentBlocks(blocks []session.Block) ([]anthropic.ContentBlockParamUnion, error) {
-	ts, err := texts(blocks)
-	if err != nil {
+	if err := textOnly(blocks); err != nil {
 		return nil, err
 	}
-	out := make([]anthropic.ContentBlockParamUnion, 0, len(ts))
-	for _, t := range ts {
-		out = append(out, anthropic.NewTextBlock(t))
+	out := make([]anthropic.ContentBlockParamUnion, 0, len(blocks))
+	for _, b := range blocks {
+		out = append(out, anthropic.NewTextBlock(b.Text))
 	}
 	return out, nil
 }
 
-// textOf joins text blocks with newlines, for the places the API takes a string rather than
-// a block list.
+// textOf is session.TextOf behind the codec's refusal, for the places the API takes a string
+// rather than a block list.
 func textOf(blocks []session.Block) (string, error) {
-	ts, err := texts(blocks)
-	if err != nil {
+	if err := textOnly(blocks); err != nil {
 		return "", err
 	}
-	return strings.Join(ts, "\n"), nil
+	return session.TextOf(blocks), nil
 }

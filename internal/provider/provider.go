@@ -26,6 +26,11 @@ type Message struct {
 	Role      Role            `json:"role"`
 	Content   []session.Block `json:"content"`
 	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result only
+	// IsError is the tool_result's outcome as the wire spells it: true for anything but a
+	// clean run (an error, a killed tool, a result lost to a crash). A provider that has a
+	// flag for it says so, which is what lets the model tell a failure from an answer
+	// instead of reading the text and guessing. tool_result only.
+	IsError bool `json:"is_error,omitempty"`
 }
 
 // ToolDef is a tool as the model sees it.

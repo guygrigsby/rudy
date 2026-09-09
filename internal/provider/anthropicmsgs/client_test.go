@@ -277,6 +277,67 @@ func TestBuildParamsSkipsUnsignedThinking(t *testing.T) {
 	}
 }
 
+// TestBuildParamsDropsAnEmptyAssistantMessage: a Ctrl-C during thinking records an assistant
+// message whose only block is an unsigned one, the loop above drops that block, and a message
+// with no content at all is a 400 from the API. It would be a 400 on every later request too,
+// /compact included, since they all replay the same log; the message is dropped instead and
+// the ones either side of it still go.
+func TestBuildParamsDropsAnEmptyAssistantMessage(t *testing.T) {
+	req := provider.Request{
+		Model: session.ModelRef{Provider: "anth", Model: "claude-sonnet-5"}, MaxTokens: 100,
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("first")}},
+			{Role: provider.RoleAssistant, Content: []session.Block{{Type: session.BlockThinking, Text: "interrupted reasoning"}}},
+			{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("second")}},
+		},
+	}
+	p, err := buildParams(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Messages) != 2 {
+		t.Fatalf("sent %d messages, want the two user messages: %+v", len(p.Messages), p.Messages)
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "interrupted reasoning") || strings.Contains(string(body), `"role":"assistant"`) {
+		t.Errorf("the empty assistant message reached the wire: %s", body)
+	}
+	for _, want := range []string{`{"text":"first","type":"text"}`, `{"text":"second","type":"text"}`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("message around the dropped one is missing %s: %s", want, body)
+		}
+	}
+}
+
+// TestToolResultCarriesItsOutcome: the model has to be able to tell a tool that failed from
+// one that answered, and is_error is where the Messages API says so.
+func TestToolResultCarriesItsOutcome(t *testing.T) {
+	req := provider.Request{
+		Model: session.ModelRef{Provider: "anth", Model: "claude-sonnet-5"}, MaxTokens: 100,
+		Messages: []provider.Message{
+			{Role: provider.RoleToolResult, ToolUseID: "toolu_ok", Content: []session.Block{session.TextBlock("fine")}},
+			{Role: provider.RoleToolResult, ToolUseID: "toolu_bad", Content: []session.Block{session.TextBlock("boom")}, IsError: true},
+		},
+	}
+	p, err := buildParams(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"tool_use_id":"toolu_bad","is_error":true`) {
+		t.Errorf("a failed tool result must be sent with is_error: %s", body)
+	}
+	if !strings.Contains(string(body), `"tool_use_id":"toolu_ok","is_error":false`) {
+		t.Errorf("a clean tool result must not be sent with is_error: %s", body)
+	}
+}
+
 func TestMapStop(t *testing.T) {
 	cases := map[string]session.StopReason{
 		"end_turn":                      session.StopEndTurn,

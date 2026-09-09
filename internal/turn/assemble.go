@@ -50,7 +50,15 @@ func messagesOf(entries []session.Entry, overrides map[string][]session.Block) [
 			if over, ok := overrides[p.ToolUseID]; ok {
 				content = over
 			}
-			out = append(out, provider.Message{Role: provider.RoleToolResult, Content: content, ToolUseID: p.ToolUseID})
+			// Anything but a clean run is an error to the model: a tool that failed, one
+			// killed by a steer, and one whose result was lost to a crash all say so on
+			// the wire rather than arriving as an ordinary answer.
+			out = append(out, provider.Message{
+				Role:      provider.RoleToolResult,
+				Content:   content,
+				ToolUseID: p.ToolUseID,
+				IsError:   p.Outcome != session.OutcomeOK,
+			})
 		}
 	}
 	return out

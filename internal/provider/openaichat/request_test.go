@@ -106,3 +106,35 @@ func TestBuildRequestRefusesImages(t *testing.T) {
 		t.Fatalf("want errImageUnsupported, got %v", err)
 	}
 }
+
+// TestBuildRequestDropsAnEmptyAssistantMessage: a Ctrl-C during thinking records an assistant
+// message whose only block is a thinking block, which this codec never sends back, leaving a
+// message with neither content nor tool calls. The endpoint refuses that, and would refuse it
+// on every later request too, /compact included, since they all replay the same log; the
+// message is dropped instead and the ones either side of it still go.
+func TestBuildRequestDropsAnEmptyAssistantMessage(t *testing.T) {
+	req := provider.Request{
+		Model: session.ModelRef{Provider: "p", Model: "m"},
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("first")}},
+			{Role: provider.RoleAssistant, Content: []session.Block{{Type: session.BlockThinking, Text: "interrupted reasoning"}}},
+			{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("second")}},
+		},
+	}
+	got, err := buildRequest(req)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	want := compact(t, `{
+	  "model": "m",
+	  "messages": [
+	    {"role": "user", "content": "first"},
+	    {"role": "user", "content": "second"}
+	  ],
+	  "stream": true,
+	  "stream_options": {"include_usage": true}
+	}`)
+	if string(got) != want {
+		t.Fatalf("body mismatch\n got: %s\nwant: %s", got, want)
+	}
+}

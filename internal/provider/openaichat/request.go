@@ -4,13 +4,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
 var errImageUnsupported = errors.New("openaichat: image blocks are not supported in this plan")
+
+// errNothingToSend is buildMessage reporting a message with nothing left to put on the wire.
+// buildRequest drops such a message: an assistant turn with neither content nor tool calls is
+// refused, and since every later request replays the same log (a /compact summary included),
+// one of them would fail the rest of the session rather than just this request.
+var errNothingToSend = errors.New("openaichat: message has no content to send")
 
 type wireRequest struct {
 	Model         string             `json:"model"`
@@ -70,6 +75,9 @@ func buildRequest(req provider.Request) ([]byte, error) {
 	}
 	for i, m := range req.Messages {
 		wm, err := buildMessage(m)
+		if errors.Is(err, errNothingToSend) {
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("openaichat: message %d: %w", i, err)
 		}
@@ -94,12 +102,11 @@ func buildMessage(m provider.Message) (wireMessage, error) {
 		}
 		return wireMessage{Role: "user", Content: text}, nil
 	case provider.RoleAssistant:
-		var texts []string
 		var calls []wireToolCall
 		for _, b := range m.Content {
 			switch b.Type {
 			case session.BlockText:
-				texts = append(texts, b.Text)
+				// Joined by session.TextOf below rather than gathered here.
 			case session.BlockToolUse:
 				calls = append(calls, wireToolCall{
 					ID:       b.ID,
@@ -114,7 +121,14 @@ func buildMessage(m provider.Message) (wireMessage, error) {
 				return wireMessage{}, fmt.Errorf("openaichat: block type %q in assistant message", b.Type)
 			}
 		}
-		return wireMessage{Role: "assistant", Content: strings.Join(texts, "\n"), ToolCalls: calls}, nil
+		text := session.TextOf(m.Content)
+		if text == "" && len(calls) == 0 {
+			// Only reachable for an assistant message whose blocks were all thinking,
+			// which this codec never sends back: a Ctrl-C during thinking records exactly
+			// that. A message carrying a tool call or any text still has something here.
+			return wireMessage{}, errNothingToSend
+		}
+		return wireMessage{Role: "assistant", Content: text, ToolCalls: calls}, nil
 	case provider.RoleToolResult:
 		text, err := textOf(m.Content)
 		if err != nil {
@@ -125,18 +139,18 @@ func buildMessage(m provider.Message) (wireMessage, error) {
 	return wireMessage{}, fmt.Errorf("openaichat: unknown role %q", m.Role)
 }
 
-// textOf joins text blocks with newlines. Anything else is refused.
+// textOf is session.TextOf behind the codec's own refusal: an image is refused until the
+// image plan lands, and anything but text is a bug upstream. The assistant branch does not
+// come through here, since a tool_use block is exactly what it expects to see.
 func textOf(blocks []session.Block) (string, error) {
-	var texts []string
 	for _, b := range blocks {
 		switch b.Type {
 		case session.BlockText:
-			texts = append(texts, b.Text)
 		case session.BlockImage:
 			return "", errImageUnsupported
 		default:
 			return "", fmt.Errorf("openaichat: block type %q not allowed here", b.Type)
 		}
 	}
-	return strings.Join(texts, "\n"), nil
+	return session.TextOf(blocks), nil
 }
