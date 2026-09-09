@@ -278,6 +278,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.notification(protocol.Notification(msg)), pump(m.cl))
 	case DisconnectedMsg:
 		m.disconnected = true
+		// No turn.state will arrive for a turn in flight now, so the mirror rests and the
+		// spinner stops here rather than on an edge that never comes.
+		m.turn = turnControl{}
+		m.spinning = false
 		text := "disconnected from the server"
 		if msg.Err != nil {
 			text += ": " + msg.Err.Error()
@@ -1271,8 +1275,8 @@ func (m *Model) widgetLines(slot protocol.WidgetSlot) []string {
 		// A widget with nothing to say takes no line, the way a status item with nothing
 		// to say takes no cell: a plugin clears its widget by emptying it, and a blank
 		// line in a slot is not what clearing looks like.
-		if s := m.clamp(renderSpans(m.th, w.Content)); s != "" {
-			out = append(out, s)
+		if s := renderSpans(m.th, w.Content); s != "" {
+			out = append(out, m.clamp(strings.Repeat(" ", transcript.Gutter)+s))
 		}
 	}
 	return out

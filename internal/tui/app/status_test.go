@@ -215,3 +215,24 @@ func TestTurnItemSpinsWhileTheTurnRuns(t *testing.T) {
 		t.Error("a tick that arrives after the turn rested asks for no further tick")
 	}
 }
+
+func TestADisconnectRestsTheTurnCell(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.status.items": []string{"turn"}})
+	sid, turn := h.m.session.SessionID, session.NewID().String()
+	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: sid, TurnID: turn, State: stateStreaming})
+	if !h.m.spinning {
+		t.Fatal("a running turn arms the tick loop")
+	}
+	h.update(DisconnectedMsg{})
+	// No turn.state will ever arrive for this turn again: the cell would spin for the
+	// life of the process on a turn nobody can finish.
+	if got := ansi.Strip(h.m.statusLine()); got != "" {
+		t.Errorf("a disconnect empties the turn cell: %q", got)
+	}
+	if h.m.spinning {
+		t.Error("a disconnect stops the tick loop")
+	}
+	if cmd := h.m.spinTicked(spinner.TickMsg{ID: h.m.spin.ID()}); cmd != nil {
+		t.Error("a tick that arrives after the disconnect asks for no further tick")
+	}
+}
