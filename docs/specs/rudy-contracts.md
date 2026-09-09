@@ -486,6 +486,12 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.transcript.block_gap` | int | 1 | blank lines between assistant blocks; zero or positive |
 | `ui.diff.style` | `text`, `background` | `text` | |
 | `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"]` | built-in keys plus `plugin:key` for plugin items; `turn` is a spinner and one word (`thinking`, `streaming`, `tool`, `steering`, `waiting`) while a turn runs and nothing at rest |
+| `ui.header.show` | bool | true | the startup header: the greeting, the wordmark, the session facts, the tips and what is new. Drawn once at the top of the transcript and scrolled away by it (ADR 0016) |
+| `ui.header.animate` | bool | true | the wordmark materializes once on startup, then settles. Altscreen only: inline draws the settled header, since an inline frame that grows and shrinks strands its rows |
+| `ui.header.name` | string | `` | the name the greeting uses; empty resolves git `user.name`, then the OS user, first token capitalized |
+| `ui.header.tips` | int | 2 | tips drawn in the right column, rotated by the day; `0` draws none |
+| `ui.header.updates` | int | 3 | bullets from the newest `CHANGELOG.md` release the binary was built with; `0` draws none |
+| `ui.header.max_width` | int | 120 | the widest the box draws; a wider terminal leaves the rest of the line empty rather than stretching |
 | `ui.notices.max` | int | 3 | notice lines the client draws under the transcript, newest first; `0` draws none |
 | `ui.theme.name` | string | `default` | a file under `themes/` or the built-in |
 | `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes |

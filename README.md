@@ -55,6 +55,11 @@ each default to `~/.config`, `~/.local/share` and `~/.cache`, plus `/rudy`.
     rudy sessions resume <session id>     # the same, as a verb
     rudy sessions fork <session id>       # a fork of it, --at <entry id> for where
 
+The client opens on a header: a greeting, the wordmark, this session's model and
+workspace, a tip or two and what the build carries as news. It materializes once,
+any key skips it, and the conversation scrolls it away. `[ui.header]` turns each
+part off.
+
 The client opens full screen and keeps every row expandable. Keys are pi's
 action ids over the closed set ADR 0013 lists, rebound in a `[keys]` table. Esc
 in insert goes to vim normal; in normal with a turn running once steers and

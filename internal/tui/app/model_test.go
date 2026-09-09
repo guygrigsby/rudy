@@ -69,7 +69,10 @@ func testConfig(t *testing.T, over map[string]any) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	paths := config.Paths{Config: dir, Data: dir, Runtime: dir, Cache: dir, Home: dir}
-	m := map[string]any{"default.provider": "fake", "default.model": "m1"}
+	// The startup header is off unless a test asks for it: it is a dozen lines about the
+	// build and the day, and every other permutation golden is about the transcript under
+	// it. TestGoldenStartupHeader is where it is pinned.
+	m := map[string]any{"default.provider": "fake", "default.model": "m1", "ui.header.show": false}
 	maps.Copy(m, over)
 	cfg, err := config.Load(paths, m)
 	if err != nil {
@@ -83,10 +86,12 @@ func testConfig(t *testing.T, over map[string]any) *config.Config {
 // request the client made, so a test can see what the model asked the server to do
 // without a real server's timing in the way.
 type harness struct {
-	t   *testing.T
-	m   *Model
-	srv protocol.Conn
-	cl  *protocol.Client
+	t *testing.T
+	m *Model
+	// startup is what the first window size asked for, which is the header's own command.
+	startup tea.Cmd
+	srv     protocol.Conn
+	cl      *protocol.Client
 
 	mu   sync.Mutex
 	reqs []recorded
@@ -107,10 +112,17 @@ func newHarness(t *testing.T, over map[string]any) *harness {
 // prompt on the command line reaches the client.
 func newHarnessPrompt(t *testing.T, over map[string]any, prompt string) *harness {
 	t.Helper()
+	return newHarnessWith(t, over, func(o *Options) { o.Prompt = prompt })
+}
+
+// newHarnessWith is the same with a last word on the Options the model is built from, for
+// the tests that fix the header's clock, its version or the changelog it reads.
+func newHarnessWith(t *testing.T, over map[string]any, opts func(*Options)) *harness {
+	t.Helper()
 	cc, sc := protocol.Pipe()
 	cl := protocol.NewClient(cc)
 	t.Cleanup(func() { _ = cl.Close(); _ = sc.Close() })
-	m := New(Options{
+	o := Options{
 		Config: testConfig(t, over),
 		Theme:  theme.Default(),
 		Keys:   keys.Default(),
@@ -125,12 +137,18 @@ func newHarnessPrompt(t *testing.T, over map[string]any, prompt string) *harness
 		Models:    testModels(),
 		Version:   "test",
 		Cwd:       "/w",
-		Prompt:    prompt,
 		Workspace: "rudy main*",
-	})
+	}
+	if opts != nil {
+		opts(&o)
+	}
+	m := New(o)
 	h := &harness{t: t, m: m, srv: sc, cl: cl}
 	go h.answerEmpty(sc)
-	h.update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	// The first window size is what a program sends before anything else, and it is what
+	// the startup header waits for: inline owes a print, altscreen owes the first step of
+	// the reveal. Kept rather than dropped so a test can run it.
+	h.startup = h.update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return h
 }
 

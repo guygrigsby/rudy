@@ -233,6 +233,14 @@ double_press_ms = 500
 [ui.layout]
 slots = ["transcript", "input", "status"]
 
+[ui.header]
+show = true
+animate = true
+name = ""
+tips = 2
+updates = 3
+max_width = 120
+
 [ui.transcript]
 tool_collapsed = true
 tool_preview_lines = 2
@@ -291,6 +299,14 @@ rows are committed there when it rests, and a committed row no longer expands.
 Assistant text streams as plain text and renders through glamour once its entry
 arrives. Queued follow-ups are held by the client and submitted when the turn
 rests. ADR 0013, ADR 0015.
+
+The client opens on a header: a framed two column box with a greeting, the block
+wordmark, the session's model and workspace on the left, and a tip or two beside
+what the build carries as news, read from the `CHANGELOG.md` it was compiled
+with. The wordmark materializes once and settles, and any key skips it. The box
+is the top of the transcript rather than a slot, so the conversation scrolls it
+away; inline prints it into the terminal's own scrollback instead. Every part is
+a `[ui.header]` field. ADR 0016.
 
 A draft that opens with `/` and carries no space yet lists the matching commands
 above the editor, name and description, filtered as it is typed. The editor keeps

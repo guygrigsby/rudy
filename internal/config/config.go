@@ -53,6 +53,18 @@ type NoticesConfig struct {
 	Max int `mapstructure:"max"`
 }
 
+// HeaderConfig is the [ui.header] table: the startup header the client draws once at the
+// top of the transcript and lets the conversation scroll away (ADR 0016). Name empty
+// resolves git's user.name and then the OS user.
+type HeaderConfig struct {
+	Show     bool   `mapstructure:"show"`
+	Animate  bool   `mapstructure:"animate"`
+	Name     string `mapstructure:"name"`
+	Tips     int    `mapstructure:"tips"`
+	Updates  int    `mapstructure:"updates"`
+	MaxWidth int    `mapstructure:"max_width"`
+}
+
 // UIConfig is the [ui] table. Theme holds ui.theme.name plus role overrides, merged
 // over ThemeDefaults by hand in Load since viper replaces a nested default table
 // wholesale rather than merging it key by key with a partial file table.
@@ -64,6 +76,7 @@ type UIConfig struct {
 	Diff       DiffConfig        `mapstructure:"diff"`
 	Status     StatusConfig      `mapstructure:"status"`
 	Notices    NoticesConfig     `mapstructure:"notices"`
+	Header     HeaderConfig      `mapstructure:"header"`
 	Theme      map[string]string `mapstructure:"theme"`
 }
 
@@ -178,6 +191,12 @@ func Defaults() map[string]any {
 		"mcp.connect_timeout_ms":           10000,
 		"max_tokens":                       8192,
 		"ui.render":                        "altscreen",
+		"ui.header.show":                   true,
+		"ui.header.animate":                true,
+		"ui.header.name":                   "",
+		"ui.header.tips":                   2,
+		"ui.header.updates":                3,
+		"ui.header.max_width":              120,
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,
@@ -463,6 +482,15 @@ func (c *Config) validateUI() []error {
 	}
 	if c.UI.Notices.Max < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.notices.max %d must be zero or positive", c.UI.Notices.Max))
+	}
+	if c.UI.Header.Tips < 0 {
+		errs = append(errs, fmt.Errorf("config: ui.header.tips %d must be zero or positive", c.UI.Header.Tips))
+	}
+	if c.UI.Header.Updates < 0 {
+		errs = append(errs, fmt.Errorf("config: ui.header.updates %d must be zero or positive", c.UI.Header.Updates))
+	}
+	if c.UI.Header.MaxWidth <= 0 {
+		errs = append(errs, fmt.Errorf("config: ui.header.max_width %d must be positive", c.UI.Header.MaxWidth))
 	}
 	seenSlots := map[string]bool{}
 	for _, s := range c.UI.Layout.Slots {

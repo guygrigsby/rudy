@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
@@ -92,6 +93,20 @@ func screen(t *testing.T, over map[string]any, drive func(tm *teatest.TestModel,
 	// spinner stands at its first frame, which is the frame these goldens pin.
 	final.spin = newSpinner()
 	return final.View().Content
+}
+
+// startupScreen is the frame a client opens on, before anything has been said: the header
+// over an empty transcript. It is its own helper because screen drives the design's whole
+// conversation through the model first, which is the frame every other golden pins.
+func startupScreen(t *testing.T, over map[string]any) string {
+	t.Helper()
+	h := newHarnessWith(t, over, func(o *Options) {
+		o.Now = time.Date(2026, 9, 9, 13, 30, 0, 0, time.UTC)
+		o.Version = "0.1.0"
+		o.Changelog = "# Changelog\n\n## 0.1.0\n\n- Opens full screen, and every row stays expandable\n- Typing / lists the commands as you type\n- /exit closes the client, the daemon keeps running\n"
+	})
+	h.update(tea.WindowSizeMsg{Width: goldenWidth, Height: goldenHeight})
+	return h.m.View().Content
 }
 
 // golden compares got against testdata/<name>.golden through teatest, or rewrites it
@@ -237,6 +252,19 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 			Matcher: session.Matcher{Tool: "bash", Prefix: "rm -rf"},
 		}))
 	}))
+}
+
+// TestGoldenStartupHeader is what a person meets: the framed header at the top of an empty
+// transcript, the greeting, the settled wordmark, the session's facts, the tips and what
+// the build carries as news (ADR 0016). The clock, the name and the changelog are fixed
+// here, so what this pins is the layout and not the day it ran.
+func TestGoldenStartupHeader(t *testing.T) {
+	over := map[string]any{
+		"ui.header.show":    true,
+		"ui.header.animate": false,
+		"ui.header.name":    "Guy",
+	}
+	golden(t, "startup_header", startupScreen(t, over))
 }
 
 // TestGoldenSlashMenu pins the completion above the editor: what command.list answered

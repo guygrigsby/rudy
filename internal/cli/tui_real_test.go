@@ -57,6 +57,10 @@ const (
 // ui.render = "altscreen" means on the wire and what the default now does (ADR 0015).
 const altScreenEnter = "\x1b[?1049h"
 
+// settledWordmarkRow is the top row of the block wordmark once its reveal has finished. A
+// row still being revealed carries the dim and bright characters instead.
+const settledWordmarkRow = "████  █   █ ████  █   █"
+
 // slashCommand is the one this run completes and then runs: /exit is the client's own, so
 // it needs no provider and it is what ends the process.
 const slashCommand = "/exit"
@@ -104,6 +108,13 @@ func TestRealTUIOverPTY(t *testing.T) {
 	// session resolved, in the "provider:model" form the status item renders.
 	waitFor(t, log, "the status line to show INSERT and "+ref, firstFrameWait, func(s string) bool {
 		return strings.Contains(s, "INSERT") && strings.Contains(s, ref)
+	})
+
+	// The startup header, and the wordmark settled: the reveal runs on its own timer and
+	// the last step is the whole word, so seeing every block is the animation having
+	// finished rather than a frame of it (ADR 0016).
+	waitFor(t, log, "the settled wordmark and the release notes", drawWait, func(s string) bool {
+		return strings.Contains(s, settledWordmarkRow) && strings.Contains(s, "What's new in")
 	})
 
 	// Full screen: the client took the alternate buffer, which is what every other

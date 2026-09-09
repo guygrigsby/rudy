@@ -86,6 +86,12 @@ type Options struct {
 	// on the command line is a draft the user has already typed, not a turn they have
 	// already sent, so Enter is still what sends it.
 	Prompt string
+	// Changelog is CHANGELOG.md as the binary carries it, which the startup header reads
+	// the newest release out of. Empty draws no news (ADR 0016).
+	Changelog string
+	// Now fixes the clock the header's greeting and tips are resolved against. Zero means
+	// time.Now, which is what a run does; a test sets it so a golden is not a clock.
+	Now time.Time
 	// Workspace overrides the workspace status item. Empty means read it from git in
 	// Cwd, which is what a run does; a test sets it so drawing a status line never
 	// depends on the directory the test happens to run in.
@@ -134,6 +140,12 @@ type Model struct {
 	// mirrored, the question standing on screen and what Esc does next (turn.go).
 	turn turnControl
 
+	// header is the startup header: where it is drawn, how far its reveal has got and the
+	// greeting it was opened with (header.go).
+	header headerState
+	// version and changelog are what the header's title and its news are drawn from.
+	version   string
+	changelog string
 	// pick is the picker standing in the editor's place, nil when none is up. While one
 	// stands it owns the keyboard (picker.go).
 	pick *picker
@@ -215,6 +227,8 @@ func New(o Options) *Model {
 		width:     defaultWidth,
 		height:    defaultHeight,
 	}
+	m.version, m.changelog = o.Version, o.Changelog
+	m.header = m.newHeader(o)
 	m.tr = m.newTranscript()
 	m.ed = input.New(cfg.UI.Vim, o.Theme, defaultWidth, table)
 	if o.Prompt != "" {
@@ -299,7 +313,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.callResult(msg)
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
-		return m, nil
+		// The header needs a width before it can be drawn at all, so the first size is
+		// what starts it: the inline print, or the first step of the reveal.
+		return m, m.headerStart()
+	case headerTickMsg:
+		return m, m.headerTicked()
 	case tea.KeyPressMsg:
 		return m, m.key(msg)
 	case tea.MouseClickMsg:
@@ -912,6 +930,8 @@ func (m *Model) resize(w, h int) {
 // A picker takes every key, a question's y, a and n included: it is what the keyboard is
 // pointed at while it stands, and a question it hid is still standing when it closes.
 func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
+	// Somebody typing has stopped watching the wordmark arrive.
+	m.settleHeader()
 	if m.pick != nil {
 		return m.pickerKey(k)
 	}
@@ -1208,6 +1228,10 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 	laid := m.tr.Layout()
 	notices := m.noticeLines()
+	// The header is the top of the transcript, above the first row, and the conversation
+	// scrolls it away as it grows. Inline never has one here: it was printed into the
+	// terminal's own scrollback when the first size arrived (header.go).
+	head := m.headerLines()
 	if m.inline() {
 		// The live region is what the frame has left once the other slots have taken
 		// theirs. A turn that outgrew it keeps its newest lines: the oldest have already
@@ -1223,9 +1247,10 @@ func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 		}
 		return append(lines, notices...), rows
 	}
-	content := make([]string, len(laid))
-	for i, l := range laid {
-		content[i] = l.Text
+	content := make([]string, 0, len(head)+len(laid))
+	content = append(content, head...)
+	for _, l := range laid {
+		content = append(content, l.Text)
 	}
 	m.vp.SetHeight(max(h-len(notices), 1))
 	// A viewport sitting at the bottom follows the rows that land under it; one the user
@@ -1239,7 +1264,9 @@ func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 	view := strings.Split(m.vp.View(), "\n")
 	rows := make([]*transcript.Row, len(view))
 	for i := range view {
-		if j := m.vp.YOffset() + i; j < len(laid) {
+		// The header's own lines belong to no row, so the click that traces a line back to
+		// one counts from where the rows start rather than from the top of the viewport.
+		if j := m.vp.YOffset() + i - len(head); j >= 0 && j < len(laid) {
 			rows[i] = laid[j].Row
 		}
 	}

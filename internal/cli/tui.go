@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/oklog/ulid/v2"
 
+	rudy "github.com/guygrigsby/rudy"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/tui/app"
@@ -197,14 +198,16 @@ func launchApp(ctx context.Context, r clientRun) error {
 		_, _ = fmt.Fprintln(r.stderr, "rudy: registry.list:", err)
 	}
 	return app.Run(ctx, app.Options{
-		Config:  r.dial.Config,
-		Theme:   r.look.theme,
-		Keys:    r.look.keys,
-		Client:  r.dial.Client,
-		Session: r.info,
-		Models:  reg.Models,
-		Version: r.dial.Version,
-		Cwd:     r.cwd,
-		Prompt:  r.prompt,
+		Config: r.dial.Config,
+		// The binary's own release notes, for the startup header's news (ADR 0016).
+		Changelog: rudy.Changelog,
+		Theme:     r.look.theme,
+		Keys:      r.look.keys,
+		Client:    r.dial.Client,
+		Session:   r.info,
+		Models:    reg.Models,
+		Version:   r.dial.Version,
+		Cwd:       r.cwd,
+		Prompt:    r.prompt,
 	})
 }
