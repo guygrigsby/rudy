@@ -73,6 +73,10 @@ Typing `/` lists the commands above the editor with what each does, filtered as
 you type. The arrows move the selection, tab completes the name, Esc dismisses
 the list. Enter completes a half-typed name and runs a whole one.
 
+Icons are Nerd Font glyphs by default: the branch in the workspace cell, the
+model, the context and one per tool. A terminal without a patched font wants
+`ui.icons.set = "unicode"`, and `ui.icons.<name> = ""` turns any single one off.
+
 Every render choice is a config field under `[ui]` with a default, listed in
 `docs/specs/rudy-contracts.md`; `ui.render = "inline"` swaps the full screen for
 the terminal's own scrollback, where a turn's rows are committed when it rests

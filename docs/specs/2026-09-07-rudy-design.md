@@ -214,7 +214,9 @@ is one prefix glyph and no padding. One blank line between assistant blocks.
 Tool calls fold to one row plus a two-line preview; bash shows the last two
 lines of output, edits show the first hunk as red and green text, read, grep and
 glob show a one-line count. Thinking hidden. Every row and the status line sit
-one column in, the gutter the screen above draws. Status under the input, vim
+one column in, the gutter the screen above draws. Icons come from `[ui.icons]`: the branch
+in the workspace cell, the model, the context, one per tool on a tool row and
+one per notice level. Status under the input, vim
 mode first and `turn` last: a spinner and one word for what the turn is doing
 (`thinking` until an answer streams, then `streaming`, `tool`, `steering`,
 `waiting`), drawing nothing at rest. Enter or a click expands a row. A permission
@@ -259,6 +261,9 @@ items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn"]
 
 [ui.notices]
 max = 3
+
+[ui.icons]
+set = "nerd"
 
 [ui.theme]
 name = "default"
