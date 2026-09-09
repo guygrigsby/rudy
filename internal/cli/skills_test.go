@@ -46,9 +46,9 @@ func writeSkillsConfig(t *testing.T, cfgHome string, dirs, migrateFrom []string)
 	}
 }
 
-// skillsTestRoot points every XDG dir, and HOME, at a fresh temp tree, so config.Load's "~/"
+// tempXDG points every XDG dir, and HOME, at a fresh temp tree, so config.Load's "~/"
 // expansion cannot reach the real home either.
-func skillsTestRoot(t *testing.T) *cobra.Command {
+func tempXDG(t *testing.T) {
 	t.Helper()
 	base := t.TempDir()
 	t.Setenv("HOME", base)
@@ -56,6 +56,12 @@ func skillsTestRoot(t *testing.T) *cobra.Command {
 	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(base, "run"))
+}
+
+// skillsTestRoot is a root command over a fresh temp tree.
+func skillsTestRoot(t *testing.T) *cobra.Command {
+	t.Helper()
+	tempXDG(t)
 	return NewRoot()
 }
 

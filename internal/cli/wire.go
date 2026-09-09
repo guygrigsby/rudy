@@ -18,6 +18,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
+	mcpplugin "github.com/guygrigsby/rudy/internal/plugins/mcp"
 	memoryplugin "github.com/guygrigsby/rudy/internal/plugins/memory"
 	openaichatplugin "github.com/guygrigsby/rudy/internal/plugins/openaichat"
 	skillsplugin "github.com/guygrigsby/rudy/internal/plugins/skills"
@@ -196,15 +197,24 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 }
 
 // BuiltinPlugins is the linked-in set: the six tools, the agent tool, /init, /compact,
-// /skills, /memory, the kernel's own slash commands (/model, /help, /fork, /plugins) and the
-// openai_chat and anthropic_messages providers.
+// /skills, /memory, the kernel's own slash commands (/model, /help, /fork, /plugins), the
+// MCP servers from mcp.toml and the openai_chat and anthropic_messages providers.
 func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
 	return append(BuiltinTools(), subagents.New(paths.Config), initcmd.New(), compactcmd.New(), commands.New(),
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
+		newMCPPlugin(cfg, paths, resolve, version),
 		openaichatplugin.New(cfg.Providers, httpc, resolve),
 		anthropicplugin.New(cfg.Providers, httpc, resolve))
+}
+
+// newMCPPlugin is the mcp plugin over the user and project mcp.toml files. Plugins load once
+// at boot, before any session, so the project scope is the workspace rudy was started in; no
+// workspace there means the user scope is all there is, never a reason to fail the build.
+func newMCPPlugin(cfg *config.Config, paths config.Paths, resolve func(string) (string, error), version string) plugin.Plugin {
+	user, project := mcpplugin.Paths(paths.Config)
+	return mcpplugin.New(user, project, time.Duration(cfg.MCP.ConnectTimeoutMS)*time.Millisecond, resolve, version)
 }
 
 // summarizeWith is the one prompt the memory plugin runs through a model. Nothing is resolved
