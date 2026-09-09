@@ -144,9 +144,13 @@ func (r *Registry) statusAt(i int, s Status) {
 // shared registry. Called only after Init has returned nil, so every name in
 // the stage already cleared the duplicate check against the committed table.
 func (r *Registry) commit(h *host) {
+	// h.mu is held across the registry write, not just the copy: it is what flips the host
+	// from staging to writing through, and a SetStatus from a goroutine the plugin started
+	// during Init must land either wholly before the stage (and be overwritten by it) or
+	// wholly after (and overwrite it), never in between. h.mu outside r.mu is the order
+	// stageRegister already uses.
 	h.mu.Lock()
-	// From here on the host writes straight through to the registry instead of staging: a
-	// plugin keeps its Host and sets its status again whenever it has something to say.
+	defer h.mu.Unlock()
 	h.live = true
 	statuses := make([]StatusItem, 0, len(h.statusOrder))
 	for _, k := range h.statusOrder {
@@ -156,7 +160,6 @@ func (r *Registry) commit(h *host) {
 	for _, k := range h.widgetOrder {
 		widgets = append(widgets, h.widgets[k])
 	}
-	h.mu.Unlock()
 
 	r.mu.Lock()
 	for _, n := range h.toolOrder {
@@ -304,10 +307,17 @@ func (r *Registry) Fail(name, reason string) {
 			r.statuses[i] = Status{Name: name, State: StateFailed, Reason: reason}
 		}
 	}
-	f := r.services.StatusChanged
+	statusChanged := r.services.StatusChanged
+	providersChanged := r.services.ProvidersChanged
+	remaining := r.providersLocked()
 	r.mu.Unlock()
-	if hadStatus && f != nil {
-		f()
+	if hadStatus && statusChanged != nil {
+		statusChanged()
+	}
+	// The provider registry took its own copy of the set at boot and never revisits it, so
+	// without this the withdrawn plugin's provider still answers the next turn.
+	if providersChanged != nil {
+		providersChanged(remaining)
 	}
 }
 
@@ -362,6 +372,11 @@ func (r *Registry) Command(name string) (Command, bool) {
 func (r *Registry) Providers() []provider.Provider {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	return r.providersLocked()
+}
+
+// providersLocked is Providers for a caller that already holds mu. Caller holds mu.
+func (r *Registry) providersLocked() []provider.Provider {
 	out := make([]provider.Provider, 0, len(r.provOrder))
 	for _, n := range r.provOrder {
 		out = append(out, r.providers[n].value)

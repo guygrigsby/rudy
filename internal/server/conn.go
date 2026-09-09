@@ -63,6 +63,15 @@ func (cn *conn) notify(method string, params any) {
 	cn.send(req)
 }
 
+// subscribed reports whether this connection holds sid. Self-locking (takes cn.mu, which
+// is never nested inside any of the server's locks).
+func (cn *conn) subscribed(sid ulid.ULID) bool {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	_, ok := cn.subs[sid]
+	return ok
+}
+
 // pump drains the outbox to the transport, in order, until ctx ends or a send fails.
 func (cn *conn) pump(ctx context.Context) {
 	for {

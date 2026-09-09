@@ -43,6 +43,10 @@ type Services struct {
 	Connect       func(ctx context.Context, plugin string) (protocol.Conn, error)
 	StatusChanged func()         // after any SetStatus; the server broadcasts status.updated
 	WidgetChanged func(w Widget) // after any SetWidget; the server broadcasts widget.updated
+	// ProvidersChanged is called after Fail has withdrawn a plugin's providers, with the
+	// set that survives. The provider registry keeps its own copy of the provider set, so
+	// withdrawing one here is invisible to a turn until that copy is replaced.
+	ProvidersChanged func(ps []provider.Provider)
 }
 
 // Action is what a slash command asks the server to do.

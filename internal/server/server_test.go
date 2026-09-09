@@ -171,7 +171,9 @@ func newHarnessWith(t *testing.T, prov *scriptProvider, extra ...plugin.Plugin) 
 	})
 	// The wiring order wire.go uses: the server exists before Load so a plugin's Host can
 	// reach it, and the provider registry takes its providers from what Load committed.
-	plugins.SetServices(srv.PluginServices())
+	services := srv.PluginServices()
+	services.ProvidersChanged = func(ps []provider.Provider) { reg.SetProviders(ps...) }
+	plugins.SetServices(services)
 	plugins.Load(ctx, append([]plugin.Plugin{fp}, extra...)...)
 	reg.SetProviders(plugins.Providers()...)
 	if err := reg.Refresh(ctx); err != nil {
@@ -1256,9 +1258,17 @@ func TestPluginHostReachesTheServerOverTheProtocol(t *testing.T) {
 		t.Fatalf("status items %+v", su.Items)
 	}
 
+	// A widget set after Init reaches them the same way.
+	if err := hp.host.SetWidget("w", plugin.SlotHeader, []plugin.Span{{Text: "hi", Role: "text"}}); err != nil {
+		t.Fatalf("set widget: %v", err)
+	}
+	ns = drain(t, cl, func(n protocol.Notification) bool { return n.Method == protocol.NotifyWidgetUpdated })
+	assertWidget(t, ns[len(ns)-1])
+
 	// A connection that arrives afterwards is told the same state right after its hello.
 	cl2 := h.dial(t, false)
 	states := map[string]string{}
+	sawStatus, sawWidget := false, false
 	drain(t, cl2, func(n protocol.Notification) bool {
 		switch n.Method {
 		case protocol.NotifyStatusUpdated:
@@ -1269,6 +1279,10 @@ func TestPluginHostReachesTheServerOverTheProtocol(t *testing.T) {
 			if len(s2.Items) != 1 || s2.Items[0].Owner != "p" {
 				t.Errorf("status on connect %+v", s2.Items)
 			}
+			sawStatus = true
+		case protocol.NotifyWidgetUpdated:
+			assertWidget(t, n)
+			sawWidget = true
 		case protocol.NotifyPluginState:
 			var ps protocol.PluginState
 			if err := json.Unmarshal(n.Params, &ps); err != nil {
@@ -1276,10 +1290,115 @@ func TestPluginHostReachesTheServerOverTheProtocol(t *testing.T) {
 			}
 			states[ps.Name] = ps.State
 		}
-		return len(states) == 2
+		return sawStatus && sawWidget && len(states) == 2
 	})
 	if states["fake"] != string(plugin.StateReady) || states["p"] != string(plugin.StateReady) {
 		t.Fatalf("plugin.state = %+v", states)
+	}
+}
+
+func assertWidget(t *testing.T, n protocol.Notification) {
+	t.Helper()
+	var w protocol.WidgetUpdated
+	if err := json.Unmarshal(n.Params, &w); err != nil {
+		t.Fatal(err)
+	}
+	if w.Owner != "p" || w.Key != "w" || w.Slot != plugin.SlotHeader || len(w.Content) != 1 || w.Content[0].Text != "hi" {
+		t.Errorf("widget = %+v", w)
+	}
+}
+
+// dialPlugin is a plugin-class connection: the pipe the host got from Connect, wrapped in a
+// client that has said hello, exactly as a plugin would drive it.
+func dialPlugin(t *testing.T, hp *hostPlugin) *protocol.Client {
+	t.Helper()
+	ctx := context.Background()
+	pc, err := hp.host.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	if err := pc.Call(ctx, protocol.MethodClientHello, protocol.ClientHelloParams{Client: "p", Version: "0", Asker: true}, &protocol.ClientHelloResult{}); err != nil {
+		t.Fatalf("plugin hello: %v", err)
+	}
+	return pc
+}
+
+func TestPluginConnectionCannotAnswerOrSubmitElsewhere(t *testing.T) {
+	hp := &hostPlugin{}
+	h := newHarnessWith(t, &scriptProvider{}, hp)
+	ctx := context.Background()
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	pc := dialPlugin(t, hp)
+
+	// Answering a permission question is the asker's job, never a plugin's, even one whose
+	// hello declared asker.
+	err := pc.Call(ctx, protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
+		SessionID: info.SessionID, ToolUseID: "tu1",
+		Decision: session.Allow, Scope: session.ScopeOnce, Reason: "plugin says so",
+	}, &struct{}{})
+	if got := code(t, err); got != protocol.CodeUnauthorized {
+		t.Fatalf("plugin answer: code %d (%v)", got, err)
+	}
+
+	// Nor may it drive a session somebody else opened.
+	err = pc.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &protocol.SessionSubmitResult{})
+	if got := code(t, err); got != protocol.CodeUnauthorized {
+		t.Fatalf("plugin submit elsewhere: code %d (%v)", got, err)
+	}
+}
+
+// TestBroadcastsSkipPluginConnections pins the fan-out rule: a plugin's own connection gets
+// the render state once, when it says hello, and never again. Nothing obliges a plugin to
+// drain its notification queue, so a broadcast on every status change would grow that queue
+// for the life of the process. The ordering is deterministic: the outbox is FIFO, so a
+// broadcast enqueued before session.open would have to arrive before that call's replay.
+func TestBroadcastsSkipPluginConnections(t *testing.T) {
+	hp := &hostPlugin{}
+	h := newHarnessWith(t, &scriptProvider{}, hp)
+	ctx := context.Background()
+	pc := dialPlugin(t, hp)
+	drain(t, pc, func(n protocol.Notification) bool {
+		var ps protocol.PluginState
+		return n.Method == protocol.NotifyPluginState && json.Unmarshal(n.Params, &ps) == nil && ps.Name == "p"
+	})
+
+	hp.host.SetStatus("k", []plugin.Span{{Text: "one", Role: "muted"}})
+	if err := hp.host.SetWidget("w", plugin.SlotHeader, []plugin.Span{{Text: "hi", Role: "text"}}); err != nil {
+		t.Fatalf("set widget: %v", err)
+	}
+	if err := pc.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: h.ws}, &protocol.SessionInfo{}); err != nil {
+		t.Fatalf("plugin open: %v", err)
+	}
+	ns := drain(t, pc, func(n protocol.Notification) bool { return n.Method == protocol.NotifyEntryAppended })
+	for _, n := range ns {
+		if n.Method == protocol.NotifyStatusUpdated || n.Method == protocol.NotifyWidgetUpdated {
+			t.Fatalf("plugin connection got broadcasts: %v", methods(ns))
+		}
+	}
+}
+
+func TestPluginConnectionSubmitsToItsOwnSession(t *testing.T) {
+	hp := &hostPlugin{}
+	h := newHarnessWith(t, &scriptProvider{}, hp)
+	ctx := context.Background()
+	pc := dialPlugin(t, hp)
+
+	var own protocol.SessionInfo
+	if err := pc.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: h.ws}, &own); err != nil {
+		t.Fatalf("plugin open: %v", err)
+	}
+	var sub protocol.SessionSubmitResult
+	if err := pc.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: own.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("plugin submit: %v", err)
+	}
+	if sub.TurnID == "" {
+		t.Fatal("empty turn id")
 	}
 }
 

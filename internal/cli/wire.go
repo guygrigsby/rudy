@@ -52,11 +52,17 @@ type BuildOptions struct {
 // is unset, so a stalled provider cannot hold a command silent forever.
 const defaultRefreshTimeout = 20 * time.Second
 
+// shutdownBudget bounds the unwind of a half-built server, which has no running turn and no
+// client, so it only has to close the sessions it never opened.
+const shutdownBudget = 2 * time.Second
+
 // buildFunc is what commands call to wire a server; tests substitute fakes through it.
 type buildFunc func(ctx context.Context, stderr io.Writer) (*Built, error)
 
-// Build wires config, store, plugins, registry, gate and server. It never writes config.
-func Build(ctx context.Context, o BuildOptions) (*Built, error) {
+// Build wires config, store, plugins, registry, gate and server. It never writes config. A
+// failure after the server exists shuts it back down: it holds a context, loaded plugins and
+// their connections, and a caller that got an error will never call Shutdown itself.
+func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	env := o.Env
 	if env == nil {
 		env = os.Getenv
@@ -107,7 +113,18 @@ func Build(ctx context.Context, o BuildOptions) (*Built, error) {
 		Gate:     g,
 		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
 	})
-	plugins.SetServices(srv.PluginServices())
+	defer func() {
+		if err != nil {
+			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
+			defer cancel()
+			_ = srv.Shutdown(shutCtx)
+		}
+	}()
+	services := srv.PluginServices()
+	// Withdrawing a provider has to reach the provider registry's own copy, not just the
+	// plugin registry; SetProviders below installs the initial set the same way.
+	services.ProvidersChanged = func(ps []provider.Provider) { registry.SetProviders(ps...) }
+	plugins.SetServices(services)
 	plugins.Load(ctx, set...)
 	providers := plugins.Providers()
 	registry.SetProviders(providers...)

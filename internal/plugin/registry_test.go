@@ -356,7 +356,11 @@ func TestNoteAndConnectBeforeServices(t *testing.T) {
 func TestFailWithdrawsEverythingThePluginOwns(t *testing.T) {
 	r, _ := newTestRegistry(nil)
 	var statusCalls int
-	r.SetServices(Services{StatusChanged: func() { statusCalls++ }})
+	var remaining [][]provider.Provider
+	r.SetServices(Services{
+		StatusChanged:    func() { statusCalls++ },
+		ProvidersChanged: func(ps []provider.Provider) { remaining = append(remaining, ps) },
+	})
 	r.Load(context.Background(),
 		funcPlugin{"a", func(h Host) error {
 			if err := h.RegisterTool(namedTool("read")); err != nil {
@@ -376,6 +380,9 @@ func TestFailWithdrawsEverythingThePluginOwns(t *testing.T) {
 		}},
 		funcPlugin{"b", func(h Host) error {
 			h.SetStatus("k", []Span{{Text: "two", Role: "muted"}})
+			if err := h.RegisterProvider(fakeProvider{"mlx"}); err != nil {
+				return err
+			}
 			return h.RegisterTool(namedTool("bash"))
 		}},
 	)
@@ -394,8 +401,12 @@ func TestFailWithdrawsEverythingThePluginOwns(t *testing.T) {
 	if _, ok := r.Command("init"); ok {
 		t.Error("init survived Fail")
 	}
-	if got := r.Providers(); len(got) != 0 {
+	if got := r.Providers(); len(got) != 1 || got[0].Name() != "mlx" {
 		t.Errorf("providers %+v", got)
+	}
+	// The provider registry keeps its own copy, so Fail has to hand it the survivors.
+	if len(remaining) != 1 || len(remaining[0]) != 1 || remaining[0][0].Name() != "mlx" {
+		t.Errorf("ProvidersChanged got %+v", remaining)
 	}
 	if got := r.Hooks(HookBeforeTurn); len(got) != 0 {
 		t.Errorf("hooks %+v", got)

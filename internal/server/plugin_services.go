@@ -45,6 +45,11 @@ func (s *Server) connectPlugin(_ context.Context, name string) (protocol.Conn, e
 	s.wgMu.Lock()
 	if s.shuttingDown {
 		s.wgMu.Unlock()
+		// Close both ends rather than leaking a pipe nobody serves: a plugin handed the
+		// client end of an unserved pipe would block on its first Call until its own
+		// context expired instead of failing here.
+		_ = serverEnd.Close()
+		_ = clientEnd.Close()
 		return nil, ErrShuttingDown
 	}
 	s.wgMu.Unlock()
@@ -66,18 +71,18 @@ func (s *Server) appendNote(sid ulid.ULID, owner, text string, role session.Note
 	return ls.appendNote(owner, text, role)
 }
 
-// broadcastStatus sends the whole status line to every connection. The conns snapshot is
-// taken under mu and the notifies happen after releasing it: conn.mu is never nested inside
-// any of the server's locks (see the Server doc), and notify only enqueues anyway.
+// broadcastStatus sends the whole status line to every client connection. The conns snapshot
+// is taken under mu and the notifies happen after releasing it: conn.mu is never nested
+// inside any of the server's locks (see the Server doc), and notify only enqueues anyway.
 func (s *Server) broadcastStatus() {
 	items := s.d.Plugins.StatusItems()
-	for _, cn := range s.snapshotConns() {
+	for _, cn := range s.clientConns() {
 		cn.notify(protocol.NotifyStatusUpdated, protocol.StatusUpdated{Items: items})
 	}
 }
 
 func (s *Server) broadcastWidget(w plugin.Widget) {
-	for _, cn := range s.snapshotConns() {
+	for _, cn := range s.clientConns() {
 		cn.notify(protocol.NotifyWidgetUpdated, w)
 	}
 }
@@ -97,11 +102,19 @@ func (s *Server) sendConnectState(cn *conn) {
 	}
 }
 
-func (s *Server) snapshotConns() []*conn {
+// clientConns is every connection a render notification is worth sending to: the clients.
+// Plugin connections are skipped. A protocol.Client queues notifications without bound and
+// nothing obliges a plugin to drain them, so a plugin that only ever makes calls would grow
+// that queue for the life of the process on every status or widget change. A plugin that
+// does want the state asks for it with a hello (see sendConnectState).
+func (s *Server) clientConns() []*conn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*conn, 0, len(s.conns))
 	for _, cn := range s.conns {
+		if cn.plugin != "" {
+			continue
+		}
 		out = append(out, cn)
 	}
 	return out

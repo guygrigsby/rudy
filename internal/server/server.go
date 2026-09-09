@@ -279,7 +279,7 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 	case protocol.MethodSessionClose:
 		return s.handleClose(cn, req.Params)
 	case protocol.MethodSessionSubmit:
-		return s.handleSubmit(req.Params)
+		return s.handleSubmit(cn, req.Params)
 	case protocol.MethodSessionInterrupt:
 		return s.handleInterrupt(req.Params)
 	case protocol.MethodSessionAnswer:
@@ -335,7 +335,10 @@ func (s *Server) handleClose(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	return struct{}{}, nil
 }
 
-func (s *Server) handleSubmit(raw json.RawMessage) (any, *protocol.Error) {
+// handleSubmit starts a turn. A plugin connection may only submit to a session it opened or
+// attached itself: driving somebody else's session is not what the plugin caller class is
+// for, and a child session (Task 5) is exactly a session the plugin does hold.
+func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
 	var p protocol.SessionSubmitParams
 	if e := decode(raw, &p); e != nil {
 		return nil, e
@@ -343,6 +346,9 @@ func (s *Server) handleSubmit(raw json.RawMessage) (any, *protocol.Error) {
 	ls, e := s.lookup(p.SessionID)
 	if e != nil {
 		return nil, e
+	}
+	if cn.plugin != "" && !cn.subscribed(ls.sess.ID()) {
+		return nil, perr(protocol.CodeUnauthorized, "plugin may only submit to sessions it opened")
 	}
 	if len(p.Content) == 0 {
 		return nil, perr(protocol.CodeInvalidArgument, "empty content")
@@ -397,6 +403,9 @@ func (s *Server) handleAnswer(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	var p protocol.SessionAnswerParams
 	if e := decode(raw, &p); e != nil {
 		return nil, e
+	}
+	if cn.plugin != "" {
+		return nil, perr(protocol.CodeUnauthorized, "plugins cannot answer permission questions")
 	}
 	if !cn.asker {
 		return nil, perr(protocol.CodeUnauthorized, "connection did not declare asker")
