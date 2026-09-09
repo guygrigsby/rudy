@@ -224,6 +224,8 @@ type CommandRunParams struct {
 type CommandRunResult struct {
 	TurnID string `json:"turn_id,omitempty"`
 	Notice string `json:"notice,omitempty"`
+	// SessionID is set when the command opened another session, a fork.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 type PluginAppendNoteParams struct {

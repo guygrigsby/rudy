@@ -62,11 +62,21 @@ type Notice struct{ Text string }
 // Instructions steer the summary and skip the before_compaction hook.
 type Compact struct{ Instructions string }
 
+// SetModel has the server switch this session's model, the body of session.set_model. Model is
+// a provider:id spec or a bare id unique across providers.
+type SetModel struct{ Model string }
+
+// Fork has the server fork this session at AtEntryID and attach the caller to the result, the
+// body of session.fork. An empty AtEntryID means the newest entry of any kind.
+type Fork struct{ AtEntryID string }
+
 type NoAction struct{}
 
 func (SubmitPrompt) isAction() {}
 func (Notice) isAction()       {}
 func (Compact) isAction()      {}
+func (SetModel) isAction()     {}
+func (Fork) isAction()         {}
 func (NoAction) isAction()     {}
 
 type CommandCall struct {

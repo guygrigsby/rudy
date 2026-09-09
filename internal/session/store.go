@@ -30,16 +30,17 @@ func (st *Store) Root() string { return st.root }
 // Dir is the directory of one session.
 func (st *Store) Dir(id ulid.ULID) string { return filepath.Join(st.root, id.String()) }
 
-// Summary is what List reports without replaying a log.
+// Summary is what List reports without replaying a log. Json tags match the contract's
+// SessionSummary shape (rudy-contracts.md); session.list wire-encodes this struct directly.
 type Summary struct {
-	ID        ulid.ULID
-	OpenedAt  time.Time
-	Workspace Workspace
-	Model     ModelRef
-	Forked    bool
+	ID        ulid.ULID `json:"id"`
+	OpenedAt  time.Time `json:"opened_at"`
+	Workspace Workspace `json:"workspace"`
+	Model     ModelRef  `json:"model"`
+	Forked    bool      `json:"forked"`
 	// ParentSessionID is the session whose tool call opened this one; empty means a root
 	// session. Children are listed like any other session.
-	ParentSessionID string
+	ParentSessionID string `json:"parent_session_id"`
 }
 
 // List reads the first line of every session log, newest first. A fork's

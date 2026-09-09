@@ -191,12 +191,13 @@ func (ls *liveSession) snapshotEntries() []session.Entry {
 }
 
 // latestEntryID is the id of the newest mirrored entry of any of the given kinds, or "" when
-// none matches. Self-locking (takes obsMu).
+// none matches. No kinds at all means match any kind: the newest entry of the session, the
+// default a bare /fork forks at. Self-locking (takes obsMu).
 func (ls *liveSession) latestEntryID(kinds ...session.Kind) string {
 	ls.obsMu.Lock()
 	defer ls.obsMu.Unlock()
 	for _, e := range slices.Backward(ls.entries) {
-		if slices.Contains(kinds, e.Kind) {
+		if len(kinds) == 0 || slices.Contains(kinds, e.Kind) {
 			return e.ID.String()
 		}
 	}

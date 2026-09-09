@@ -20,6 +20,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/subagents"
 	"github.com/guygrigsby/rudy/internal/protocol"
@@ -527,6 +528,154 @@ func TestCommandRunSubmitsPrompt(t *testing.T) {
 	var pe *protocol.Error
 	if !errorsAs(err, &pe) || pe.Code != protocol.CodeNotFound {
 		t.Fatalf("unknown command err = %v", err)
+	}
+}
+
+// namedModelPlugin registers a provider with one model, for a test that needs a second model to
+// switch to; the harness's own fakePlugin always registers "fake:m1".
+type namedModelPlugin struct{ provider, model string }
+
+func (p namedModelPlugin) Name() string { return p.provider }
+
+func (p namedModelPlugin) Init(_ context.Context, h plugin.Host) error {
+	return h.RegisterProvider(namedModelProvider(p))
+}
+
+type namedModelProvider struct{ provider, model string }
+
+func (p namedModelProvider) Name() string { return p.provider }
+
+func (p namedModelProvider) ListModels(context.Context) ([]provider.Model, error) {
+	return []provider.Model{{
+		Ref:          session.ModelRef{Provider: p.provider, Model: p.model},
+		DisplayName:  p.model,
+		Capabilities: provider.Capabilities{Tools: true},
+	}}, nil
+}
+
+func (p namedModelProvider) Complete(context.Context, provider.Request, func(provider.Part) error) error {
+	return errors.New("namedModelProvider: no turn ever runs on it in a test")
+}
+
+// TestCommandRunSetsModelAndRefusesDuringActiveTurn: /model routes through plugin.SetModel and
+// s.setModel the same way session.set_model does, so it appends a model_change and reports the
+// resolved ref in its notice; and it is refused with conflict while a turn is active, the same
+// as the raw RPC.
+func TestCommandRunSetsModelAndRefusesDuringActiveTurn(t *testing.T) {
+	prov := &scriptProvider{block: make(chan struct{})}
+	h := newHarnessWith(t, prov, commands.New(), namedModelPlugin{"aperture", "other"})
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, cl, func(n protocol.Notification) bool { return n.Method == protocol.NotifyStreamDelta })
+
+	var conflict protocol.CommandRunResult
+	err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "model", Args: "aperture:other",
+	}, &conflict)
+	if got := code(t, err); got != protocol.CodeConflict {
+		t.Fatalf("/model during active turn code %d (%v)", got, err)
+	}
+
+	close(prov.block)
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+
+	var res protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "model", Args: "aperture:other",
+	}, &res); err != nil {
+		t.Fatalf("/model: %v", err)
+	}
+	if res.TurnID != "" || res.Notice != "model set to aperture:other" || res.SessionID != "" {
+		t.Fatalf("result %+v", res)
+	}
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.Entry.Kind == session.KindModelChange
+	})
+	es := entries(t, ns)
+	mc := es[len(es)-1].Payload.(session.ModelChange)
+	if mc.Model.String() != "aperture:other" {
+		t.Fatalf("model_change = %+v", mc)
+	}
+}
+
+// TestCommandRunForksAtTheNewestEntry: a bare /fork forks at the session's newest entry of any
+// kind and the caller connection is attached to the child, so it receives the child's own
+// replay ending with the fork_point (Session.Fork's doc: "a new session whose first entry is a
+// fork_point at `at`" - "first" of the child's own log, last of the merged view this test reads
+// off the wire).
+func TestCommandRunForksAtTheNewestEntry(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	h := newHarnessWith(t, prov, commands.New())
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatal(err)
+	}
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+	turnEntries := entries(t, ns)
+	newest := turnEntries[len(turnEntries)-1].ID
+
+	var res protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "fork",
+	}, &res); err != nil {
+		t.Fatalf("/fork: %v", err)
+	}
+	if res.SessionID == "" || res.SessionID == info.SessionID {
+		t.Fatalf("result %+v", res)
+	}
+	if res.Notice != "forked to "+res.SessionID {
+		t.Fatalf("notice %q", res.Notice)
+	}
+
+	childNs := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.SessionID == res.SessionID && ea.Entry.Kind == session.KindForkPoint
+	})
+	childEntries := entries(t, childNs)
+	last := childEntries[len(childEntries)-1]
+	fp, ok := last.Payload.(session.ForkPoint)
+	if !ok {
+		t.Fatalf("last replayed child entry kind = %v, want fork_point", last.Kind)
+	}
+	if fp.ParentSessionID.String() != info.SessionID || fp.ParentEntryID != newest {
+		t.Fatalf("fork_point = %+v, want parent %s at %s", fp, info.SessionID, newest)
 	}
 }
 

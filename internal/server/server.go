@@ -444,29 +444,42 @@ func (s *Server) handleSetModel(raw json.RawMessage) (any, *protocol.Error) {
 	if e != nil {
 		return nil, e
 	}
-	m, err := s.d.Registry.Resolve(p.Model)
+	_, res, serr := s.setModel(ls, p.Model)
+	if serr != nil {
+		return nil, serr
+	}
+	return res, nil
+}
+
+// setModel is the body of session.set_model, factored out so command.run's /model can share
+// it: resolve spec against the registry, refuse a closed session or one with an active turn,
+// and append a model_change only when the value actually differs. It also returns the resolved
+// model, so a caller building a message for a person (a /model notice) can name it without
+// resolving spec a second time.
+func (s *Server) setModel(ls *liveSession, spec string) (provider.Model, EntryIDResult, *protocol.Error) {
+	m, err := s.d.Registry.Resolve(spec)
 	if err != nil {
-		return nil, perr(protocol.CodeNotFound, err.Error())
+		return provider.Model{}, EntryIDResult{}, perr(protocol.CodeNotFound, err.Error())
 	}
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	if ls.closed {
-		return nil, perr(protocol.CodeNotFound, "session closed")
+		return provider.Model{}, EntryIDResult{}, perr(protocol.CodeNotFound, "session closed")
 	}
 	st, _ := ls.mirroredState()
 	if ls.runner != nil && isActive(st) {
-		return nil, perr(protocol.CodeConflict, "a turn is active")
+		return provider.Model{}, EntryIDResult{}, perr(protocol.CodeConflict, "a turn is active")
 	}
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
 	if m.Ref == view.Model {
-		return EntryIDResult{EntryID: ls.latestEntryID(session.KindModelChange, session.KindSessionOpened)}, nil
+		return m, EntryIDResult{EntryID: ls.latestEntryID(session.KindModelChange, session.KindSessionOpened)}, nil
 	}
 	e2, err := ls.appendAndBroadcastLocked(session.ModelChange{Model: m.Ref})
 	if err != nil {
-		return nil, protocol.ErrorFrom(err)
+		return provider.Model{}, EntryIDResult{}, protocol.ErrorFrom(err)
 	}
 	ls.model = m
-	return EntryIDResult{EntryID: e2.ID.String()}, nil
+	return m, EntryIDResult{EntryID: e2.ID.String()}, nil
 }
 
 func (s *Server) handleSetMode(raw json.RawMessage) (any, *protocol.Error) {
@@ -658,6 +671,26 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 		}
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
 		return protocol.CommandRunResult{Notice: notice}, nil
+	case plugin.SetModel:
+		m, _, serr := s.setModel(ls, a.Model)
+		if serr != nil {
+			return nil, serr
+		}
+		notice := "model set to " + m.Ref.String()
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
+		return protocol.CommandRunResult{Notice: notice}, nil
+	case plugin.Fork:
+		at := a.AtEntryID
+		if at == "" {
+			at = ls.latestEntryID()
+		}
+		info, ferr := s.forkAt(cn, ls, at)
+		if ferr != nil {
+			return nil, ferr
+		}
+		notice := "forked to " + info.SessionID
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
+		return protocol.CommandRunResult{SessionID: info.SessionID, Notice: notice}, nil
 	default:
 		return protocol.CommandRunResult{}, nil
 	}
@@ -904,15 +937,27 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, "bad session id")
 	}
-	at, err := ulid.Parse(p.AtEntryID)
-	if err != nil {
-		return nil, perr(protocol.CodeInvalidArgument, "bad entry id")
-	}
 	parent, lerr := s.loadCold(cn, sid)
 	if lerr != nil {
 		return nil, lerr
 	}
+	info, ferr := s.forkAt(cn, parent, p.AtEntryID)
+	if ferr != nil {
+		return nil, ferr
+	}
+	return info, nil
+}
 
+// forkAt is the body of session.fork once the parent is already resolved to a live session:
+// shared by fork, which loads it cold from a session id, and command.run's /fork, which already
+// has it live from the command's own session_id. at is the entry id to fork at, as a string so
+// a caller can pass an unparsed one straight through and get invalid_argument back rather than
+// having to parse it itself.
+func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.SessionInfo, *protocol.Error) {
+	atID, err := ulid.Parse(at)
+	if err != nil {
+		return protocol.SessionInfo{}, perr(protocol.CodeInvalidArgument, "bad entry id")
+	}
 	parent.mu.Lock()
 	st, _ := parent.mirroredState()
 	active := parent.runner != nil && isActive(st)
@@ -921,19 +966,19 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 	switch {
 	case closed:
 		parent.mu.Unlock()
-		return nil, perr(protocol.CodeUnavailable, "session unavailable, retry")
+		return protocol.SessionInfo{}, perr(protocol.CodeUnavailable, "session unavailable, retry")
 	case active:
 		parent.mu.Unlock()
-		return nil, perr(protocol.CodeConflict, "a turn is active")
+		return protocol.SessionInfo{}, perr(protocol.CodeConflict, "a turn is active")
 	default:
-		child, err = parent.sess.Fork(s.d.Store, at)
+		child, err = parent.sess.Fork(s.d.Store, atID)
 		parent.mu.Unlock()
 	}
 	if err != nil {
 		if errors.Is(err, session.ErrInvariant) {
-			return nil, perr(protocol.CodeNotFound, err.Error())
+			return protocol.SessionInfo{}, perr(protocol.CodeNotFound, err.Error())
 		}
-		return nil, protocol.ErrorFrom(err)
+		return protocol.SessionInfo{}, protocol.ErrorFrom(err)
 	}
 	m, rerr := s.d.Registry.Resolve(child.Model().String())
 	if rerr != nil {

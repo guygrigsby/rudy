@@ -326,6 +326,9 @@ func submit(ctx context.Context, client *protocol.Client, sessionID, prompt stri
 		}
 		if res.TurnID == "" {
 			if res.Notice != "" {
+				// A fork's new session id travels in Notice text, not a separate print path:
+				// res.SessionID names it structurally for a caller that wants the id alone, but
+				// this print path always prints the notice as it would for any other command.
 				_, _ = fmt.Fprintln(stdout, res.Notice)
 			}
 			return "", 0, nil
