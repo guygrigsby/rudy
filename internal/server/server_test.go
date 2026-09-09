@@ -1139,4 +1139,17 @@ func TestSessionHooksFireOnceAndReachTheSystemPrompt(t *testing.T) {
 	if len(closed) != 1 || closed[0] != info.SessionID {
 		t.Errorf("session_closed %v", closed)
 	}
+
+	// Shutdown must not fire again for a session detach already closed: both paths claim the
+	// same flag, and only the winner fires. Close the client first so Shutdown's wait for
+	// this connection's Serve loop ends at once rather than at its deadline.
+	_ = cl.Close()
+	shutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := h.srv.Shutdown(shutCtx); err != nil {
+		t.Fatal(err)
+	}
+	if _, closed = hr.counts(); len(closed) != 1 {
+		t.Errorf("session_closed after shutdown %v", closed)
+	}
 }

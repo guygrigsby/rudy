@@ -2,7 +2,6 @@ package plugin
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -78,5 +77,22 @@ func TestResultFor(t *testing.T) {
 	if ResultFor(HookAfterResponse) != nil {
 		t.Error("after_response returns nothing")
 	}
-	var _ = errors.New
+}
+
+// TestRegisterHookRefusals covers the two registrations the host refuses. A handler with no
+// Handle would panic at the first fire, and the refusal makes the plugin fail loudly at load
+// instead, taking the rest of its registrations with it.
+func TestRegisterHookRefusals(t *testing.T) {
+	r := NewRegistry(nil, nil)
+	r.Load(context.Background(), hookPlugin{"nohandle", []HookHandler{{Point: HookBeforeTurn}}})
+	if st := r.Statuses()[0]; st.State != StateFailed || !strings.Contains(st.Reason, "no Handle") {
+		t.Errorf("status %+v", st)
+	}
+	if got := r.Hooks(HookBeforeTurn); len(got) != 0 {
+		t.Errorf("a failed plugin committed %d hooks", len(got))
+	}
+	// A runner built with no configured timeout still bounds every handler.
+	if got := NewHookRunner(r, 0, nil).timeout; got != DefaultHookTimeout {
+		t.Errorf("timeout %s, want the default", got)
+	}
 }

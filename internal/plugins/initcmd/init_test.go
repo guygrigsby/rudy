@@ -6,30 +6,20 @@ import (
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugin/plugintest"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
-	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
-	"github.com/guygrigsby/rudy/internal/tool"
 )
 
-type captureHost struct{ cmds []plugin.Command }
-
-func (h *captureHost) RegisterTool(tool.Tool) error             { return nil }
-func (h *captureHost) RegisterCommand(c plugin.Command) error   { h.cmds = append(h.cmds, c); return nil }
-func (h *captureHost) RegisterProvider(provider.Provider) error { return nil }
-func (h *captureHost) RegisterHook(plugin.HookHandler) error    { return nil }
-func (h *captureHost) Config() map[string]any                   { return nil }
-func (h *captureHost) Notice(string)                            {}
-
 func TestInitSubmitsThePrompt(t *testing.T) {
-	h := &captureHost{}
+	h := &plugintest.Host{}
 	if err := initcmd.New().Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.cmds) != 1 || h.cmds[0].Name != "init" {
-		t.Fatalf("commands = %+v", h.cmds)
+	if len(h.Commands) != 1 || h.Commands[0].Name != "init" {
+		t.Fatalf("commands = %+v", h.Commands)
 	}
-	act, err := h.cmds[0].Run(context.Background(), plugin.CommandCall{Workspace: session.Workspace{Root: "/tmp/x"}})
+	act, err := h.Commands[0].Run(context.Background(), plugin.CommandCall{Workspace: session.Workspace{Root: "/tmp/x"}})
 	if err != nil {
 		t.Fatal(err)
 	}

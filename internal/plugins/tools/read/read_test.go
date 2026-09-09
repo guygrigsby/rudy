@@ -9,32 +9,22 @@ import (
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugin/plugintest"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/read"
-	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
 )
 
-// captureHost records the one tool a plugin registers.
-type captureHost struct{ tools []tool.Tool }
-
-func (h *captureHost) RegisterTool(t tool.Tool) error           { h.tools = append(h.tools, t); return nil }
-func (h *captureHost) RegisterCommand(plugin.Command) error     { return nil }
-func (h *captureHost) RegisterProvider(provider.Provider) error { return nil }
-func (h *captureHost) RegisterHook(plugin.HookHandler) error    { return nil }
-func (h *captureHost) Config() map[string]any                   { return nil }
-func (h *captureHost) Notice(string)                            {}
-
 func load(t *testing.T, p plugin.Plugin) tool.Tool {
 	t.Helper()
-	h := &captureHost{}
+	h := &plugintest.Host{}
 	if err := p.Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.tools) != 1 {
-		t.Fatalf("registered %d tools", len(h.tools))
+	if len(h.Tools) != 1 {
+		t.Fatalf("registered %d tools", len(h.Tools))
 	}
-	return h.tools[0]
+	return h.Tools[0]
 }
 
 func call(t *testing.T, tl tool.Tool, root string, input string) tool.Result {

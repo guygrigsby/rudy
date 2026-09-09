@@ -8,29 +8,19 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugin/plugintest"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/glob"
-	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
 )
 
-type captureHost struct{ tools []tool.Tool }
-
-func (h *captureHost) RegisterTool(t tool.Tool) error           { h.tools = append(h.tools, t); return nil }
-func (h *captureHost) RegisterCommand(plugin.Command) error     { return nil }
-func (h *captureHost) RegisterProvider(provider.Provider) error { return nil }
-func (h *captureHost) RegisterHook(plugin.HookHandler) error    { return nil }
-func (h *captureHost) Config() map[string]any                   { return nil }
-func (h *captureHost) Notice(string)                            {}
-
 func load(t *testing.T) tool.Tool {
 	t.Helper()
-	h := &captureHost{}
+	h := &plugintest.Host{}
 	if err := glob.New().Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	return h.tools[0]
+	return h.Tools[0]
 }
 
 func call(t *testing.T, tl tool.Tool, root, input string) tool.Result {

@@ -1061,6 +1061,9 @@ func TestRunnerFiresHooksInOrder(t *testing.T) {
 	if dec.Decision != session.Allow || dec.DecidedBy != session.ByHook || dec.Reason != "hook says yes" {
 		t.Errorf("decision %+v", dec)
 	}
+	if len(dec.Input) != 0 {
+		t.Errorf("a decision no hook modified carries an input: %s", dec.Input)
+	}
 	if tools.ran() != 1 {
 		t.Errorf("tool ran %d times", tools.ran())
 	}
@@ -1093,6 +1096,10 @@ func TestRunnerHookDenyAndModify(t *testing.T) {
 			if p.Decision != session.Deny || p.DecidedBy != session.ByHook || p.Reason != "no" {
 				t.Errorf("decision %+v", p)
 			}
+			// The modify still happened, so the log records the bytes the call carried.
+			if string(p.Input) != `{"x":2}` {
+				t.Errorf("decision input %s, want the modified bytes verbatim", p.Input)
+			}
 		case session.ToolResult:
 			if p.Outcome != session.OutcomeError || !strings.Contains(p.Content[0].Text, "denied: no") {
 				t.Errorf("result %+v", p)
@@ -1101,6 +1108,11 @@ func TestRunnerHookDenyAndModify(t *testing.T) {
 	}
 	if tools.ran() != 0 {
 		t.Error("tool ran despite deny")
+	}
+	// after_tool fires on the denied result too: the contract is the append, not the run.
+	want := []plugin.HookPoint{plugin.HookBeforeTurn, plugin.HookBeforeRequest, plugin.HookAfterResponse, plugin.HookBeforeTool, plugin.HookAfterTool, plugin.HookBeforeRequest, plugin.HookAfterResponse, plugin.HookTurnCompleted}
+	if got := hooks.points(); !reflect.DeepEqual(got, want) {
+		t.Errorf("points %v\nwant   %v", got, want)
 	}
 	if got := string(hooks.calls[3].Payload.(*plugin.BeforeToolPayload).Input); got != `{"x":1}` {
 		t.Errorf("before_tool saw input %s", got)
@@ -1159,5 +1171,61 @@ func TestRunnerToolTimeout(t *testing.T) {
 	}
 	if !seen {
 		t.Fatal("no tool result")
+	}
+}
+
+// TestRunnerOverridesOutliveTheTurn covers the after_tool replacement staying in place for
+// every later request: a redaction that lapsed at the turn boundary would put the secret back
+// in the next request.
+func TestRunnerOverridesOutliveTheTurn(t *testing.T) {
+	s, prov, tools := newTurnFixture(t,
+		append(toolCall("tu1", "echo", `{"x":1}`), stop(session.StopToolUse, "tool_calls")),
+		[]provider.Part{text("done"), stop(session.StopEndTurn, "stop")},
+		[]provider.Part{text("still done"), stop(session.StopEndTurn, "stop")},
+	)
+	hooks := &recordingHooks{results: map[plugin.HookPoint][]any{
+		plugin.HookAfterTool: {&plugin.AfterToolResult{Content: []session.Block{session.TextBlock("REDACTED")}}},
+	}}
+	r := NewRunner(Config{Session: s, Provider: prov, Model: provider.Model{Ref: s.Model()}, Tools: tools, Gate: gate.New(nil), MaxTokens: 10, Hooks: hooks})
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "again")); err != nil {
+		t.Fatal(err)
+	}
+	if len(prov.requests) != 3 {
+		t.Fatalf("%d requests", len(prov.requests))
+	}
+	for i, req := range prov.requests[1:] {
+		found := false
+		for _, m := range req.Messages {
+			if m.Role == provider.RoleToolResult {
+				found = true
+				if m.Content[0].Text != "REDACTED" {
+					t.Errorf("request %d carried %q", i+1, m.Content[0].Text)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("request %d has no tool result", i+1)
+		}
+	}
+}
+
+// TestRunnerSharesTheServerOverrideMap covers Config.Overrides being the caller's map: the
+// server keeps one per session and every runner it builds writes into that one.
+func TestRunnerSharesTheServerOverrideMap(t *testing.T) {
+	s, prov, tools := newTurnFixture(t, callThenDone("tu1", "echo", `{"x":1}`)...)
+	shared := map[string][]session.Block{}
+	hooks := &recordingHooks{results: map[plugin.HookPoint][]any{
+		plugin.HookAfterTool: {&plugin.AfterToolResult{Content: []session.Block{session.TextBlock("REDACTED")}}},
+	}}
+	r := NewRunner(Config{Session: s, Provider: prov, Model: provider.Model{Ref: s.Model()}, Tools: tools, Gate: gate.New(nil), MaxTokens: 10, Hooks: hooks, Overrides: shared})
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := shared["tu1"]
+	if !ok || got[0].Text != "REDACTED" {
+		t.Errorf("shared map holds %v", shared)
 	}
 }

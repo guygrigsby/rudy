@@ -125,25 +125,32 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// blocksOf returns the block slice of a payload that carries one, and a
-// scalar-only view of the rest of its fields. The scalar view is a distinct
-// anonymous struct rather than the payload with Content zeroed: the
-// payload's own Content tag has no omitempty (interfaces.md pins it that
-// way), so zeroing it in place and marshaling the payload would still emit
-// "content":null alongside the content array appendBlocks writes by hand,
-// producing a line with two "content" keys.
+// splitPayload separates the fields the log line writes by hand from a
+// scalar-only view of everything else. Two fields are written by hand: a
+// content block array (see appendBlocks), and a permission_decision's
+// input, the model's own bytes when a hook modified them.
 //
-// The three anonymous structs below mirror UserMessage, AssistantMessage
-// and ToolResult minus Content, field for field; a field added to, removed
-// from or retagged on one of those types must change here too.
-func blocksOf(p Payload) (blocks []Block, rest any, has bool) {
+// The scalar view is a distinct anonymous struct rather than the payload
+// with the hand-written field zeroed. For Content: the payload's own tag
+// has no omitempty (interfaces.md pins it that way), so zeroing it in place
+// and marshaling the payload would still emit "content":null alongside the
+// content array appendBlocks writes by hand, producing a line with two
+// "content" keys. For Input: omitempty would drop it when empty, but when
+// it is present encoding/json compacts what a RawMessage returns, and
+// compaction is exactly what byte fidelity forbids.
+//
+// The four anonymous structs below mirror UserMessage, AssistantMessage,
+// ToolResult and PermissionDecision minus their hand-written field, field
+// for field; a field added to, removed from or retagged on one of those
+// types must change here too.
+func splitPayload(p Payload) (blocks []Block, input json.RawMessage, rest any, hasBlocks bool) {
 	switch v := p.(type) {
 	case UserMessage:
-		return v.Content, struct {
+		return v.Content, nil, struct {
 			Source Source `json:"source"`
 		}{v.Source}, true
 	case AssistantMessage:
-		return v.Content, struct {
+		return v.Content, nil, struct {
 			Model         ModelRef      `json:"model"`
 			Thinking      ThinkingLevel `json:"thinking"`
 			Usage         Usage         `json:"usage"`
@@ -151,13 +158,24 @@ func blocksOf(p Payload) (blocks []Block, rest any, has bool) {
 			StopReasonRaw string        `json:"stop_reason_raw"`
 		}{v.Model, v.Thinking, v.Usage, v.StopReason, v.StopReasonRaw}, true
 	case ToolResult:
-		return v.Content, struct {
+		return v.Content, nil, struct {
 			ToolUseID  string  `json:"tool_use_id"`
 			Outcome    Outcome `json:"outcome"`
 			DurationMS int64   `json:"duration_ms"`
 		}{v.ToolUseID, v.Outcome, v.DurationMS}, true
+	case PermissionDecision:
+		return nil, v.Input, struct {
+			ToolUseID string    `json:"tool_use_id"`
+			Tool      string    `json:"tool"`
+			Mode      Mode      `json:"mode"`
+			Matcher   Matcher   `json:"matcher"`
+			Decision  Decision  `json:"decision"`
+			DecidedBy DecidedBy `json:"decided_by"`
+			Scope     Scope     `json:"scope"`
+			Reason    string    `json:"reason"`
+		}{v.ToolUseID, v.Tool, v.Mode, v.Matcher, v.Decision, v.DecidedBy, v.Scope, v.Reason}, false
 	}
-	return nil, p, false
+	return nil, nil, p, false
 }
 
 // MarshalJSON writes the flattened envelope:
@@ -173,7 +191,7 @@ func (e Entry) MarshalJSON() ([]byte, error) {
 	if err := Validate(e.Payload); err != nil {
 		return nil, fmt.Errorf("entry %s: %w", e.Kind, err)
 	}
-	blocks, rest, has := blocksOf(e.Payload)
+	blocks, input, rest, has := splitPayload(e.Payload)
 	scalars, err := encodeNoEscape(rest)
 	if err != nil {
 		return nil, err
@@ -192,6 +210,10 @@ func (e Entry) MarshalJSON() ([]byte, error) {
 	if len(interior) > 0 {
 		out = append(out, ',')
 		out = append(out, interior...)
+	}
+	if len(input) > 0 {
+		out = append(out, `,"input":`...)
+		out = append(out, input...)
 	}
 	if has {
 		out = append(out, `,"content":`...)

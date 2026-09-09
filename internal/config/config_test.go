@@ -212,8 +212,10 @@ func TestWaveDefaults(t *testing.T) {
 func TestPluginsDisabledAndTables(t *testing.T) {
 	home := t.TempDir()
 	paths := config.XDG(func(string) string { return "" }, home)
-	os.MkdirAll(paths.Config, 0o700)
-	os.WriteFile(filepath.Join(paths.Config, "config.toml"), []byte(`
+	if err := os.MkdirAll(paths.Config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(paths.Config, "config.toml"), []byte(`
 [default]
 provider = "p"
 model = "m"
@@ -233,7 +235,9 @@ enabled = false
 summary_model = "p:small"
 [memory.fold]
 observe_after_tokens = 10
-`), 0o600)
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	c, err := config.Load(paths, nil)
 	if err != nil {
 		t.Fatal(err)

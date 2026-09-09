@@ -344,6 +344,10 @@ type PermissionDecision struct {
 	DecidedBy DecidedBy `json:"decided_by"`
 	Scope     Scope     `json:"scope"`
 	Reason    string    `json:"reason"`
+	// Input is the bytes the tool ran with when a before_tool hook modified them, verbatim,
+	// and is absent otherwise. Without it the log would show a decision, and then a tool
+	// result, for an input nothing in the session ever recorded.
+	Input json.RawMessage `json:"input,omitempty"`
 }
 
 type ToolResult struct {
@@ -459,6 +463,9 @@ func Validate(p Payload) error {
 	case PermissionDecision:
 		if v.ToolUseID == "" || v.Tool == "" || !v.Mode.Valid() || !v.Decision.Valid() || !v.DecidedBy.Valid() || !v.Scope.Valid() || v.Reason == "" {
 			return errors.New("permission_decision: incomplete")
+		}
+		if len(v.Input) > 0 && !json.Valid(v.Input) {
+			return errors.New("permission_decision: input is not valid JSON")
 		}
 	case ToolResult:
 		if v.ToolUseID == "" || !v.Outcome.Valid() {

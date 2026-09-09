@@ -112,6 +112,7 @@ func TestEntryRoundTripAllKinds(t *testing.T) {
 		UserMessage{Source: SourceTyped, Content: []Block{TextBlock("fix the flaky fork test")}},
 		AssistantMessage{Model: ModelRef{"aperture", "cline-pass/kimi-k3"}, Thinking: ThinkingHigh, Content: []Block{TextBlock("Looking."), ToolUseBlock("toolu_01", "bash", json.RawMessage(`{"command":"go test ./..."}`))}, Usage: Usage{Input: 1200, Output: 80}, StopReason: StopToolUse, StopReasonRaw: "tool_calls"},
 		PermissionDecision{ToolUseID: "toolu_01", Tool: "bash", Mode: ModeStrict, Matcher: Matcher{Tool: "bash", Prefix: "go test"}, Decision: Allow, DecidedBy: ByAsker, Scope: ScopeSession, Reason: "allow for session"},
+		PermissionDecision{ToolUseID: "toolu_02", Tool: "bash", Mode: ModeStrict, Matcher: Matcher{Tool: "bash", Prefix: "go test"}, Decision: Allow, DecidedBy: ByHook, Scope: ScopeOnce, Reason: "hook", Input: json.RawMessage(`{"command": "go test ./...", "spaced": true}`)},
 		ToolResult{ToolUseID: "toolu_01", Outcome: OutcomeOK, Content: []Block{TextBlock("ok\n")}, DurationMS: 412},
 		ModelChange{Model: ModelRef{"aperture", "gpt-5.6-sol"}},
 		ModeChange{Mode: ModePermissive},
@@ -189,7 +190,7 @@ func TestEntryTextAndSignatureVerbatim(t *testing.T) {
 	}
 }
 
-// TestEntryContentKeyAppearsOnce guards against a regression where blocksOf
+// TestEntryContentKeyAppearsOnce guards against a regression where splitPayload
 // zeroed Content on a copy of the payload and marshaled that copy for the
 // scalar fields: since Content has no omitempty tag, the scalar encode
 // still emitted "content":null, and MarshalJSON then appended a second,
@@ -245,5 +246,56 @@ func TestEntryUnmarshalRejects(t *testing.T) {
 		if err := e.UnmarshalJSON([]byte(line)); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
+	}
+}
+
+// TestPermissionDecisionInputIsByteExact covers the one payload field outside a block that the
+// log writes by hand: a hook's modified tool input. Re-marshaling a json.RawMessage through
+// encoding/json compacts it, so a round trip through the generic encoder would silently
+// rewrite bytes the session claims are the model's own.
+func TestPermissionDecisionInputIsByteExact(t *testing.T) {
+	id := mustULID(t, "01K4M0A7Q8ZJ3N6R9T2V5X8B1D")
+	at := time.Date(2026, 9, 7, 20, 30, 0, 0, time.UTC)
+	raw := `{"command": "go test ./...",  "n": 2}`
+	e := Entry{ID: id, At: at, Kind: KindPermissionDecision, Payload: PermissionDecision{
+		ToolUseID: "t1", Tool: "bash", Mode: ModeStrict, Matcher: Matcher{Tool: "bash"},
+		Decision: Allow, DecidedBy: ByHook, Scope: ScopeOnce, Reason: "hook",
+		Input: json.RawMessage(raw),
+	}}
+	line, err := e.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(line, []byte(`"input":`+raw)) {
+		t.Fatalf("input not verbatim in\n%s", line)
+	}
+	if n := bytes.Count(line, []byte(`"input":`)); n != 1 {
+		t.Fatalf("input key %d times in\n%s", n, line)
+	}
+	var back Entry
+	if err := back.UnmarshalJSON(line); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(back.Payload.(PermissionDecision).Input); got != raw {
+		t.Errorf("read back %q, want %q", got, raw)
+	}
+
+	// A decision nobody modified carries no input key at all.
+	e.Payload = PermissionDecision{ToolUseID: "t1", Tool: "bash", Mode: ModeStrict,
+		Matcher: Matcher{Tool: "bash"}, Decision: Allow, DecidedBy: ByAsker, Scope: ScopeOnce, Reason: "asker"}
+	line, err = e.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(line, []byte(`"input"`)) {
+		t.Errorf("unmodified decision carries an input key:\n%s", line)
+	}
+
+	// Bytes that are not JSON never reach the log.
+	e.Payload = PermissionDecision{ToolUseID: "t1", Tool: "bash", Mode: ModeStrict,
+		Matcher: Matcher{Tool: "bash"}, Decision: Allow, DecidedBy: ByHook, Scope: ScopeOnce, Reason: "hook",
+		Input: json.RawMessage(`not json`)}
+	if _, err := e.MarshalJSON(); err == nil {
+		t.Error("marshal accepted an input that is not JSON")
 	}
 }

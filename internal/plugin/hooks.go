@@ -189,9 +189,16 @@ type HookRunner struct {
 	notice  func(string)
 }
 
+// DefaultHookTimeout is what a handler gets when no timeout was configured. It matches
+// config's hook_timeout_ms default, and is what a caller with no config to read should use.
+const DefaultHookTimeout = 5 * time.Second
+
 func NewHookRunner(reg *Registry, timeout time.Duration, notice func(string)) *HookRunner {
 	if notice == nil {
 		notice = func(string) {}
+	}
+	if timeout <= 0 {
+		timeout = DefaultHookTimeout
 	}
 	return &HookRunner{reg: reg, timeout: timeout, notice: notice}
 }

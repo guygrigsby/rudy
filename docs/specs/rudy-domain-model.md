@@ -170,6 +170,7 @@ Value object, payload of a `permission_decision` entry. Records what happened, w
 | `decidedBy` | `DecidedBy` | Who or what decided |
 | `scope` | `Scope` | once or session; `session` only ever comes from an asker allow |
 | `reason` | string | Never empty. The asker's text, the hook's reason or the rule name; for `no_asker` the fixed string `no asker attached` |
+| `input` | bytes | The input the tool ran with when a `before_tool` hook modified it; absent otherwise. Kept byte for byte, so the log shows exactly what the call carried when it differs from the `tool_use` block |
 
 ## Matcher
 
@@ -1026,6 +1027,7 @@ classDiagram
         +DecidedBy decidedBy
         +Scope scope
         +string reason
+        +bytes input
     }
     class Matcher {
         +string tool

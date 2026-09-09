@@ -190,7 +190,7 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 | `before_request` | `TurnStarted`, `TurnResumed` and every subsequent request in the turn | `{session_id, turn_id, provider, model, headers: table, body_size: int}` | `{headers: table}` merged over the request headers; body is not exposed in pass 1 |
 | `after_response` | `AssistantMessageAppended` | `{session_id, turn_id, message: Entry}` | nothing |
 | `before_tool` | `ToolRequested`, before the Gate | `{session_id, turn_id, tool_use_id, tool, input, safety}` | `{decision: pass, allow, deny or modify, input, reason}`; `allow` and `deny` short-circuit the Gate and are recorded with `decided_by: hook`; `modify` replaces `input` |
-| `after_tool` | `ToolResultAppended`, before the result reaches the next request | `{session_id, turn_id, tool_use_id, result: Entry}` | `{content: [ContentBlock]}` replacing what the model sees; the stored entry is unchanged |
+| `after_tool` | `ToolResultAppended`, before the result reaches the next request | `{session_id, turn_id, tool_use_id, result: Entry}` | `{content: [ContentBlock]}` replacing what the model sees; the stored entry is unchanged. The replacement is held for as long as the session is live, so it applies to every later request in the session and not only the turn that produced it, and it is not persisted: a session loaded from disk sends the stored entry again until a handler replaces it again |
 | `before_compaction` | `CompactionRequested`, when the Compactor decides to compact and `session.compact` carried no `instructions` | `{session_id, first_entry_id, last_entry_id, prompt_tokens: int, context_window: int}` | `{summary: string}`; the first non-empty summary in handler order is used and the model is not asked; empty means pass |
 | `turn_completed` | `TurnCompleted` | `{session_id, turn_id, usage}` | nothing |
 | `session_closed` | last client detaches, or the server exits | `{session_id}` | nothing; the server waits `hook_timeout_ms` |
@@ -331,9 +331,11 @@ A pass 1 log lacks the two parent fields; `Load` reads their absence as empty.
 | `decided_by` | `class`, `mode`, `allowance`, `hook`, `asker`, `no_asker` | no | `class` means the tool is safe; `mode` means off or permissive let it through; `allowance` means a prior session-scope allow matched; `no_asker` is always a deny |
 | `scope` | `once`, `session` | no | `session` only ever comes from an asker allow; every other row says `once` |
 | `reason` | string | no | the asker's text, the hook's reason or the rule name; never empty |
+| `input` | object | yes | the input the tool ran with when a `before_tool` hook modified it; absent otherwise. Written and read byte for byte, like a `tool_use` input, and the last key on the line |
 
 ```json
 {"id":"01K4M0AA...","at":"...","kind":"permission_decision","tool_use_id":"toolu_01","tool":"bash","mode":"strict","matcher":{"tool":"bash","prefix":"go test"},"decision":"allow","decided_by":"asker","scope":"session","reason":"allow for session"}
+{"id":"01K4M0AB...","at":"...","kind":"permission_decision","tool_use_id":"toolu_02","tool":"bash","mode":"strict","matcher":{"tool":"bash","prefix":"go test"},"decision":"allow","decided_by":"hook","scope":"once","reason":"hook","input":{"command":"go test ./..."}}
 ```
 
 **`tool_result`**

@@ -62,6 +62,12 @@ type liveSession struct {
 	closed      bool     // sess has been closed and removed from Server.live; never touch sess again
 	hookContext []string // what session_opened handlers added to this session's system prompt
 
+	// overrides is what after_tool handlers replaced, by tool_use id, for as long as this
+	// session is live. The map reference is set once in newLive and never replaced, so it
+	// needs no lock; its contents belong to whichever turn.Runner is currently running and
+	// are only touched on that runner's own goroutine (see turn.Config.Overrides).
+	overrides map[string][]session.Block
+
 	obsMu   sync.Mutex
 	entries []session.Entry
 	conns   []*conn
@@ -74,10 +80,11 @@ type liveSession struct {
 // mirror, and that read is only safe while this caller is still the sole owner.
 func newLive(sess *session.Session, m provider.Model) *liveSession {
 	return &liveSession{
-		sess:    sess,
-		model:   m,
-		entries: append([]session.Entry(nil), sess.Entries()...),
-		pending: map[string]chan turn.Answer{},
+		sess:      sess,
+		model:     m,
+		entries:   append([]session.Entry(nil), sess.Entries()...),
+		pending:   map[string]chan turn.Answer{},
+		overrides: map[string][]session.Block{},
 	}
 }
 
@@ -228,17 +235,42 @@ func deriveInfo(id ulid.ULID, entries []session.Entry) protocol.SessionInfo {
 
 // closeIfOpen closes sess exactly once. It races safely against every other path that can
 // also decide to close this session (detach reaching zero subscribers, Shutdown closing every
-// live session): both go through this, and whichever sets closed first is the one that
-// actually calls sess.Close; the other is a no-op. Without that, Shutdown running concurrently
-// with a connection's own detach (its Serve loop returning and unsubscribing the last
-// connection) could call sess.Close twice on the same *session.Session.
-func (ls *liveSession) closeIfOpen() error {
+// live session): both go through the same claim, and whichever sets closed first is the one
+// that actually fires before and calls sess.Close; the other is a no-op. Without that,
+// Shutdown running concurrently with a connection's own detach (its Serve loop returning and
+// unsubscribing the last connection) could call sess.Close twice on the same *session.Session,
+// and would fire session_closed twice for one session.
+func (ls *liveSession) closeIfOpen(before func()) error {
 	ls.mu.Lock()
 	already := ls.closed
 	ls.closed = true
 	ls.mu.Unlock()
 	if already {
 		return nil
+	}
+	return ls.closeClaimed(before)
+}
+
+// claimCloseIfIdle marks the session closed and reports whether this caller now owns closing
+// it, refusing while a turn still owns the session or somebody else has already claimed it.
+// detach uses it instead of closeIfOpen because it has to make that decision while still
+// holding Server.mu, and do the closing itself after releasing it (see detach).
+func (ls *liveSession) claimCloseIfIdle() bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	st, _ := ls.mirroredState()
+	if ls.closed || (ls.runner != nil && isActive(st)) {
+		return false
+	}
+	ls.closed = true
+	return true
+}
+
+// closeClaimed runs before, then closes sess. The caller has already won the claim, so this
+// body runs exactly once per session and before is exactly the once-per-session hook point.
+func (ls *liveSession) closeClaimed(before func()) error {
+	if before != nil {
+		before()
 	}
 	return ls.sess.Close()
 }

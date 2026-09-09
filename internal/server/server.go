@@ -176,8 +176,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	var errs []error
 	for _, ls := range lives {
-		s.fireSessionClosed(ctx, ls)
-		if err := ls.closeIfOpen(); err != nil {
+		// A fresh context for the closing hooks rather than ctx: ctx is the caller's bound
+		// on waiting for turns and Serve loops above and may already be done, and an expired
+		// context would skip every handler instead of running it.
+		hookCtx, cancelHooks := s.hookContext()
+		err := ls.closeIfOpen(func() { s.fireSessionClosed(hookCtx, ls) })
+		cancelHooks()
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -567,9 +572,8 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 		return nil, protocol.ErrorFrom(err)
 	}
 	ls := newLive(sess, m)
-	info := s.installAndAttach(cn, ls)
 	s.fireSessionOpened(s.ctx, ls, false)
-	return info, nil
+	return s.installAndAttach(cn, ls), nil
 }
 
 // resume attaches cn to sid, loading it from disk first when it is not already live. loadCold
@@ -697,13 +701,26 @@ func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.E
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "model not in registry: " + sess.Model().String()})
 	}
 	ls := newLive(sess, m)
+	// Every path that brings a session back from disk goes through here, so this is where a
+	// resumed session gets its session_opened, once, whether the caller was resume or fork.
+	// Before the install, not after: loadCold checks s.live before s.loading, so a session
+	// already in s.live is one another connection can attach to and submit a turn on, and
+	// that turn would assemble its system prompt without a context still being computed.
+	s.fireSessionOpened(s.ctx, ls, true)
 	s.mu.Lock()
 	s.live[sid] = ls
 	s.mu.Unlock()
-	// Every path that brings a session back from disk goes through here, so this is where a
-	// resumed session gets its session_opened, once, whether the caller was resume or fork.
-	s.fireSessionOpened(s.ctx, ls, true)
 	return ls, nil
+}
+
+// hookContext bounds one set of hook handlers for a caller that has no request context to
+// use. Every handler is bounded again, individually, by the HookRunner's own timeout.
+func (s *Server) hookContext() (context.Context, context.CancelFunc) {
+	d := time.Duration(s.d.Config.HookTimeoutMS) * time.Millisecond
+	if d <= 0 {
+		d = plugin.DefaultHookTimeout
+	}
+	return context.WithTimeout(context.Background(), d)
 }
 
 // hookFirer is s.d.Hooks as the interface the turn loop takes, or nil when no runner is
@@ -717,17 +734,19 @@ func (s *Server) hookFirer() turn.HookFirer {
 	return s.d.Hooks
 }
 
-// fireSessionOpened runs the session_opened hook for a session that has just gone live and
-// keeps every context it returns for that session's system prompt. It holds no lock while
-// firing: each handler gets hook_timeout_ms, and holding ls.mu across that would block every
-// other request for this session for as long as the slowest handler takes. The payload comes
-// from the entries mirror, not from ls.sess, for the reason every other reader here does the
-// same: the session is single-owner and a turn that has already started owns it.
+// fireSessionOpened runs the session_opened hook for a session that is about to go live and
+// keeps every context it returns for that session's system prompt. Callers must not have
+// shared ls yet (open before installAndAttach, coldLoadOne before the s.live install), which
+// is what makes the unlocked write to hookContext safe: nothing else can reach ls until the
+// install publishes it under Server.mu, and every later reader takes that lock to find it.
+// Firing first is also the point, not an optimization: a session already visible is one
+// another connection can submit a turn on, and that turn would build its system prompt while
+// the handlers deciding what belongs in it are still running.
 func (s *Server) fireSessionOpened(ctx context.Context, ls *liveSession, resumed bool) {
 	if s.d.Hooks == nil {
 		return
 	}
-	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
+	view := deriveInfo(ls.sess.ID(), ls.entries)
 	p := &plugin.SessionOpenedPayload{
 		SessionID: view.SessionID,
 		Workspace: view.Workspace,
@@ -736,23 +755,16 @@ func (s *Server) fireSessionOpened(ctx context.Context, ls *liveSession, resumed
 		Thinking:  view.Thinking,
 		Resumed:   resumed,
 	}
-	var add []string
 	for _, res := range s.d.Hooks.Fire(ctx, plugin.HookCall{Point: plugin.HookSessionOpened, SessionID: p.SessionID, Payload: p}) {
 		if so, ok := res.(*plugin.SessionOpenedResult); ok && so.Context != "" {
-			add = append(add, so.Context)
+			ls.hookContext = append(ls.hookContext, so.Context)
 		}
 	}
-	if len(add) == 0 {
-		return
-	}
-	ls.mu.Lock()
-	ls.hookContext = append(ls.hookContext, add...)
-	ls.mu.Unlock()
 }
 
-// fireSessionClosed runs the session_closed hook for a session about to be closed. Callers
-// hold no lock: like fireSessionOpened this waits on handlers, and the session is already
-// out of s.live by the time it runs.
+// fireSessionClosed runs the session_closed hook for a session about to be closed. It runs
+// from inside closeClaimed, so it fires exactly once per session no matter which of detach and
+// Shutdown won the claim, and with no lock held: it waits on handlers.
 func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
 	if s.d.Hooks == nil {
 		return
@@ -828,24 +840,17 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 		return
 	}
 
-	ls.mu.Lock()
-	st, _ := ls.mirroredState()
-	active := ls.runner != nil && isActive(st)
-	alreadyClosed := ls.closed
-	if !active && !alreadyClosed {
-		ls.closed = true
-	}
-	ls.mu.Unlock()
-	if active || alreadyClosed {
+	if !ls.claimCloseIfIdle() {
 		s.mu.Unlock()
 		return
 	}
 
 	// The delete is what has to happen before releasing mu: it is what stops a concurrent
 	// attachIfLive from finding this session again. The actual Close, once that is done, no
-	// longer needs mu - nothing can reach ls through s.live to race it, and ls.closed (set
-	// above, under ls.mu) is what stops any other path (Shutdown's closeIfOpen) from also
-	// closing it. But sess.Close still has to run (releasing the store's flock) before a cold
+	// longer needs mu - nothing can reach ls through s.live to race it, and the claim above
+	// (ls.closed, set under ls.mu by claimCloseIfIdle) is what stops any other path
+	// (Shutdown's closeIfOpen) from also closing it, or from firing session_closed a second
+	// time for the same session. But sess.Close still has to run (releasing the store's flock) before a cold
 	// load for this same id can safely call session.Load again, so register it in s.closing in
 	// this same critical section, before releasing mu: a concurrent loadCold checks s.closing
 	// right alongside s.live and s.loading (see loadCold) and waits instead of racing the
@@ -859,8 +864,7 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	delete(s.live, id)
 	s.mu.Unlock()
 
-	s.fireSessionClosed(s.ctx, ls)
-	_ = ls.sess.Close()
+	_ = ls.closeClaimed(func() { s.fireSessionClosed(s.ctx, ls) })
 
 	s.mu.Lock()
 	delete(s.closing, id)
@@ -944,6 +948,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		MaxTokens:   s.d.Config.MaxTokens,
 		Hooks:       s.hookFirer(),
 		ToolTimeout: time.Duration(s.d.Config.ToolTimeoutMS) * time.Millisecond,
+		Overrides:   ls.overrides,
 	})
 	la.runner = r
 	ls.runner = r
