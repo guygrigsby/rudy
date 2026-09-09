@@ -34,8 +34,12 @@ var errNoAsker = errors.New("server: no asker attached")
 //     obsMu, see below) would deadlock against it. A handler that needs "is a turn active"
 //     reads the mirror in obsMu instead of asking the runner directly.
 //
-//   - obsMu guards entries (the log mirror), conns (subscribers) and state/turnID (a mirror of
-//     the runner's State/TurnID, updated from the Observer callbacks). It is the ONLY lock a
+//   - obsMu guards entries (the log mirror), conns (subscribers), state/turnID (a mirror of
+//     the runner's State/TurnID, updated from the Observer callbacks) and the standing and
+//     answered permission questions. Those last two sit here rather than beside pending
+//     because subscribeLocked reads them under the Server.mu it already holds, and waiting
+//     there on mu, which a compaction owns for the length of a provider request, would stall
+//     every session lookup in the process (see claimCloseIfIdle). obsMu is the ONLY lock a
 //     turn.Observer callback (fanout's EntryAppended/Delta/StateChanged) may take, together
 //     with each connection's own outbox lock (conn.mu, unrelated to either lock here): those
 //     callbacks run while the turn.Runner holds its own mutex, so taking mu, or calling any
@@ -88,6 +92,24 @@ type liveSession struct {
 	conns   []*conn
 	state   turn.State
 	turnID  string
+
+	// standing is the permission questions the askers have been asked and none has
+	// answered yet, by tool_use id: what an asker attaching while one stands is owed, and
+	// what detach abandons when the last asker leaves. answered is the ids one of them has
+	// already decided, kept until the turn rests (see fanout.StateChanged): it is what
+	// tells a second answer, which is a conflict, from an answer to a question nobody is
+	// asking, which is not_found.
+	standing map[string]standingQuestion
+	answered map[string]bool
+}
+
+// standingQuestion is one question currently put to the askers: the payload to re-send to an
+// asker attaching while it stands, and the channel closed when the last asker detaches, which
+// is what turns the wait in liveAsker.Ask into the errNoAsker the runner already records as a
+// no_asker denial. There is no second way to write that decision.
+type standingQuestion struct {
+	req     protocol.PermissionRequested
+	abandon chan struct{}
 }
 
 // newLive wraps a freshly opened, loaded or forked session. It must be called before the
@@ -101,6 +123,8 @@ func newLive(sess *session.Session, m provider.Model) *liveSession {
 		pending:   map[string]chan turn.Answer{},
 		overrides: map[string][]session.Block{},
 		children:  map[string]bool{},
+		standing:  map[string]standingQuestion{},
+		answered:  map[string]bool{},
 	}
 }
 
@@ -160,32 +184,106 @@ func (ls *liveSession) hookContextSuffixLocked() string {
 	return "\n\n" + strings.Join(ls.hookContext, "\n\n")
 }
 
-// firstAsker is the connection a turn's permission questions route to: the first subscriber
-// whose hello declared asker, or, for a child session (whose only subscriber is the plugin
-// that opened it), its parent's. That is the binding: a subagent's unsafe tool is answered by
-// the human who is already answering for the session that spawned it. Self-locking (takes
-// obsMu); the walk up the parent chain takes each ancestor's obsMu in turn, never holding two
-// at once, and the chain is only ever one link long (a child has no agent tool to open a
-// grandchild with).
+// askers is every connection a turn's permission questions go to: each subscriber whose hello
+// declared asker, or, for a child session (whose only subscriber is the plugin that opened
+// it), its parent's. That is the binding: a subagent's unsafe tool is answered by the humans
+// already answering for the session that spawned it. Every one of them is asked and the first
+// answer decides (ADR 0014). Self-locking (takes obsMu); the walk up the parent chain takes
+// the ancestor's obsMu only after releasing this session's, never holding two at once, and
+// the chain is only ever one link long (a child has no agent tool to open a grandchild with).
 //
-// A plugin connection is never the asker, whatever its hello said: the plugin that opened a
+// A plugin connection is never an asker, whatever its hello said: the plugin that opened a
 // child session is the one waiting on that child's answer, so routing the child's question
 // back to it would park the question behind the tool call it is the answer to. handleHello
 // refuses the claim at the door too; this is the second half of the same rule.
-func (ls *liveSession) firstAsker() *conn {
+func (ls *liveSession) askers() []*conn {
 	ls.obsMu.Lock()
+	out := ls.askersObsLocked()
+	parent := ls.parent
+	ls.obsMu.Unlock()
+	if len(out) == 0 && parent != nil {
+		return parent.askers()
+	}
+	return out
+}
+
+// askersObsLocked is askers for this session's own subscribers, without the walk up to the
+// parent. Caller holds obsMu.
+func (ls *liveSession) askersObsLocked() []*conn {
+	var out []*conn
 	for _, c := range ls.conns {
 		if c.asker && c.plugin == "" {
-			ls.obsMu.Unlock()
-			return c
+			out = append(out, c)
 		}
+	}
+	return out
+}
+
+// stand publishes q as one of this session's standing questions and returns the askers to put
+// it to; none of them means nobody can answer and the caller denies instead. Recording it and
+// snapshotting the subscribers in one obsMu section is what makes delivery exactly once
+// against a concurrent attach: either the newcomer is already in conns and is notified below,
+// or it subscribes afterwards and reads the question out of standing (see subscribeLocked).
+// Self-locking (takes obsMu, then the parent's askers after releasing it, never both at once).
+func (ls *liveSession) stand(q standingQuestion) []*conn {
+	ls.obsMu.Lock()
+	targets := ls.askersObsLocked()
+	if len(targets) > 0 {
+		ls.standing[q.req.ToolUseID] = q
 	}
 	parent := ls.parent
 	ls.obsMu.Unlock()
-	if parent != nil {
-		return parent.firstAsker()
+	if len(targets) > 0 || parent == nil {
+		return targets
 	}
-	return nil
+	// A child's question is answered by the parent's askers, but it stands on the child: an
+	// asker attaching to the child itself is owed it too.
+	targets = parent.askers()
+	if len(targets) == 0 {
+		return nil
+	}
+	ls.obsMu.Lock()
+	ls.standing[q.req.ToolUseID] = q
+	ls.obsMu.Unlock()
+	return targets
+}
+
+// forget drops a question that is no longer standing, whether it was answered, abandoned or
+// interrupted. Self-locking (takes mu, then obsMu inside it, the order the type documents).
+func (ls *liveSession) forget(toolUseID string) {
+	ls.mu.Lock()
+	delete(ls.pending, toolUseID)
+	ls.obsMu.Lock()
+	delete(ls.standing, toolUseID)
+	ls.obsMu.Unlock()
+	ls.mu.Unlock()
+}
+
+// abandonStanding denies every question this session has standing once nobody is left to
+// answer it, by closing the channel liveAsker.Ask waits on: the runner then records the one
+// no_asker denial it already knows how to write. Called by detach with neither Server.mu nor
+// ls.mu held, because the runner goroutine it wakes goes straight for both.
+//
+// Who could still answer is asked before obsMu is taken, since that walk takes the parent's
+// obsMu and this must never hold two at once. An asker attaching in the gap is handed a
+// question that is then denied: it sees the permission_decision moments later, which is the
+// same thing it sees when the answer it was about to send loses the race to another asker.
+// The parent's last asker leaving does not reach a child's standing question, which stays
+// until the turn is interrupted; a child has no back pointer from the parent to walk down.
+func (ls *liveSession) abandonStanding() {
+	if len(ls.askers()) > 0 {
+		return
+	}
+	ls.obsMu.Lock()
+	abandoned := make([]chan struct{}, 0, len(ls.standing))
+	for id, q := range ls.standing {
+		abandoned = append(abandoned, q.abandon)
+		delete(ls.standing, id)
+	}
+	ls.obsMu.Unlock()
+	for _, ch := range abandoned {
+		close(ch)
+	}
 }
 
 // snapshotEntries returns a copy of the entries mirror. Self-locking (takes obsMu).
@@ -219,23 +317,53 @@ func (ls *liveSession) broadcastObsLocked(method string, params any) {
 	}
 }
 
-// subscribeLocked registers cn as a subscriber and returns a snapshot of entries to replay
-// plus the info to reply with. Caller holds mu (from installAndAttach or attachIfLive, both of
-// which hold Server.mu across the whole lookup-then-subscribe, which is what keeps this from
-// ever racing detach's decide-and-remove into subscribing to a session that is concurrently
-// being closed - see detach).
-func (ls *liveSession) subscribeLocked(cn *conn) ([]session.Entry, protocol.SessionInfo) {
+// attachment is everything a newly subscribed connection is owed, in the order the contract
+// hands it over: every entry as entry.appended, then the current turn.state when a turn is
+// active, then each standing permission.requested when the newcomer is an asker, and last the
+// response carrying info.
+type attachment struct {
+	entries  []session.Entry
+	state    *protocol.TurnStateChanged
+	standing []protocol.PermissionRequested
+	info     protocol.SessionInfo
+}
+
+// subscribeLocked registers cn as a subscriber and returns what it is owed: the entries to
+// replay, the turn's current state and any standing question, and the info to reply with.
+// Caller holds mu (from installAndAttach or attachIfLive, both of which hold Server.mu across
+// the whole lookup-then-subscribe, which is what keeps this from ever racing detach's
+// decide-and-remove into subscribing to a session that is concurrently being closed - see
+// detach). Registering and reading standing in one obsMu section is the other half of stand's
+// exactly-once: a question published before this runs is read out of standing here, and one
+// published after finds cn already in conns and notifies it directly.
+func (ls *liveSession) subscribeLocked(cn *conn) attachment {
+	sid := ls.sess.ID()
 	ls.obsMu.Lock()
 	ls.conns = append(ls.conns, cn)
-	entries := append([]session.Entry(nil), ls.entries...)
-	info := deriveInfo(ls.sess.ID(), ls.entries)
+	at := attachment{
+		entries: append([]session.Entry(nil), ls.entries...),
+		info:    deriveInfo(sid, ls.entries),
+	}
+	if isActive(ls.state) {
+		at.state = &protocol.TurnStateChanged{SessionID: sid.String(), TurnID: ls.turnID, State: string(ls.state)}
+	}
+	if cn.asker && cn.plugin == "" {
+		for _, q := range ls.standing {
+			at.standing = append(at.standing, q.req)
+		}
+		// Map order is not an order. Sorting by tool_use id makes what a newcomer hears
+		// the same on every attach, which is what the order test can pin.
+		slices.SortFunc(at.standing, func(a, b protocol.PermissionRequested) int {
+			return strings.Compare(a.ToolUseID, b.ToolUseID)
+		})
+	}
 	ls.obsMu.Unlock()
 
 	cn.mu.Lock()
-	cn.subs[ls.sess.ID()] = ls
+	cn.subs[sid] = ls
 	cn.mu.Unlock()
 
-	return entries, info
+	return at
 }
 
 // mirror records an entry appended to the session by something other than a turn and sends it
@@ -386,6 +514,12 @@ func (f *fanout) StateChanged(turnID string, s turn.State) {
 	f.ls.obsMu.Lock()
 	f.ls.state = s
 	f.ls.turnID = turnID
+	if !isActive(s) {
+		// The answered set is per turn: once the turn is over, an answer naming one of its
+		// tool_use ids is not a second answer to a live question, it is an answer to a
+		// question nobody is asking, which is not_found rather than conflict.
+		clear(f.ls.answered)
+	}
 	f.ls.broadcastObsLocked(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: f.sid, TurnID: turnID, State: string(s)})
 	f.ls.obsMu.Unlock()
 }
@@ -423,9 +557,9 @@ func (o *firstAppendSignal) StateChanged(turnID string, s turn.State) {
 	o.Observer.StateChanged(turnID, s)
 }
 
-// liveAsker routes one turn's permission questions to the session's first asker connection
-// (the binding: "the asker is the first subscribed connection whose hello declared asker") and
-// waits for session.answer to resolve them by tool_use id.
+// liveAsker puts one turn's permission questions to every asker connection the session has
+// (see askers for the binding, the child sessions included) and waits for the first
+// session.answer to resolve each of them by tool_use id.
 type liveAsker struct {
 	ls     *liveSession
 	sid    string
@@ -437,24 +571,35 @@ type liveAsker struct {
 // gives the freshest value, unlike a handler that already holds mu or obsMu, which must use
 // the mirror instead.
 func (a *liveAsker) Ask(ctx context.Context, q turn.Question) (turn.Answer, error) {
-	first := a.ls.firstAsker()
-	if first == nil {
-		return turn.Answer{}, errNoAsker
+	// TurnID before any lock is taken: calling a Runner method under one is what the
+	// liveSession doc rules out, and here no lock is held, so it is also the freshest value.
+	req := protocol.PermissionRequested{
+		SessionID: a.sid, TurnID: a.runner.TurnID(), ToolUseID: q.ToolUseID, Tool: q.Tool, Input: q.Input, Matcher: q.Matcher,
 	}
 	ch := make(chan turn.Answer, 1)
+	abandon := make(chan struct{})
 	a.ls.mu.Lock()
 	a.ls.pending[q.ToolUseID] = ch
 	a.ls.mu.Unlock()
-	first.notify(protocol.NotifyPermissionRequested, protocol.PermissionRequested{
-		SessionID: a.sid, TurnID: a.runner.TurnID(), ToolUseID: q.ToolUseID, Tool: q.Tool, Input: q.Input, Matcher: q.Matcher,
-	})
+	askers := a.ls.stand(standingQuestion{req: req, abandon: abandon})
+	if len(askers) == 0 {
+		a.ls.forget(q.ToolUseID)
+		return turn.Answer{}, errNoAsker
+	}
+	for _, c := range askers {
+		c.notify(protocol.NotifyPermissionRequested, req)
+	}
 	select {
 	case ans := <-ch:
 		return ans, nil
+	case <-abandon:
+		// The last asker detached while this stood. Same return as never having had one,
+		// so the runner records the same no_asker denial rather than the server growing a
+		// second path that writes a permission_decision of its own.
+		a.ls.forget(q.ToolUseID)
+		return turn.Answer{}, errNoAsker
 	case <-ctx.Done():
-		a.ls.mu.Lock()
-		delete(a.ls.pending, q.ToolUseID)
-		a.ls.mu.Unlock()
+		a.ls.forget(q.ToolUseID)
 		return turn.Answer{}, ctx.Err()
 	}
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/gate"
@@ -80,12 +81,13 @@ func TestMarkStartingBeforeAnyObserverCallback(t *testing.T) {
 	}
 }
 
-// TestFirstAskerNeverAPluginConnection: a plugin connection can send a hello of its own, and
-// the one that opened a child session is the connection subscribed to it. Routing that child's
-// permission question there would park it behind the tool call it is the answer to, so the
-// question walks up to the parent's human instead. handleHello refuses the claim at the door
-// as well; both halves are asserted here.
-func TestFirstAskerNeverAPluginConnection(t *testing.T) {
+// TestAskersNeverIncludeAPluginConnection: a plugin connection can send a hello of its own,
+// and the one that opened a child session is the connection subscribed to it. Routing that
+// child's permission question there would park it behind the tool call it is the answer to,
+// so the question walks up to the parent's humans instead. handleHello refuses the claim at
+// the door as well; both halves are asserted here, along with the walk returning every asker
+// of the session it lands on rather than only the first.
+func TestAskersNeverIncludeAPluginConnection(t *testing.T) {
 	srv := New(Deps{Version: "test"})
 
 	pluginConn := newConn(1, nil)
@@ -110,23 +112,29 @@ func TestFirstAskerNeverAPluginConnection(t *testing.T) {
 		t.Fatal("a client connection that declared asker must be one")
 	}
 
+	secondClient := newConn(3, nil)
+	if _, e := srv.handleHello(secondClient, raw); e != nil {
+		t.Fatalf("hello: %v", e)
+	}
+
 	// The plugin subscribed first, so order alone would pick it.
 	parent := &liveSession{}
-	parent.conns = []*conn{pluginConn, clientConn}
+	parent.conns = []*conn{pluginConn, clientConn, secondClient}
 	child := &liveSession{parent: parent}
 	// Even with the flag set by hand, the walk skips a plugin connection.
 	pluginConn.asker = true
 	child.conns = []*conn{pluginConn}
-	if got := child.firstAsker(); got != clientConn {
-		t.Errorf("child asker = %+v, want the parent's client connection", got)
+	want := []*conn{clientConn, secondClient}
+	if got := child.askers(); !slices.Equal(got, want) {
+		t.Errorf("child askers = %+v, want the parent's client connections", got)
 	}
-	if got := parent.firstAsker(); got != clientConn {
-		t.Errorf("parent asker = %+v, want its client connection", got)
+	if got := parent.askers(); !slices.Equal(got, want) {
+		t.Errorf("parent askers = %+v, want its client connections", got)
 	}
 	// A session whose only subscriber is a plugin has no asker at all, which is a deny.
 	lone := &liveSession{}
 	lone.conns = []*conn{pluginConn}
-	if got := lone.firstAsker(); got != nil {
-		t.Errorf("lone plugin session asker = %+v, want none", got)
+	if got := lone.askers(); len(got) != 0 {
+		t.Errorf("lone plugin session askers = %+v, want none", got)
 	}
 }

@@ -459,7 +459,7 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// A plugin connection is never an asker, whatever it claims: the plugin that opens a
 	// child session is the one waiting on that child's tool call, so routing that child's
 	// permission question back to it would park the question behind its own answer. The
-	// human's connection is the only one that can answer, and firstAsker skips plugin
+	// human's connection is the only one that can answer, and askers skips plugin
 	// connections for the same reason.
 	cn.asker = p.Asker && cn.plugin == ""
 	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version}, nil
@@ -557,11 +557,26 @@ func (s *Server) handleAnswer(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	if !p.Decision.Valid() || !p.Scope.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "invalid decision or scope")
 	}
+	// The first answer decides. Claiming the pending channel and marking the id answered in
+	// one critical section is what makes that race-free between two askers holding the same
+	// question: exactly one of them finds the channel, and the loser is told which of the two
+	// refusals applies. obsMu nests inside the mu this already holds, the order the
+	// liveSession doc fixes.
 	ls.mu.Lock()
 	ch, ok := ls.pending[p.ToolUseID]
 	delete(ls.pending, p.ToolUseID)
+	ls.obsMu.Lock()
+	already := ls.answered[p.ToolUseID]
+	if ok {
+		ls.answered[p.ToolUseID] = true
+		delete(ls.standing, p.ToolUseID)
+	}
+	ls.obsMu.Unlock()
 	ls.mu.Unlock()
 	if !ok {
+		if already {
+			return nil, perr(protocol.CodeConflict, "another asker already answered "+p.ToolUseID)
+		}
 		return nil, perr(protocol.CodeNotFound, "no pending question for "+p.ToolUseID)
 	}
 	ch <- turn.Answer{Decision: p.Decision, Scope: p.Scope, Reason: p.Reason}
@@ -1299,10 +1314,10 @@ func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
 func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInfo {
 	s.mu.Lock()
 	s.live[ls.sess.ID()] = ls
-	entries, info := ls.subscribeLocked(cn)
+	at := ls.subscribeLocked(cn)
 	s.mu.Unlock()
-	replay(cn, ls.sess.ID(), entries)
-	return info
+	deliverAttach(cn, ls.sess.ID(), at)
+	return at.info
 }
 
 // attachIfLive subscribes cn to sid's live session, atomically with the s.live lookup: holding
@@ -1316,16 +1331,30 @@ func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bo
 		s.mu.Unlock()
 		return protocol.SessionInfo{}, false
 	}
-	entries, info := ls.subscribeLocked(cn)
+	at := ls.subscribeLocked(cn)
 	s.mu.Unlock()
-	replay(cn, sid, entries)
-	return info, true
+	deliverAttach(cn, sid, at)
+	return at.info, true
 }
 
 func replay(cn *conn, sid ulid.ULID, entries []session.Entry) {
 	sidStr := sid.String()
 	for _, e := range entries {
 		cn.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: sidStr, Entry: e})
+	}
+}
+
+// deliverAttach sends a new subscriber everything it is owed, in the contract's order: the
+// replay, then the turn's current state when one is running, then each question standing for
+// an asker. The response the caller returns leaves after all of them, on the same ordered
+// outbox (see conn.pump), which is what "then this response" in the session.resume row means.
+func deliverAttach(cn *conn, sid ulid.ULID, at attachment) {
+	replay(cn, sid, at.entries)
+	if at.state != nil {
+		cn.notify(protocol.NotifyTurnState, *at.state)
+	}
+	for _, q := range at.standing {
+		cn.notify(protocol.NotifyPermissionRequested, q)
 	}
 }
 
@@ -1354,9 +1383,17 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	ls.conns = kept
 	empty := len(ls.conns) == 0
 	steering := ls.state == turn.Steering
+	standing := len(ls.standing) > 0
 	ls.obsMu.Unlock()
 
 	s.closeIfUnusedLocked(ls)
+	if standing {
+		// A question this session is holding may have just lost the last connection that
+		// could answer it. Both locks are released by now, which is what abandonStanding
+		// needs: it wakes the runner's own goroutine, and that goroutine goes straight for
+		// ls.mu.
+		ls.abandonStanding()
+	}
 	if !empty || !steering {
 		return
 	}
@@ -1479,7 +1516,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	sid := ls.sess.ID().String()
 	la := &liveAsker{ls: ls, sid: sid}
 	var asker turn.Asker
-	if ls.firstAsker() != nil {
+	if len(ls.askers()) > 0 {
 		asker = la
 	}
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())

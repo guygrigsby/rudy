@@ -1859,7 +1859,8 @@ func TestAppendNoteRefusedFromAClient(t *testing.T) {
 }
 
 // runTurn submits one message and waits for the turn to complete.
-func runTurn(t *testing.T, cl *protocol.Client, sid, text string) {
+// submit starts one turn and returns what the server answered, the turn id included.
+func submit(t *testing.T, cl *protocol.Client, sid, text string) protocol.SessionSubmitResult {
 	t.Helper()
 	var sub protocol.SessionSubmitResult
 	if err := cl.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
@@ -1867,14 +1868,13 @@ func runTurn(t *testing.T, cl *protocol.Client, sid, text string) {
 	}, &sub); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	drain(t, cl, func(n protocol.Notification) bool {
-		if n.Method != protocol.NotifyTurnState {
-			return false
-		}
-		var ts protocol.TurnStateChanged
-		_ = json.Unmarshal(n.Params, &ts)
-		return ts.State == "completed"
-	})
+	return sub
+}
+
+func runTurn(t *testing.T, cl *protocol.Client, sid, text string) {
+	t.Helper()
+	submit(t, cl, sid, text)
+	drain(t, cl, completedOn(sid))
 }
 
 // lastCompaction is the newest compaction entry the connection was told about.
