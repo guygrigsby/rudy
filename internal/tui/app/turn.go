@@ -33,13 +33,17 @@ const (
 const answerReason = "asker"
 
 // turnControl is what the client knows about the turn: the state the server last
-// reported and the turn it belongs to, when the last Esc that reached the table landed,
-// and the permission question standing on screen, if any.
+// reported and the turn it belongs to, when the last Esc the table acted on landed, the
+// permission question standing on screen and the one this client has answered but not yet
+// heard back about.
 type turnControl struct {
 	state   string
 	turnID  string
 	lastEsc time.Time
 	prompt  *protocol.PermissionRequested
+	// asked is the question whose answer is in flight, kept so a call that never reached
+	// the server can put the question back.
+	asked *protocol.PermissionRequested
 }
 
 // running is a turn the server is working on: streaming, running a tool, or waiting for
@@ -71,10 +75,10 @@ func (m *Model) turnChanged(p protocol.TurnStateChanged) tea.Cmd {
 		return nil
 	}
 	// A turn that ended answers no question: an interrupt denies what it was waiting on
-	// and the decision is already in the log, so the prompt goes with the turn.
-	m.turn.prompt = nil
+	// and the decision is already in the log, so the question goes with the turn.
+	m.turn.prompt, m.turn.asked = nil, nil
 	var commit tea.Cmd
-	if m.cfg.UI.Render != renderAltscreen {
+	if m.inline() {
 		// One Println for the whole turn: the program writes each one above the frame as
 		// its own block, and a turn's rows are one block, in order.
 		if lines := m.tr.Commit(p.TurnID); len(lines) > 0 {
@@ -84,9 +88,9 @@ func (m *Model) turnChanged(p protocol.TurnStateChanged) tea.Cmd {
 	return tea.Batch(commit, m.sendQueued())
 }
 
-// sendQueued submits the oldest message waiting behind the turn that just rested. It is
-// sent as typed because that is what it is: a message the user wrote and the client held
-// back while the session was busy.
+// sendQueued sends the oldest message waiting behind the turn that just rested, down the
+// same path Enter would have taken it: what was held back is a message the user typed, so
+// a queued slash word is still a command.
 func (m *Model) sendQueued() tea.Cmd {
 	if m.disconnected {
 		return nil
@@ -95,7 +99,34 @@ func (m *Model) sendQueued() tea.Cmd {
 	if !ok {
 		return nil
 	}
-	return m.submitText(head, session.SourceTyped)
+	return m.sendTyped(head)
+}
+
+// sendTyped starts a turn with text, or runs it as a command when it opens with a slash.
+// It is the one path a typed message takes, whether Enter sent it now or the queue sent it
+// when the turn rested.
+func (m *Model) sendTyped(text string) tea.Cmd {
+	if name, args, ok := commandIn(text); ok {
+		return m.call(protocol.MethodCommandRun, protocol.CommandRunParams{
+			SessionID: m.session.SessionID,
+			Name:      name,
+			Args:      args,
+		})
+	}
+	return m.submitText(text, session.SourceTyped)
+}
+
+// lateRows commits a row that arrived after its turn had already gone to scrollback: a
+// note appended between turns carries the committed turn's id, and nothing else would
+// ever print it. Altscreen keeps every row, so it commits nothing here either.
+func (m *Model) lateRows(added []string) tea.Cmd {
+	if len(added) == 0 || !m.inline() {
+		return nil
+	}
+	if lines := m.tr.CommitLate(); len(lines) > 0 {
+		return tea.Println(strings.Join(lines, "\n"))
+	}
+	return nil
 }
 
 // requested puts a permission question on screen and makes it the one the keyboard
@@ -111,7 +142,23 @@ func (m *Model) answered(toolUseID string) {
 	if m.turn.prompt != nil && m.turn.prompt.ToolUseID == toolUseID {
 		m.turn.prompt = nil
 	}
+	if m.turn.asked != nil && m.turn.asked.ToolUseID == toolUseID {
+		m.turn.asked = nil
+	}
 	m.tr.Answered(toolUseID)
+}
+
+// reask puts back the question this client answered when the answer never reached the
+// server. Without it the turn waits on a decision that will never come, with nothing on
+// screen to answer it with.
+func (m *Model) reask() {
+	// A question standing now is a later one the server is waiting on, and it keeps the
+	// keyboard: the failed answer's own question is moot, since nothing asks twice.
+	if m.turn.asked == nil || m.turn.prompt != nil {
+		return
+	}
+	m.turn.prompt = m.turn.asked
+	m.tr.Prompt(*m.turn.asked)
 }
 
 // answer is the standing question's own key handling, and it runs before anything else:
@@ -129,8 +176,10 @@ func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {
 	}
 	// The question goes now rather than when the decision entry arrives: the server has
 	// the answer, and a question that stays on screen after it was answered reads as one
-	// that was not.
+	// that was not. It is kept in hand until the call comes back, since an answer that
+	// never arrived has to go back up.
 	m.answered(p.ToolUseID)
+	m.turn.asked = p
 	return m.call(protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
 		SessionID: m.session.SessionID,
 		ToolUseID: p.ToolUseID,
@@ -173,23 +222,28 @@ func (m *Model) interrupt() (cmd tea.Cmd, handled bool) {
 	}
 	now := time.Now()
 	double := !m.turn.lastEsc.IsZero() && now.Sub(m.turn.lastEsc) < m.doublePress()
-	m.turn.lastEsc = now
 	switch {
 	case m.turn.running():
+		m.turn.lastEsc = now
 		if double {
 			return m.cancelTurn(), true
 		}
 		return m.interruptTurn(session.InterruptSteer), true
 	case m.turn.steering():
-		// A steering turn with a draft continues on Enter, so Esc only arms the second
-		// press that cancels it. With nothing to continue it with, one Esc is the cancel.
+		// A steering turn with a draft continues on Enter, so Esc does nothing but arm
+		// the second press that cancels it: this is the one row of the table that arms
+		// the window without issuing an interrupt, and without it the row's own second
+		// press could never be a double. With nothing to continue the turn with, one Esc
+		// is the cancel.
+		m.turn.lastEsc = now
 		if double || m.ed.Empty() {
 			return m.cancelTurn(), true
 		}
 		return nil, true
 	}
 	// Idle: closing a picker or a selection is Task 8's, and until then Esc is the
-	// editor's own.
+	// editor's own. It arms nothing, or a turn that starts by itself (the queue draining
+	// into a new turn) would read the next Esc as a double press and cancel it.
 	return nil, false
 }
 
@@ -233,14 +287,7 @@ func (m *Model) submit() tea.Cmd {
 	if m.turn.steering() {
 		return m.submitText(text, session.SourceSteer)
 	}
-	if name, args, ok := commandIn(text); ok {
-		return m.call(protocol.MethodCommandRun, protocol.CommandRunParams{
-			SessionID: m.session.SessionID,
-			Name:      name,
-			Args:      args,
-		})
-	}
-	return m.submitText(text, session.SourceTyped)
+	return m.sendTyped(text)
 }
 
 // submitText sends one message as a turn's content.

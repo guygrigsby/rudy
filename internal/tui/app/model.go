@@ -310,7 +310,8 @@ func (m *Model) decode(n protocol.Notification, v any) bool {
 // A model change the registry snapshot cannot explain returns the command that refreshes
 // it.
 func (m *Model) entry(e session.Entry) tea.Cmd {
-	m.tr.Apply(e)
+	added := m.tr.Apply(e)
+	var cmd tea.Cmd
 	switch p := e.Payload.(type) {
 	case session.AssistantMessage:
 		m.usage = m.usage.Add(p.Usage)
@@ -320,7 +321,7 @@ func (m *Model) entry(e session.Entry) tea.Cmd {
 		// the row standing in its place goes.
 		m.answered(p.ToolUseID)
 	case session.ModelChange:
-		return m.setModel(p.Model)
+		cmd = m.setModel(p.Model)
 	case session.ModeChange:
 		m.session.Mode = p.Mode
 	case session.ThinkingChange:
@@ -328,7 +329,9 @@ func (m *Model) entry(e session.Entry) tea.Cmd {
 	case session.TitleChange:
 		m.session.Title = p.Title
 	}
-	return nil
+	// An entry can land after its turn has already been committed to scrollback, and the
+	// row it made would stand in the live region for the rest of the session.
+	return tea.Batch(cmd, m.lateRows(added))
 }
 
 // callResult folds one server answer in. A call whose answer says nothing this model
@@ -337,10 +340,19 @@ func (m *Model) entry(e session.Entry) tea.Cmd {
 // methods beside these.
 func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 	if r.Err != nil {
+		if r.Method == protocol.MethodSessionAnswer {
+			// The question came down when the answer went out and the server never got
+			// it: put it back rather than leave the turn waiting on a decision with
+			// nothing on screen to make it with.
+			m.reask()
+		}
 		m.note(levelError, r.Method+": "+r.Err.Error())
 		return nil
 	}
 	switch r.Method {
+	case protocol.MethodSessionAnswer:
+		// The server has the decision; nothing is left to put back.
+		m.turn.asked = nil
 	case protocol.MethodRegistryList:
 		var res protocol.RegistryListResult
 		if !m.result(r, &res) {
@@ -411,6 +423,11 @@ func (m *Model) setWidget(w protocol.Widget) {
 	m.widgets = append(m.widgets, w)
 }
 
+// inline reports whether the client draws inline, in the terminal's own scrollback, which
+// is what makes a rested turn's rows commit and leave the live region. The other mode is
+// altscreen, which owns the screen and keeps every row.
+func (m *Model) inline() bool { return m.cfg.UI.Render != renderAltscreen }
+
 // resize takes the terminal's size. The transcript and the editor rewrap to it; the
 // viewport's height is settled while composing, once the other slots have taken theirs.
 func (m *Model) resize(w, h int) {
@@ -446,6 +463,11 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 		case keys.TUIInputSubmit:
 			return m.submit()
 		case keys.AppMessageFollowUp:
+			// A follow-up with nothing to follow is just a message: at rest there is no
+			// turn to queue behind, and a queue nothing draws would swallow the draft.
+			if m.turn.resting() {
+				return m.submit()
+			}
 			m.ed.Enqueue()
 			return nil
 		case keys.AppMessageDequeue:
@@ -497,7 +519,7 @@ func (m *Model) expandNewestTool() bool {
 // landed in scrollback, which this client does not own.
 func (m *Model) click(y int) {
 	lines, rowAt := m.compose()
-	if m.cfg.UI.Render != renderAltscreen {
+	if m.inline() {
 		y -= m.height - len(lines)
 		if y < 0 {
 			return
@@ -513,7 +535,7 @@ func (m *Model) click(y int) {
 // wheel scrolls the transcript. Only altscreen has a viewport to scroll: inline rendering
 // lives in the terminal's own scrollback, which the terminal scrolls itself.
 func (m *Model) wheel(b tea.MouseButton) {
-	if m.cfg.UI.Render != renderAltscreen {
+	if m.inline() {
 		return
 	}
 	switch b {
@@ -529,7 +551,7 @@ func (m *Model) wheel(b tea.MouseButton) {
 func (m *Model) View() tea.View {
 	lines, _ := m.compose()
 	v := tea.NewView(strings.Join(lines, "\n"))
-	v.AltScreen = m.cfg.UI.Render == renderAltscreen
+	v.AltScreen = !m.inline()
 	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
@@ -600,7 +622,7 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 	laid := m.tr.Layout()
 	notices := m.noticeLines()
-	if m.cfg.UI.Render != renderAltscreen {
+	if m.inline() {
 		// The live region is what the frame has left once the other slots have taken
 		// theirs. A turn that outgrew it keeps its newest lines: the oldest have already
 		// been read, and the editor and the status line must stay on screen.

@@ -1,11 +1,17 @@
 package app
 
 import (
+	"encoding/json"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/guygrigsby/rudy/internal/config"
+	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
@@ -94,6 +100,147 @@ func TestDoubleEscWithinWindowCancels(t *testing.T) {
 	if got := h.editor().Text(); got != "second thoughts" {
 		t.Errorf("the draft survives the cancel, got %q", got)
 	}
+}
+
+// TestDoubleEscWhileRunningCancels pins the running row of the TurnControl table against
+// a server that only records what it was asked: the second Esc inside the window must send
+// cancel rather than a second steer, and must put the queue back where it can be edited.
+// Nothing here waits on a turn, so nothing here can race one.
+func TestDoubleEscWhileRunningCancels(t *testing.T) {
+	h := newHarness(t, nil)
+	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{
+		SessionID: h.m.session.SessionID, TurnID: session.NewID().String(), State: stateStreaming,
+	})
+	h.typeText("queued")
+	runCmd(t, h.press("alt+enter")) // a running turn queues the follow-up
+	if len(h.m.ed.Queue()) != 1 || !h.m.ed.Empty() {
+		t.Fatalf("queued: draft %q queue %q", h.m.ed.Text(), h.m.ed.Queue())
+	}
+	runCmd(t, h.press("escape")) // insert to normal, the editor's
+	runCmd(t, h.press("escape")) // running: steer
+	runCmd(t, h.press("escape")) // running, inside the window: cancel
+	want := []session.Interrupt{session.InterruptSteer, session.InterruptCancel}
+	if got := h.interrupts(); !slices.Equal(got, want) {
+		t.Fatalf("interrupts %v want %v", got, want)
+	}
+	if got := h.m.ed.Text(); got != "queued" {
+		t.Errorf("the cancelled turn's queue comes back as a draft, got %q", got)
+	}
+	if q := h.m.ed.Queue(); len(q) != 0 {
+		t.Errorf("the queue is emptied into the draft: %q", q)
+	}
+}
+
+// TestAnIdleEscArmsNothing is the other half of the window rule: an Esc the table did not
+// act on must not make the next one a double press, or a turn that starts by itself (the
+// queue draining) would be cancelled by the Esc that was meant to steer it.
+func TestAnIdleEscArmsNothing(t *testing.T) {
+	h := newHarness(t, nil)
+	runCmd(t, h.press("escape")) // insert to normal, the editor's
+	runCmd(t, h.press("escape")) // idle: nothing to interrupt
+	if got := h.interrupts(); len(got) != 0 {
+		t.Fatalf("an idle escape interrupts nothing, sent %v", got)
+	}
+	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{
+		SessionID: h.m.session.SessionID, TurnID: session.NewID().String(), State: stateStreaming,
+	})
+	runCmd(t, h.press("escape")) // the first Esc of a running turn: steer
+	want := []session.Interrupt{session.InterruptSteer}
+	if got := h.interrupts(); !slices.Equal(got, want) {
+		t.Fatalf("interrupts %v want %v", got, want)
+	}
+}
+
+func TestAFailedAnswerPutsTheQuestionBack(t *testing.T) {
+	h := newHarness(t, nil)
+	h.notify(protocol.NotifyPermissionRequested, protocol.PermissionRequested{
+		SessionID: h.m.session.SessionID, TurnID: session.NewID().String(), ToolUseID: "t1",
+		Tool: "bash", Input: json.RawMessage(`{"command":"go test ./..."}`),
+		Matcher: session.Matcher{Tool: "bash", Prefix: "go test"},
+	})
+	runCmd(t, h.press("y"))
+	if strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
+		t.Fatalf("the question comes down when the answer goes out:\n%s", h.view())
+	}
+	h.update(CallResultMsg{Method: protocol.MethodSessionAnswer, Err: errors.New("boom")})
+	if !strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
+		t.Errorf("an answer that never reached the server puts the question back:\n%s", h.view())
+	}
+	if h.m.turn.prompt == nil {
+		t.Error("and the keyboard answers it again")
+	}
+	if !strings.Contains(ansi.Strip(h.view()), "session.answer: boom") {
+		t.Errorf("the failure is a notice too:\n%s", h.view())
+	}
+	// The decision arriving anyway is what takes it down for good.
+	h.appended(session.PermissionDecision{
+		ToolUseID: "t1", Tool: "bash", Mode: session.ModeStrict,
+		Matcher:  session.Matcher{Tool: "bash", Prefix: "go test"},
+		Decision: session.Allow, DecidedBy: session.ByAsker, Scope: session.ScopeOnce, Reason: "asker",
+	})
+	h.update(CallResultMsg{Method: protocol.MethodSessionAnswer, Err: errors.New("late")})
+	if strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
+		t.Errorf("a decided question does not come back:\n%s", h.view())
+	}
+}
+
+func TestALateRowCommitsAtOnce(t *testing.T) {
+	h := newAppHarness(t, scripted{text("done")})
+	h.typeText("go")
+	h.press("enter")
+	h.waitTurn(stateCompleted)
+	h.waitPrinted("› go")
+	// A note appended between turns carries the turn that has just gone to scrollback.
+	h.typeText("/note the tests are green")
+	h.press("enter")
+	h.waitPrinted("the tests are green")
+	if strings.Contains(h.view(), "the tests are green") {
+		t.Errorf("a late row must leave the live region:\n%s", h.view())
+	}
+	if rows := h.m.tr.Rows(); len(rows) != 0 {
+		t.Errorf("nothing is left on screen: %+v", rows)
+	}
+}
+
+func TestALateRowStaysInAltscreen(t *testing.T) {
+	h := newAppHarnessWith(t, scripted{text("done")}, func(c *config.Config) {
+		c.UI.Render = renderAltscreen
+	})
+	h.typeText("go")
+	h.press("enter")
+	h.waitTurn(stateCompleted)
+	h.typeText("/note the tests are green")
+	h.press("enter")
+	h.waitFor("the note", func(v string) bool { return strings.Contains(v, "the tests are green") })
+	if got := h.printed(); got != "" {
+		t.Errorf("altscreen commits nothing to scrollback, printed %q", got)
+	}
+}
+
+func TestAQueuedSlashRunsAsACommand(t *testing.T) {
+	h := newAppHarness(t, scripted{slowText("one", 300*time.Millisecond), text("two")})
+	h.typeText("first")
+	h.press("enter")
+	h.waitTurn(stateStreaming)
+	h.typeText("/notice from the queue")
+	h.press("alt+enter")
+	if len(h.editor().Queue()) != 1 {
+		t.Fatalf("queued %q", h.editor().Queue())
+	}
+	h.waitFor("the queued command running", func(v string) bool {
+		return strings.Contains(v, "noticed: from the queue")
+	})
+}
+
+func TestFollowUpAtRestSubmits(t *testing.T) {
+	h := newAppHarness(t, scripted{text("done")})
+	h.typeText("go")
+	h.press("alt+enter") // nothing is running, so there is nothing to queue behind
+	if q := h.editor().Queue(); len(q) != 0 {
+		t.Fatalf("a follow-up at rest is a submit, not a queue: %q", q)
+	}
+	h.waitTurn(stateCompleted)
+	h.waitPrinted("› go")
 }
 
 func TestQueueSubmitsWhenTheTurnRests(t *testing.T) {

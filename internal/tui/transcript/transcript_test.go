@@ -226,6 +226,32 @@ func TestASteerMessageStaysInTheTurnItContinues(t *testing.T) {
 	}
 }
 
+func TestCommitLateTakesRowsOfACommittedTurn(t *testing.T) {
+	tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2, UserPrefix: "›", BlockGap: 1}, theme.Default())
+	u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+	tr.Apply(u)
+	tr.Apply(entry(t, session.AssistantMessage{Model: ref, Thinking: session.ThinkingOff, StopReason: session.StopEndTurn, Content: []session.Block{session.TextBlock("Done.")}}))
+	if tr.CommitLate() != nil {
+		t.Fatal("a turn still on screen has nothing late about it")
+	}
+	tr.Commit(u.ID.String())
+	// A note appended between turns carries the turn that has just been committed.
+	tr.Apply(entry(t, session.Note{Plugin: "memory", Text: "remembered something", Role: session.NoteInfo}))
+	if rows := tr.Rows(); len(rows) != 1 {
+		t.Fatalf("the note is on screen first: %+v", rows)
+	}
+	late := ansi.Strip(strings.Join(tr.CommitLate(), "\n"))
+	if !strings.Contains(late, "remembered something") {
+		t.Errorf("late lines %q", late)
+	}
+	if rows := tr.Rows(); len(rows) != 0 {
+		t.Errorf("and leaves the live region: %+v", rows)
+	}
+	if tr.CommitLate() != nil {
+		t.Error("nothing is committed twice")
+	}
+}
+
 func TestToggleExpandsOnlyToolRows(t *testing.T) {
 	tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2}, theme.Default())
 	u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})

@@ -38,6 +38,10 @@ type Transcript struct {
 	// for a message that commits a live row, so the committed rows land in the turn the
 	// stream said they were in.
 	liveTurn string
+	// committed are the turns Commit has already taken off screen. A row that arrives
+	// after its turn was committed (a note appended between turns) is one nothing would
+	// ever print otherwise, and this is what lets a client recognize it.
+	committed map[string]bool
 	// md is the glamour renderer for the current width, built on first use and dropped
 	// by SetWidth.
 	md mdCache
@@ -45,7 +49,7 @@ type Transcript struct {
 
 // New opens an empty transcript.
 func New(o Options, th theme.Theme) *Transcript {
-	return &Transcript{opts: o, th: th, byKey: make(map[string]*Row)}
+	return &Transcript{opts: o, th: th, byKey: make(map[string]*Row), committed: make(map[string]bool)}
 }
 
 // Rows are the transcript's rows, in order. The Row pointers are the transcript's own:
@@ -341,8 +345,11 @@ func (t *Transcript) layout(rows []*Row) []Line {
 }
 
 // Commit renders the rows of turnID in order, removes them and returns the lines, for
-// the client to print above the live region. An unknown turn returns nil.
+// the client to print above the live region. An unknown turn returns nil. The turn is
+// remembered as committed either way: what says a later row is late is that its turn has
+// already gone, whether or not it had rows of its own at the time.
 func (t *Transcript) Commit(turnID string) []string {
+	t.committed[turnID] = true
 	kept := make([]*Row, 0, len(t.rows))
 	going := make([]*Row, 0, len(t.rows))
 	for _, r := range t.rows {
@@ -370,6 +377,26 @@ func (t *Transcript) Commit(turnID string) []string {
 		t.liveTurn = ""
 	}
 	return lines
+}
+
+// CommitLate is Commit for the rows of turns that have already been committed: an entry
+// that arrives after its turn went to scrollback, a note appended between turns, a result
+// for a tool_use whose row has gone. They are committed in the order they stand in, so
+// they reach scrollback behind the turn they belong to rather than sitting in the live
+// region for the rest of the session. Nothing to commit returns nil, which is every call
+// while a turn is still on screen.
+func (t *Transcript) CommitLate() []string {
+	var late []string
+	for _, r := range t.rows {
+		if t.committed[r.TurnID] && !slices.Contains(late, r.TurnID) {
+			late = append(late, r.TurnID)
+		}
+	}
+	var out []string
+	for _, id := range late {
+		out = append(out, t.Commit(id)...)
+	}
+	return out
 }
 
 // gap is the blank lines between two adjacent rows. The design puts one blank line

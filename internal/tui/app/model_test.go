@@ -78,19 +78,29 @@ func testConfig(t *testing.T, over map[string]any) *config.Config {
 }
 
 // harness drives one Model over a real protocol.Client whose server side is the test: it
-// pushes notifications in and hands whatever the pump reads to Update.
+// pushes notifications in, hands whatever the pump reads to Update, and records every
+// request the client made, so a test can see what the model asked the server to do
+// without a real server's timing in the way.
 type harness struct {
 	t   *testing.T
 	m   *Model
 	srv protocol.Conn
 	cl  *protocol.Client
+
+	mu   sync.Mutex
+	reqs []recorded
+}
+
+// recorded is one request the client made, as the server side saw it.
+type recorded struct {
+	Method string
+	Params json.RawMessage
 }
 
 func newHarness(t *testing.T, over map[string]any) *harness {
 	t.Helper()
 	cc, sc := protocol.Pipe()
 	cl := protocol.NewClient(cc)
-	go answerEmpty(sc)
 	t.Cleanup(func() { _ = cl.Close(); _ = sc.Close() })
 	m := New(Options{
 		Config: testConfig(t, over),
@@ -110,13 +120,14 @@ func newHarness(t *testing.T, over map[string]any) *harness {
 		Workspace: "rudy main*",
 	})
 	h := &harness{t: t, m: m, srv: sc, cl: cl}
+	go h.answerEmpty(sc)
 	h.update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return h
 }
 
-// answerEmpty is the server side of the pipe: every request gets an empty result, so a
-// call made as a command finishes instead of hanging.
-func answerEmpty(conn protocol.Conn) {
+// answerEmpty is the server side of the pipe: every request is recorded and gets an empty
+// result, so a call made as a command finishes instead of hanging.
+func (h *harness) answerEmpty(conn protocol.Conn) {
 	ctx := context.Background()
 	for {
 		raw, err := conn.Recv(ctx)
@@ -124,11 +135,16 @@ func answerEmpty(conn protocol.Conn) {
 			return
 		}
 		var in struct {
-			ID json.RawMessage `json:"id"`
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
 		}
 		if err := json.Unmarshal(raw, &in); err != nil || len(in.ID) == 0 {
 			continue
 		}
+		h.mu.Lock()
+		h.reqs = append(h.reqs, recorded{Method: in.Method, Params: in.Params})
+		h.mu.Unlock()
 		resp, err := protocol.NewResponse(in.ID, nil)
 		if err != nil {
 			return
@@ -137,6 +153,25 @@ func answerEmpty(conn protocol.Conn) {
 			return
 		}
 	}
+}
+
+// interrupts are the how of every session.interrupt the client has made, in order.
+func (h *harness) interrupts() []session.Interrupt {
+	h.t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []session.Interrupt
+	for _, r := range h.reqs {
+		if r.Method != protocol.MethodSessionInterrupt {
+			continue
+		}
+		var p protocol.SessionInterruptParams
+		if err := json.Unmarshal(r.Params, &p); err != nil {
+			h.t.Fatalf("session.interrupt params: %v", err)
+		}
+		out = append(out, p.How)
+	}
+	return out
 }
 
 func (h *harness) update(msg tea.Msg) tea.Cmd {
@@ -783,8 +818,9 @@ func (p *fakeProvider) Complete(ctx context.Context, _ provider.Request, emit fu
 }
 
 // fakePlugin registers everything a turn in these tests can reach: the scripted provider,
-// one unsafe tool and one safe one (so a test chooses whether the gate asks), and two
-// commands, one that answers with a notice and one that submits a prompt.
+// one unsafe tool and one safe one (so a test chooses whether the gate asks), and three
+// commands, one that answers with a notice, one that submits a prompt and one that
+// appends a note.
 type fakePlugin struct{ provider *fakeProvider }
 
 func (fakePlugin) Name() string { return "fake" }
@@ -807,10 +843,23 @@ func (f fakePlugin) Init(_ context.Context, h plugin.Host) error {
 	}); err != nil {
 		return err
 	}
-	return h.RegisterCommand(plugin.Command{
+	if err := h.RegisterCommand(plugin.Command{
 		Name: "ask", Description: "submit a prompt",
 		Run: func(_ context.Context, call plugin.CommandCall) (plugin.Action, error) {
 			return plugin.SubmitPrompt{Text: call.Args}, nil
+		},
+	}); err != nil {
+		return err
+	}
+	// A note is how an entry lands between turns, with no turn of its own: the row it
+	// makes belongs to the turn that has already been committed.
+	return h.RegisterCommand(plugin.Command{
+		Name: "note", Description: "append a note",
+		Run: func(_ context.Context, call plugin.CommandCall) (plugin.Action, error) {
+			if err := h.Note(call.SessionID, call.Args, session.NoteInfo); err != nil {
+				return nil, err
+			}
+			return plugin.NoAction{}, nil
 		},
 	})
 }
