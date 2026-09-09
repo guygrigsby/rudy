@@ -42,36 +42,49 @@ type lockFile struct {
 // at Root/plugins/<name>, the lock at Root/plugins.lock.toml.
 type Store struct{ Root string }
 
-// New is a Store over root, normally $XDG_DATA_HOME/rudy. Any install or update stage a
-// prior process crashed before cleaning up (Root/plugins/.install-* or .update-*) is swept
-// immediately: a stage is scratch space claimed nowhere else, so leaving it once found would
-// only let it accumulate forever.
-func New(root string) *Store {
-	s := &Store{Root: root}
-	s.sweepStages()
-	return s
-}
+// New is a Store over root, normally $XDG_DATA_HOME/rudy. New does no filesystem clean-up
+// itself: it runs on every session boot, through DisabledFromLock, and a session starting
+// while another terminal's rudy plugin install is mid-clone must not go anywhere near that
+// terminal's stage. See sweepStaleStages for where stale stages actually get removed.
+func New(root string) *Store { return &Store{Root: root} }
 
 func (s *Store) lockPath() string               { return filepath.Join(s.Root, LockFile) }
 func (s *Store) pluginsDir() string             { return filepath.Join(s.Root, "plugins") }
 func (s *Store) checkoutDir(name string) string { return filepath.Join(s.pluginsDir(), name) }
 
-// sweepStages removes every leftover .install-* and .update-* directory under
-// Root/plugins. A missing plugins directory means nothing has ever been installed, not
-// something to sweep; any other read failure is left for the next real operation to report,
-// since sweeping is best-effort clean-up, not the thing New's caller is asking for.
-func (s *Store) sweepStages() {
+// staleStageAge is how old an .install-* or .update-* directory under Root/plugins has to be
+// before Install or Update will remove it as abandoned rather than leave it alone as
+// possibly still in use. An hour is generous next to how long even a large --depth 1 clone
+// takes, and every write inside an active stage (git writing objects, os.CopyFS writing
+// files) bumps the stage directory's own mtime, so a clone that is still actually making
+// progress never ages past this no matter how long it runs.
+const staleStageAge = time.Hour
+
+// sweepStaleStages removes every .install-* and .update-* directory under Root/plugins whose
+// modification time is older than staleStageAge. Called from Install and Update, never from
+// New or DisabledFromLock: those run on every session boot and every rudy plugin list, and
+// neither is the moment to go deleting another process's in-progress work. A missing plugins
+// directory means nothing has ever been installed, not something to sweep; any other read
+// failure is left for the caller's real operation to report, since sweeping is best-effort
+// clean-up, not the thing being asked for.
+func (s *Store) sweepStaleStages() {
 	ents, err := os.ReadDir(s.pluginsDir())
 	if err != nil {
 		return
 	}
+	cutoff := time.Now().Add(-staleStageAge)
 	for _, e := range ents {
 		if !e.IsDir() {
 			continue
 		}
-		if strings.HasPrefix(e.Name(), ".install-") || strings.HasPrefix(e.Name(), ".update-") {
-			_ = os.RemoveAll(filepath.Join(s.pluginsDir(), e.Name()))
+		if !strings.HasPrefix(e.Name(), ".install-") && !strings.HasPrefix(e.Name(), ".update-") {
+			continue
 		}
+		info, err := e.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(s.pluginsDir(), e.Name()))
 	}
 }
 
@@ -179,6 +192,19 @@ func DisabledFromLock(path string) ([]string, error) {
 // same message rudy plugin's CLI commands surface for an unknown name.
 func notInstalled(name string) error { return fmt.Errorf("no plugin named %s", name) }
 
+// validateName refuses an operator-supplied name before it is used to look anything up in
+// the lock or touch a path under Root/plugins (Uninstall's os.RemoveAll, SetEnabled and
+// Update's checkoutDir(name)). plugin.ValidateManifestName is the same rule ReadManifest
+// holds every plugin.toml's own name to; a name is not trustworthy just because it was typed
+// on a command line rather than read out of a file. Install never needs this itself: its
+// name always comes from a manifest ReadManifest has already validated.
+func validateName(name string) error {
+	if err := plugin.ValidateManifestName(name); err != nil {
+		return fmt.Errorf("pluginstore: %w", err)
+	}
+	return nil
+}
+
 // Install stages source under Root/plugins/.install-*, reads its manifest, and on success
 // renames the stage to Root/plugins/<name>, name being the manifest's own name rather than
 // the stage's random one. Every error path removes the stage: a failed install leaves no
@@ -191,6 +217,7 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 	if err := os.MkdirAll(s.pluginsDir(), 0o700); err != nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
 	}
+	s.sweepStaleStages()
 	stage, err := os.MkdirTemp(s.pluginsDir(), ".install-*")
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
@@ -258,6 +285,9 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 
 // Uninstall removes a plugin's checkout and its lock entry.
 func (s *Store) Uninstall(name string) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
 	locked, err := s.Read()
 	if err != nil {
 		return err
@@ -274,6 +304,9 @@ func (s *Store) Uninstall(name string) error {
 
 // SetEnabled flips a plugin's enabled flag in the lock.
 func (s *Store) SetEnabled(name string, on bool) error {
+	if err := validateName(name); err != nil {
+		return err
+	}
 	locked, err := s.Read()
 	if err != nil {
 		return err
@@ -291,6 +324,10 @@ func (s *Store) SetEnabled(name string, on bool) error {
 // hard-resets to the remote's default branch, a path-copied plugin is removed and re-copied
 // from its original source through a stage, the same way Install lands a fresh copy.
 func (s *Store) Update(ctx context.Context, name string, now time.Time) (Installed, error) {
+	if err := validateName(name); err != nil {
+		return Installed{}, err
+	}
+	s.sweepStaleStages()
 	locked, err := s.Read()
 	if err != nil {
 		return Installed{}, err
@@ -352,18 +389,31 @@ func (s *Store) recopy(source, dir string) error {
 	return nil
 }
 
-// sourceSchemeRe matches an explicit URL scheme (https://, git://, ssh://, file://, ...);
-// sourceSCPRe matches the scp-like shorthand git itself accepts (user@host:path, with no
-// scheme). Either means source names a remote endpoint, not a filesystem path.
-var (
-	sourceSchemeRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)
-	sourceSCPRe    = regexp.MustCompile(`^[^@/\s]+@[^:/\s]+:`)
-)
+// sourceSchemeRe matches an explicit URL scheme (https://, git://, ssh://, file://, ...).
+var sourceSchemeRe = regexp.MustCompile(`(?i)^[a-z][a-z0-9+.-]*://`)
 
 // isRemoteSource reports whether source names a remote git endpoint rather than a
-// filesystem path.
+// filesystem path, mirroring git's own transport detection. An explicit scheme:// is always
+// remote. Otherwise, a ":" appearing before source's first "/" (or with no "/" at all) is
+// git's scp-like shorthand, with or without a "user@" (build.example.com:team/plugin.git is
+// as valid to git as git@build.example.com:team/plugin.git); that shorthand is remote unless
+// source is in fact an existing local path, since a filename with a colon in it is legal,
+// if rare, and a real directory on disk beats the shorthand's guess.
 func isRemoteSource(source string) bool {
-	return sourceSchemeRe.MatchString(source) || sourceSCPRe.MatchString(source)
+	if sourceSchemeRe.MatchString(source) {
+		return true
+	}
+	colon := strings.IndexByte(source, ':')
+	if colon < 0 {
+		return false
+	}
+	if slash := strings.IndexByte(source, '/'); slash >= 0 && slash < colon {
+		return false
+	}
+	if _, err := os.Stat(source); err == nil {
+		return false
+	}
+	return true
 }
 
 // resolveSource is what Install records as Installed.Source. A remote endpoint is recorded

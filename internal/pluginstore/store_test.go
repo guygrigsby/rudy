@@ -534,35 +534,8 @@ func TestInstallRecordsARelativePathSourceAsAbsolute(t *testing.T) {
 	}
 }
 
-// TestNewSweepsStaleInstallAndUpdateStages covers fix round 1 finding 3: a stage a crashed
-// process never cleaned up must not accumulate forever.
-func TestNewSweepsStaleInstallAndUpdateStages(t *testing.T) {
-	root := t.TempDir()
-	pluginsDir := filepath.Join(root, "plugins")
-	stale1 := filepath.Join(pluginsDir, ".install-abc123")
-	stale2 := filepath.Join(pluginsDir, ".update-xyz789")
-	kept := filepath.Join(pluginsDir, "hello")
-	for _, d := range []string{stale1, stale2, kept} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	New(root)
-
-	if _, err := os.Stat(stale1); !os.IsNotExist(err) {
-		t.Fatalf(".install- stage stat = %v, want swept", err)
-	}
-	if _, err := os.Stat(stale2); !os.IsNotExist(err) {
-		t.Fatalf(".update- stage stat = %v, want swept", err)
-	}
-	if _, err := os.Stat(kept); err != nil {
-		t.Fatalf("real checkout was swept: %v", err)
-	}
-}
-
-// TestNewToleratesAMissingPluginsDirectory covers the common case the sweep must not
-// disturb: a fresh XDG data root with nothing installed yet.
+// TestNewToleratesAMissingPluginsDirectory covers the common case a fresh XDG data root: no
+// plugins directory yet, and New must not create one or error.
 func TestNewToleratesAMissingPluginsDirectory(t *testing.T) {
 	root := t.TempDir()
 	s := New(root)
@@ -571,5 +544,137 @@ func TestNewToleratesAMissingPluginsDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "plugins")); !os.IsNotExist(err) {
 		t.Fatalf("plugins dir stat = %v, want still not exist", err)
+	}
+}
+
+// TestNewLeavesAFreshStageAlone covers fix round 2 finding 1: New must never sweep a stage,
+// since it runs on every session boot (through DisabledFromLock) and a session starting
+// while another terminal's rudy plugin install is mid-clone must not touch that terminal's
+// stage. Sweeping moved to Install and Update, and is age-gated there; see
+// TestInstallSweepsAStaleStageButLeavesAFreshOne.
+func TestNewLeavesAFreshStageAlone(t *testing.T) {
+	root := t.TempDir()
+	stage := filepath.Join(root, "plugins", ".install-inprogress")
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	New(root)
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatalf("New touched a live stage: %v", err)
+	}
+}
+
+// TestDisabledFromLockLeavesAFreshStageAlone covers the same finding for the other path that
+// reaches New on every session boot, through wire's discoverPlugins.
+func TestDisabledFromLockLeavesAFreshStageAlone(t *testing.T) {
+	root := t.TempDir()
+	stage := filepath.Join(root, "plugins", ".install-inprogress")
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DisabledFromLock(filepath.Join(root, LockFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatalf("DisabledFromLock touched a live stage: %v", err)
+	}
+}
+
+// TestInstallSweepsAStaleStageButLeavesAFreshOne covers the age gate itself: Install removes
+// a leftover stage only once it is older than staleStageAge (backdated here with
+// os.Chtimes, the way a real crash would leave one after an hour passes), and leaves a stage
+// that could still be an in-progress install or update alone.
+func TestInstallSweepsAStaleStageButLeavesAFreshOne(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, helloManifest)
+	root := t.TempDir()
+	pluginsDir := filepath.Join(root, "plugins")
+	stale := filepath.Join(pluginsDir, ".install-stale")
+	fresh := filepath.Join(pluginsDir, ".update-fresh")
+	for _, d := range []string{stale, fresh} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-staleStageAge - time.Minute)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(root)
+	if _, _, err := s.Install(context.Background(), src, time.Now()); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale stage stat = %v, want swept", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Fatalf("fresh stage was swept: %v", err)
+	}
+}
+
+// TestIsRemoteSourceHostOnlySCPForm covers fix round 2 finding 2: git's scp-like shorthand
+// works with or without a "user@", and isRemoteSource has to recognize both.
+func TestIsRemoteSourceHostOnlySCPForm(t *testing.T) {
+	if isRemoteSource("./rel") {
+		t.Fatal(`"./rel" classified as remote`)
+	}
+	if !isRemoteSource("build.example.com:team/plugin.git") {
+		t.Fatal("host-only scp form not classified as remote")
+	}
+	if !isRemoteSource("git@build.example.com:team/plugin.git") {
+		t.Fatal("user@host scp form not classified as remote")
+	}
+}
+
+// TestResolveSourcePassesHostOnlySCPFormThrough is the same finding at the level Install
+// actually calls: a host-only scp source must reach the lock untouched, not mangled through
+// filepath.Abs as if it were a relative filesystem path.
+func TestResolveSourcePassesHostOnlySCPFormThrough(t *testing.T) {
+	const source = "build.example.com:team/plugin.git"
+	got, err := resolveSource(source)
+	if err != nil {
+		t.Fatalf("resolveSource: %v", err)
+	}
+	if got != source {
+		t.Fatalf("resolveSource(%q) = %q, want it untouched", source, got)
+	}
+}
+
+// TestResolveSourceStillResolvesALocalRelativePath guards against isRemoteSource's new
+// colon-before-slash rule swallowing an ordinary local path.
+func TestResolveSourceStillResolvesALocalRelativePath(t *testing.T) {
+	dir := t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(filepath.Dir(dir)); err != nil {
+		t.Fatal(err)
+	}
+	rel := "./" + filepath.Base(dir)
+	want, err := filepath.Abs(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveSource(rel)
+	if err != nil {
+		t.Fatalf("resolveSource: %v", err)
+	}
+	if got != want {
+		t.Fatalf("resolveSource(%q) = %q, want %q", rel, got, want)
+	}
+}
+
+// TestUninstallRefusesAnUnsafeName covers fix round 2 finding 3: Uninstall, SetEnabled and
+// Update all validate name with plugin.ValidateManifestName before touching the lock or the
+// checkout directory. One covering test, per the ruling; the other two verbs share the exact
+// same validateName call.
+func TestUninstallRefusesAnUnsafeName(t *testing.T) {
+	s := New(t.TempDir())
+	err := s.Uninstall("../x")
+	if err == nil || !strings.Contains(err.Error(), "must match") {
+		t.Fatalf("err = %v, want the manifest name rule's error", err)
 	}
 }

@@ -46,15 +46,29 @@ const ManifestFile = "plugin.toml"
 // merely cosmetic: a name that fails this cannot walk the checkout outside Root/plugins.
 var manifestNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
+// ValidateManifestName is the one rule every plugin name has to hold to, wherever it arrives
+// from: non-empty, matching manifestNameRe, and equal to its own filepath.Base (implied by
+// the regexp, which already excludes "/" and ".", but cheap and it says directly what the
+// check is for). ReadManifest runs it on a freshly parsed plugin.toml; pluginstore runs it
+// again on a bare name an operator typed (rudy plugin uninstall/enable/disable/update
+// <name>) before that name ever reaches a lock lookup or a Root/plugins/<name> path, since a
+// name is not trustworthy just because ReadManifest once accepted it for some other
+// checkout.
+func ValidateManifestName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is empty")
+	}
+	if !manifestNameRe.MatchString(name) || name != filepath.Base(name) {
+		return fmt.Errorf("name %q must match %s", name, manifestNameRe.String())
+	}
+	return nil
+}
+
 // ReadManifest reads dir/plugin.toml. A manifest with no name or no command is refused: both
-// are what the server needs before it can run anything. The name is further refused unless
-// it matches manifestNameRe and equals its own filepath.Base: the second condition is
-// implied by the first (the regexp already excludes "/" and "."), but it is cheap and it
-// says directly what the check is for, which is what a future edit to the regexp would
-// otherwise have to rediscover by reasoning about it. Both rudy's own Discover, which also
+// are what the server needs before it can run anything. Both rudy's own Discover, which also
 // checks the name against the directory it was found in, and rudy plugin Install, whose
-// stage directory's name is a random temp name and never checked against the manifest,
-// share this one validation.
+// stage directory's name is a random temp name and never checked against the manifest, go
+// through this to validate the name.
 func ReadManifest(dir string) (Manifest, error) {
 	path := filepath.Join(dir, ManifestFile)
 	b, err := os.ReadFile(path)
@@ -65,11 +79,8 @@ func ReadManifest(dir string) (Manifest, error) {
 	if err := toml.Unmarshal(b, &m); err != nil {
 		return Manifest{}, fmt.Errorf("plugin: %s: %w", path, err)
 	}
-	if m.Name == "" {
-		return Manifest{}, fmt.Errorf("plugin: %s: name is empty", path)
-	}
-	if !manifestNameRe.MatchString(m.Name) || m.Name != filepath.Base(m.Name) {
-		return Manifest{}, fmt.Errorf("plugin: %s: name %q must match %s", path, m.Name, manifestNameRe.String())
+	if err := ValidateManifestName(m.Name); err != nil {
+		return Manifest{}, fmt.Errorf("plugin: %s: %w", path, err)
 	}
 	if m.Command == "" {
 		return Manifest{}, fmt.Errorf("plugin: %s: command is empty", path)
