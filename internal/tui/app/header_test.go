@@ -140,10 +140,10 @@ func expandedRows(rows []*transcript.Row) int {
 	return n
 }
 
-// TestTheWordmarkRevealSettlesAndStops walks the animation the way the program does: the
+// TestTheMarkRevealSettlesAndStops walks the animation the way the program does: the
 // first size starts it, each tick advances it, and the last one ends the loop rather than
 // asking for another.
-func TestTheWordmarkRevealSettlesAndStops(t *testing.T) {
+func TestTheMarkRevealSettlesAndStops(t *testing.T) {
 	h := newHarnessWith(t, headerOver(map[string]any{"ui.header.animate": true}), func(o *Options) {
 		o.Now, o.Changelog, o.Version = headerNow, headerChangelog, "0.1.0"
 	})
@@ -168,8 +168,8 @@ func TestTheWordmarkRevealSettlesAndStops(t *testing.T) {
 	if ticks != banner.Frames+1 {
 		t.Errorf("the reveal took %d ticks, want %d", ticks, banner.Frames+1)
 	}
-	if !strings.Contains(ansi.Strip(h.view()), "█") {
-		t.Errorf("and the settled wordmark is drawn:\n%s", ansi.Strip(h.view()))
+	if !strings.Contains(ansi.Strip(h.view()), `( o.o )`) {
+		t.Errorf("and the settled cat is drawn:\n%s", ansi.Strip(h.view()))
 	}
 }
 

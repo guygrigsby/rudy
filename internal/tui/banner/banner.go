@@ -32,7 +32,7 @@ type Options struct {
 	Updates int
 	// Changelog is CHANGELOG.md as the binary carries it.
 	Changelog string
-	// Step is the wordmark's reveal, Settled for the finished word.
+	// Step is the mark's reveal, Settled for the finished picture.
 	Step int
 }
 
@@ -58,14 +58,14 @@ func title(version string) string {
 	return "rudy " + version
 }
 
-// left is the greeting, the wordmark and the session's facts, each centered in its column.
+// left is the greeting, the mark and the session's facts, each centered in its column.
 // The facts are the two a person checks before typing: what is answering, and where.
 func left(o Options, w int) []cell {
 	out := []cell{
 		{text: Greeting(o.Now, o.Name), role: theme.RoleText, center: true},
 		line(),
 	}
-	for _, row := range Wordmark(o.Step) {
+	for _, row := range Mark(o.Step) {
 		out = append(out, cell{text: row, role: theme.RoleAccent, center: true})
 	}
 	out = append(out, line())

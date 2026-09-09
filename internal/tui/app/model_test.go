@@ -461,7 +461,9 @@ func TestWidgetsAndStatusFillTheirSlots(t *testing.T) {
 		return -1
 	}
 	header, hint, skills, status := at("rudy v0"), at("3 memories loaded"), at("12 skills"), at("2 servers")
-	if header >= hint || hint >= skills || skills != status-1 {
+	// The composer's lower rule sits between the below_editor widget and the status line,
+	// which is why skills is two lines above status rather than one (ADR 0017).
+	if header >= hint || hint >= skills || skills != status-2 {
 		t.Fatalf("slot order header %d above %d below %d status %d in\n%s", header, hint, skills, status, strings.Join(lines, "\n"))
 	}
 	if strings.Contains(ansi.Strip(h.view()), "never drawn") {
@@ -478,7 +480,7 @@ func TestWidgetsAndStatusFillTheirSlots(t *testing.T) {
 	// The line it held is gone rather than blanked: the editor now sits against the
 	// status line with nothing between them. Counting the frame would not show it, since
 	// the client draws the whole screen (ADR 0015) however many lines its slots take.
-	if editor, status := at("┃"), at("2 servers"); editor != status-1 {
+	if editor, status := at("┃"), at("2 servers"); editor != status-2 {
 		t.Fatalf("an emptied widget must leave no blank line: editor %d, status %d in\n%s", editor, status, strings.Join(lines, "\n"))
 	}
 	h.notify(protocol.NotifyWidgetUpdated, protocol.Widget{

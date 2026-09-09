@@ -306,9 +306,13 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	if c.UI.Diff.Style != "text" {
 		t.Errorf("diff %+v", c.UI.Diff)
 	}
-	want := []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"}
+	// No "context": the percentage is drawn on the composer's lower rule, once (ADR 0017).
+	want := []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn"}
 	if !reflect.DeepEqual(c.UI.Status.Items, want) {
 		t.Errorf("status %v", c.UI.Status.Items)
+	}
+	if !c.UI.Input.Rules {
+		t.Errorf("input %+v", c.UI.Input)
 	}
 	if c.UI.Notices.Max != 3 {
 		t.Errorf("notices %+v", c.UI.Notices)

@@ -55,7 +55,7 @@ each default to `~/.config`, `~/.local/share` and `~/.cache`, plus `/rudy`.
     rudy sessions resume <session id>     # the same, as a verb
     rudy sessions fork <session id>       # a fork of it, --at <entry id> for where
 
-The client opens on a header: a greeting, the wordmark, this session's model and
+The client opens on a header: a greeting, a cat, this session's model and
 workspace, a tip or two and what the build carries as news. It materializes once,
 any key skips it, and the conversation scrolls it away. `[ui.header]` turns each
 part off.

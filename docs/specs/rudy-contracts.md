@@ -485,9 +485,10 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.transcript.user_prefix` | string | `›` | |
 | `ui.transcript.block_gap` | int | 1 | blank lines between assistant blocks; zero or positive |
 | `ui.diff.style` | `text`, `background` | `text` | |
-| `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"]` | built-in keys plus `plugin:key` for plugin items; `turn` is a spinner and one word (`thinking`, `streaming`, `tool`, `steering`, `waiting`) while a turn runs and nothing at rest |
-| `ui.header.show` | bool | true | the startup header: the greeting, the wordmark, the session facts, the tips and what is new. Drawn once at the top of the transcript and scrolled away by it (ADR 0016) |
-| `ui.header.animate` | bool | true | the wordmark materializes once on startup, then settles. Altscreen only: inline draws the settled header, since an inline frame that grows and shrinks strands its rows |
+| `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "cost", "workspace", "turn"]` | built-in keys plus `plugin:key` for plugin items; `context` is still a legal item and is no longer a default, since the composer's lower rule carries it (ADR 0017); `turn` is a spinner and one word (`thinking`, `streaming`, `tool`, `steering`, `waiting`) while a turn runs and nothing at rest |
+| `ui.input.rules` | bool | true | a rule above the composer and one below it; the lower one carries the context percentage, labelled, and is the only place it is drawn (ADR 0017) |
+| `ui.header.show` | bool | true | the startup header: the greeting, the mark, the session facts, the tips and what is new. Drawn once at the top of the transcript and scrolled away by it (ADR 0016) |
+| `ui.header.animate` | bool | true | the mark materializes once on startup, then settles. Altscreen only: inline draws the settled header, since an inline frame that grows and shrinks strands its rows |
 | `ui.header.name` | string | `` | the name the greeting uses; empty resolves git `user.name`, then the OS user, first token capitalized |
 | `ui.header.tips` | int | 2 | tips drawn in the right column, rotated by the day; `0` draws none |
 | `ui.header.updates` | int | 3 | bullets from the newest `CHANGELOG.md` release the binary was built with; `0` draws none |

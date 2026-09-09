@@ -233,6 +233,9 @@ double_press_ms = 500
 [ui.layout]
 slots = ["transcript", "input", "status"]
 
+[ui.input]
+rules = true
+
 [ui.header]
 show = true
 animate = true
@@ -252,7 +255,7 @@ block_gap = 1
 style = "text"
 
 [ui.status]
-items = ["vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"]
+items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn"]
 
 [ui.notices]
 max = 3
@@ -300,10 +303,10 @@ Assistant text streams as plain text and renders through glamour once its entry
 arrives. Queued follow-ups are held by the client and submitted when the turn
 rests. ADR 0013, ADR 0015.
 
-The client opens on a header: a framed two column box with a greeting, the block
-wordmark, the session's model and workspace on the left, and a tip or two beside
+The client opens on a header: a framed two column box with a greeting, a cat, the session's model and workspace on the left, and a tip or two beside
 what the build carries as news, read from the `CHANGELOG.md` it was compiled
-with. The wordmark materializes once and settles, and any key skips it. The box
+with. The cat materializes once, column by column, and any key skips it. The composer
+sits between two rules, and the lower one carries the context percentage. The box
 is the top of the transcript rather than a slot, so the conversation scrolls it
 away; inline prints it into the terminal's own scrollback instead. Every part is
 a `[ui.header]` field. ADR 0016.

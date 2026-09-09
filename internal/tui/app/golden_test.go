@@ -255,7 +255,7 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 }
 
 // TestGoldenStartupHeader is what a person meets: the framed header at the top of an empty
-// transcript, the greeting, the settled wordmark, the session's facts, the tips and what
+// transcript, the greeting, the settled mark, the session's facts, the tips and what
 // the build carries as news (ADR 0016). The clock, the name and the changelog are fixed
 // here, so what this pins is the layout and not the day it ran.
 func TestGoldenStartupHeader(t *testing.T) {

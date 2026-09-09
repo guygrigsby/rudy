@@ -930,7 +930,7 @@ func (m *Model) resize(w, h int) {
 // A picker takes every key, a question's y, a and n included: it is what the keyboard is
 // pointed at while it stands, and a question it hid is still standing when it closes.
 func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
-	// Somebody typing has stopped watching the wordmark arrive.
+	// Somebody typing has stopped watching the mark arrive.
 	m.settleHeader()
 	if m.pick != nil {
 		return m.pickerKey(k)
@@ -1180,11 +1180,16 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 			if m.pick != nil {
 				editor = m.pickerView()
 			}
+			// The composer's own rules bracket it, outside the plugin widgets so a
+			// widget still sits against the editor it belongs to (ADR 0017).
+			above, below := m.composerRules()
 			blocks = append(blocks,
+				above,
 				m.widgetLines(protocol.SlotAboveEditor),
 				m.menuLines(),
 				editor,
 				m.widgetLines(protocol.SlotBelowEditor),
+				below,
 			)
 		case slotStatus:
 			if s := m.statusLine(); s != "" {

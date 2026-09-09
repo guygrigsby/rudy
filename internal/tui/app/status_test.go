@@ -23,8 +23,9 @@ func TestStatusLineIsTheDesignScreen(t *testing.T) {
 		Usage:   session.Usage{Input: 20000, Output: 1000, CacheRead: 22000},
 	})
 	got := ansi.Strip(h.m.statusLine())
-	// One column in, the gutter the design draws every row and the status line in.
-	want := " INSERT  fake:m1  strict  42%  $0.08  rudy main*"
+	// One column in, the gutter the design draws every row and the status line in. No
+	// context percentage: the composer's lower rule carries it now (ADR 0017).
+	want := " INSERT  fake:m1  strict  $0.08  rudy main*"
 	if got != want {
 		t.Fatalf("status %q want %q", got, want)
 	}

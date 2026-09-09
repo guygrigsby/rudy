@@ -53,6 +53,12 @@ type NoticesConfig struct {
 	Max int `mapstructure:"max"`
 }
 
+// InputConfig is the [ui.input] table. Rules are the two lines that bracket the composer,
+// the lower one carrying the context percentage (ADR 0017).
+type InputConfig struct {
+	Rules bool `mapstructure:"rules"`
+}
+
 // HeaderConfig is the [ui.header] table: the startup header the client draws once at the
 // top of the transcript and lets the conversation scroll away (ADR 0016). Name empty
 // resolves git's user.name and then the OS user.
@@ -77,6 +83,7 @@ type UIConfig struct {
 	Status     StatusConfig      `mapstructure:"status"`
 	Notices    NoticesConfig     `mapstructure:"notices"`
 	Header     HeaderConfig      `mapstructure:"header"`
+	Input      InputConfig       `mapstructure:"input"`
 	Theme      map[string]string `mapstructure:"theme"`
 }
 
@@ -197,6 +204,7 @@ func Defaults() map[string]any {
 		"ui.header.tips":                   2,
 		"ui.header.updates":                3,
 		"ui.header.max_width":              120,
+		"ui.input.rules":                   true,
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,
@@ -205,7 +213,7 @@ func Defaults() map[string]any {
 		"ui.transcript.user_prefix":        "›",
 		"ui.transcript.block_gap":          1,
 		"ui.diff.style":                    "text",
-		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"},
+		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn"},
 		"ui.notices.max":                   3,
 	}
 }

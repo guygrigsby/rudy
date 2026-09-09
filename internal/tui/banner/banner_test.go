@@ -211,30 +211,33 @@ func TestReleaseReadsTheNewestSection(t *testing.T) {
 	}
 }
 
-// TestTheWordmarkMaterializes pins the reveal: blank at the start, whole at the end, and
-// in between a leading edge that has moved.
-func TestTheWordmarkMaterializes(t *testing.T) {
-	whole := strings.Join(Wordmark(Settled), "\n")
-	if !strings.Contains(whole, "█") || strings.ContainsAny(whole, "▓▒") {
-		t.Errorf("the settled word is blocks and nothing else:\n%s", whole)
+// TestTheMarkMaterializes pins the reveal: blank at the start, the whole picture at the
+// end, and in between a leading edge that has moved and left the drawing behind it.
+func TestTheMarkMaterializes(t *testing.T) {
+	whole := strings.Join(Mark(Settled), "\n")
+	if !strings.Contains(whole, `/\_/\`) || strings.ContainsAny(whole, "▓▒") {
+		t.Errorf("the settled mark is the drawing and nothing else:\n%s", whole)
 	}
-	if got := strings.TrimSpace(strings.Join(Wordmark(0), "")); got != "" {
+	if got := strings.TrimSpace(strings.Join(Mark(0), "")); got != "" {
 		t.Errorf("step zero has drawn nothing yet: %q", got)
 	}
-	mid := strings.Join(Wordmark(Frames/2), "\n")
+	mid := strings.Join(Mark(Frames/2), "\n")
 	if !strings.ContainsAny(mid, "▓▒") {
 		t.Errorf("a step in flight has a leading edge:\n%s", mid)
 	}
-	if last := strings.Join(Wordmark(Frames), "\n"); last != whole {
-		t.Errorf("the last step is the settled word:\n%s", last)
+	if !strings.Contains(mid, "(") {
+		t.Errorf("and the drawing itself behind it, not a wall of blocks:\n%s", mid)
 	}
-	for _, rows := range [][]string{Wordmark(0), Wordmark(Frames / 2), Wordmark(Settled)} {
-		if len(rows) != glyphHeight {
-			t.Fatalf("every step is %d rows, got %d", glyphHeight, len(rows))
+	if last := strings.Join(Mark(Frames), "\n"); last != whole {
+		t.Errorf("the last step is the settled mark:\n%s", last)
+	}
+	for _, rows := range [][]string{Mark(0), Mark(Frames / 2), Mark(Settled)} {
+		if len(rows) != markHeight {
+			t.Fatalf("every step is %d rows, got %d", markHeight, len(rows))
 		}
 		for _, r := range rows {
-			if got := ansi.StringWidth(r); got != wordmarkWidth {
-				t.Errorf("every step is %d columns, got %d in %q", wordmarkWidth, got, r)
+			if got := ansi.StringWidth(r); got != markWidth {
+				t.Errorf("every step is %d columns, got %d in %q", markWidth, got, r)
 			}
 		}
 	}

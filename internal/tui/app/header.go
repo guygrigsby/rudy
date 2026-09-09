@@ -10,7 +10,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/tui/banner"
 )
 
-// frameEvery is how long one step of the wordmark's reveal lasts. The whole reveal is
+// frameEvery is how long one step of the mark's reveal lasts. The whole reveal is
 // banner.Frames of these, about a second, which is long enough to read as motion and short
 // enough that nobody waits for it. ADR 0016.
 const frameEvery = 40 * time.Millisecond

@@ -1,8 +1,8 @@
-// Package banner draws the startup header: the greeting, the wordmark, the session's own
+// Package banner draws the startup header: the greeting, the mark, the session's own
 // facts, a tip or two and what the build it was cut from carries as news. ADR 0016.
 //
 // Everything here is pure. A caller hands it the facts and a theme and gets lines back, so
-// the layout, the changelog parse and the wordmark's frames are each testable without a
+// the layout, the changelog parse and the mark's frames are each testable without a
 // terminal, and the client's only job is to decide when to draw them.
 package banner
 
@@ -27,7 +27,7 @@ const (
 	teeBottom         = "┴"
 )
 
-// The widths the layout changes shape at. Two columns need room for a wordmark beside a
+// The widths the layout changes shape at. Two columns need room for the mark beside a
 // sentence; one column needs room for a frame worth drawing; below that the header is the
 // greeting on its own line and nothing else.
 const (
@@ -43,7 +43,7 @@ type cell struct {
 	text string
 	role theme.Role
 	// center puts the text in the middle of its column rather than against the left
-	// border, which is what the left column does with the greeting and the wordmark.
+	// border, which is what the left column does with the greeting and the mark.
 	center bool
 }
 
@@ -51,8 +51,8 @@ type cell struct {
 func line() cell { return cell{} }
 
 // fit truncates text to w columns, marking the cut so a clipped tip does not read as a
-// finished sentence. Measured in terminal columns, not bytes, since a wordmark is made of
-// block characters and a path may hold anything.
+// finished sentence. Measured in terminal columns, not bytes, since a path may hold
+// anything.
 func fit(text string, w int) string {
 	if w <= 0 {
 		return ""
@@ -81,13 +81,10 @@ func padTo(text string, w int, center bool) string {
 }
 
 // columns splits an inner width into a left and a right column with a divider between
-// them. The left column holds the wordmark, so it takes the smaller share only when that
-// still leaves the wordmark room.
+// them. The left column holds the mark, so it takes the smaller share only when that still
+// leaves the mark room.
 func columns(inner int) (left, right int) {
-	left = inner * 4 / 10
-	if left < wordmarkWidth+2*pad {
-		left = wordmarkWidth + 2*pad
-	}
+	left = max(inner*4/10, markWidth+2*pad)
 	right = inner - left - 1 // the divider
 	return left, right
 }
@@ -118,7 +115,7 @@ func layout(title string, left, right []cell, width int, th theme.Theme, frame t
 	oneColumn := width < twoColumnWidth || len(right) == 0
 	lw, rw := inner, 0
 	if oneColumn {
-		// Too narrow to sit beside the wordmark, so the right column goes under it with a
+		// Too narrow to sit beside the mark, so the right column goes under it with a
 		// blank line between. Dropping it would lose the tips and the news at exactly the
 		// width where a person has the least idea what to type.
 		if len(right) > 0 {
