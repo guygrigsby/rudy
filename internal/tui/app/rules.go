@@ -5,6 +5,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
 )
@@ -56,7 +57,7 @@ func (m *Model) composerRules() (above, below []string) {
 		return nil, nil
 	}
 	top := m.rule("")
-	bottom := m.rule(contextLabel(contextPercent(m.model.ContextWindow, m.lastPrompt)))
+	bottom := m.rule(m.ic.Label(icons.Context, contextLabel(contextPercent(m.model.ContextWindow, m.lastPrompt))))
 	if top == "" || bottom == "" {
 		return nil, nil
 	}

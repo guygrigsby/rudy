@@ -85,6 +85,8 @@ type UIConfig struct {
 	Header     HeaderConfig      `mapstructure:"header"`
 	Input      InputConfig       `mapstructure:"input"`
 	Theme      map[string]string `mapstructure:"theme"`
+	// Icons holds ui.icons.set plus per-name overrides, merged the same way Theme is.
+	Icons map[string]string `mapstructure:"icons"`
 }
 
 // themeDefaults are the design's twelve ui.theme role values
@@ -270,6 +272,25 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 	c.UI.Theme["name"] = "default"
 	for k, val := range v.GetStringMapString("ui.theme") {
 		c.UI.Theme[k] = val
+	}
+	for _, key := range v.AllKeys() {
+		if role, ok := strings.CutPrefix(key, "ui.theme."); ok {
+			c.UI.Theme[role] = v.GetString(key)
+		}
+	}
+	// ui.icons is the same shape: the set's name plus per-icon overrides, merged over the
+	// default set by hand for the same reason ui.theme is.
+	c.UI.Icons = map[string]string{"set": "nerd"}
+	for k, val := range v.GetStringMapString("ui.icons") {
+		c.UI.Icons[k] = val
+	}
+	// A caller that set one key by its dotted name rather than as a table, which is what
+	// an override map does, is not in the map view above: viper answers a nested table
+	// from the file and the defaults, not from Set. Walk the keys it knows instead.
+	for _, key := range v.AllKeys() {
+		if name, ok := strings.CutPrefix(key, "ui.icons."); ok {
+			c.UI.Icons[name] = v.GetString(key)
+		}
 	}
 	// permissions.double_press_ms is the contract's canonical key; the design also
 	// shows it under [ui], so that spelling is accepted as an alias when the canonical

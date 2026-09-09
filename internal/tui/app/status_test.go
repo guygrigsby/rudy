@@ -25,7 +25,7 @@ func TestStatusLineIsTheDesignScreen(t *testing.T) {
 	got := ansi.Strip(h.m.statusLine())
 	// One column in, the gutter the design draws every row and the status line in. No
 	// context percentage: the composer's lower rule carries it now (ADR 0017).
-	want := " INSERT  fake:m1  strict  $0.08  rudy main*"
+	want := " INSERT  ◆ fake:m1  strict  $0.08  rudy ⎇ main*"
 	if got != want {
 		t.Fatalf("status %q want %q", got, want)
 	}
@@ -36,29 +36,29 @@ func TestStatusLineIsTheDesignScreen(t *testing.T) {
 
 func TestStatusItemsRenderOnlyWhatConfigPlaced(t *testing.T) {
 	h := newHarness(t, map[string]any{"ui.status.items": []string{"workspace", "vim_mode"}})
-	if got := ansi.Strip(h.m.statusLine()); got != " rudy main*  INSERT" {
+	if got := ansi.Strip(h.m.statusLine()); got != " rudy ⎇ main*  INSERT" {
 		t.Fatalf("status %q", got)
 	}
 }
 
 func TestVimModeItem(t *testing.T) {
 	h := newHarness(t, map[string]any{"ui.status.items": []string{"vim_mode", "model"}})
-	if got := ansi.Strip(h.m.statusLine()); got != " INSERT  fake:m1" {
+	if got := ansi.Strip(h.m.statusLine()); got != " INSERT  ◆ fake:m1" {
 		t.Fatalf("insert %q", got)
 	}
 	h.press("escape") // vim insert to normal
-	if got := ansi.Strip(h.m.statusLine()); got != " NORMAL  fake:m1" {
+	if got := ansi.Strip(h.m.statusLine()); got != " NORMAL  ◆ fake:m1" {
 		t.Fatalf("normal %q", got)
 	}
 	off := newHarness(t, map[string]any{"ui.vim": false, "ui.status.items": []string{"vim_mode", "model"}})
-	if got := ansi.Strip(off.m.statusLine()); got != " fake:m1" {
+	if got := ansi.Strip(off.m.statusLine()); got != " ◆ fake:m1" {
 		t.Fatalf("vim off must leave no cell and no separator: %q", got)
 	}
 }
 
 func TestPluginStatusItem(t *testing.T) {
 	h := newHarness(t, map[string]any{"ui.status.items": []string{"memory:servers", "model"}})
-	if got := ansi.Strip(h.m.statusLine()); got != " fake:m1" {
+	if got := ansi.Strip(h.m.statusLine()); got != " ◆ fake:m1" {
 		t.Fatalf("an item no plugin set renders nothing: %q", got)
 	}
 	h.notify(protocol.NotifyStatusUpdated, protocol.StatusUpdated{Items: []protocol.StatusItem{
@@ -66,14 +66,14 @@ func TestPluginStatusItem(t *testing.T) {
 			{Text: "2", Role: "success"}, {Text: " servers", Role: "muted"},
 		}},
 	}})
-	if got := ansi.Strip(h.m.statusLine()); got != " 2 servers  fake:m1" {
+	if got := ansi.Strip(h.m.statusLine()); got != " 2 servers  ◆ fake:m1" {
 		t.Fatalf("status %q", got)
 	}
 	// A span is data: escapes and newlines a plugin sends never reach the screen.
 	h.notify(protocol.NotifyStatusUpdated, protocol.StatusUpdated{Items: []protocol.StatusItem{
 		{Owner: "memory", Key: "servers", Content: []protocol.Span{{Text: "\x1b[31mred\nnext", Role: "muted"}}},
 	}})
-	if got := ansi.Strip(h.m.statusLine()); got != " rednext  fake:m1" {
+	if got := ansi.Strip(h.m.statusLine()); got != " rednext  ◆ fake:m1" {
 		t.Fatalf("unsanitized span %q", got)
 	}
 }

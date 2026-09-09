@@ -254,6 +254,14 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 	}))
 }
 
+// TestGoldenNerdIcons pins the default icon set, which every other golden turns down to
+// the unicode one so its bytes stay readable in a diff. What this file carries is Nerd
+// Font codepoints in the private use area: a terminal whose font is not patched draws a
+// box for each, which is what ui.icons.set = "unicode" is for (ADR 0018).
+func TestGoldenNerdIcons(t *testing.T) {
+	golden(t, "icons_nerd", screen(t, map[string]any{"ui.icons.set": "nerd"}, nil))
+}
+
 // TestGoldenStartupHeader is what a person meets: the framed header at the top of an empty
 // transcript, the greeting, the settled mark, the session's facts, the tips and what
 // the build carries as news (ADR 0016). The clock, the name and the changelog are fixed

@@ -11,6 +11,7 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
@@ -58,15 +59,16 @@ func (m *Model) statusItem(id string) string {
 	case itemModel:
 		// The canonical form, "provider:model": two providers can carry the same model
 		// id, and the picker and every log entry name one this way.
-		return m.styled(theme.RoleMuted, m.session.Model.String())
+		return m.styled(theme.RoleMuted, m.ic.Label(icons.Model, m.session.Model.String()))
 	case itemPermissionMode:
 		return m.styled(theme.RoleMuted, string(m.session.Mode))
 	case itemContext:
-		return m.styled(theme.RoleMuted, contextPercent(m.model.ContextWindow, m.lastPrompt))
+		return m.styled(theme.RoleMuted, m.ic.Label(icons.Context, contextPercent(m.model.ContextWindow, m.lastPrompt)))
 	case itemCost:
+		// No icon: the currency symbol the amount opens with is the icon.
 		return m.styled(theme.RoleMuted, cost(m.model.Pricing, m.usage))
 	case itemWorkspace:
-		return m.styled(theme.RoleMuted, m.workspace)
+		return m.styled(theme.RoleMuted, m.workspaceCell())
 	case itemTurn:
 		return m.styled(theme.RoleMuted, m.turnCell())
 	}
@@ -77,6 +79,18 @@ func (m *Model) statusItem(id string) string {
 		return ""
 	}
 	return renderSpans(m.th, item.Content)
+}
+
+// workspaceCell is the workspace item: the repository, then the branch behind the branch
+// icon, then the dirty marker. detectWorkspace hands over "<repo> <branch>[*]", which is
+// the design's own spelling, so the icon is set in front of the branch rather than in
+// front of the whole cell.
+func (m *Model) workspaceCell() string {
+	repo, branch, ok := strings.Cut(m.workspace, " ")
+	if !ok {
+		return m.workspace
+	}
+	return repo + " " + m.ic.Label(icons.Branch, branch)
 }
 
 // styled is text in one role, or "" for an item with nothing to say. Built-in text is the

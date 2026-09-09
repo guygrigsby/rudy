@@ -27,6 +27,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
@@ -72,13 +73,30 @@ func testConfig(t *testing.T, over map[string]any) *config.Config {
 	// The startup header is off unless a test asks for it: it is a dozen lines about the
 	// build and the day, and every other permutation golden is about the transcript under
 	// it. TestGoldenStartupHeader is where it is pinned.
-	m := map[string]any{"default.provider": "fake", "default.model": "m1", "ui.header.show": false}
+	// The unicode icon set unless a test says otherwise: the default set is Nerd Font
+	// codepoints in the private use area, which a golden would carry as bytes nobody can
+	// read in a diff. TestGoldenNerdIcons is where the default set is pinned.
+	m := map[string]any{
+		"default.provider": "fake", "default.model": "m1",
+		"ui.header.show": false, "ui.icons.set": "unicode",
+	}
 	maps.Copy(m, over)
 	cfg, err := config.Load(paths, m)
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
 	return cfg
+}
+
+// testIcons resolves ui.icons the way the launcher does, so a test that names a set gets
+// that set rather than the built-in default.
+func testIcons(t *testing.T, cfg *config.Config) icons.Set {
+	t.Helper()
+	set, err := icons.Load(cfg.UI.Icons["set"], cfg.UI.Icons)
+	if err != nil {
+		t.Fatalf("icons: %v", err)
+	}
+	return set
 }
 
 // harness drives one Model over a real protocol.Client whose server side is the test: it
@@ -122,8 +140,10 @@ func newHarnessWith(t *testing.T, over map[string]any, opts func(*Options)) *har
 	cc, sc := protocol.Pipe()
 	cl := protocol.NewClient(cc)
 	t.Cleanup(func() { _ = cl.Close(); _ = sc.Close() })
+	cfg := testConfig(t, over)
 	o := Options{
-		Config: testConfig(t, over),
+		Config: cfg,
+		Icons:  testIcons(t, cfg),
 		Theme:  theme.Default(),
 		Keys:   keys.Default(),
 		Client: cl,
@@ -788,7 +808,7 @@ func TestModelAndModeChangesMoveTheStatusLine(t *testing.T) {
 	h.appended(session.ModelChange{Model: session.ModelRef{Provider: "fake", Model: "m2"}})
 	h.appended(session.ModeChange{Mode: session.ModePermissive})
 	got := ansi.Strip(h.m.statusLine())
-	if got != " fake:m2  permissive" {
+	if got != " ◆ fake:m2  permissive" {
 		t.Fatalf("status %q", got)
 	}
 }
@@ -1036,7 +1056,7 @@ func newAppHarnessWith(t *testing.T, script scripted, over func(*config.Config))
 		over(cfg)
 	}
 	m := New(Options{
-		Config: cfg, Theme: theme.Default(), Keys: keys.Default(),
+		Config: cfg, Theme: theme.Default(), Icons: testIcons(t, cfg), Keys: keys.Default(),
 		Client: cl, Session: info, Models: testModels(), Version: "test",
 		Cwd: info.Workspace.Root, Workspace: "rudy main",
 	})

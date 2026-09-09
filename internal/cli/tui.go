@@ -16,6 +16,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/tui/app"
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 )
@@ -25,6 +26,7 @@ import (
 // configuration error, and it costs a message rather than a half-opened session.
 type look struct {
 	theme theme.Theme
+	icons icons.Set
 	keys  *keys.Table
 }
 
@@ -185,7 +187,13 @@ func loadLook(paths config.Paths, cfg *config.Config) (look, error) {
 	if err != nil {
 		return look{}, err
 	}
-	return look{theme: th, keys: table}, nil
+	// The icon set last: a bad set name or an icon nobody has heard of is a configuration
+	// error like the other two, and costs a message rather than a half drawn client.
+	set, err := icons.Load(cfg.UI.Icons["set"], cfg.UI.Icons)
+	if err != nil {
+		return look{}, err
+	}
+	return look{theme: th, icons: set, keys: table}, nil
 }
 
 // launchApp is the real launcher: the model registry as the client's snapshot of it, then
@@ -202,6 +210,7 @@ func launchApp(ctx context.Context, r clientRun) error {
 		// The binary's own release notes, for the startup header's news (ADR 0016).
 		Changelog: rudy.Changelog,
 		Theme:     r.look.theme,
+		Icons:     r.look.icons,
 		Keys:      r.look.keys,
 		Client:    r.dial.Client,
 		Session:   r.info,

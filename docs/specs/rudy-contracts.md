@@ -494,6 +494,8 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.header.updates` | int | 3 | bullets from the newest `CHANGELOG.md` release the binary was built with; `0` draws none |
 | `ui.header.max_width` | int | 120 | the widest the box draws; a wider terminal leaves the rest of the line empty rather than stretching |
 | `ui.notices.max` | int | 3 | notice lines the client draws under the transcript, newest first; `0` draws none |
+| `ui.icons.set` | `nerd`, `unicode`, `ascii` | `nerd` | the glyph set: `nerd` is Nerd Font codepoints (Powerline, Font Awesome 4) and needs a patched font, `unicode` needs none, `ascii` is what the client drew before icons (ADR 0018) |
+| `ui.icons.<name>` | string | per set | overrides one glyph; the empty string draws none and leaves no gap. Names: `branch`, `model`, `context`, `tool`, `bash`, `edit`, `read`, `write`, `grep`, `glob`, `fetch`, `agent`, `info`, `warn`, `error`; an unknown set or name is a load error naming it |
 | `ui.theme.name` | string | `default` | a file under `themes/` or the built-in |
 | `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes |
 | `keys.<action id>` | string or [string] | pi defaults | one of the ids ADR 0013 decision 5 lists; a value replaces the default for that action; `[]` unbinds; an unknown id or an unparseable key is a load error naming it |

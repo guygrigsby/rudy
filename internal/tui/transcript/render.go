@@ -27,8 +27,18 @@ import (
 // column in too, which is what keeps the status line under the rows it belongs to.
 const Gutter = 1
 
+// toolIcon opens a tool row: the icon set's glyph for this tool, or the design's own
+// glyph when no set was configured, which is what a zero Options carries.
+func (t *Transcript) toolIcon(name string) string {
+	if g := t.opts.Icons.ForTool(name); g != "" {
+		return g
+	}
+	return toolGlyph
+}
+
 const (
-	// toolGlyph opens a tool row, as in the design's default screen.
+	// toolGlyph opens a tool row when no icon set says otherwise, as in the design's
+	// default screen.
 	toolGlyph = "▸"
 	// previewIndent is how far a tool row's preview, its expansion and a permission
 	// question's choices sit under the row they belong to.
@@ -310,7 +320,7 @@ var summaryField = map[string]string{
 // summaryLine opens a tool row and a permission question alike: the glyph, the tool and
 // what the call does.
 func (t *Transcript) summaryLine(name string, input json.RawMessage) string {
-	return t.line(theme.RoleTool, 0, toolGlyph+" "+name+"  "+summary(name, input), false)
+	return t.line(theme.RoleTool, 0, t.toolIcon(name)+" "+name+"  "+summary(name, input), false)
 }
 
 // summary is a tool call in one line: the field that says what it does for the built-in

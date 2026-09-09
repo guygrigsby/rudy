@@ -29,6 +29,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
@@ -75,6 +76,7 @@ const maxNotices = 20
 type Options struct {
 	Config  *config.Config
 	Theme   theme.Theme
+	Icons   icons.Set
 	Keys    *keys.Table
 	Client  *protocol.Client
 	Session protocol.SessionInfo // already opened or resumed by the caller
@@ -109,6 +111,7 @@ type notice struct {
 type Model struct {
 	cfg  *config.Config
 	th   theme.Theme
+	ic   icons.Set
 	keys *keys.Table
 	cl   *protocol.Client
 	// cwd is the caller's directory, kept for the calls that need it: a session this
@@ -211,6 +214,7 @@ func New(o Options) *Model {
 	m := &Model{
 		cfg:          cfg,
 		th:           o.Theme,
+		ic:           o.Icons,
 		keys:         table,
 		cl:           o.Client,
 		cwd:          o.Cwd,
@@ -226,6 +230,9 @@ func New(o Options) *Model {
 		wsFixed:   o.Workspace != "",
 		width:     defaultWidth,
 		height:    defaultHeight,
+	}
+	if m.ic == nil {
+		m.ic = icons.Default()
 	}
 	m.version, m.changelog = o.Version, o.Changelog
 	m.header = m.newHeader(o)
@@ -256,6 +263,7 @@ func (m *Model) newTranscript() *transcript.Transcript {
 		ShowThinking:     m.showThinking,
 		UserPrefix:       m.cfg.UI.Transcript.UserPrefix,
 		BlockGap:         m.cfg.UI.Transcript.BlockGap,
+		Icons:            m.ic,
 		DiffBackground:   m.cfg.UI.Diff.Style == diffBackground,
 	}, m.th)
 }
@@ -1280,6 +1288,13 @@ func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 
 // noticeRoles map the notice level vocabulary onto the theme's. A level the contract does
 // not define reads as text rather than being dropped.
+// noticeIcons is the glyph each level opens with, the same three the roles below paint.
+var noticeIcons = map[string]icons.Name{
+	levelInfo:  icons.Info,
+	levelWarn:  icons.Warn,
+	levelError: icons.Error,
+}
+
 var noticeRoles = map[string]theme.Role{
 	levelInfo:  theme.RoleText,
 	levelWarn:  theme.RoleWarning,
@@ -1302,7 +1317,7 @@ func (m *Model) noticeLines() []string {
 		if !ok {
 			role = theme.RoleText
 		}
-		out = append(out, m.tr.Wrap(role, n.text)...)
+		out = append(out, m.tr.Wrap(role, m.ic.Label(noticeIcons[n.level], n.text))...)
 	}
 	if len(out) > limit {
 		out = out[len(out)-limit:]

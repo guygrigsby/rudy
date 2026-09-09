@@ -11,6 +11,7 @@ package transcript
 import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 )
 
 // RowKind is what a row is. The set is closed.
@@ -70,6 +71,9 @@ type Options struct {
 	ShowThinking     bool
 	UserPrefix       string
 	BlockGap         int
+	// Icons is the glyph set ui.icons resolved: a tool row opens with the icon for its
+	// own tool, or the generic one for a tool the set does not name.
+	Icons icons.Set
 	// DiffBackground is ui.diff.style == "background": the diff roles paint the line's
 	// background instead of its text. It is the one place the design allows a painted
 	// background.
