@@ -390,7 +390,7 @@ func TestPrintReleasesTheSessionLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := build(context.Background(), io.Discard)
+	b, err := build(context.Background(), BuildOptions{Stderr: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}

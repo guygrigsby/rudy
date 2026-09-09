@@ -133,7 +133,7 @@ func readPrompt(args []string, stdin io.Reader, tty bool) (string, error) {
 func runPrint(ctx context.Context, o printOptions, prompt string, build buildFunc, stdout, stderr io.Writer) (int, error) {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	b, err := build(ctx, stderr)
+	b, err := build(ctx, BuildOptions{Stderr: stderr})
 	if err != nil {
 		return 1, err
 	}

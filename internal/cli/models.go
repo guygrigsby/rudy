@@ -23,7 +23,7 @@ func newModelsCommand(build buildFunc) *cobra.Command {
 		Short: "list the discovered models with context windows and prices",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			b, err := build(cmd.Context(), cmd.ErrOrStderr())
+			b, err := build(cmd.Context(), BuildOptions{Stderr: cmd.ErrOrStderr()})
 			if err != nil {
 				return err
 			}

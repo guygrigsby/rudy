@@ -59,6 +59,7 @@ type BuildOptions struct {
 	Env            func(string) string // nil means os.Getenv
 	Home           string              // "" means os.UserHomeDir
 	Stderr         io.Writer           // nil means os.Stderr
+	Socket         string              // "" means paths.Socket(); the socket a locked session tells a client to attach through
 	RefreshTimeout time.Duration       // <= 0 means 20 seconds; bounds the startup registry refresh
 }
 
@@ -70,8 +71,11 @@ const defaultRefreshTimeout = 20 * time.Second
 // client, so it only has to close the sessions it never opened.
 const shutdownBudget = 2 * time.Second
 
-// buildFunc is what commands call to wire a server; tests substitute fakes through it.
-type buildFunc func(ctx context.Context, stderr io.Writer) (*Built, error)
+// buildFunc is what commands call to wire a server; tests substitute fakes through it. The
+// options are the wiring a command varies: where its notices go, and which socket the server
+// says a locked session is being served on. A fake builder honors those two and supplies the
+// rest itself, so a test's socket still reaches the server it built.
+type buildFunc func(ctx context.Context, o BuildOptions) (*Built, error)
 
 // Build wires config, store, plugins, registry, gate and server. It never writes config. A
 // failure after the server exists shuts it back down: it holds a context, loaded plugins and
@@ -94,6 +98,12 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		stderr = os.Stderr
 	}
 	paths := config.XDG(env, home)
+	// A command that named a socket is serving on that one, so that is the socket a locked
+	// session tells the next client to attach through; nobody naming one means the default.
+	socket := o.Socket
+	if socket == "" {
+		socket = paths.Socket()
+	}
 	cfg, err := config.Load(paths, o.Overrides)
 	if err != nil {
 		return nil, err
@@ -132,7 +142,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		Plugins:  plugins,
 		Gate:     g,
 		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
-		Socket:   paths.Socket(),
+		Socket:   socket,
 	})
 	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv}
 	defer func() {

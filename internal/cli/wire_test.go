@@ -134,20 +134,19 @@ func testBuilderOver(t *testing.T, fp *fakeProvider, over map[string]any, extra 
 		"permissions.mode": "off",
 	}
 	maps.Copy(overrides, over)
-	return func(ctx context.Context, stderr io.Writer) (*Built, error) {
-		return Build(ctx, BuildOptions{
-			Version:   "test",
-			Overrides: overrides,
-			Plugins:   plugins,
-			Home:      base,
-			Stderr:    stderr,
-		})
+	// The caller's Stderr and Socket are its own; everything else is the test's.
+	return func(ctx context.Context, o BuildOptions) (*Built, error) {
+		o.Version = "test"
+		o.Overrides = overrides
+		o.Plugins = plugins
+		o.Home = base
+		return Build(ctx, o)
 	}
 }
 
 func TestBuildLoadsPluginsAndRegistry(t *testing.T) {
 	fp := &fakeProvider{}
-	b, err := testBuilder(t, fp)(context.Background(), io.Discard)
+	b, err := testBuilder(t, fp)(context.Background(), BuildOptions{Stderr: io.Discard})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -178,7 +177,7 @@ func TestBuildWiresTheServerSocketFromPaths(t *testing.T) {
 	build := testBuilder(t, fp)
 	ctx := context.Background()
 
-	b1, err := build(ctx, io.Discard)
+	b1, err := build(ctx, BuildOptions{Stderr: io.Discard})
 	if err != nil {
 		t.Fatalf("Build (1): %v", err)
 	}
@@ -193,7 +192,7 @@ func TestBuildWiresTheServerSocketFromPaths(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
-	b2, err := build(ctx, io.Discard)
+	b2, err := build(ctx, BuildOptions{Stderr: io.Discard})
 	if err != nil {
 		t.Fatalf("Build (2): %v", err)
 	}
@@ -221,6 +220,60 @@ func TestBuildWiresTheServerSocketFromPaths(t *testing.T) {
 	}
 	if data.Socket != b2.Paths.Socket() {
 		t.Fatalf("socket = %q, want %q (the resuming Build's own paths.Socket())", data.Socket, b2.Paths.Socket())
+	}
+}
+
+// TestBuildTakesTheSocketFromOptions: rudy serve --socket serves a path the XDG defaults
+// know nothing about, and a locked session has to name the socket a client can actually
+// reach this server on, not the one it would have used. Same shape as the test above: the
+// second Build is the second process, and the error it answers a locked resume with is
+// where the option shows up.
+func TestBuildTakesTheSocketFromOptions(t *testing.T) {
+	fp := &fakeProvider{}
+	build := testBuilder(t, fp)
+	ctx := context.Background()
+	const socket = "/tmp/rudy-not-the-default.sock"
+
+	b1, err := build(ctx, BuildOptions{Stderr: io.Discard})
+	if err != nil {
+		t.Fatalf("Build (1): %v", err)
+	}
+	defer func() { _ = b1.Server.Shutdown(context.Background()) }()
+	cl1, close1, err := serveInMemory(b1, "test", false)
+	if err != nil {
+		t.Fatalf("serveInMemory (1): %v", err)
+	}
+	defer close1()
+	var info protocol.SessionInfo
+	if err := cl1.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: t.TempDir()}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	b2, err := build(ctx, BuildOptions{Stderr: io.Discard, Socket: socket})
+	if err != nil {
+		t.Fatalf("Build (2): %v", err)
+	}
+	defer func() { _ = b2.Server.Shutdown(context.Background()) }()
+	cl2, close2, err := serveInMemory(b2, "test", false)
+	if err != nil {
+		t.Fatalf("serveInMemory (2): %v", err)
+	}
+	defer close2()
+
+	var resumed protocol.SessionInfo
+	err = cl2.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &resumed)
+	var pe *protocol.Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("resume of a locked session = %v, want *protocol.Error", err)
+	}
+	var data struct {
+		Socket string `json:"socket"`
+	}
+	if !protocol.ErrorData(pe, &data) {
+		t.Fatalf("no data on %+v", pe)
+	}
+	if data.Socket != socket {
+		t.Fatalf("socket = %q, want %q (BuildOptions.Socket)", data.Socket, socket)
 	}
 }
 
@@ -476,7 +529,7 @@ func (c closingPlugin) Close() error                          { close(c.closed);
 func TestBuiltCloseShutsTheServerAndThePlugins(t *testing.T) {
 	fp := &fakeProvider{}
 	c := closingPlugin{closed: make(chan struct{})}
-	b, err := testBuilder(t, fp, c)(context.Background(), io.Discard)
+	b, err := testBuilder(t, fp, c)(context.Background(), BuildOptions{Stderr: io.Discard})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

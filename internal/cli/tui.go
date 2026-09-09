@@ -104,7 +104,7 @@ func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch la
 	// Ctrl-C is a key (app.clear), not a signal.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	b, err := build(ctx, stderr)
+	b, err := build(ctx, BuildOptions{Stderr: stderr})
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1

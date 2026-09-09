@@ -4,7 +4,6 @@ package cli
 
 import (
 	"context"
-	"io"
 
 	"github.com/spf13/cobra"
 )
@@ -18,8 +17,9 @@ func Version() string { return version }
 
 // NewRoot is the rudy command with the real wiring. Same signature as Task 1.
 func NewRoot() *cobra.Command {
-	return newRoot(version, func(ctx context.Context, stderr io.Writer) (*Built, error) {
-		return Build(ctx, BuildOptions{Version: version, Stderr: stderr})
+	return newRoot(version, func(ctx context.Context, o BuildOptions) (*Built, error) {
+		o.Version = version
+		return Build(ctx, o)
 	})
 }
 
@@ -34,6 +34,6 @@ func newRoot(version string, build buildFunc) *cobra.Command {
 	}
 	root.SetVersionTemplate("rudy {{.Version}}\n")
 	registerPrint(root, build)
-	root.AddCommand(newModelsCommand(build), newSessionsCommand(build), newSkillsCommand(), newMCPCommand(), newPluginCommand())
+	root.AddCommand(newServeCommand(build), newModelsCommand(build), newSessionsCommand(build), newSkillsCommand(), newMCPCommand(), newPluginCommand())
 	return root
 }
