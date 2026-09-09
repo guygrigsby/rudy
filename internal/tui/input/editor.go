@@ -17,6 +17,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	vimbubble "github.com/guygrigsby/vimbubble/v2"
 
 	"github.com/guygrigsby/rudy/internal/tui/keys"
@@ -63,18 +64,22 @@ type Editor struct {
 	queue []string
 }
 
-// New builds the composer at width columns, painted from th. vim starts the editor in
-// Insert (the design opens ready to type, not in Normal as vim itself does); vim false
-// leaves vimbubble disabled, so every key reaches the textarea. The editor comes back
-// focused: Focus is for the app's Init, which needs the cursor's blink command.
-func New(vim bool, th theme.Theme, width int) *Editor {
+// New builds the composer at width columns, painted from th and keyed from table, the
+// [keys] table a config resolved; a nil table means pi's defaults. vim starts the editor
+// in Insert (the design opens ready to type, not in Normal as vim itself does); vim
+// false leaves vimbubble disabled, so every key reaches the textarea. The editor comes
+// back focused: Focus is for the app's Init, which needs the cursor's blink command.
+func New(vim bool, th theme.Theme, width int, table *keys.Table) *Editor {
+	if table == nil {
+		table = keys.Default()
+	}
 	e := &Editor{ta: textarea.New()}
 	e.ta.Placeholder = ""
 	e.ta.ShowLineNumbers = false
 	// MaxHeight is the textarea's content limit as well as its viewport height, and a
 	// composer must accept more lines than it shows. fit clamps the viewport instead.
 	e.ta.MaxHeight = 0
-	e.ta.KeyMap = keyMap()
+	e.ta.KeyMap = keyMap(table)
 	e.ta.SetStyles(styles(th))
 	e.ta.SetPromptFunc(promptWidth, prompt)
 	e.ta.SetWidth(width)
@@ -96,8 +101,10 @@ func prompt(info textarea.PromptInfo) string {
 	return promptRest
 }
 
-// styles paints the textarea from th. Foreground only: no role paints a ground, so the
-// cursor's line and a visual-mode selection are marked by color, not by a block.
+// styles paints the textarea from th. Every color is a foreground, since no theme role
+// paints a ground. The one exception is the visual-mode selection, which needs to read
+// as a block and gets reverse video: an attribute, not a color, so it borrows whatever
+// the terminal is already painting rather than choosing a ground of its own.
 func styles(th theme.Theme) textarea.Styles {
 	text := th.Style(theme.RoleText)
 	muted := th.Style(theme.RoleMuted)
@@ -109,7 +116,7 @@ func styles(th theme.Theme) textarea.Styles {
 		EndOfBuffer: muted,
 		Placeholder: muted,
 		Prompt:      accent,
-		Selection:   accent,
+		Selection:   lipgloss.NewStyle().Reverse(true),
 	}
 	blurred := focused
 	blurred.Text = muted
@@ -133,25 +140,25 @@ func styles(th theme.Theme) textarea.Styles {
 // pi's tui.editor.undo has no field here: the textarea cannot undo, so that action is
 // left for the app. Everything the textarea can do that pi does not name (paste, input
 // begin and end, the case verbs, the selection motions) keeps bubbles' own default.
-func keyMap() textarea.KeyMap {
+func keyMap(t *keys.Table) textarea.KeyMap {
 	km := textarea.DefaultKeyMap()
-	km.LinePrevious = binding(keys.TUIEditorCursorUp)
-	km.LineNext = binding(keys.TUIEditorCursorDown)
-	km.CharacterBackward = binding(keys.TUIEditorCursorLeft)
-	km.CharacterForward = binding(keys.TUIEditorCursorRight)
-	km.WordBackward = binding(keys.TUIEditorCursorWordLeft)
-	km.WordForward = binding(keys.TUIEditorCursorWordRight)
-	km.LineStart = binding(keys.TUIEditorCursorLineStart)
-	km.LineEnd = binding(keys.TUIEditorCursorLineEnd)
-	km.PageUp = binding(keys.TUIEditorPageUp)
-	km.PageDown = binding(keys.TUIEditorPageDown)
-	km.DeleteCharacterBackward = binding(keys.TUIEditorDeleteCharBackward)
-	km.DeleteCharacterForward = binding(keys.TUIEditorDeleteCharForward)
-	km.DeleteWordBackward = binding(keys.TUIEditorDeleteWordBackward)
-	km.DeleteWordForward = binding(keys.TUIEditorDeleteWordForward)
-	km.DeleteBeforeCursor = binding(keys.TUIEditorDeleteToLineStart)
-	km.DeleteAfterCursor = binding(keys.TUIEditorDeleteToLineEnd)
-	km.InsertNewline = binding(keys.TUIInputNewLine)
+	km.LinePrevious = binding(t, keys.TUIEditorCursorUp)
+	km.LineNext = binding(t, keys.TUIEditorCursorDown)
+	km.CharacterBackward = binding(t, keys.TUIEditorCursorLeft)
+	km.CharacterForward = binding(t, keys.TUIEditorCursorRight)
+	km.WordBackward = binding(t, keys.TUIEditorCursorWordLeft)
+	km.WordForward = binding(t, keys.TUIEditorCursorWordRight)
+	km.LineStart = binding(t, keys.TUIEditorCursorLineStart)
+	km.LineEnd = binding(t, keys.TUIEditorCursorLineEnd)
+	km.PageUp = binding(t, keys.TUIEditorPageUp)
+	km.PageDown = binding(t, keys.TUIEditorPageDown)
+	km.DeleteCharacterBackward = binding(t, keys.TUIEditorDeleteCharBackward)
+	km.DeleteCharacterForward = binding(t, keys.TUIEditorDeleteCharForward)
+	km.DeleteWordBackward = binding(t, keys.TUIEditorDeleteWordBackward)
+	km.DeleteWordForward = binding(t, keys.TUIEditorDeleteWordForward)
+	km.DeleteBeforeCursor = binding(t, keys.TUIEditorDeleteToLineStart)
+	km.DeleteAfterCursor = binding(t, keys.TUIEditorDeleteToLineEnd)
+	km.InsertNewline = binding(t, keys.TUIInputNewLine)
 	// Four of bubbles' remaining defaults collide with a pi binding for something else,
 	// and the switch in textarea.Update would let whichever it tests first win. pi's
 	// binding is the one that stands, so bubbles' claim on the key goes: ctrl+home and
@@ -164,34 +171,18 @@ func keyMap() textarea.KeyMap {
 	return km
 }
 
-// binding is a's pi default bindings as a keybind.Binding. keybind.Matches compares
-// against tea.Key.String, so each key string is parsed in pi's grammar and re-spelled
-// in bubbletea's: "pageUp" becomes "pgup", "escape" becomes "esc". keys.Defaults is a
-// compile-time table every entry of which parses, so a failure here is a bug in that
-// table, not bad input.
-func binding(a keys.Action) keybind.Binding {
-	spellings := make([]string, 0, len(keys.Defaults[a]))
-	for _, s := range keys.Defaults[a] {
-		k, err := keys.Parse(s)
-		if err != nil {
-			panic("input: keys.Defaults[" + string(a) + "] holds an unparsable key: " + err.Error())
-		}
-		spellings = append(spellings, tea.Key(terminal(k)).String())
+// binding is the keys a is bound to as a keybind.Binding. keybind.Matches compares
+// against tea.Key.String, so each key is re-spelled through keys.Normalize: "pageUp"
+// becomes "pgup", "escape" becomes "esc", "shift+l" becomes "L", and a ctrl or alt combo
+// drops the character a [keys] table's grammar carried in Text. Normalize is the same
+// rule keys.Table.Match indexes by, so the two agree on what a keystroke is.
+func binding(t *keys.Table, a keys.Action) keybind.Binding {
+	bound := t.Keys(a)
+	spellings := make([]string, 0, len(bound))
+	for _, k := range bound {
+		spellings = append(spellings, keys.Normalize(k).String())
 	}
 	return keybind.NewBinding(keybind.WithKeys(spellings...))
-}
-
-// terminal restates k the way a terminal reports it. tea.Key.String, which both
-// keybind.Matches and vimbubble read a key through, returns Text when there is any and
-// the keystroke otherwise, and a terminal only fills Text for a key that produces text,
-// never for one carrying ctrl, alt or super. keys.Parse fills Text from the character
-// in a binding string whatever its modifiers, so ctrl+a would otherwise read as a plain
-// "a": it would miss the ctrl+a binding and type an "a" into the buffer.
-func terminal(k tea.Key) tea.Key {
-	if k.Mod&^tea.ModShift != 0 {
-		k.Text = ""
-	}
-	return k
 }
 
 // Update routes msg. A key press goes through vim first and stops there if vim consumed
@@ -203,7 +194,7 @@ func (e *Editor) Update(msg tea.Msg) tea.Cmd {
 	if !isKey {
 		return e.toTextarea(msg)
 	}
-	press = tea.KeyPressMsg(terminal(tea.Key(press)))
+	press = tea.KeyPressMsg(keys.Normalize(tea.Key(press)))
 	if consumed, cmd := e.vim.Update(press); consumed {
 		e.fit()
 		return cmd
@@ -222,11 +213,24 @@ func (e *Editor) toTextarea(msg tea.Msg) tea.Cmd {
 	return cmd
 }
 
-// fit sizes the editor to its content: one line empty, growing a line at a time to
-// maxHeight, past which it scrolls. Called after everything that changes the buffer,
-// including the vim verbs, which edit it behind the textarea's back.
+// fit sizes the editor to the rows its content actually occupies: every logical line
+// takes as many rows as it soft wraps into at the current text width, at least one, and
+// the total is clamped to maxHeight, past which the textarea scrolls. Counting logical
+// lines instead would clip a single long line into a one-row viewport. Called after
+// everything that changes the buffer, the vim verbs included, since those edit it behind
+// the textarea's back, and after every width change, which rewraps it.
 func (e *Editor) fit() {
-	e.ta.SetHeight(min(e.ta.LineCount(), maxHeight))
+	// Model.Width is already the text width: SetWidth reserves the prompt gutter out of
+	// the width it is given.
+	textWidth := e.ta.Width()
+	if textWidth < 1 {
+		textWidth = 1
+	}
+	rows := 0
+	for _, line := range strings.Split(e.ta.Value(), "\n") {
+		rows += max(1, (ansi.StringWidth(line)+textWidth-1)/textWidth)
+	}
+	e.ta.SetHeight(min(rows, maxHeight))
 }
 
 // View renders the composer. The mode label is the app's to place, from Mode.
@@ -301,8 +305,12 @@ func (e *Editor) Restore() {
 	e.SetText(strings.Join(parts, queueSeparator))
 }
 
-// SetWidth resizes the editor, prompt gutter included.
-func (e *Editor) SetWidth(w int) { e.ta.SetWidth(w) }
+// SetWidth resizes the editor, prompt gutter included, and resizes the height with it:
+// a narrower editor wraps the same text into more rows.
+func (e *Editor) SetWidth(w int) {
+	e.ta.SetWidth(w)
+	e.fit()
+}
 
 // Focus focuses the textarea and returns the cursor's blink command.
 func (e *Editor) Focus() tea.Cmd { return e.ta.Focus() }

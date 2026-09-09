@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	keybind "charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	lipgloss "charm.land/lipgloss/v2"
 
 	"github.com/guygrigsby/rudy/internal/tui/keys"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
@@ -31,7 +33,7 @@ func typeText(e *Editor, s string) {
 }
 
 func TestVimModesAndLabel(t *testing.T) {
-	e := New(true, theme.Default(), 80)
+	e := New(true, theme.Default(), 80, nil)
 	if e.Mode() != ModeInsert {
 		t.Fatalf("starts in insert: %s", e.Mode())
 	}
@@ -53,7 +55,7 @@ func TestVimModesAndLabel(t *testing.T) {
 	if e.Mode() != ModeNormal || e.Text() != "hello" {
 		t.Errorf("visual escape: %s %q", e.Mode(), e.Text())
 	}
-	off := New(false, theme.Default(), 80)
+	off := New(false, theme.Default(), 80, nil)
 	if off.Mode() != ModeDisabled {
 		t.Error("vim off is disabled")
 	}
@@ -64,7 +66,7 @@ func TestVimModesAndLabel(t *testing.T) {
 }
 
 func TestEmacsEditsInInsert(t *testing.T) {
-	e := New(true, theme.Default(), 80)
+	e := New(true, theme.Default(), 80, nil)
 	typeText(e, "hello world")
 	e.Update(key("ctrl+a"))
 	e.Update(key("ctrl+k"))
@@ -109,7 +111,7 @@ func TestPiEditorKeysActThroughTheTextarea(t *testing.T) {
 			t.Errorf("%s has no pi default to press", c.action)
 		}
 		for _, s := range keys.Defaults[c.action] {
-			e := New(false, theme.Default(), 80)
+			e := New(false, theme.Default(), 80, nil)
 			e.SetText(base)
 			if c.atEnd {
 				e.ta.MoveToEnd()
@@ -140,7 +142,7 @@ func TestPiVerticalMotionsActThroughTheTextarea(t *testing.T) {
 	}
 	for _, c := range cases {
 		for _, s := range keys.Defaults[c.action] {
-			e := New(false, theme.Default(), 80)
+			e := New(false, theme.Default(), 80, nil)
 			e.SetText(tall)
 			e.ta.SetCursorColumn(0)
 			for range 15 {
@@ -165,7 +167,7 @@ func TestPiVerticalMotionsActThroughTheTextarea(t *testing.T) {
 func TestUnboundActionsLeaveTheKeyAlone(t *testing.T) {
 	untouched := []string{"ctrl+-", "ctrl+g", "ctrl+t", "ctrl+p", "ctrl+n"}
 	for _, s := range untouched {
-		e := New(false, theme.Default(), 80)
+		e := New(false, theme.Default(), 80, nil)
 		e.SetText("one two")
 		e.ta.MoveToEnd()
 		e.Update(key(s))
@@ -179,7 +181,7 @@ func TestUnboundActionsLeaveTheKeyAlone(t *testing.T) {
 }
 
 func TestQueue(t *testing.T) {
-	e := New(true, theme.Default(), 80)
+	e := New(true, theme.Default(), 80, nil)
 	typeText(e, "first")
 	e.Enqueue()
 	typeText(e, "second")
@@ -199,7 +201,7 @@ func TestQueue(t *testing.T) {
 }
 
 func TestQueueEdges(t *testing.T) {
-	e := New(true, theme.Default(), 80)
+	e := New(true, theme.Default(), 80, nil)
 	e.Enqueue()
 	if len(e.Queue()) != 0 {
 		t.Errorf("an empty draft does not enqueue: %v", e.Queue())
@@ -216,6 +218,10 @@ func TestQueueEdges(t *testing.T) {
 	if !e.Empty() || e.Text() != "" {
 		t.Errorf("clear: %q", e.Text())
 	}
+	e.Restore()
+	if e.Text() != "" || len(e.Queue()) != 0 {
+		t.Errorf("restore with nothing queued and nothing drafted: %q %v", e.Text(), e.Queue())
+	}
 	typeText(e, "queued")
 	e.Enqueue()
 	e.Restore()
@@ -225,7 +231,7 @@ func TestQueueEdges(t *testing.T) {
 }
 
 func TestNewlineAndSubmitKeysAreNotConsumed(t *testing.T) {
-	e := New(true, theme.Default(), 80)
+	e := New(true, theme.Default(), 80, nil)
 	typeText(e, "one")
 	e.Update(key("shift+enter"))
 	typeText(e, "two")
@@ -257,7 +263,7 @@ func TestNewlineAndSubmitKeysAreNotConsumed(t *testing.T) {
 }
 
 func TestPromptAndHeight(t *testing.T) {
-	e := New(true, theme.Default(), 80)
+	e := New(true, theme.Default(), 80, nil)
 	if view := e.View(); !strings.Contains(view, "\u2503") {
 		t.Errorf("the first line carries the bar: %q", view)
 	}
@@ -284,4 +290,122 @@ func TestPromptAndHeight(t *testing.T) {
 // viewHeight is the number of rendered rows e currently occupies.
 func viewHeight(e *Editor) int {
 	return len(strings.Split(strings.TrimRight(e.View(), "\n"), "\n"))
+}
+
+// mustTable resolves a [keys] table the test wrote itself.
+func mustTable(t *testing.T, overrides map[string][]string) *keys.Table {
+	t.Helper()
+	tb, err := keys.New(overrides)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tb
+}
+
+// TestOverriddenKeysReachTheTextarea is the whole point of taking a table rather than
+// reading keys.Defaults: a [keys] table that moves an editor action moves the key the
+// composer acts on, and frees the key it moved off.
+func TestOverriddenKeysReachTheTextarea(t *testing.T) {
+	tb := mustTable(t, map[string][]string{
+		"tui.editor.deleteToLineEnd": {"ctrl+e"},
+		"tui.editor.cursorLineEnd":   {"end"},
+	})
+	e := New(false, theme.Default(), 80, tb)
+	e.SetText("one two")
+	e.ta.MoveToBegin()
+	e.Update(key("ctrl+e"))
+	if e.Text() != "" {
+		t.Errorf("ctrl+e is deleteToLineEnd now: %q", e.Text())
+	}
+	// ctrl+k is bound to nothing at all now, so it edits nothing: a ctrl combo carries
+	// no text for the textarea's default branch to insert either.
+	e.SetText("one two")
+	e.ta.MoveToBegin()
+	e.Update(key("ctrl+k"))
+	if e.Text() != "one two" {
+		t.Errorf("ctrl+k is unbound now: %q", e.Text())
+	}
+	// The default table still has it the other way round.
+	d := New(false, theme.Default(), 80, nil)
+	d.SetText("one two")
+	d.ta.MoveToBegin()
+	d.Update(key("ctrl+k"))
+	if d.Text() != "" {
+		t.Errorf("ctrl+k is deleteToLineEnd by default: %q", d.Text())
+	}
+}
+
+// TestOverriddenShiftedLetterMatches covers the spelling keys.Normalize owns: a shifted
+// letter is the one binding whose canonical form is neither what a [keys] table writes
+// nor what every terminal reports.
+func TestOverriddenShiftedLetterMatches(t *testing.T) {
+	tb := mustTable(t, map[string][]string{"tui.editor.cursorLineEnd": {"shift+l"}})
+	presses := map[string]tea.KeyPressMsg{
+		"as a table spells it":    key("shift+l"),
+		"as a kitty terminal is":  tea.KeyPressMsg{Code: 'l', Mod: tea.ModShift, ShiftedCode: 'L', Text: "L"},
+		"as a legacy terminal is": tea.KeyPressMsg{Code: 'L', Text: "L"},
+	}
+	for name, press := range presses {
+		e := New(false, theme.Default(), 80, tb)
+		e.SetText("one two")
+		e.ta.MoveToBegin()
+		e.Update(press)
+		typeText(e, "X")
+		if got := e.Text(); got != "one twoX" {
+			t.Errorf("%s: %q, want %q", name, got, "one twoX")
+		}
+	}
+}
+
+// TestHeightCountsWrappedRows: a line too long for the width takes as many rows as it
+// wraps into, not the one row a logical-line count would give it.
+func TestHeightCountsWrappedRows(t *testing.T) {
+	e := New(true, theme.Default(), 40, nil)
+	e.SetText(strings.Repeat("x", 100))
+	if got := viewHeight(e); got != 3 {
+		t.Errorf("100 columns of text at width 40: %d rows, want 3", got)
+	}
+	// Narrowing rewraps the same text into more rows, and widening back into fewer.
+	e.SetWidth(20)
+	if got := viewHeight(e); got != 6 {
+		t.Errorf("the same text at width 20: %d rows, want 6", got)
+	}
+	e.SetWidth(120)
+	if got := viewHeight(e); got != 1 {
+		t.Errorf("the same text at width 120: %d rows, want 1", got)
+	}
+	// Wrapped rows are clamped the same way logical ones are.
+	e.SetWidth(40)
+	e.SetText(strings.Repeat("x", 1000))
+	if got := viewHeight(e); got != maxHeight {
+		t.Errorf("1000 columns at width 40: %d rows, want %d", got, maxHeight)
+	}
+	// A wide rune counts by its display width, not its rune count.
+	e.SetText(strings.Repeat("漢", 40))
+	if got := viewHeight(e); got != 3 {
+		t.Errorf("40 double-width runes at width 40: %d rows, want 3", got)
+	}
+}
+
+// TestSelectionIsReverseVideo: the selection has to read as a block, and reverse video
+// is the one way to get one without choosing a background color.
+func TestSelectionIsReverseVideo(t *testing.T) {
+	s := styles(theme.Default())
+	for name, state := range map[string]textarea.StyleState{"focused": s.Focused, "blurred": s.Blurred} {
+		if !state.Selection.GetReverse() {
+			t.Errorf("%s selection is not reverse video", name)
+		}
+		if _, ok := state.Selection.GetBackground().(lipgloss.NoColor); !ok {
+			t.Errorf("%s selection paints a ground: %#v", name, state.Selection.GetBackground())
+		}
+		for role, style := range map[string]lipgloss.Style{
+			"base": state.Base, "text": state.Text, "cursor line": state.CursorLine,
+			"prompt": state.Prompt, "placeholder": state.Placeholder,
+			"end of buffer": state.EndOfBuffer,
+		} {
+			if _, ok := style.GetBackground().(lipgloss.NoColor); !ok {
+				t.Errorf("%s %s paints a ground: %#v", name, role, style.GetBackground())
+			}
+		}
+	}
 }

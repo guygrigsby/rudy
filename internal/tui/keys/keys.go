@@ -7,6 +7,7 @@ package keys
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"unicode"
 
 	tea "charm.land/bubbletea/v2"
@@ -199,26 +200,68 @@ func shiftedLetter(k tea.Key) (rune, bool) {
 	return 0, false
 }
 
-// normalize collapses k to the key Table looks bindings up by. Shift on a letter takes
-// priority (see shiftedLetter) and always normalizes to the shifted form with the Shift
-// bit stripped, so a shift+l binding and every shape a real shift+l press can take land
-// on the same entry. Otherwise a printable key with no modifiers matches by its Text (a
-// terminal that reports Code differently for the same character still matches); every
-// other key matches by Mod and Code.
-func normalize(k tea.Key) matchKey {
+// Normalize restates k the way a terminal reports the same physical keystroke, so that
+// a key Parse built from a [keys] table and a key a decoder built from the wire become
+// the same value. Two rules, and they are the whole of what a Table matches by:
+//
+// Shift on a letter takes priority (see shiftedLetter) and collapses to the shifted
+// form with the Shift bit stripped and, when nothing else is held, the letter as Text.
+// Both spellings a real shift+l press can take, and the "shift+l" a table binds, land on
+// Key{Code: 'L', Text: "L"}. The Text stays off when another modifier is held, since
+// tea.Key.String returns Text over the keystroke and would otherwise render ctrl+shift+p
+// as a bare "P", indistinguishable from shift+p.
+//
+// Otherwise Text is cleared for anything carrying ctrl, alt or super. A terminal only
+// fills Text for a key that produces text and never for those, while Parse fills it from
+// the character in the binding string whatever its modifiers, so ctrl+a would otherwise
+// read as a plain "a".
+//
+// Normalize is what lets a caller outside this package (the composer's textarea key map,
+// which matches on tea.Key.String rather than through Match) spell a binding and read an
+// incoming press by the same rule the Table uses.
+func Normalize(k tea.Key) tea.Key {
 	if letter, ok := shiftedLetter(k); ok {
-		return matchKey{mod: k.Mod &^ tea.ModShift, code: letter}
+		n := tea.Key{Mod: k.Mod &^ tea.ModShift, Code: letter}
+		if n.Mod == 0 {
+			n.Text = string(letter)
+		}
+		return n
 	}
-	if k.Mod == 0 && k.Text != "" {
-		return matchKey{code: []rune(k.Text)[0]}
+	if k.Mod&^tea.ModShift != 0 {
+		k.Text = ""
 	}
-	return matchKey{mod: k.Mod, code: k.Code}
+	return k
+}
+
+// normalize collapses k to the key Table looks bindings up by: Normalize's canonical key
+// reduced to the pair Match indexes on. A printable key with no modifiers matches by its
+// Text, so a terminal that reports Code differently for the same character still
+// matches; every other key matches by Mod and Code.
+func normalize(k tea.Key) matchKey {
+	n := Normalize(k)
+	if n.Mod == 0 && n.Text != "" {
+		return matchKey{code: []rune(n.Text)[0]}
+	}
+	return matchKey{mod: n.Mod, code: n.Code}
 }
 
 // Table is a resolved [keys] table: Defaults with a config's overrides applied, indexed
-// for Match.
+// for Match and, the other way round, for Keys.
 type Table struct {
-	byKey map[matchKey][]Action
+	byKey    map[matchKey][]Action
+	byAction map[Action][]tea.Key
+}
+
+// Default is the table a config with no [keys] section resolves to: pi's Defaults, no
+// overrides.
+func Default() *Table {
+	t, err := New(nil)
+	if err != nil {
+		// Defaults is a compile-time table covered by the keys tests, and New only
+		// fails on an override, of which there are none here.
+		panic("keys: built-in defaults are invalid: " + err.Error())
+	}
+	return t
 }
 
 // New builds a Table from overrides, a [keys] table as config.Config.Keys holds it: a
@@ -246,6 +289,7 @@ func New(overrides map[string][]string) (*Table, error) {
 		return nil, errors.Join(errs...)
 	}
 	byKey := make(map[matchKey][]Action)
+	byAction := make(map[Action][]tea.Key, len(Actions))
 	for _, a := range Actions {
 		for _, s := range bindings[a] {
 			k, err := Parse(s)
@@ -255,12 +299,21 @@ func New(overrides map[string][]string) (*Table, error) {
 			}
 			nk := normalize(k)
 			byKey[nk] = append(byKey[nk], a)
+			byAction[a] = append(byAction[a], k)
 		}
 	}
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
-	return &Table{byKey: byKey}, nil
+	return &Table{byKey: byKey, byAction: byAction}, nil
+}
+
+// Keys are the keys a is bound to, in the order the table binds them, as Parse read
+// them: an unbound action has none. It is the inverse of Match, for a caller that has to
+// hand a binding to something matching keys its own way rather than through Match, and
+// that caller runs each key through Normalize to spell it.
+func (t *Table) Keys(a Action) []tea.Key {
+	return slices.Clone(t.byAction[a])
 }
 
 // Match returns every action k is bound to, in Actions order (so, for instance, a plain
