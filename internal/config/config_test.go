@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -25,8 +26,8 @@ func TestXDGDefaultsAndOverrides(t *testing.T) {
 	if p.Cache != "/home/guy/.cache/rudy" {
 		t.Errorf("cache %q", p.Cache)
 	}
-	if !strings.HasSuffix(p.Runtime, "/rudy") {
-		t.Errorf("runtime %q", p.Runtime)
+	if want := filepath.Join(os.TempDir(), "rudy-"+strconv.Itoa(os.Getuid())); p.Runtime != want {
+		t.Errorf("runtime %q want %q", p.Runtime, want)
 	}
 	p = config.XDG(envOf(map[string]string{
 		"XDG_CONFIG_HOME": "/x/cfg", "XDG_DATA_HOME": "/x/data",
