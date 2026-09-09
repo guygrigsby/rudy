@@ -11,7 +11,7 @@
 | Workspace | The directory a session acts on: root, git root, project id | Session |
 | Safety class | `safe` or `unsafe` on every tool; the one switch driving both the gate and the durable-record rule | Session |
 | Permission mode | `strict`, `permissive` or `off`; how the gate treats unsafe tools | Session |
-| Asker | Whoever can answer a permission question; an attached client. No asker means deny | Session |
+| Asker | Whoever can answer a permission question; every attached client that declared it. The first answer decides; no asker means deny | Session |
 | Dangerous set | The tools and shell shapes that still ask in permissive mode | Session |
 | Compaction | A summary entry that stands in for earlier entries when building the next request | Session |
 | Request context | The newest compaction's summary, then every entry after the last one it covers, older compactions dropped, translated for a provider | Session, derived |

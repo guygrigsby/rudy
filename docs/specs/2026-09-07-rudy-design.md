@@ -301,9 +301,9 @@ dedicated files and nothing else.
 
 | command | does |
 |---|---|
-| `rudy` | TUI; embeds the server or attaches to a running `rudy serve` |
+| `rudy` | TUI; attaches to a running `rudy serve` when its socket answers within 50ms, else embeds the server; `--socket <path>` names one, `--embed` skips the probe (ADR 0014) |
 | `rudy -p "prompt"`, `rudy --print` | headless printer client; `--output text|json|stream-json`, `--mode`, `--model` |
-| `rudy serve` | server on `$XDG_RUNTIME_DIR/rudy.sock` (0600) |
+| `rudy serve` | server on `$XDG_RUNTIME_DIR/rudy/rudy.sock` (directory 0700, socket 0600, peer uid checked); `--socket <path>`; foreground, SIGINT or SIGTERM cancels active turns, shuts down and removes the socket |
 | `rudy sessions list|resume|fork` | session management |
 | `rudy models` | the discovered registry with prices |
 | `rudy mcp add|remove|list|get` | MCP servers, the Claude Code shape: `add <name> <command…>`, `add --transport http <name> <url>`, `--scope user|project`; writes `mcp.toml` under XDG config or the workspace's `.rudy/` |
@@ -321,8 +321,10 @@ dedicated files and nothing else.
 - A spawned plugin that dies is marked failed with its stderr tail in a notice;
   its tools disappear from the next request; the session continues.
 - A killed tool records outcome `killed` and its partial output.
-- `rudy serve` sessions survive client exit; a client reattaches by replaying
-  entries then following live.
+- `rudy serve` sessions survive client exit while a turn runs; a client
+  reattaches by replaying entries, hearing the current turn state and any
+  standing permission question, then following live. A session nobody is
+  attached to closes at rest and resumes cold with the same transcript.
 
 ## Testing
 

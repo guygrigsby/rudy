@@ -312,6 +312,7 @@ Entity, owned by Session, not stored (its progress is the tail of the log). One 
 - A transition not in the table below is refused.
 - Entering `running_tool` for an unsafe tool is refused unless a `permission_decision` allow for `pendingToolCallID` has been appended and fsynced.
 - Leaving any active state on interrupt records partials already streamed before the state changes.
+- In `awaiting_permission` the question is put to every attached asker, and to an asker that attaches while it stands; the first answer decides and a later answer is refused. When the last asker detaches while the question stands, the Gate records `permission_decision{no_asker}` and the turn leaves `awaiting_permission` as a denial (ADR 0014).
 
 ### States
 
@@ -323,6 +324,7 @@ stateDiagram-v2
     streaming --> awaiting_permission: unsafe tool, mode asks
     awaiting_permission --> running_tool: allow
     awaiting_permission --> streaming: deny, tool_result error appended
+    awaiting_permission --> streaming: last asker detached, no_asker denial
     running_tool --> streaming: tool_result appended
     streaming --> completed: stop, no tool_use
     streaming --> steering: Esc once
