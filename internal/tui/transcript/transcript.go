@@ -150,25 +150,33 @@ func (t *Transcript) applyAssistant(e session.Entry, m session.AssistantMessage)
 			built = append(built, &Row{Key: b.ID, Kind: RowTool, TurnID: turn, Entry: e, ToolUse: b})
 		}
 	}
-	if len(built) == 0 || t.settled(built) {
+	if len(built) == 0 {
+		// Nothing on screen comes of this message, but the turn's live rows were
+		// standing in for it and must not stay Live. They drew nothing (a live text row
+		// with text always yields text blocks, and a hidden thinking row renders
+		// empty), so sweeping them adds or changes no key.
+		t.rows = t.placeCommitted(turn, nil)
+		return nil
+	}
+	if t.settled(built) {
 		return nil
 	}
 	changed := make([]string, 0, len(built))
-	insert := make([]*Row, 0, len(built))
-	replaced := make(map[string]bool, len(built))
-	for _, r := range built {
+	for i, r := range built {
 		changed = append(changed, r.Key)
 		old := t.byKey[r.Key]
 		if old == nil {
-			insert = append(insert, r)
 			t.byKey[r.Key] = r
 			continue
 		}
+		// A live tool row is replaced through its pointer, keeping what the user opened
+		// and anything already absorbed into it, and it is that pointer that takes the
+		// row's place in the committed order.
 		r.Expanded, r.Decision, r.Result = old.Expanded, old.Decision, old.Result
 		*old = *r
-		replaced[r.Key] = true
+		built[i] = old
 	}
-	t.rows = t.placeCommitted(turn, insert, replaced)
+	t.rows = t.placeCommitted(turn, built)
 	return changed
 }
 
@@ -183,28 +191,39 @@ func (t *Transcript) settled(built []*Row) bool {
 	return true
 }
 
-// placeCommitted drops the turn's live text and thinking rows and puts insert where the
-// first of them stood, or ahead of the first row replaced in place, or at the end.
-func (t *Transcript) placeCommitted(turn string, insert []*Row, replaced map[string]bool) []*Row {
-	out := make([]*Row, 0, len(t.rows)+len(insert))
-	done := false
+// placeCommitted puts built on screen in block order. One assistant message's rows are
+// one contiguous group, so the turn's live text and thinking rows go, any row a tool row
+// is replacing is lifted out of where the stream left it, and the whole of built goes in
+// at the first position the group held. Placing each row individually is what keeps
+// [text, tool_use, text] in that order: anchoring the group and appending would put both
+// text rows in front of the tool row.
+//
+// built may be empty, which is the sweep on its own: an assistant message that draws
+// nothing still ends the turn's live rows.
+func (t *Transcript) placeCommitted(turn string, built []*Row) []*Row {
+	member := make(map[string]bool, len(built))
+	for _, r := range built {
+		member[r.Key] = true
+	}
+	out := make([]*Row, 0, len(t.rows)+len(built))
+	anchor := -1
 	for _, r := range t.rows {
-		switch {
-		case r.Live && r.Kind != RowTool && r.TurnID == turn:
-			delete(t.byKey, r.Key)
-			if !done {
-				out, done = append(out, insert...), true
-			}
+		live := r.Live && r.Kind != RowTool && r.TurnID == turn
+		if !member[r.Key] && !live {
+			out = append(out, r)
 			continue
-		case !done && replaced[r.Key]:
-			out, done = append(out, insert...), true
 		}
-		out = append(out, r)
+		if anchor < 0 {
+			anchor = len(out)
+		}
+		if live {
+			delete(t.byKey, r.Key)
+		}
 	}
-	if !done {
-		out = append(out, insert...)
+	if anchor < 0 {
+		anchor = len(out)
 	}
-	return out
+	return slices.Insert(out, anchor, built...)
 }
 
 // Delta folds one streamed part into the turn's live rows.

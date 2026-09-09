@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 
 	"charm.land/glamour/v2"
 	glamourstyle "charm.land/glamour/v2/ansi"
@@ -134,27 +135,39 @@ func (t *Transcript) expansion(input json.RawMessage, res *session.ToolResult) [
 // preview is the folded form of a result, at most ToolPreviewLines lines: the tail of a
 // command's output, the first hunk of an edit, a count for the tools that answer with a
 // list, and the head of anything else.
+//
+// Only a clean run gets that treatment. A tool that failed, was killed or lost its
+// result did not produce the shape those previews read, so it shows what it actually
+// said: a failed edit would otherwise draw the diff of a change that never landed, and a
+// failed read a count of the lines of its error message.
 func (t *Transcript) preview(name string, input json.RawMessage, res *session.ToolResult) []segment {
 	n := t.opts.ToolPreviewLines
 	if n <= 0 {
 		return nil
 	}
 	text := session.TextOf(res.Content)
+	if res.Outcome != session.OutcomeOK {
+		role := theme.RoleMuted
+		if res.Outcome == session.OutcomeError {
+			role = theme.RoleError
+		}
+		return paint(role, head(splitLines(text), n)...)
+	}
 	switch name {
 	case "read":
-		return muted(count(text, "line", "lines"))
+		return paint(theme.RoleMuted, listCount(text, "line", "lines"))
 	case "grep":
-		return muted(count(text, "match", "matches"))
+		return paint(theme.RoleMuted, listCount(text, "match", "matches"))
 	case "glob":
-		return muted(count(text, "file", "files"))
+		return paint(theme.RoleMuted, listCount(text, "file", "files"))
 	case "write":
-		return muted(firstLine(text))
+		return paint(theme.RoleMuted, firstLine(text))
 	case "edit":
 		return t.diff(input, n)
 	case "bash":
-		return muted(tail(splitLines(text), n)...)
+		return paint(theme.RoleMuted, tail(splitLines(text), n)...)
 	}
-	return muted(head(splitLines(text), n)...)
+	return paint(theme.RoleMuted, head(splitLines(text), n)...)
 }
 
 // segment is one preview line and the role that paints it.
@@ -165,10 +178,10 @@ type segment struct {
 	fill bool
 }
 
-func muted(texts ...string) []segment {
+func paint(role theme.Role, texts ...string) []segment {
 	out := make([]segment, 0, len(texts))
 	for _, s := range texts {
-		out = append(out, segment{text: s, role: theme.RoleMuted})
+		out = append(out, segment{text: s, role: role})
 	}
 	return out
 }
@@ -251,7 +264,13 @@ var noteRoles = map[session.NoteRole]theme.Role{
 func (t *Transcript) marker(r *Row) []string {
 	switch p := r.Entry.Payload.(type) {
 	case session.Note:
-		return t.wrap(noteRoles[p.Role], 0, p.Text)
+		role, ok := noteRoles[p.Role]
+		if !ok {
+			// A role the note vocabulary does not define reaches line as its own name,
+			// where StyleFor falls back to text.
+			role = theme.Role(p.Role)
+		}
+		return t.wrap(role, 0, p.Text)
 	case session.Compaction:
 		// How many entries a compaction covered is a server-side count; the client has
 		// the summary, so the first line of it stands for the range.
@@ -295,31 +314,64 @@ func summary(name string, input json.RawMessage) string {
 			}
 		}
 	}
-	return ansi.Truncate(strings.TrimSpace(string(input)), summaryMax, "")
+	return ansi.Truncate(sanitize(strings.TrimSpace(string(input))), summaryMax, "")
 }
 
-// line is one display line: truncated to what is left of the width, indented and
-// painted. fill paints role as the background instead, which only the diff roles ask
-// for and only under ui.diff.style = "background".
+// line is one display line: sanitized, truncated to what is left of the width, indented
+// and painted. The role resolves through StyleFor, so a role name the theme does not
+// know, a note's own vocabulary among them, falls back to text rather than to no color
+// at all. fill paints role as the background instead, which only the diff roles ask for
+// and only under ui.diff.style = "background".
 func (t *Transcript) line(role theme.Role, indent int, text string, fill bool) string {
+	text = sanitize(text)
 	if w := t.opts.Width - indent; w > 0 {
 		text = ansi.Truncate(text, w, "")
 	}
-	st := t.th.Style(role)
+	st := t.th.StyleFor(string(role))
 	if fill {
 		st = t.th.Style(theme.RoleText).Background(t.th.Colors[role])
 	}
 	return strings.Repeat(" ", indent) + st.Render(text)
 }
 
-// wrap is line over text word wrapped to the width.
+// wrap is line over text wrapped to the width. ansi.Wrap, not ansi.Wordwrap: word
+// wrapping alone leaves a token longer than the width whole, and line would then
+// truncate it and lose the rest. Wrap is the word wrap with a hard break inside a token
+// that does not fit, so prose is never cut.
 func (t *Transcript) wrap(role theme.Role, indent int, text string) []string {
 	w := max(t.opts.Width-indent, 1)
 	var out []string
-	for _, l := range splitLines(ansi.Wordwrap(text, w, "")) {
-		out = append(out, t.line(role, indent, l, false))
+	for _, l := range splitLines(ansi.Wrap(sanitize(text), w, "")) {
+		// A wrap that lands on a space leaves it at the end of the line, where it is
+		// invisible and only pads the byte count.
+		out = append(out, t.line(role, indent, strings.TrimRight(l, " "), false))
 	}
 	return out
+}
+
+// sanitize makes untrusted text safe to draw. A tool result, a user message, a model's
+// own tool input and a provider's error message all reach the screen otherwise as they
+// are, and one embedded reset or cursor motion corrupts the inline region the client
+// owns. ANSI sequences go, and so do the control characters that move the cursor by
+// themselves; tab and newline stay, since previews, diffs and read's output are built
+// out of them. Assistant markdown does not come through here: glamour escapes it and
+// then adds the styling this must not remove.
+func sanitize(s string) string {
+	s = ansi.Strip(s)
+	if !strings.ContainsFunc(s, isControl) {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if isControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// isControl is a rune a terminal acts on rather than draws, tab and newline excepted.
+func isControl(r rune) bool {
+	return (r < 0x20 && r != '\n' && r != '\t') || (r >= 0x7f && r <= 0x9f)
 }
 
 // markdown renders one answer block through glamour, with chroma on fences.
@@ -369,9 +421,54 @@ func glamourStyle(th theme.Theme) glamourstyle.StyleConfig {
 	sc.BlockQuote.Color, sc.HorizontalRule.Color = muted, muted
 	sc.Image.Color, sc.ImageText.Color = muted, muted
 	sc.Code.Color = chromaText(th.Chroma)
-	sc.CodeBlock.Color, sc.CodeBlock.Chroma, sc.CodeBlock.Theme = nil, nil, th.Chroma
+	sc.CodeBlock.Color, sc.CodeBlock.Chroma, sc.CodeBlock.Theme = nil, nil, noGround(th.Chroma)
 	clearBackgrounds(&sc)
 	return sc
+}
+
+// groundless guards the derived chroma styles: chroma's registry is a package-level map
+// and a client may build more than one transcript.
+var groundless struct {
+	sync.Mutex
+	names map[string]string
+}
+
+// noGroundSuffix names the derived style. It is deterministic, so a golden of a fence is
+// stable, and distinct, so registering it never overwrites the style it came from.
+const noGroundSuffix = "-rudy-noground"
+
+// noGround registers, once, a copy of the chroma style named name with every background
+// cleared, and returns the name to highlight fences with. The design paints no
+// backgrounds and several chroma styles do: tokyonight-night, the default, gives
+// GenericInserted and GenericDeleted one, so a ```diff fence would paint a ground the
+// theme never asked for.
+func noGround(name string) string {
+	groundless.Lock()
+	defer groundless.Unlock()
+	if got, ok := groundless.names[name]; ok {
+		return got
+	}
+	derived := strings.ToLower(name) + noGroundSuffix
+	src := chromastyles.Get(name)
+	b := chroma.NewStyleBuilder(derived)
+	for _, tt := range src.Types() {
+		e := src.Get(tt)
+		e.Background = 0
+		b.AddEntry(tt, e)
+	}
+	built, err := b.Build()
+	if err != nil {
+		// Build only fails on an unparseable entry, and every entry here came out of a
+		// registered style. Fences keep their grounds rather than losing their colors.
+		derived = name
+	} else {
+		chromastyles.Register(built)
+	}
+	if groundless.names == nil {
+		groundless.names = make(map[string]string)
+	}
+	groundless.names[name] = derived
+	return derived
 }
 
 // clearBackgrounds nils every BackgroundColor in sc. glamour's built-in styles paint a
@@ -429,13 +526,48 @@ func prettyJSON(input json.RawMessage) []string {
 	return splitLines(buf.String())
 }
 
-// count is "<n> <noun>" over the lines of a tool's answer.
-func count(text, one, many string) string {
-	n := len(splitLines(text))
-	if n == 1 {
-		return "1 " + one
+// noResults is the answer read, grep and glob give when nothing matched, verbatim
+// (internal/plugins/tools/{grep,glob}). Counting its one line would say "1 match".
+const noResults = "no matches"
+
+// cutPrefix opens the line those tools append when they cut a list short: read's
+// "… N more lines", grep's "… truncated at N matches", glob's "… truncated at N
+// results". It is not an entry, so it is not counted.
+const cutPrefix = "… "
+
+// listCount summarizes a result that is a list: read's numbered lines, grep's matches,
+// glob's paths. The empty answer and the cap line are the tools' own shapes, read off
+// internal/plugins/tools, not guessed from the blob.
+func listCount(text, one, many string) string {
+	lines := splitLines(text)
+	cut := ""
+	if len(lines) > 0 {
+		if last := lines[len(lines)-1]; strings.HasPrefix(last, cutPrefix) {
+			lines, cut = lines[:len(lines)-1], ", "+cutSummary(last)
+		}
 	}
-	return fmt.Sprintf("%d %s", n, many)
+	switch {
+	case len(lines) == 0, len(lines) == 1 && lines[0] == noResults:
+		return "no " + many
+	case len(lines) == 1:
+		return "1 " + one + cut
+	}
+	return fmt.Sprintf("%d %s%s", len(lines), many, cut)
+}
+
+// cutSummary shortens a tool's cap line for a one-line preview: "… 40 more lines" next
+// to a count of lines only needs to say "40 more".
+func cutSummary(line string) string {
+	s := strings.TrimPrefix(line, cutPrefix)
+	i := strings.LastIndexByte(s, ' ')
+	if i <= 0 {
+		return s
+	}
+	switch s[i+1:] {
+	case "lines", "matches", "results", "files":
+		return s[:i]
+	}
+	return s
 }
 
 // splitLines is text as lines, without the empty one a trailing newline leaves.

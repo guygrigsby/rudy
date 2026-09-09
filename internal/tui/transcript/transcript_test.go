@@ -254,3 +254,209 @@ func TestSilentEntriesProduceNoRow(t *testing.T) {
 		t.Errorf("rows %+v", tr.Rows())
 	}
 }
+
+// assistantWith is one assistant message over the given blocks.
+func assistantWith(t *testing.T, blocks ...session.Block) session.Entry {
+	t.Helper()
+	return entry(t, session.AssistantMessage{Model: ref, Thinking: session.ThinkingOff, StopReason: session.StopToolUse, Content: blocks})
+}
+
+func keysOf(rows []*Row) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Key)
+	}
+	return out
+}
+
+// Finding 1: the committed rows come out in block order, not bunched at one anchor.
+func TestCommittedRowsKeepBlockOrder(t *testing.T) {
+	t.Run("text tool text", func(t *testing.T) {
+		tr := New(Options{Width: 80}, theme.Default())
+		tr.Delta("turn1", provider.Part{Type: provider.PartTextDelta, Text: "first"})
+		tr.Delta("turn1", provider.Part{Type: provider.PartToolUseStart, ID: "t1", Name: "bash"})
+		a := assistantWith(t,
+			session.TextBlock("first"),
+			session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`)),
+			session.TextBlock("second"),
+		)
+		tr.Apply(a)
+		want := []string{a.ID.String() + "/0", "t1", a.ID.String() + "/2"}
+		if got := keysOf(tr.Rows()); !reflect.DeepEqual(got, want) {
+			t.Errorf("keys %v, want %v", got, want)
+		}
+	})
+	t.Run("tool text", func(t *testing.T) {
+		tr := New(Options{Width: 80}, theme.Default())
+		tr.Delta("turn1", provider.Part{Type: provider.PartToolUseStart, ID: "t1", Name: "bash"})
+		tr.Delta("turn1", provider.Part{Type: provider.PartTextDelta, Text: "after"})
+		a := assistantWith(t,
+			session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`)),
+			session.TextBlock("after"),
+		)
+		tr.Apply(a)
+		want := []string{"t1", a.ID.String() + "/1"}
+		if got := keysOf(tr.Rows()); !reflect.DeepEqual(got, want) {
+			t.Errorf("keys %v, want %v", got, want)
+		}
+	})
+	t.Run("replay with no live rows", func(t *testing.T) {
+		tr := New(Options{Width: 80}, theme.Default())
+		a := assistantWith(t,
+			session.TextBlock("first"),
+			session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`)),
+			session.TextBlock("second"),
+		)
+		tr.Apply(a)
+		want := []string{a.ID.String() + "/0", "t1", a.ID.String() + "/2"}
+		if got := keysOf(tr.Rows()); !reflect.DeepEqual(got, want) {
+			t.Errorf("keys %v, want %v", got, want)
+		}
+	})
+}
+
+// Minor: a message that draws nothing still ends the turn's live rows.
+func TestAssistantWithNoRowsSweepsTheLiveRows(t *testing.T) {
+	tr := New(Options{Width: 80}, theme.Default())
+	tr.Delta("turn1", provider.Part{Type: provider.PartThinkingDelta, Text: "weighing"})
+	if rows := tr.Rows(); len(rows) != 1 || !rows[0].Live {
+		t.Fatalf("live rows %+v", rows)
+	}
+	// Thinking is hidden, so this message builds no rows at all.
+	if keys := tr.Apply(assistantWith(t, session.Block{Type: session.BlockThinking, Text: "weighing"})); keys != nil {
+		t.Errorf("keys %v", keys)
+	}
+	if rows := tr.Rows(); len(rows) != 0 {
+		t.Errorf("live rows survived: %+v", rows)
+	}
+}
+
+// Finding 4: a token longer than the width wraps; nothing is truncated away.
+func TestLongTokensWrapRatherThanTruncate(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	tr := New(Options{Width: 40, UserPrefix: "›"}, theme.Default())
+	tr.Apply(entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("see " + long + " end")}}))
+	lines := tr.Render(tr.Rows()[0])
+	got := ansi.Strip(strings.Join(lines, "\n"))
+	if n := strings.Count(got, "a"); n != 200 {
+		t.Errorf("kept %d of 200 characters:\n%s", n, got)
+	}
+	if !strings.Contains(got, "end") {
+		t.Errorf("lost the tail:\n%s", got)
+	}
+	for _, l := range lines {
+		if w := ansi.StringWidth(l); w > 40 {
+			t.Errorf("line %d cells wide: %q", w, l)
+		}
+	}
+}
+
+// Finding 5: untrusted text draws without the sequences that would move the cursor.
+func TestUntrustedTextIsStripped(t *testing.T) {
+	const (
+		esc  = "\x1b"
+		bell = "\a"
+	)
+	tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2, UserPrefix: "›"}, theme.Default())
+	u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{
+		session.TextBlock("look " + esc + "[31mred" + esc + "[m\rnow" + bell),
+	}})
+	tr.Apply(u)
+	// The escape reaches the summary through valid JSON, the way a model would send it.
+	tr.Apply(assistantWith(t, session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"say \u001b[2Jhi"}`))))
+	tr.Apply(entry(t, session.ToolResult{ToolUseID: "t1", Outcome: session.OutcomeOK, Content: []session.Block{
+		session.TextBlock(esc + "[31mboom" + esc + "[m\rgone" + bell),
+	}}))
+	out := strings.Join(tr.Commit(u.ID.String()), "\n")
+	for _, bad := range []string{"[31m", "[2J", "\r", bell} {
+		if strings.Contains(out, bad) {
+			t.Errorf("%q survived: %q", bad, out)
+		}
+	}
+	// A dropped carriage return closes the gap it left: nothing is inserted in its place.
+	for _, want := range []string{"look rednow", "boomgone", "say hi"} {
+		if !strings.Contains(ansi.Strip(out), want) {
+			t.Errorf("lost %q from %q", want, ansi.Strip(out))
+		}
+	}
+}
+
+// Finding 2: the list tools' counts come off their real result shapes.
+func TestListCountsFollowTheToolShapes(t *testing.T) {
+	cases := []struct {
+		tool, result, want string
+	}{
+		{"read", "1\tpackage x\n2\tfunc f()\n", "2 lines"},
+		{"read", "1\tpackage x\n", "1 line"},
+		{"read", "1\ta\n2\tb\n… 40 more lines\n", "2 lines, 40 more"},
+		{"grep", "no matches\n", "no matches"},
+		{"grep", "a.go:1:x\n", "1 match"},
+		{"grep", "a.go:1:x\na.go:2:y\n… truncated at 200 matches\n", "2 matches, truncated at 200"},
+		{"glob", "no matches\n", "no files"},
+		{"glob", "a.go\nb.go\n", "2 files"},
+		{"glob", "a.go\n… truncated at 1000 results\n", "1 file, truncated at 1000"},
+		{"glob", "", "no files"},
+	}
+	for _, c := range cases {
+		t.Run(c.tool+"/"+c.want, func(t *testing.T) {
+			tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2}, theme.Default())
+			u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+			tr.Apply(u)
+			tr.Apply(assistantWith(t, session.ToolUseBlock("t1", c.tool, json.RawMessage(`{"pattern":"x","path":"y"}`))))
+			var blocks []session.Block
+			if c.result != "" {
+				blocks = append(blocks, session.TextBlock(c.result))
+			}
+			tr.Apply(entry(t, session.ToolResult{ToolUseID: "t1", Outcome: session.OutcomeOK, Content: blocks}))
+			got := ansi.Strip(strings.Join(tr.Commit(u.ID.String()), "\n"))
+			if !strings.Contains(got, c.want) {
+				t.Errorf("preview %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// Finding 3: a failed tool shows what it said, in the error role, whatever tool it is.
+func TestFailedToolsShowTheirText(t *testing.T) {
+	// The error role's opening sequence, to prove the preview carries it.
+	errOpen := strings.TrimSuffix(theme.Default().Style(theme.RoleError).Render("x"), "x\x1b[m")
+	cases := []struct {
+		name, tool, input, result, absent string
+	}{
+		{"edit", "edit", `{"path":"a.go","old":"x\n","new":"y\n"}`, "edit: old text not found in a.go\n", "-x"},
+		{"read", "read", `{"path":"a.go"}`, "read: a.go is a binary file\n", "lines"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2}, theme.Default())
+			u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+			tr.Apply(u)
+			tr.Apply(assistantWith(t, session.ToolUseBlock("t1", c.tool, json.RawMessage(c.input))))
+			tr.Apply(entry(t, session.ToolResult{ToolUseID: "t1", Outcome: session.OutcomeError, Content: []session.Block{session.TextBlock(c.result)}}))
+			joined := strings.Join(tr.Commit(u.ID.String()), "\n")
+			plain := ansi.Strip(joined)
+			if !strings.Contains(plain, strings.TrimSpace(c.result)) {
+				t.Errorf("preview %q, want the error text", plain)
+			}
+			if strings.Contains(plain, c.absent) {
+				t.Errorf("preview still shows the clean-run shape %q: %q", c.absent, plain)
+			}
+			if !strings.Contains(joined, errOpen) {
+				t.Errorf("preview is not in the error role: %q", joined)
+			}
+		})
+	}
+}
+
+// Minor: a note role the vocabulary does not define falls back to text rather than to no
+// color at all.
+func TestUnknownNoteRoleFallsBackToText(t *testing.T) {
+	tr := New(Options{Width: 80}, theme.Default())
+	e := session.Entry{ID: session.NewID(), Kind: session.KindNote, Payload: session.Note{Plugin: "p", Text: "hello", Role: session.NoteRole("shouty")}}
+	tr.Apply(e)
+	got := strings.Join(tr.Render(tr.Rows()[0]), "\n")
+	want := theme.Default().Style(theme.RoleText).Render("hello")
+	if got != want {
+		t.Errorf("note %q, want %q", got, want)
+	}
+}

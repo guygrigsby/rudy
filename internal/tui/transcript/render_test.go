@@ -202,3 +202,40 @@ func TestGoldenLiveAssistantRow(t *testing.T) {
 	tr.Delta(turn, provider.Part{Type: provider.PartToolUseDelta, ID: "t1", Text: `{"path":"internal/session/fork.go"}`})
 	golden(t, "live_stream", strings.Join(tr.Commit(turn), "\n")+"\n")
 }
+
+// mdDoc exercises every markdown path the theme touches: a heading, a link, an inline
+// code span, a highlighted fence and a diff fence, which is the one chroma styles paint
+// a background on.
+const mdDoc = "## The fork bound\n\n" +
+	"See [ADR 0013](https://example.test/adr) and `Row.Key`.\n\n" +
+	"```go\nfunc f() int { return 1 }\n```\n\n" +
+	"```diff\n-\tentries := s.entries[:at]\n+\tentries := s.entries[:at+1]\n```\n"
+
+func TestGoldenMarkdown(t *testing.T) {
+	tr, turn := start(t, defaults(), "explain the bound")
+	tr.Apply(entry(t, session.AssistantMessage{Model: ref, Thinking: session.ThinkingOff, StopReason: session.StopEndTurn, Content: []session.Block{
+		session.TextBlock(mdDoc),
+	}}))
+	golden(t, "markdown", strings.Join(tr.Commit(turn), "\n")+"\n")
+}
+
+// TestNoPaintedBackgrounds is the design's "no painted backgrounds, the terminal's black
+// shows through" as a gate over every golden. ui.diff.style = "background" is the one
+// exception the design grants, and it is one file.
+func TestNoPaintedBackgrounds(t *testing.T) {
+	files, err := filepath.Glob(filepath.Join("testdata", "*.golden"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no goldens: %v", err)
+	}
+	for _, f := range files {
+		body, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		painted := strings.Contains(string(body), "48;")
+		want := filepath.Base(f) == "screen_diff_background.golden"
+		if painted != want {
+			t.Errorf("%s paints a background: %v, want %v", f, painted, want)
+		}
+	}
+}
