@@ -17,18 +17,43 @@ import (
 const (
 	exitCommand = "exit"
 	quitCommand = "quit"
+	// scopedModelsCommand opens the set ctrl+p and ctrl+n cycle through. The cycle is the
+	// client's own state, never the session's, so the command is the client's too
+	// (ADR 0020).
+	scopedModelsCommand = "scoped-models"
 )
 
 // clientCommands are those two as the menu lists them, under everything the server
 // registered: they are the client's vocabulary, and they never reach a session log.
 var clientCommands = []protocol.CommandInfo{
+	{Name: scopedModelsCommand, Description: "Choose the models ctrl+p cycles through"},
 	{Name: exitCommand, Description: "Close the client; a session on a running rudy serve keeps its place"},
 	{Name: quitCommand, Description: "Close the client, the same as /exit"},
 }
 
 // localCommand reports whether the client answers name itself. It is read ahead of
 // command.run, so a plugin registering either name finds it unreachable from this client.
-func localCommand(name string) bool { return name == exitCommand || name == quitCommand }
+func localCommand(name string) bool {
+	switch name {
+	case exitCommand, quitCommand, scopedModelsCommand:
+		return true
+	}
+	return false
+}
+
+// runLocal runs one of the client's own commands. The editor has already been cleared by
+// the submit that got here, the way it is for a command the server runs.
+func (m *Model) runLocal(name, args string) tea.Cmd {
+	switch name {
+	case exitCommand, quitCommand:
+		return tea.Quit
+	case scopedModelsCommand:
+		// An argument is the filter the picker opens under, so /scoped-models kimi lands
+		// on the models worth choosing between rather than on the whole registry.
+		return m.openScopePicker(strings.TrimSpace(args))
+	}
+	return nil
+}
 
 // menuState is the slash menu's own state: the row the keyboard is on, the draft that
 // selection was made under, and the draft an Esc dismissed the menu for. What is on screen

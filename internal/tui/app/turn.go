@@ -149,9 +149,9 @@ func (m *Model) sendQueued() tea.Cmd {
 func (m *Model) sendTyped(text string) tea.Cmd {
 	if name, args, ok := commandIn(text); ok {
 		if localCommand(name) {
-			// The client's own, never the server's: quitting ends this program and leaves
-			// a daemon and its session alone (ADR 0015 decision 3).
-			return tea.Quit
+			// The client's own, never the server's: what they do is the client's business
+			// and no session hears about them (ADR 0015 decision 3, ADR 0020).
+			return m.runLocal(name, args)
 		}
 		return m.callNamed(protocol.MethodCommandRun, name, protocol.CommandRunParams{
 			SessionID: m.session.SessionID,

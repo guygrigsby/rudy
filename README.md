@@ -63,7 +63,8 @@ part off.
 The client opens full screen and keeps every row expandable. Keys are pi's
 action ids over the closed set ADR 0013 lists, rebound in a `[keys]` table. Esc
 in insert goes to vim normal; in normal with a turn running once steers and
-twice cancels. `ctrl+l` picks a model, `shift+tab` cycles thinking, `ctrl+o`
+twice cancels. `ctrl+l` picks a model and `ctrl+p` cycles through them, `/scoped-models`
+narrows that cycle to the ones you actually use, `shift+tab` cycles thinking, `ctrl+o`
 expands the newest tool row, `alt+enter` queues a follow-up behind the running
 turn, and `ctrl+d` on an empty editor exits, as does `/exit`. An unsafe tool
 asks where its row will be: `y` allows once, `a` for the session, `n` and Esc

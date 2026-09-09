@@ -10,3 +10,4 @@ bullet here is what a person sees when they open the client on that build.
 - `/exit` closes the client, the daemon keeps running
 - `rudy serve` holds sessions across clients
 - A startup header with the model and what is new
+- `/rename` names a session, `/scoped-models` narrows ctrl+p

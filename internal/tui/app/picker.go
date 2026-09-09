@@ -18,6 +18,15 @@ import (
 const (
 	pickerModel   = "model"
 	pickerSession = "session"
+	pickerScope   = "scope"
+)
+
+// The marks a multi-select picker draws in front of a row, in and out of the set being
+// chosen. A cross rather than a colour: nothing under internal/tui paints a background,
+// and a set has to be readable in one glance.
+const (
+	inSet  = "[x] "
+	outSet = "[ ] "
 )
 
 // pickerMinRows is the shortest list worth drawing. The longest is half the frame, so
@@ -45,6 +54,25 @@ type picker struct {
 	sel int
 	// top is the first filtered row drawn, moved only to keep sel on screen.
 	top int
+	// chosen is the ids picked so far, for a picker that takes a set rather than one row.
+	// Nil for the single-row pickers, which is what tells the two apart when drawing.
+	chosen map[string]bool
+}
+
+// multi reports whether this picker takes a set rather than one row.
+func (p *picker) multi() bool { return p.chosen != nil }
+
+// toggle puts the row under the cursor in or out of the set.
+func (p *picker) toggle() {
+	row, ok := p.current()
+	if !ok {
+		return
+	}
+	if p.chosen[row.id] {
+		delete(p.chosen, row.id)
+		return
+	}
+	p.chosen[row.id] = true
 }
 
 // pickRow is one row: the text it draws and matches on, and the id a confirm sends, a
@@ -69,8 +97,8 @@ func (p *picker) visible() []pickRow {
 	return out
 }
 
-// chosen is the row under the cursor, false for a filter that matches nothing.
-func (p *picker) chosen() (pickRow, bool) {
+// current is the row under the cursor, false for a filter that matches nothing.
+func (p *picker) current() (pickRow, bool) {
 	rows := p.visible()
 	if p.sel < 0 || p.sel >= len(rows) {
 		return pickRow{}, false
@@ -104,7 +132,7 @@ func (p *picker) point(id string) {
 // row survived: a registry answer that lands while the picker is open must not move the
 // selection out from under the keyboard.
 func (p *picker) setRows(rows []pickRow) {
-	at, ok := p.chosen()
+	at, ok := p.current()
 	p.rows = rows
 	p.sel, p.top = 0, 0
 	if ok {
@@ -253,6 +281,25 @@ func (m *Model) openSessionPicker(sums []session.Summary) {
 	m.pick.point(m.session.SessionID)
 }
 
+// openScopePicker opens the model list as a set to choose: the models ctrl+p and ctrl+n
+// cycle through. It opens on whatever the scope is now, so a person sees what they already
+// chose rather than an empty list (ADR 0020).
+func (m *Model) openScopePicker(filter string) tea.Cmd {
+	if m.offline() {
+		return nil
+	}
+	chosen := make(map[string]bool, len(m.scope))
+	for _, ref := range m.scope {
+		chosen[ref.String()] = true
+	}
+	m.pick = &picker{
+		kind: pickerScope, title: "cycle these models  (space toggles, enter confirms)",
+		rows: modelRows(m.models), chosen: chosen, filter: filter,
+	}
+	m.pick.point(m.session.Model.String())
+	return m.call(protocol.MethodRegistryRefresh, nil)
+}
+
 // pickerKey routes one key while a picker is up. The picker owns the keyboard: the
 // tui.select actions drive it, anything printable filters it, and everything else is
 // swallowed, so no key reaches the turn or the editor behind it. Enter carries both
@@ -275,10 +322,22 @@ func (m *Model) pickerKey(k tea.KeyPressMsg) tea.Cmd {
 			return nil
 		case keys.TUISelectConfirm:
 			return m.confirmPick()
+		case keys.TUIInputTab:
+			// Tab toggles a row in a picker that takes a set. Space does too, below: it is
+			// what pi uses, and a model id never needs one in a filter. Neither is a new
+			// action id, so ADR 0013 decision 5's closed set stands.
+			if m.pick.multi() {
+				m.pick.toggle()
+				return nil
+			}
 		case keys.TUISelectCancel:
 			m.pick = nil
 			return nil
 		}
+	}
+	if m.pick.multi() && k.Code == ' ' && k.Mod == 0 {
+		m.pick.toggle()
+		return nil
 	}
 	m.pick.filterKey(tea.Key(k))
 	return nil
@@ -289,8 +348,14 @@ func (m *Model) pickerKey(k tea.KeyPressMsg) tea.Cmd {
 func (m *Model) confirmPick() tea.Cmd {
 	p := m.pick
 	m.pick = nil
-	row, ok := p.chosen()
+	row, ok := p.current()
 	if !ok {
+		return nil
+	}
+	if p.kind == pickerScope {
+		// A confirm takes the set as it stands, an empty one included: emptying the scope
+		// is how a person goes back to cycling the whole registry.
+		m.setScope(p.chosen)
 		return nil
 	}
 	switch p.kind {
@@ -332,6 +397,14 @@ func (m *Model) pickerView() []string {
 		role, mark := theme.RoleText, unselectedMark
 		if j == p.sel {
 			role, mark = theme.RoleAccent, selectedMark
+		}
+		if p.multi() {
+			// The cursor's mark, then whether this row is in the set: a person moving
+			// through the list has to see both at once.
+			mark += outSet
+			if p.chosen[rows[j].id] {
+				mark = mark[:len(mark)-len(outSet)] + inSet
+			}
 		}
 		out = append(out, m.clamp(m.th.Style(role).Render(mark+spanText(rows[j].text))))
 	}

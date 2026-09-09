@@ -16,13 +16,13 @@
                                                                                                     
                                                                                                     
                                                                                                     
-                                                                                                    
 
  [38;2;86;95;137m───────────────────────────────────────────────────────────────────────────────────────────────────[m
 [38;2;122;162;247m> /model  Switch this session's model: /model <provider:id or unique id>[m
 [38;2;86;95;137m  /help  List the slash commands[m
 [38;2;86;95;137m  /fork  Fork this session at an entry: /fork [entry id], default the newest[m
 [38;2;86;95;137m  /plugins  List loaded plugins and their state[m
+[38;2;86;95;137m  /scoped-models  Choose the models ctrl+p cycles through[m
 [38;2;86;95;137m  /exit  Close the client; a session on a running rudy serve keeps its place[m
 [38;2;86;95;137m  /quit  Close the client, the same as /exit[m
 [38;2;192;202;245m[38;2;122;162;247m ┃ [m[m[38;2;192;202;245m/[m[38;2;192;202;245m[7;38;2;122;162;247m [m[m[38;2;192;202;245m[m[38;2;192;202;245m                                                                                               [m

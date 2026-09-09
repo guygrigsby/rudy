@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -159,6 +160,10 @@ type Model struct {
 	// menu is the slash menu's own state, which is only ever a selection and a dismissal:
 	// what it lists comes from the draft.
 	menu menuState
+	// scope is the models app.model.cycleForward and cycleBackward step through, in
+	// registry order. Empty means the whole registry, which is what a client opens on
+	// (ADR 0020).
+	scope []session.ModelRef
 	// switching is the session switch waiting for its answer, nil when none is. It holds
 	// the session being left and the notifications that arrived while it was in flight,
 	// which for a resume, an open and a fork are the new session's replay: the server
@@ -817,20 +822,64 @@ func (m *Model) setSessionModel(ref session.ModelRef) tea.Cmd {
 	})
 }
 
-// cycleModel steps d models through the registry from the session's own, wrapping at both
-// ends. A model the registry does not carry starts the walk at the first entry rather
-// than nowhere.
+// cycleModel steps d models through the cycle from the session's own, wrapping at both
+// ends. A model the cycle does not carry starts the walk at its first entry rather than
+// nowhere, which is also what happens the first time a scope is set from outside it.
 func (m *Model) cycleModel(d int) tea.Cmd {
-	n := len(m.models)
+	refs := m.cycle()
+	n := len(refs)
 	if n == 0 {
 		m.note(levelWarn, "the registry has no models")
 		return nil
 	}
 	next := 0
-	if i := slices.IndexFunc(m.models, func(mo provider.Model) bool { return mo.Ref == m.session.Model }); i >= 0 {
+	if i := slices.Index(refs, m.session.Model); i >= 0 {
 		next = ((i+d)%n + n) % n
 	}
-	return m.setSessionModel(m.models[next].Ref)
+	return m.setSessionModel(refs[next])
+}
+
+// cycle is what ctrl+p and ctrl+n step through: the scope when one is set, the whole
+// registry otherwise. A scoped model the registry has since stopped carrying is dropped
+// here rather than at the moment it was chosen, so a registry refresh cannot leave the
+// cycle pointing at something that no longer answers.
+func (m *Model) cycle() []session.ModelRef {
+	if len(m.scope) == 0 {
+		out := make([]session.ModelRef, 0, len(m.models))
+		for _, mo := range m.models {
+			out = append(out, mo.Ref)
+		}
+		return out
+	}
+	out := make([]session.ModelRef, 0, len(m.scope))
+	for _, ref := range m.scope {
+		if slices.ContainsFunc(m.models, func(mo provider.Model) bool { return mo.Ref == ref }) {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+// setScope takes the ids a scope picker confirmed, in registry order so cycling follows
+// the order the picker listed them. An empty set clears the scope, which is how a person
+// goes back to the whole registry, and either way the client says what it did: nothing on
+// screen carries the scope.
+func (m *Model) setScope(chosen map[string]bool) {
+	var scope []session.ModelRef
+	for _, mo := range m.models {
+		if chosen[mo.Ref.String()] {
+			scope = append(scope, mo.Ref)
+		}
+	}
+	m.scope = scope
+	switch len(scope) {
+	case 0:
+		m.note(levelInfo, "cycling every model in the registry")
+	case 1:
+		m.note(levelInfo, "cycling one model: "+scope[0].String())
+	default:
+		m.note(levelInfo, "cycling "+strconv.Itoa(len(scope))+" models")
+	}
 }
 
 // thinkingLevels is the cycle app.thinking.cycle steps through, in the order the domain

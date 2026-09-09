@@ -320,9 +320,10 @@ A draft that opens with `/` and carries no space yet lists the matching commands
 above the editor, name and description, filtered as it is typed. The editor keeps
 the keyboard: the arrows move the selection, tab or Enter completes the name, Esc
 dismisses the menu. The list is `command.list`, asked once on connect, plus the
-two commands the client answers itself: `/exit` and its alias `/quit` close the
-client, detaching from a daemon and ending an embedded server with the process.
-ADR 0015.
+commands the client answers itself: `/exit` and its alias `/quit` close the
+client, detaching from a daemon and ending an embedded server with the process,
+and `/scoped-models` chooses the set `ctrl+p` cycles through, space toggling a
+row and an empty set meaning the whole registry. ADR 0015, ADR 0020.
 
 ## CLI
 
