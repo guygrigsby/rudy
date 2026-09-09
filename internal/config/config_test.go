@@ -293,7 +293,7 @@ func loadFile(t *testing.T, body string) *config.Config {
 
 func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	c := loadWith(t, map[string]any{"default.provider": "p", "default.model": "m"})
-	if c.UI.Render != "inline" || !c.UI.Vim || c.Permissions.DoublePressMS != 500 {
+	if c.UI.Render != "altscreen" || !c.UI.Vim || c.Permissions.DoublePressMS != 500 {
 		t.Errorf("ui %+v", c.UI)
 	}
 	if !reflect.DeepEqual(c.UI.Layout.Slots, []string{"transcript", "input", "status"}) {

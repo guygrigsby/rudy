@@ -177,7 +177,7 @@ func Defaults() map[string]any {
 		"memory.summary_model":             "",
 		"mcp.connect_timeout_ms":           10000,
 		"max_tokens":                       8192,
-		"ui.render":                        "inline",
+		"ui.render":                        "altscreen",
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,

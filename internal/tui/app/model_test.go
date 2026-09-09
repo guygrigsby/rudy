@@ -453,12 +453,15 @@ func TestWidgetsAndStatusFillTheirSlots(t *testing.T) {
 	h.notify(protocol.NotifyWidgetUpdated, protocol.Widget{
 		Owner: "skills", Key: "count", Slot: protocol.SlotBelowEditor, Content: nil,
 	})
-	before := len(lines)
-	if now := len(h.lines()); now != before-1 {
-		t.Fatalf("an emptied widget must leave no blank line: %d lines, was %d\n%s", now, before, h.view())
-	}
+	lines = h.lines()
 	if strings.Contains(ansi.Strip(h.view()), "12 skills") {
 		t.Error("an emptied widget must go")
+	}
+	// The line it held is gone rather than blanked: the editor now sits against the
+	// status line with nothing between them. Counting the frame would not show it, since
+	// the client draws the whole screen (ADR 0015) however many lines its slots take.
+	if editor, status := at("┃"), at("2 servers"); editor != status-1 {
+		t.Fatalf("an emptied widget must leave no blank line: editor %d, status %d in\n%s", editor, status, strings.Join(lines, "\n"))
 	}
 	h.notify(protocol.NotifyWidgetUpdated, protocol.Widget{
 		Owner: "skills", Key: "count", Slot: protocol.SlotBelowEditor,
@@ -1332,7 +1335,7 @@ func TestAltscreenFollowsTheNewestRowAndScrolls(t *testing.T) {
 // home to tui.editor.cursorLineStart as well as to tui.altScreen.top, and inline has no
 // viewport, so the key has to reach the editor exactly as it did before.
 func TestInlineLeavesTheScrollKeysToTheEditor(t *testing.T) {
-	h := newHarness(t, nil) // inline is the default
+	h := newHarness(t, inlineOver())
 	h.typeText("hello")
 	h.press("home")
 	h.typeText("X")

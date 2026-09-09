@@ -55,18 +55,23 @@ each default to `~/.config`, `~/.local/share` and `~/.cache`, plus `/rudy`.
     rudy sessions resume <session id>     # the same, as a verb
     rudy sessions fork <session id>       # a fork of it, --at <entry id> for where
 
-The client draws inline, so the transcript is the terminal's own scrollback:
-a turn's rows are committed when it rests. Keys are pi's action ids over the
-closed set ADR 0013 lists, rebound in a `[keys]` table. Esc in insert goes to
-vim normal; in normal with a turn running once steers and twice cancels.
-`ctrl+l` picks a model, `shift+tab` cycles thinking, `ctrl+o` expands the
-newest tool row, `alt+enter` queues a follow-up behind the running turn, and
-`ctrl+d` on an empty editor exits. An unsafe tool asks inline where its row
-will be: `y` allows once, `a` for the session, `n` and Esc deny.
+The client opens full screen and keeps every row expandable. Keys are pi's
+action ids over the closed set ADR 0013 lists, rebound in a `[keys]` table. Esc
+in insert goes to vim normal; in normal with a turn running once steers and
+twice cancels. `ctrl+l` picks a model, `shift+tab` cycles thinking, `ctrl+o`
+expands the newest tool row, `alt+enter` queues a follow-up behind the running
+turn, and `ctrl+d` on an empty editor exits, as does `/exit`. An unsafe tool
+asks where its row will be: `y` allows once, `a` for the session, `n` and Esc
+deny.
+
+Typing `/` lists the commands above the editor with what each does, filtered as
+you type. The arrows move the selection, tab or Enter completes the name, Esc
+dismisses it.
 
 Every render choice is a config field under `[ui]` with a default, listed in
-`docs/specs/rudy-contracts.md`; `ui.render = "altscreen"` swaps the inline
-scrollback for a viewport where every row stays expandable.
+`docs/specs/rudy-contracts.md`; `ui.render = "inline"` swaps the full screen for
+the terminal's own scrollback, where a turn's rows are committed when it rests
+and a committed row no longer expands.
 
 ## Run headless
 

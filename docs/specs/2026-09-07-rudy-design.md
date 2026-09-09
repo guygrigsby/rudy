@@ -187,9 +187,9 @@ memory plugin. ADR 0008.
 
 ## Client
 
-The TUI is Bubble Tea v2 with the charm.land v2 stack pinned exactly. Inline
-rendering by default so the transcript lives in native scrollback. The default
-screen, from the owner's spec:
+The TUI is Bubble Tea v2 with the charm.land v2 stack pinned exactly. It opens
+full screen, owning the terminal until it exits, and `ui.render = "inline"`
+draws in native scrollback instead. The default screen, from the owner's spec:
 
 ```
  › fix the flaky fork test
@@ -226,7 +226,7 @@ Every choice is a config field with the default that produces that screen:
 
 ```toml
 [ui]
-render = "inline"
+render = "altscreen"
 vim = true
 double_press_ms = 500
 
@@ -285,11 +285,20 @@ double-press window, or once while steering with an empty editor, cancels the
 turn, drops queued follow-ups back into the editor and idles. Idle Esc only
 closes a picker or a selection. ADR 0006.
 
-Inline rendering commits a turn's rows to native scrollback when the turn
-rests; a row still in the live region expands, a committed one does not.
-`ui.render = "altscreen"` keeps every row expandable. Assistant text streams
-as plain text and renders through glamour once its entry arrives. Queued
-follow-ups are held by the client and submitted when the turn rests. ADR 0013.
+Full screen keeps every row expandable for the life of the session.
+`ui.render = "inline"` trades that for the terminal's own scrollback: a turn's
+rows are committed there when it rests, and a committed row no longer expands.
+Assistant text streams as plain text and renders through glamour once its entry
+arrives. Queued follow-ups are held by the client and submitted when the turn
+rests. ADR 0013, ADR 0015.
+
+A draft that opens with `/` and carries no space yet lists the matching commands
+above the editor, name and description, filtered as it is typed. The editor keeps
+the keyboard: the arrows move the selection, tab or Enter completes the name, Esc
+dismisses the menu. The list is `command.list`, asked once on connect, plus the
+two commands the client answers itself: `/exit` and its alias `/quit` close the
+client, detaching from a daemon and ending an embedded server with the process.
+ADR 0015.
 
 ## CLI
 

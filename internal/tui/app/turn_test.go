@@ -18,7 +18,7 @@ import (
 )
 
 func TestSubmitStreamsAndCommitsInline(t *testing.T) {
-	h := newAppHarness(t, scripted{text("Looking at the test first.")})
+	h := newAppHarnessWith(t, scripted{text("Looking at the test first.")}, inlineRender)
 	h.typeText("fix the flaky fork test")
 	h.press("enter")
 	h.waitTurn(stateCompleted)
@@ -47,7 +47,7 @@ func TestSubmitStreamsAndCommitsInline(t *testing.T) {
 }
 
 func TestEscOnceSteersTwiceCancels(t *testing.T) {
-	h := newAppHarness(t, scripted{slowText("thinking...", 2*time.Second)})
+	h := newAppHarnessWith(t, scripted{slowText("thinking...", 2*time.Second)}, inlineRender)
 	h.typeText("go")
 	h.press("enter")
 	h.waitTurn(stateStreaming)
@@ -185,7 +185,7 @@ func TestAFailedAnswerPutsTheQuestionBack(t *testing.T) {
 }
 
 func TestALateRowCommitsAtOnce(t *testing.T) {
-	h := newAppHarness(t, scripted{text("done")})
+	h := newAppHarnessWith(t, scripted{text("done")}, inlineRender)
 	h.typeText("go")
 	h.press("enter")
 	h.waitTurn(stateCompleted)
@@ -233,7 +233,7 @@ func TestAQueuedSlashRunsAsACommand(t *testing.T) {
 }
 
 func TestFollowUpAtRestSubmits(t *testing.T) {
-	h := newAppHarness(t, scripted{text("done")})
+	h := newAppHarnessWith(t, scripted{text("done")}, inlineRender)
 	h.typeText("go")
 	h.press("alt+enter") // nothing is running, so there is nothing to queue behind
 	if q := h.editor().Queue(); len(q) != 0 {
@@ -244,7 +244,7 @@ func TestFollowUpAtRestSubmits(t *testing.T) {
 }
 
 func TestQueueSubmitsWhenTheTurnRests(t *testing.T) {
-	h := newAppHarness(t, scripted{slowText("one", 300*time.Millisecond), text("two")})
+	h := newAppHarnessWith(t, scripted{slowText("one", 300*time.Millisecond), text("two")}, inlineRender)
 	h.typeText("first")
 	h.press("enter")
 	h.typeText("second")
@@ -260,7 +260,7 @@ func TestQueueSubmitsWhenTheTurnRests(t *testing.T) {
 }
 
 func TestSubmitWhileRunningQueues(t *testing.T) {
-	h := newAppHarness(t, scripted{slowText("one", 300*time.Millisecond), text("two")})
+	h := newAppHarnessWith(t, scripted{slowText("one", 300*time.Millisecond), text("two")}, inlineRender)
 	h.typeText("first")
 	h.press("enter")
 	h.waitTurn(stateStreaming)
@@ -311,7 +311,7 @@ func TestCancelPutsTheQueueBackInTheEditor(t *testing.T) {
 }
 
 func TestPermissionPromptInline(t *testing.T) {
-	h := newAppHarness(t, scripted{toolCall("bash", `{"command":"go test ./..."}`), text("done")})
+	h := newAppHarnessWith(t, scripted{toolCall("bash", `{"command":"go test ./..."}`), text("done")}, inlineRender)
 	h.typeText("run the tests")
 	h.press("enter")
 	h.waitFor("the question", func(v string) bool { return strings.Contains(v, "allow once [y]") })
@@ -393,7 +393,7 @@ func TestAltscreenKeepsRowsExpandable(t *testing.T) {
 }
 
 func TestSlashRunsACommand(t *testing.T) {
-	h := newAppHarness(t, scripted{text("done")})
+	h := newAppHarnessWith(t, scripted{text("done")}, inlineRender)
 	h.typeText("/notice hello there")
 	h.press("enter")
 	h.waitFor("the command's notice", func(v string) bool { return strings.Contains(v, "noticed: hello there") })
@@ -455,7 +455,7 @@ func findDecision(t *testing.T, entries []session.Entry, tool string) session.Pe
 // replay is what puts those rows in scrollback; a second print from turnChanged would be
 // batched against it, and a tea.Batch does not order its commands.
 func TestATurnRestingDuringAReplayDoesNotPrint(t *testing.T) {
-	h := newHarness(t, nil) // inline is the default
+	h := newHarness(t, inlineOver())
 	h.fold(session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("first question")}})
 	h.fold(session.AssistantMessage{
 		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,

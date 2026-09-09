@@ -183,8 +183,8 @@ func TestNoPaintedBackgrounds(t *testing.T) {
 	}
 }
 
-func TestGoldenDefaultInline(t *testing.T) {
-	golden(t, "default_inline", screen(t, nil, nil))
+func TestGoldenDefault(t *testing.T) {
+	golden(t, "default_altscreen", screen(t, nil, nil))
 }
 
 func TestGoldenToolsExpanded(t *testing.T) {
@@ -199,8 +199,11 @@ func TestGoldenThinkingShown(t *testing.T) {
 	golden(t, "thinking_shown", screen(t, map[string]any{"ui.transcript.thinking": "shown"}, nil))
 }
 
-func TestGoldenAltscreen(t *testing.T) {
-	golden(t, "altscreen", screen(t, map[string]any{"ui.render": "altscreen"}, nil))
+// TestGoldenInline is the opt-in half of ADR 0015: the frame anchors at the bottom of
+// whatever the terminal already held, and a rested turn's rows would have been committed
+// out of it. Nothing here rests one, so what it pins is the live region.
+func TestGoldenInline(t *testing.T) {
+	golden(t, "inline", screen(t, map[string]any{"ui.render": "inline"}, nil))
 }
 
 func TestGoldenVimModes(t *testing.T) {

@@ -37,6 +37,15 @@ func sessionKeys(t *testing.T) *keys.Table {
 // has to read: inline commits a rested turn's rows to scrollback instead.
 func altscreen(c *config.Config) { c.UI.Render = renderAltscreen }
 
+// inlineRender is the other one: the client opens full screen (ADR 0015), so a test that
+// reads what was committed to the terminal's own scrollback has to ask for inline, which
+// is the only mode that commits anything.
+func inlineRender(c *config.Config) { c.UI.Render = "inline" }
+
+// inlineOver is the same last word for the pipe harness, which takes config overrides as
+// a table rather than as a function.
+func inlineOver() map[string]any { return map[string]any{"ui.render": "inline"} }
+
 // filter types into the picker's filter. It is not appHarness.typeText, which leaves the
 // editor's normal mode first: a picker takes the keys as they come, an "i" included.
 func (h *appHarness) filter(s string) {
@@ -539,7 +548,7 @@ func TestForkReplaysTheLogOnce(t *testing.T) {
 // the live region is the newest turn, which the next user message commits like any other.
 // The bound is one turn, whether the replay came with a switch or at launch.
 func TestAnInlineSwitchCommitsTheReplay(t *testing.T) {
-	h := newAppHarness(t, scripted{text("first answer"), text("second answer")})
+	h := newAppHarnessWith(t, scripted{text("first answer"), text("second answer")}, inlineRender)
 	h.m.keys = sessionKeys(t)
 	first := h.m.session.SessionID
 	h.typeText("first question")
@@ -584,7 +593,7 @@ func TestAnInlineSwitchCommitsTheReplay(t *testing.T) {
 // but the newest goes to scrollback as the next one starts, so what stands in the live
 // region is bounded by one turn.
 func TestAnInlineReplayCommitsEachTurnAsTheNextStarts(t *testing.T) {
-	h := newHarness(t, nil) // inline is the default
+	h := newHarness(t, inlineOver())
 	h.fold(session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("first question")}})
 	h.fold(session.AssistantMessage{
 		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
@@ -708,7 +717,7 @@ func TestAnEntryIsFoldedOnce(t *testing.T) {
 // whole replay was held and the fold's per-turn commits are suppressed: the answer prints
 // every turn but the newest, in one ordered block.
 func TestASwitchCommitsWhatItHeld(t *testing.T) {
-	h := newHarness(t, nil) // inline is the default
+	h := newHarness(t, inlineOver())
 	h.m.keys = sessionKeys(t)
 	h.press("ctrl+n")
 	next := session.NewID().String()
