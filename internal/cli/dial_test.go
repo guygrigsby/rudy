@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
@@ -448,5 +449,192 @@ func TestLockedSessionPrintsTheSocketHint(t *testing.T) {
 	}
 	if !strings.Contains(forkErr.String(), want) {
 		t.Fatalf("fork: stderr %q, want %q", forkErr.String(), want)
+	}
+}
+
+// TestDialRefusesASocketItDoesNotOwn is the client half of the peer uid check. On linux with
+// XDG_RUNTIME_DIR unset the default socket is /tmp/rudy-<uid>/rudy.sock and /tmp is
+// world-writable, so another local user can create that directory first, bind a socket in it
+// 0666 and answer every rudy, rudy -p and sessions resume the victim runs, taking their
+// prompts, their tool calls and their permission answers. The refusal is final: embedding
+// instead would put a second server on the same store behind a path somebody else is holding.
+func TestDialRefusesASocketItDoesNotOwn(t *testing.T) {
+	setups := []struct {
+		name string
+		// hostile prepares the default socket path and returns the substring the refusal names.
+		hostile func(t *testing.T, socket string) string
+	}{
+		{"a directory anyone can write", func(t *testing.T, socket string) string {
+			dir := filepath.Dir(socket)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			listenDeaf(t, socket)
+			if err := os.Chmod(dir, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		}},
+		{"a socket reached through a symlink", func(t *testing.T, socket string) string {
+			dir := filepath.Dir(socket)
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			real := filepath.Join(dir, "real.sock")
+			listenDeaf(t, real)
+			if err := os.Symlink(real, socket); err != nil {
+				t.Fatal(err)
+			}
+			return socket
+		}},
+	}
+	// The check runs inside attach, which both ways in share, so both are held to it: an
+	// operator naming a hostile socket is told the same thing as one who named nothing.
+	paths := []struct {
+		name string
+		opts func(socket string) dialOptions
+	}{
+		{"the default socket", func(string) dialOptions { return dialOptions{} }},
+		{"an explicit --socket", func(socket string) dialOptions { return dialOptions{Socket: socket} }},
+	}
+	for _, s := range setups {
+		for _, p := range paths {
+			t.Run(s.name+" on "+p.name, func(t *testing.T) {
+				t.Chdir(t.TempDir())
+				testBuilder(t, &fakeProvider{}) // for the XDG roots; the builder itself must never run
+				env := runtimeEnv(sockDir(t))
+				socket := config.XDG(env, t.TempDir()).Socket()
+				named := s.hostile(t, socket)
+
+				refuse := refuseToBuild(t, "a socket this uid does not own is a refusal, not a path to embed over")
+				d, code, err := dial(context.Background(), refuse,
+					BuildOptions{Stderr: io.Discard, Env: env, Home: t.TempDir()}, p.opts(socket), "dial-test", false)
+				if err == nil {
+					d.Close()
+					t.Fatal("dial attached to a socket this uid does not own")
+				}
+				if d != nil {
+					t.Fatalf("a failed dial returns no client: %+v", d)
+				}
+				if code != 1 {
+					t.Fatalf("code = %d, want 1", code)
+				}
+				if !errors.Is(err, protocol.ErrSocketNotOurs) {
+					t.Fatalf("err = %v, want ErrSocketNotOurs", err)
+				}
+				if !strings.Contains(err.Error(), named) {
+					t.Fatalf("err = %v, want it to name %s", err, named)
+				}
+			})
+		}
+	}
+}
+
+// listenSilent binds socket and holds every connection it accepts open without answering: a
+// daemon that has listened but is still loading plugins and refreshing its registry, which
+// rudy serve really is between its ListenUnix and its build. The connect succeeds and the
+// hello sits in the backlog.
+func listenSilent(t *testing.T, socket string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("listen %s: %v", socket, err)
+	}
+	var (
+		mu    sync.Mutex
+		held  []net.Conn
+		done  = make(chan struct{})
+		close = func() {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, c := range held {
+				_ = c.Close()
+			}
+		}
+	)
+	go func() {
+		defer func() { close(); done <- struct{}{} }()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+	})
+}
+
+// TestDialFailsWhenTheHelloNeverComes: the connect timeout bounds the connect and nothing
+// else. rudy serve listens before it builds, so a client that dialed a daemon still loading
+// plugins sits in its backlog with a hello nobody is reading, and a build that then fails
+// leaves it waiting on a process that is exiting. Embedding is not the answer either: two
+// servers over one store split the sessions.
+func TestDialFailsWhenTheHelloNeverComes(t *testing.T) {
+	t.Chdir(t.TempDir())
+	testBuilder(t, &fakeProvider{}) // for the XDG roots; the builder itself must never run
+	saved := greetTimeout
+	greetTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { greetTimeout = saved })
+
+	env := runtimeEnv(sockDir(t))
+	socket := config.XDG(env, t.TempDir()).Socket()
+	listenSilent(t, socket)
+
+	refuse := refuseToBuild(t, "a server that answered and never greeted is a failure, not an empty path")
+	d, code, err := dial(context.Background(), refuse,
+		BuildOptions{Stderr: io.Discard, Env: env, Home: t.TempDir()}, dialOptions{}, "dial-test", false)
+	if err == nil {
+		d.Close()
+		t.Fatal("dial waited out a hello that never came and then succeeded")
+	}
+	if d != nil {
+		t.Fatalf("a failed dial returns no client: %+v", d)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if errors.Is(err, protocol.ErrNoServer) {
+		t.Fatalf("something is holding that path, so this is not ErrNoServer: %v", err)
+	}
+	for _, want := range []string{socket, "answered but did not greet within", "--embed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want it to carry %q", err, want)
+		}
+	}
+}
+
+// TestDialEmbedsWhenThePathIsNotASocket: a plain file where the socket goes is a leftover, not
+// a server, and connect answers ENOTSOCK rather than the ECONNREFUSED a dead socket gives. A
+// client that read that as a real failure would refuse to run at all until somebody deleted
+// the file by hand.
+func TestDialEmbedsWhenThePathIsNotASocket(t *testing.T) {
+	t.Chdir(t.TempDir())
+	build := testBuilder(t, &fakeProvider{})
+	env := runtimeEnv(sockDir(t))
+	socket := config.XDG(env, t.TempDir()).Socket()
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(socket, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d, code, err := dial(context.Background(), build,
+		BuildOptions{Stderr: io.Discard, Env: env, Home: t.TempDir()}, dialOptions{}, "dial-test", false)
+	if err != nil || code != 0 {
+		t.Fatalf("dial = %d, %v", code, err)
+	}
+	defer d.Close()
+	if d.Built == nil {
+		t.Fatal("nothing is serving a plain file, so this client has to be its own server")
 	}
 }

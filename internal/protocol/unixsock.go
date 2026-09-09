@@ -28,6 +28,14 @@ var ErrPeerRefused = errors.New("protocol: peer uid is not the server's")
 // case where starting a server is the right answer.
 var ErrNoServer = errors.New("protocol: no server on the socket")
 
+// ErrSocketNotOurs means the socket, or the directory holding it, is somebody else's: owned
+// by another uid, reached through a symlink, or sitting in a directory group or other can
+// write. On linux with XDG_RUNTIME_DIR unset the default lives under /tmp, which every local
+// user can write, so a socket answering at the expected path is not by itself evidence that
+// the process behind it is the user's own. This is the client's half of the same trust
+// boundary ErrPeerRefused is the server's half of.
+var ErrSocketNotOurs = errors.New("protocol: the socket is not ours")
+
 // staleProbeTimeout bounds the dial ListenUnix makes before it takes a path over. A local
 // connect is answered by the kernel the moment a listener is bound, so a slow one means a
 // server whose backlog is full, which is a server all the same.
@@ -51,6 +59,87 @@ const (
 // package-wide while it stands, which is why no test in this package may call t.Parallel.
 var peerUID = PeerUID
 
+// statUID is the stat-to-uid step the ownership checks run, a variable for the same reason
+// peerUID is one: a test cannot arrange a second user's file, and the branch that refuses one
+// is the branch worth having a test for.
+var statUID = fileUID
+
+// fileUID is the owner of a stat the caller already took. The syscall.Stat_t is the only
+// place the uid is, and every unix this builds for has it.
+func fileUID(fi os.FileInfo) (int, error) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("protocol: %s: stat carries no uid (%T)", fi.Name(), fi.Sys())
+	}
+	return int(st.Uid), nil
+}
+
+// CheckSocketOwner refuses a socket path that is not this user's before anything connects to
+// it. The server checks its peer's uid; without this the client checks nothing, and a socket
+// under a directory another local user could create first (linux, XDG_RUNTIME_DIR unset,
+// /tmp world-writable, the path a bare uid away from guessable) would take every rudy run on
+// the machine into that user's process, prompts, tool calls and all.
+//
+// Both the socket and its directory have to be this uid's, neither may be a symlink, and the
+// directory may not be writable by group or other. Nothing here follows a link: a check that
+// resolved one would be checking the target while the connect went through the link. An
+// absent path is ErrNoServer, not a refusal: nobody there is the case where starting a server
+// is the right answer.
+func CheckSocketOwner(path string) error {
+	if err := checkSocketDir(filepath.Dir(path)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %s: %w", ErrNoServer, path, err)
+		}
+		return err
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %s: %w", ErrNoServer, path, err)
+		}
+		return fmt.Errorf("protocol: socket %s: %w", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: %s is a symlink", ErrSocketNotOurs, path)
+	}
+	uid, err := statUID(fi)
+	if err != nil {
+		return err
+	}
+	if uid != os.Getuid() {
+		return fmt.Errorf("%w: %s is owned by uid %d, not %d", ErrSocketNotOurs, path, uid, os.Getuid())
+	}
+	return nil
+}
+
+// checkSocketDir is the predicate both halves of the trust boundary apply to the directory a
+// socket lives in: this uid's, not a symlink, and closed to group and other writes. A
+// directory anyone else can write is one they can put a socket in, whoever owns the one
+// there now.
+func checkSocketDir(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("protocol: socket dir %s: %w", dir, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%w: socket dir %s is a symlink", ErrSocketNotOurs, dir)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%w: socket dir %s is not a directory", ErrSocketNotOurs, dir)
+	}
+	uid, err := statUID(fi)
+	if err != nil {
+		return err
+	}
+	if uid != os.Getuid() {
+		return fmt.Errorf("%w: socket dir %s is owned by uid %d, not %d", ErrSocketNotOurs, dir, uid, os.Getuid())
+	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("%w: socket dir %s is mode %04o, writable by group or other", ErrSocketNotOurs, dir, perm)
+	}
+	return nil
+}
+
 // Listener is a server's unix socket. It holds an exclusive lock beside the socket for as
 // long as it lives, so a second server starting at the same moment cannot decide the socket
 // is stale and take the path out from under this one, and its Accept runs the peer uid check
@@ -64,29 +153,15 @@ type Listener struct {
 	closeErr  error
 }
 
-// ListenUnix listens on path, creating its directory 0700 and the socket 0600. A socket left
-// behind by a server that died is removed; a path another server holds, by its lock or by
-// answering a probe, is refused with ErrSocketBusy.
+// ListenUnix listens on path, creating its directory 0700 and the socket 0600. A directory
+// that was already there is checked rather than narrowed, and refused with ErrSocketNotOurs
+// when it is another uid's or open to a group or other write. A socket left behind by a
+// server that died is removed; a path another server holds, by its lock or by answering a
+// probe, is refused with ErrSocketBusy.
 func ListenUnix(path string) (*Listener, error) {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, socketDirMode); err != nil {
-		return nil, fmt.Errorf("protocol: socket dir %s: %w", dir, err)
+	if err := prepareSocketDir(filepath.Dir(path)); err != nil {
+		return nil, err
 	}
-	// A symlinked directory is somebody else's decision about where the socket lives: the
-	// 0700 below would land on whatever it points at, and the socket with it.
-	di, err := os.Lstat(dir)
-	if err != nil {
-		return nil, fmt.Errorf("protocol: socket dir %s: %w", dir, err)
-	}
-	if di.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("protocol: socket dir %s is a symlink", dir)
-	}
-	// MkdirAll takes the umask off the mode it is given and leaves an existing directory's
-	// mode alone, so neither case is private without saying so outright.
-	if err := os.Chmod(dir, socketDirMode); err != nil {
-		return nil, fmt.Errorf("protocol: socket dir %s: %w", dir, err)
-	}
-
 	lock, err := takeLock(lockPath(path))
 	if err != nil {
 		return nil, err
@@ -98,6 +173,38 @@ func ListenUnix(path string) (*Listener, error) {
 		return nil, err
 	}
 	return &Listener{ln: ln, lock: lock, path: path}, nil
+}
+
+// prepareSocketDir leaves dir fit to bind a socket in: created 0700, or vouched for if it was
+// already there. Only a directory this call made is chmod'd. A chmod on any directory the
+// caller named is a chmod on a directory that is not the socket's to narrow: `rudy serve
+// --socket ~/rudy.sock` would take $HOME to 0700, and a root `--socket /tmp/x.sock` would
+// take /tmp with it, breaking every other program on the machine that expected to write
+// there. A directory that already existed is checked against the same predicate the client
+// applies before it attaches, so neither half of the trust boundary is the loose one.
+//
+// The leaf is created with Mkdir rather than MkdirAll so "we made it" is the syscall's answer
+// and not a stat that another process could have raced.
+func prepareSocketDir(dir string) error {
+	if parent := filepath.Dir(dir); parent != dir {
+		if err := os.MkdirAll(parent, socketDirMode); err != nil {
+			return fmt.Errorf("protocol: socket dir %s: %w", parent, err)
+		}
+	}
+	switch err := os.Mkdir(dir, socketDirMode); {
+	case err == nil:
+		// Mkdir takes the umask off the mode it is given, so the mode is set outright rather
+		// than left to whatever the shell that started this process was carrying. Nothing else
+		// can be in the directory: it did not exist a syscall ago.
+		if err := os.Chmod(dir, socketDirMode); err != nil {
+			return fmt.Errorf("protocol: socket dir %s: %w", dir, err)
+		}
+		return nil
+	case errors.Is(err, fs.ErrExist):
+		return checkSocketDir(dir)
+	default:
+		return fmt.Errorf("protocol: socket dir %s: %w", dir, err)
+	}
 }
 
 // lockPath is the lock that goes with a socket, in the same 0700 directory. The file is
@@ -230,13 +337,15 @@ func remove(path string) error {
 }
 
 // DialUnix connects to a server on path. timeout bounds the connect alone, not what the
-// returned Conn goes on to do. An absent path or a refused connection is ErrNoServer, which
-// is how a probing client tells nobody there from a socket it cannot use.
+// returned Conn goes on to do. An absent path, a refused connection or a path that is not a
+// socket at all is ErrNoServer, which is how a probing client tells nobody there from a
+// socket it cannot use: a plain file or a directory where the socket goes is a leftover, not
+// a server, and the caller starting its own is the right answer to all three.
 func DialUnix(ctx context.Context, path string, timeout time.Duration) (Conn, error) {
 	d := net.Dialer{Timeout: timeout}
 	c, err := d.DialContext(ctx, "unix", path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOTSOCK) {
 			return nil, fmt.Errorf("%w: %s: %w", ErrNoServer, path, err)
 		}
 		return nil, fmt.Errorf("protocol: dial %s: %w", path, err)

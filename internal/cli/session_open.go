@@ -33,7 +33,10 @@ func serveInMemory(b *Built, name string, asker bool) (*protocol.Client, func(),
 		<-served
 		cancelSrv()
 	}
-	if _, err := greet(client, name, b.Version, asker); err != nil {
+	// A background context and no timeout: the server is in this process, on a pipe with no
+	// backlog to sit in, and a hello it does not answer is a deadlock a deadline would only
+	// rename. attach bounds its own, where the server is somebody else.
+	if _, err := greet(context.Background(), client, name, b.Version, asker); err != nil {
 		closeConn()
 		return nil, nil, err
 	}
@@ -41,11 +44,12 @@ func serveInMemory(b *Built, name string, asker bool) (*protocol.Client, func(),
 }
 
 // greet is the first request on every connection this binary opens, in-memory or over a
-// socket. A background context on purpose: the hello has to be answered even when the
-// caller's context is already the one an interrupt will cancel.
-func greet(client *protocol.Client, name, version string, asker bool) (protocol.ClientHelloResult, error) {
+// socket. ctx is never the caller's: the hello has to be answered even when the caller's
+// context is already the one an interrupt will cancel, so what a caller passes is a deadline
+// of its own or nothing at all.
+func greet(ctx context.Context, client *protocol.Client, name, version string, asker bool) (protocol.ClientHelloResult, error) {
 	var hello protocol.ClientHelloResult
-	err := client.Call(context.Background(), protocol.MethodClientHello,
+	err := client.Call(ctx, protocol.MethodClientHello,
 		protocol.ClientHelloParams{Client: name, Version: version, Asker: asker}, &hello)
 	if err != nil {
 		return hello, fmt.Errorf("hello: %w", err)

@@ -302,9 +302,9 @@ dedicated files and nothing else.
 | command | does |
 |---|---|
 | `rudy` | TUI; attaches to a running `rudy serve` when its socket answers within 50ms, else embeds the server; `--socket <path>` names one, `--embed` skips the probe (ADR 0014) |
-| `rudy -p "prompt"`, `rudy --print` | headless printer client; `--output text|json|stream-json`, `--mode`, `--model` |
+| `rudy -p "prompt"`, `rudy --print` | headless printer client; `--output text|json|stream-json`, `--mode`, `--model`; attaches or embeds exactly as `rudy` does, with `--socket <path>` and `--embed` (ADR 0014) |
 | `rudy serve` | server on `$XDG_RUNTIME_DIR/rudy/rudy.sock` (directory 0700, socket 0600, peer uid checked); `--socket <path>`; foreground, SIGINT or SIGTERM cancels active turns, shuts down and removes the socket |
-| `rudy sessions list|resume|fork` | session management |
+| `rudy sessions list|resume|fork` | session management; `resume` and `fork` attach or embed as `rudy` does, with `--socket <path>` and `--embed` (ADR 0014); `list` reads the store directly and takes neither |
 | `rudy models` | the discovered registry with prices |
 | `rudy mcp add|remove|list|get` | MCP servers, the Claude Code shape: `add <name> <command…>`, `add --transport http <name> <url>`, `--scope user|project`; writes `mcp.toml` under XDG config or the workspace's `.rudy/` |
 | `rudy plugin install|uninstall|list|enable|disable|update` | spawned plugins, the Claude Code shape; installs under `$XDG_DATA_HOME/rudy/plugins/<name>/` with a lock file |

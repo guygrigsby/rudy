@@ -83,8 +83,9 @@ func New(d Deps) *Server {
 
 // Serve runs one connection until it closes. client.hello must be its first request.
 // Notifications for a session reach every connection that opened, resumed or forked it, in the
-// order they were produced. Permission questions go to the first such connection whose hello
-// declared asker; none means no asker.
+// order they were produced. A permission question goes to every such connection whose hello
+// declared asker, and to an asker that attaches while it stands; the first answer decides and
+// every later one is conflict. None means no asker.
 func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
 	return s.serveConn(ctx, c, "", nil)
 }

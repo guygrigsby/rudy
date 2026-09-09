@@ -44,7 +44,15 @@ Writing the plan surfaced decisions the design and the contracts leave open:
    `0700`, the socket `0600`, and the server accepts only a connection whose
    peer uid is its own (`LOCAL_PEERCRED` on darwin, `SO_PEERCRED` on linux),
    closing any other before reading a byte. `--socket <path>` overrides the
-   path on `rudy serve` and on every client command.
+   path on `rudy serve` and on every client command. Added 2026-09-09: the
+   client checks the same boundary from its side, since `/tmp` is writable by
+   every local user and a socket answering at the expected path is not by
+   itself the user's own; before it connects it refuses a socket or a socket
+   directory owned by another uid, reached through a symlink, or open to a
+   group or other write, and that refusal never falls back to embedding.
+   `rudy serve` applies the same predicate to a socket directory that already
+   existed instead of chmod'ing it, so `--socket ~/rudy.sock` no longer takes
+   `$HOME` to `0700`.
 
 3. **Clients attach when a daemon answers, else embed.** `rudy`, `rudy -p`,
    `rudy sessions resume|fork` dial in this order: an explicit `--socket`

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -23,6 +24,14 @@ const probeTimeout = 50 * time.Millisecond
 // it, so it is worth waiting out a loaded machine rather than reporting no server on a path
 // that has one.
 const attachTimeout = 2 * time.Second
+
+// greetTimeout bounds the hello on every attached connection, which the connect timeout does
+// not: rudy serve binds its socket before it builds, so a daemon still loading plugins and
+// refreshing its registry holds a client in the listener's backlog with a connect that has
+// already succeeded and a hello nobody is reading. Unbounded, a build that then fails leaves
+// the client waiting on a process that is exiting. A variable so a test can shrink it: what
+// happens when it expires is behavior, and two seconds of it is not a test.
+var greetTimeout = 2 * time.Second
 
 // dialOptions is how a command was told to reach a server. Both empty is the default: probe
 // the socket a daemon would be serving and start one in this process if nothing answers.
@@ -103,6 +112,16 @@ func attach(o BuildOptions, socket string, timeout time.Duration, name string, a
 	if err != nil {
 		return nil, 1, err
 	}
+	// Who owns the path comes before anything is sent down it. The server checks its peer's
+	// uid; this is the same boundary from the other side, and without it a socket another
+	// local user got to first (linux, XDG_RUNTIME_DIR unset, the default under a /tmp anyone
+	// can write) takes this client's prompts, tool calls and permission answers into that
+	// user's process. A refusal is final on both paths, explicit and default: embedding
+	// instead would be a second server over the same store, which is the failure the deaf
+	// socket above is already refused for.
+	if err := protocol.CheckSocketOwner(socket); err != nil {
+		return nil, 1, err
+	}
 	// The connect is bounded by its own timeout and by nothing else, not by the caller's
 	// context: an interrupt that arrived before the client got going would otherwise turn
 	// "nothing is serving that path" into a dial failure, and the run would report a cancelled
@@ -116,9 +135,17 @@ func attach(o BuildOptions, socket string, timeout time.Duration, name string, a
 	}
 	client := protocol.NewClient(conn)
 	closeClient := func() { _ = client.Close() }
-	hello, err := greet(client, name, Version(), asker)
+	greetCtx, greeted := context.WithTimeout(context.Background(), greetTimeout)
+	defer greeted()
+	hello, err := greet(greetCtx, client, name, Version(), asker)
 	if err != nil {
 		closeClient()
+		if errors.Is(err, context.DeadlineExceeded) {
+			// Not ErrNoServer: something is holding that path, and a second server over the
+			// same store would split the sessions between the two. Retrying is the answer when
+			// the daemon was still building, --embed when it is never going to answer.
+			return nil, 1, fmt.Errorf("a server at %s answered but did not greet within %s; retry, or pass --embed", socket, greetTimeout)
+		}
 		return nil, 1, err
 	}
 	return &dialed{Client: client, Paths: paths, Config: cfg, Version: hello.Version, Close: closeClient}, 0, nil

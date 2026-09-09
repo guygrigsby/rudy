@@ -85,13 +85,13 @@ func TestListenCreatesAPrivateDirAndSocket(t *testing.T) {
 		predate func(t *testing.T, dir string)
 	}{
 		{"a dir that does not exist yet", func(*testing.T, string) {}},
-		// MkdirAll leaves an existing dir's mode alone, and a socket under a dir anyone can
-		// enter is a socket anyone can reach.
-		{"a dir that already exists wider", func(t *testing.T, dir string) {
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+		// A dir already at 0700 is one this process would have made the same way, so it is
+		// taken as it is and the socket goes in.
+		{"a dir that already exists private", func(t *testing.T, dir string) {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				t.Fatalf("mkdir: %v", err)
 			}
-			if err := os.Chmod(dir, 0o755); err != nil {
+			if err := os.Chmod(dir, 0o700); err != nil {
 				t.Fatalf("chmod: %v", err)
 			}
 		}},
@@ -349,6 +349,38 @@ func TestDialReportsNoServer(t *testing.T) {
 			t.Fatalf("err = %v, want ErrNoServer", err)
 		}
 	})
+
+	// A plain file or a directory at the path is a leftover, not a server: connect answers
+	// ENOTSOCK, and a caller that read that as a real failure would refuse to start its own
+	// server over a path nothing could ever be serving.
+	t.Run("a path that is not a socket", func(t *testing.T) {
+		cases := map[string]func(t *testing.T, path string){
+			"a plain file": func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("not a socket"), 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			},
+			"a directory": func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+			},
+		}
+		for name, leave := range cases {
+			t.Run(name, func(t *testing.T) {
+				path := filepath.Join(sockDir(t), "s.sock")
+				leave(t, path)
+				c, err := DialUnix(ctx, path, time.Second)
+				if err == nil {
+					_ = c.Close()
+					t.Fatalf("dial to %s returned a conn", name)
+				}
+				if !errors.Is(err, ErrNoServer) {
+					t.Fatalf("err = %v, want ErrNoServer", err)
+				}
+			})
+		}
+	})
 }
 
 func TestAcceptAdmitsTheOwner(t *testing.T) {
@@ -574,5 +606,273 @@ func TestCloseRemovesTheSocketAndKeepsTheLockFile(t *testing.T) {
 	}
 	if err := again.Close(); err != nil {
 		t.Fatalf("close again: %v", err)
+	}
+}
+
+// TestListenRefusesADirItDidNotMake: a pre-existing directory is checked, never narrowed. The
+// chmod that used to run here landed on whatever directory the caller named, so `rudy serve
+// --socket ~/rudy.sock` took $HOME to 0700 and a root `--socket /tmp/x.sock` took /tmp, and a
+// directory the server cannot make private is one it has no business binding a socket in.
+func TestListenRefusesADirItDidNotMake(t *testing.T) {
+	cases := []struct {
+		name  string
+		mode  os.FileMode
+		setup func(t *testing.T)
+	}{
+		{"other can write it", 0o707, func(*testing.T) {}},
+		{"group can write it", 0o770, func(*testing.T) {}},
+		{"everyone can write it", 0o777, func(*testing.T) {}},
+		// The uid branch takes the same injection peerUID's does: a test cannot make a file
+		// another user owns, and refusing one is the whole point of the check.
+		{"another uid owns it", 0o700, func(t *testing.T) {
+			saved := statUID
+			statUID = func(os.FileInfo) (int, error) { return os.Getuid() + 1, nil }
+			t.Cleanup(func() { statUID = saved })
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(sockDir(t), "run")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.Chmod(dir, tc.mode); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			tc.setup(t)
+
+			path := filepath.Join(dir, "s.sock")
+			l, err := ListenUnix(path)
+			if err == nil {
+				_ = l.Close()
+				t.Fatal("listen bound a socket in a directory it could not vouch for")
+			}
+			if !errors.Is(err, ErrSocketNotOurs) {
+				t.Fatalf("err = %v, want ErrSocketNotOurs", err)
+			}
+			if !strings.Contains(err.Error(), dir) {
+				t.Errorf("err = %v, want it to name %s", err, dir)
+			}
+			di, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatalf("stat dir: %v", err)
+			}
+			if got := di.Mode().Perm(); got != tc.mode.Perm() {
+				t.Errorf("dir mode = %04o, want the %04o it had: a refusal changes nothing", got, tc.mode.Perm())
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("socket at %s: %v, want nothing bound", path, err)
+			}
+		})
+	}
+}
+
+// TestListenLeavesADirItDidNotMake: 0750 is closed to the writes the check is about and open
+// to a group read that is the operator's own decision. The listener takes it as it is; the
+// old chmod would have narrowed it, which is the bug in the small.
+func TestListenLeavesADirItDidNotMake(t *testing.T) {
+	dir := filepath.Join(sockDir(t), "run")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	l, err := ListenUnix(filepath.Join(dir, "s.sock"))
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+	di, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatalf("stat dir: %v", err)
+	}
+	if got := di.Mode().Perm(); got != 0o750 {
+		t.Fatalf("dir mode = %04o, want the 0750 it had: the listener narrowed a dir it did not create", got)
+	}
+}
+
+// TestCheckSocketOwnerAdmitsOurOwnSocket is the shape every real run has: a 0700 directory
+// this uid owns with this uid's socket in it.
+func TestCheckSocketOwnerAdmitsOurOwnSocket(t *testing.T) {
+	path := filepath.Join(sockDir(t), "s.sock")
+	rawListen(t, path)
+	if err := CheckSocketOwner(path); err != nil {
+		t.Fatalf("CheckSocketOwner = %v, want nil for our own socket", err)
+	}
+}
+
+// TestCheckSocketOwnerReportsAnAbsentPath: nothing there is not a refusal. A client that
+// treated it as one could never start its own server, which is what an empty runtime
+// directory means.
+func TestCheckSocketOwnerReportsAnAbsentPath(t *testing.T) {
+	base := sockDir(t)
+	cases := map[string]string{
+		"no socket in the dir": filepath.Join(base, "absent.sock"),
+		"no dir at all":        filepath.Join(base, "nothing", "absent.sock"),
+	}
+	for name, path := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := CheckSocketOwner(path)
+			if !errors.Is(err, ErrNoServer) {
+				t.Fatalf("err = %v, want ErrNoServer", err)
+			}
+			if errors.Is(err, ErrSocketNotOurs) {
+				t.Fatalf("err = %v, want an absent path to be nobody there, not a refusal", err)
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Fatalf("err = %v, want it to name %s", err, path)
+			}
+		})
+	}
+}
+
+// TestCheckSocketOwnerRefusesWhatIsNotOurs is the client half of the trust boundary. On linux
+// with XDG_RUNTIME_DIR unset the default socket is /tmp/rudy-<uid>/rudy.sock and /tmp is
+// world-writable, so another local user can create the directory first, bind a socket in it
+// and answer every rudy the victim runs. Each of these is a way that ends.
+func TestCheckSocketOwnerRefusesWhatIsNotOurs(t *testing.T) {
+	cases := []struct {
+		name string
+		// build returns the path to check and the substring the refusal has to name.
+		build func(t *testing.T, base string) (string, string)
+	}{
+		{"a dir other can write", func(t *testing.T, base string) (string, string) {
+			dir := filepath.Join(base, "run")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			path := filepath.Join(dir, "s.sock")
+			rawListen(t, path)
+			if err := os.Chmod(dir, 0o777); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			return path, dir
+		}},
+		{"a dir group can write", func(t *testing.T, base string) (string, string) {
+			dir := filepath.Join(base, "run")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			path := filepath.Join(dir, "s.sock")
+			rawListen(t, path)
+			if err := os.Chmod(dir, 0o770); err != nil {
+				t.Fatalf("chmod: %v", err)
+			}
+			return path, dir
+		}},
+		{"a symlinked socket", func(t *testing.T, base string) (string, string) {
+			real := filepath.Join(base, "real.sock")
+			rawListen(t, real)
+			link := filepath.Join(base, "link.sock")
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatalf("symlink: %v", err)
+			}
+			return link, link
+		}},
+		{"a symlinked dir", func(t *testing.T, base string) (string, string) {
+			real := filepath.Join(base, "real")
+			if err := os.Mkdir(real, 0o700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			rawListen(t, filepath.Join(real, "s.sock"))
+			link := filepath.Join(base, "link")
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatalf("symlink: %v", err)
+			}
+			return filepath.Join(link, "s.sock"), link
+		}},
+		{"a file where the dir goes", func(t *testing.T, base string) (string, string) {
+			file := filepath.Join(base, "notadir")
+			if err := os.WriteFile(file, nil, 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			return filepath.Join(file, "s.sock"), file
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, named := tc.build(t, sockDir(t))
+			err := CheckSocketOwner(path)
+			if !errors.Is(err, ErrSocketNotOurs) {
+				t.Fatalf("err = %v, want ErrSocketNotOurs", err)
+			}
+			if errors.Is(err, ErrNoServer) {
+				t.Fatalf("err = %v, want a refusal rather than nobody there: the client must not embed over it", err)
+			}
+			if !strings.Contains(err.Error(), named) {
+				t.Fatalf("err = %v, want it to name %s", err, named)
+			}
+		})
+	}
+}
+
+// TestCheckSocketOwnerRefusesAnotherUID takes the injection peerUID's own test takes, for the
+// same reason: a test process cannot make a file another user owns, and the uid comparison is
+// the branch the whole check turns on.
+func TestCheckSocketOwnerRefusesAnotherUID(t *testing.T) {
+	cases := []struct {
+		name  string
+		stat  func(os.FileInfo) (int, error)
+		wants string // "" means the error is the stat's own, not a refusal
+	}{
+		{"the dir belongs to somebody else", func(os.FileInfo) (int, error) {
+			return os.Getuid() + 1, nil
+		}, "socket dir"},
+		{"the socket belongs to somebody else", func(fi os.FileInfo) (int, error) {
+			if fi.IsDir() {
+				return os.Getuid(), nil
+			}
+			return os.Getuid() + 1, nil
+		}, "s.sock"},
+		{"the stat carries no uid", func(os.FileInfo) (int, error) {
+			return 0, errors.New("stat: broken")
+		}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(sockDir(t), "s.sock")
+			rawListen(t, path)
+			saved := statUID
+			statUID = tc.stat
+			t.Cleanup(func() { statUID = saved })
+
+			err := CheckSocketOwner(path)
+			if err == nil {
+				t.Fatal("CheckSocketOwner admitted a path this uid does not own")
+			}
+			if tc.wants == "" {
+				if errors.Is(err, ErrSocketNotOurs) {
+					t.Fatalf("err = %v, want the stat's own error", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrSocketNotOurs) {
+				t.Fatalf("err = %v, want ErrSocketNotOurs", err)
+			}
+			if !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("err = %v, want it to name the %s", err, tc.wants)
+			}
+		})
+	}
+}
+
+// TestFileUIDIsTheOwner keeps the injected statUID honest: the real one has to answer this
+// process's uid for a file this process just made, or every test above is checking a stub.
+func TestFileUIDIsTheOwner(t *testing.T) {
+	path := filepath.Join(sockDir(t), "f")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat: %v", err)
+	}
+	uid, err := fileUID(fi)
+	if err != nil {
+		t.Fatalf("fileUID: %v", err)
+	}
+	if uid != os.Getuid() {
+		t.Fatalf("fileUID = %d, want %d", uid, os.Getuid())
 	}
 }
