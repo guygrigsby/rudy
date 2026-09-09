@@ -1,6 +1,6 @@
 # rudy contracts
 
-Pass 3, 2026-09-08. Pass 2 aligned the protocol section with the kernel implementation; pass 3 adds the plugins wave (ADR 0012): child sessions for subagents, `session.compact` and the ninth hook point `before_compaction`, the clinepass dialect key, the memory summary model, skill migration sources, and the `mcp.toml` and `plugins.lock.toml` records. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
+Pass 3, 2026-09-08. Pass 3 implemented 2026-09-09; the rows below were walked against the code and corrected where they differed. Pass 2 aligned the protocol section with the kernel implementation; pass 3 adds the plugins wave (ADR 0012): child sessions for subagents, `session.compact` and the ninth hook point `before_compaction`, the clinepass dialect key, the memory summary model, skill migration sources, and the `mcp.toml` and `plugins.lock.toml` records. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
 
 ## Error taxonomy
 
@@ -35,6 +35,7 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `ThinkingLevel` | `off`, `low`, `medium`, `high` |
 | `TurnState` | `idle`, `streaming`, `running_tool`, `awaiting_permission`, `steering`, `completed`, `failed` |
 | `HookPoint` | `session_opened`, `before_turn`, `before_request`, `after_response`, `before_tool`, `after_tool`, `before_compaction`, `turn_completed`, `session_closed` |
+| `StreamPart` | `{type: text_delta, thinking_delta, thinking_signature, tool_use_start, tool_use_delta, tool_use_end, usage or stop, text, id, name, signature, usage, stop_reason, stop_reason_raw}`; one streamed piece of a completion. `text` carries the fragment for `text_delta`, `thinking_delta` and `tool_use_delta`; `id` and `name` the tool use; `signature` the provider's verbatim bytes on `thinking_signature`; `usage`, `stop_reason` and `stop_reason_raw` are set on `usage` and `stop` |
 | `ParentRef` | `{session_id: ulid, tool_use_id: string}`; the session and the `tool_use` that spawned a child session |
 | `Safety` | `safe`, `unsafe` |
 
@@ -90,18 +91,18 @@ Authn column names the caller class table. Domain column names the aggregate met
 | `plugin.register_hook` | plugin | per class | own name only | `{point: HookPoint, priority: int}` | `{}` | `invalid_argument` unknown point | idempotent | `PluginRegistry.RegisterHook` |
 | `plugin.register_widget` | plugin | per class | own name only | `{key, slot: header, above_editor or below_editor, content: [Span]}` | `{}` | `invalid_argument` unknown slot | idempotent; re-registering replaces content | `PluginRegistry.SetWidget` |
 | `plugin.set_status` | plugin | per class | own name only | `{key, content: [Span]}`; empty content clears | `{}` | none | idempotent | `PluginRegistry.SetStatus` |
-| `plugin.register_provider` | plugin | per class | own name only | `{name, wire: anthropic_messages, openai_chat or custom}`; `custom` means the server calls `provider.complete` on the plugin | `{}` | `conflict` provider name taken | idempotent for identical definition | `PluginRegistry.RegisterProvider` |
-| `plugin.append_note` | plugin | per class | any session the plugin can see | `{session_id, text, role: info, muted, warn or error}` | `{entry_id}` | `not_found` | not idempotent | `Session.Append(note)` |
+| `plugin.register_provider` | plugin | per class | own name only | `{name, wire: anthropic_messages, openai_chat or custom}`; `custom` means the server calls `provider.complete` on the plugin; a spawned plugin may register only `custom`, since a codec wire needs the endpoint and credential config a linked provider plugin reads | `{}` | `conflict` provider name taken; `invalid_argument` a codec wire from a spawned plugin, or an unknown wire | idempotent for identical definition | `PluginRegistry.RegisterProvider` |
+| `plugin.append_note` | plugin | per class | any live session; pass 3 has no ownership check here, see the open list | `{session_id, text, role: info, muted, warn or error}` | `{entry_id}` | `not_found` | not idempotent | `Session.Append(note)` |
 
 ### Requests, server to plugin
 
 | method | callee | authn | authz | request | response | errors | idempotency | domain |
 |---|---|---|---|---|---|---|---|---|
-| `plugin.init` | spawned plugin | parent-child | first request the server sends | `{name, version, protocol_version, config: table, workspace_roots: [string]}`; `config` is the plugin's `[plugins.<name>]` table verbatim | `{name, version, protocol_version}` | `plugin_error` on mismatch or timeout; plugin marked failed | once per process | `Plugin.Ready` or `Plugin.Fail` |
+| `plugin.init` | spawned plugin | parent-child | first request the server sends | `{name, version, protocol_version, config: table, workspace_roots: [string]}`; `config` is the plugin's `[plugins.<name>]` table verbatim | `{name, version, protocol_version}`; registrations the plugin sends before it answers are committed with the plugin, so a plugin declares its surface while the server waits for this response | `plugin_error` on mismatch or timeout; plugin marked failed; a `plugin.register_tool`, `plugin.register_command`, `plugin.register_hook` or `plugin.register_provider` after the response is `refused_by_invariant`, since the tool set, command set, hook set and provider set a session was opened with never change under it. `plugin.set_status` and `plugin.register_widget` stay live for the life of the process: they are display, not surface | once per process | `Plugin.Ready` or `Plugin.Fail` |
 | `tool.invoke` | owning plugin | parent-child | the plugin that registered the tool | `{session_id, tool_use_id, name, input, workspace: Workspace, timeout_ms: int}` | `{content: [ContentBlock], is_error: bool}` | `plugin_error` timeout or crash; `interrupted` after `tool.cancel` | keyed by `tool_use_id`; a repeat after a lost connection is a new invocation and the old result is discarded | `Turn.RunTool`; the result is appended as `tool_result` |
 | `tool.cancel` | owning plugin | parent-child | as above | `{tool_use_id}` | `{}` | none | idempotent | `Turn.Steer` or `Turn.Cancel` reaching a running tool |
-| `hook.fire` | registered plugins in priority order | parent-child | registered for that point | `{point, session_id, payload}`; payloads in the events contract | `{result}` per point; timeout `hook_timeout_ms` from config | `plugin_error` timeout; the hook is skipped and a `notice` emitted | not idempotent | the domain event's consumer list |
-| `command.invoke` | owning plugin | parent-child | the plugin that registered the command | `{session_id, name, args: string}` | `{}` | `plugin_error` | not idempotent | plugin-defined |
+| `hook.fire` | registered plugins in priority order | parent-child | registered for that point | `{point, session_id, turn_id, payload}`; payloads in the events contract; `turn_id` is empty for `session_opened`, `before_compaction` and `session_closed` | `{result}` per point; timeout `hook_timeout_ms` from config | `plugin_error` timeout; the hook is skipped and a `notice` emitted | not idempotent | the domain event's consumer list |
+| `command.invoke` | owning plugin | parent-child | the plugin that registered the command | `{session_id, name, args: string}` | `{prompt?: string, notice?: string}`; a non-empty `prompt` is submitted to the session as a user message and its `turn_id` comes back from `command.run`, a non-empty `notice` is shown to the client; both empty means the command did its work itself | `plugin_error` | not idempotent | plugin-defined |
 | `provider.complete` | provider plugin with `wire: custom` | parent-child | registered provider | `{request_id, model: ModelRef, system: string, messages: [{role, content: [ContentBlock]}], tools: [{name, description, input_schema}], thinking: ThinkingLevel, max_tokens: int}` | `{stop_reason, stop_reason_raw, usage: Usage}` after the stream ends | `provider_error`, `interrupted` | keyed by `request_id` | `Provider.Complete` port |
 | `provider.list_models` | provider plugin with `wire: custom` | parent-child | registered provider | `{}` | `{models: [Model]}` | `provider_error` | idempotent | `Registry.Refresh` for that provider |
 
@@ -112,7 +113,7 @@ Per session, notifications are delivered in entry order. On `session.resume` the
 | notification | to | payload | delivery |
 |---|---|---|---|
 | `entry.appended` | every client attached to the session | `{session_id, entry: Entry}` | ordered by entry id; replayed on attach via resume |
-| `stream.delta` | attached clients | `{session_id, turn_id, delta: {type: text, thinking or tool_use_input, text: string, tool_use_id: string, name: string}}`; `tool_use_id` and `name` empty for text and thinking deltas | ordered; not replayed; superseded by the `assistant_message` entry |
+| `stream.delta` | attached clients | `{session_id, turn_id, part: StreamPart}` | ordered; not replayed; superseded by the `assistant_message` entry |
 | `turn.state` | attached clients | `{session_id, turn_id, state: TurnState}` | ordered |
 | `permission.requested` | attached asker clients | `{session_id, turn_id, tool_use_id, tool, input, matcher: {tool, prefix}}` | delivered once per asker; with no asker attached the Gate denies immediately and appends `permission_decision` |
 | `status.updated` | every client | `{items: [{owner, key, content: [Span]}]}` full set | latest wins; sent on connect |
@@ -125,8 +126,8 @@ Per session, notifications are delivered in entry order. On `session.resume` the
 
 | notification | payload | delivery |
 |---|---|---|
-| `tool.progress` | `{tool_use_id, text}` | pass 3: received and dropped; forwarding needs a stream part type the TUI plan defines |
-| `provider.delta` | `{request_id, delta}` same delta shape as `stream.delta` | ordered per request; the server assembles the `assistant_message` from them |
+| `tool.progress` | `{tool_use_id, text}` | pass 3: received by the spawned plugin's adapter and dropped there; forwarding to clients as `stream.delta` needs a stream part type the TUI plan defines |
+| `provider.delta` | `{request_id, part: StreamPart}` | ordered per request; the server assembles the `assistant_message` from them |
 
 ## 2. Domain events
 
@@ -187,7 +188,7 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 |---|---|---|---|
 | `session_opened` | `SessionOpened`, also on `session.resume` first attach | `{session_id, workspace, model, mode, thinking, resumed: bool, parent_session_id: string}`; `parent_session_id` is the session whose tool call opened this one, empty for a root session, so a handler that writes once per session can tell a subagent apart from the session it belongs to | `{context: string}` appended to the system prompt for the session |
 | `before_turn` | `UserMessageAppended` with source typed or queued | `{session_id, turn_id, message: Entry}` | `{system_prompt_additions: [string]}` |
-| `before_request` | `TurnStarted`, `TurnResumed` and every subsequent request in the turn | `{session_id, turn_id, provider, model, headers: table, body_size: int}` | `{headers: table}` merged over the request headers; body is not exposed in pass 1 |
+| `before_request` | `TurnStarted`, `TurnResumed` and every subsequent request in the turn | `{session_id, turn_id, provider, model, headers: table}`; no body and no body size: the hook fires while the request is still a `provider.Request`, before any codec has made bytes of it | `{headers: table}` merged over the request headers; body is not exposed in pass 1 |
 | `after_response` | `AssistantMessageAppended` | `{session_id, turn_id, message: Entry}` | nothing |
 | `before_tool` | `ToolRequested`, before the Gate | `{session_id, turn_id, tool_use_id, tool, input, safety}` | `{decision: pass, allow, deny or modify, input, reason}`; `allow` and `deny` short-circuit the Gate and are recorded with `decided_by: hook`; `modify` replaces `input` |
 | `after_tool` | `ToolResultAppended`, before the result reaches the next request | `{session_id, turn_id, tool_use_id, result: Entry}` | `{content: [ContentBlock]}` replacing what the model sees; the stored entry is unchanged. The replacement is held for as long as the session is live, so it applies to every later request in the session and not only the turn that produced it, and it is not persisted: a session loaded from disk sends the stored entry again until a handler replaces it again |
@@ -634,3 +635,8 @@ Invariants and where they are enforced:
 - the subagent model ladder from registry prices; pass 3 takes the model from the agent definition or inherits
 - the socket path on macOS when neither `XDG_RUNTIME_DIR` nor `TMPDIR` is set
 - how a spawned provider plugin authenticates to its upstream; pass 1 leaves it to the plugin's own config table
+- image content from an MCP tool result is rendered as a text placeholder, `[image <media_type>, <n> bytes]`; the bytes should go to the session's blob store and come back as an `image` content block
+- MCP servers are per process: the plugin loads `mcp.toml` once at boot with the project scope of the workspace rudy was started in. Per-session project servers wait for `rudy serve` holding many workspaces at once
+- a spawned plugin may register only `wire: custom` providers; `openai_chat` and `anthropic_messages` from a spawned plugin are refused, so a spawned plugin cannot yet stand up an endpoint of its own with config
+- `tool.progress` from a spawned plugin is received by the adapter and dropped; forwarding it to clients needs the stream part type the TUI plan defines
+- `plugin.append_note` is not in the own-session set, so a plugin may append a note to any live session, not only the ones it opened. Whether that is the contract or an omission is undecided; the note carries the plugin's name either way

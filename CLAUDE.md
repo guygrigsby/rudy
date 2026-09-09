@@ -20,6 +20,10 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
   plugin would use.
 - No vendor or wire types outside the two codecs and the provider plugins.
   `grep anthropic\.` and `grep openai` hit only under `internal/provider/`.
+  `make vendor-types`, part of `check`, greps the three vendor SDKs the same way:
+  `anthropic-sdk-go` only under `internal/provider/anthropicmsgs/`,
+  `modelcontextprotocol` only under `internal/plugins/mcp/`, `memory-go` only
+  under `internal/plugins/memory/`.
 - An unsafe tool runs only after its `permission_decision` allow entry is
   appended and fsynced. No asker means deny.
 - Tool inputs and thinking signatures are raw bytes end to end. Never
@@ -43,8 +47,17 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
 
 ## Makefile targets
 
-`build` (default), `test`, `lint`, `check`, `install`, `redeploy`. CI calls
-these and nothing else.
+`build` (default), `test`, `lint`, `check`, `fmt-check`, `vendor-types`,
+`install`, `redeploy`. CI calls these and nothing else.
+
+## Building against memory-go
+
+`go.mod` replaces `github.com/aeryx-ai/memory/memory-go` with
+`../memory/memory-go`, so the memory repository has to sit beside this one:
+`~/projects/rudy` and `~/projects/memory`. CI checks the two out side by side
+under the workspace, rudy into `rudy/` and `aeryx-ai/memory` into `memory/`,
+and runs `make check` with `working-directory: rudy`. The workflow cannot pass
+until the memory repository is pushed to `aeryx-ai/memory`.
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->

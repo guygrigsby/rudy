@@ -1,6 +1,6 @@
 # 12. The plugins wave: hooks in the kernel, subagents as child sessions, compaction behind a hook, MCP servers under one plugin
 
-- Status: Accepted
+- Status: Accepted, implemented 2026-09-09
 - Date: 2026-09-08
 - Deciders: Guy Grigsby
 
@@ -101,6 +101,18 @@ decisions the design left open or contradicted itself on:
   `config.toml` stays unwritten.
 - The memory project carries one more format in both implementations; its
   golden gate covers it.
+
+Note, 2026-09-09, on implementing decision 6. Manifest discovery reads three
+roots and `<workspace>/.rudy/plugins/` is one of them, so a repository ships a
+plugin with itself and opening that repository in rudy starts its binary. The
+plugin's tools carry the safety its manifest declares, so a tool it declares
+`safe` never reaches the Gate: cloning a repository and running rudy in it is
+running that repository's code. Discovery order is the data root first, then
+the config root, then the workspace, and the first manifest for a name wins,
+so a plugin the user installed shadows one a repository ships rather than the
+other way round. Nothing here asks the user before the first start; a prompt on
+first sight of a workspace plugin is the obvious next move and is not in this
+wave.
 
 ## Alternatives considered
 

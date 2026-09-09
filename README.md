@@ -11,8 +11,11 @@ the server mode are the next plans.
 ## Build
 
     make            # bin/rudy
-    make check      # fmt, vet, lint, test
+    make check      # fmt, vendor-type greps, vet, lint, test
     make install    # go install ./cmd/rudy
+
+`go.mod` replaces `github.com/aeryx-ai/memory/memory-go` with
+`../memory/memory-go`, so the memory repository has to sit beside this one.
 
 ## Configure
 

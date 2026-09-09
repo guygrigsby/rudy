@@ -161,8 +161,13 @@ Hook points, a closed set: `session_opened`, `before_turn`, `before_request`,
 `session_closed`. What each handler may return is in the
 [contracts](rudy-contracts.md).
 
-Discovery roots, in precedence order: workspace `.rudy/`, then
-`$XDG_CONFIG_HOME/rudy/`, then `~/.agents/`. Skills are read from
+Spawned plugin manifests are discovered from `$XDG_DATA_HOME/rudy/plugins/`
+(what `rudy plugin install` writes), then `$XDG_CONFIG_HOME/rudy/plugins/`,
+then the workspace's `.rudy/plugins/`, the first manifest for a name
+winning. A
+user-installed plugin therefore shadows one a repository ships, not the other
+way around. Other discovery roots, in precedence order: workspace `.rudy/`,
+then `$XDG_CONFIG_HOME/rudy/`, then `~/.agents/`. Skills are read from
 `~/.agents/skills` and the workspace's `.agents/skills` only. First boot offers
 to migrate skills from `.claude/skills` and pi's skill directories, and
 `rudy skills migrate` does it on demand. Agent definitions are read from

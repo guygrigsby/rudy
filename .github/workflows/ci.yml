@@ -8,12 +8,27 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
+      # rudy's go.mod replaces github.com/aeryx-ai/memory/memory-go with ../memory/memory-go,
+      # so the two repositories are checked out side by side under the workspace: rudy/ and
+      # memory/, which makes ../memory/memory-go resolve from rudy/. A path outside the
+      # workspace is not allowed, so neither checkout can use ../.
+      #
+      # This job cannot pass until the memory repository is pushed to aeryx-ai/memory; the
+      # checkout below fails with a 404 against a repository that does not exist yet.
       - uses: actions/checkout@v4
+        with:
+          path: rudy
+      - uses: actions/checkout@v4
+        with:
+          repository: aeryx-ai/memory
+          path: memory
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
+          cache-dependency-path: rudy/go.sum
       - uses: golangci/golangci-lint-action@v8
         with:
           version: latest
           install-only: true
       - run: make check
+        working-directory: rudy
