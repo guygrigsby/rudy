@@ -1,0 +1,481 @@
+package transcript
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"strings"
+
+	"charm.land/glamour/v2"
+	glamourstyle "charm.land/glamour/v2/ansi"
+	"charm.land/glamour/v2/styles"
+	chroma "github.com/alecthomas/chroma/v2"
+	chromastyles "github.com/alecthomas/chroma/v2/styles"
+	"github.com/aymanbagabas/go-udiff"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tui/theme"
+)
+
+const (
+	// toolGlyph opens a tool row, as in the design's default screen.
+	toolGlyph = "▸"
+	// previewIndent is how far a tool row's preview, its expansion and a permission
+	// question's choices sit under the row they belong to.
+	previewIndent = 4
+	// mdMargin is glamour's document margin. Live text carries the same one so a row
+	// does not jump sideways when its entry arrives and it renders as markdown.
+	mdMargin = 2
+	// summaryMax caps the summary of a tool nothing here knows the input shape of.
+	summaryMax    = 60
+	promptChoices = "allow once [y]  allow for session [a]  deny [n]"
+)
+
+// Render is the lines of one row under the current options and theme, styled: the
+// caller writes them out as they are.
+func (t *Transcript) Render(r *Row) []string {
+	if r == nil {
+		return nil
+	}
+	switch r.Kind {
+	case RowUser:
+		text := r.Text
+		if t.opts.UserPrefix != "" {
+			text = t.opts.UserPrefix + " " + text
+		}
+		return t.wrap(theme.RoleUser, 0, text)
+	case RowAssistant:
+		return t.assistant(r)
+	case RowTool:
+		return t.tool(r)
+	case RowPrompt:
+		return t.prompt(r)
+	case RowMarker:
+		return t.marker(r)
+	}
+	return nil
+}
+
+// assistant renders an answer block: markdown once the entry has arrived, wrapped plain
+// text while it streams, and muted plain text for thinking either way.
+func (t *Transcript) assistant(r *Row) []string {
+	if r.Text == "" {
+		return nil
+	}
+	if r.Thinking {
+		return t.wrap(theme.RoleMuted, mdMargin, r.Text)
+	}
+	if r.Live {
+		return t.wrap(theme.RoleAssistant, mdMargin, r.Text)
+	}
+	out, err := t.markdown(r.Text)
+	if err != nil {
+		return t.wrap(theme.RoleAssistant, mdMargin, r.Text)
+	}
+	return out
+}
+
+// tool renders a tool row: one summary line, then what the row knows. A denied call and
+// one still running say so instead of a preview; a killed or lost result says so and
+// then shows what came back.
+func (t *Transcript) tool(r *Row) []string {
+	// A permission question renders inline where the tool row would be (the design's
+	// Client section), so while one is open the tool row it stands in front of draws
+	// nothing rather than repeating its summary a line below the question.
+	if t.byKey[promptKey(r.ToolUse.ID)] != nil {
+		return nil
+	}
+	// A before_tool hook can change the bytes a tool ran with, and the decision records
+	// what it ran with. Summarize what ran.
+	input := r.ToolUse.Input
+	if r.Decision != nil && len(r.Decision.Input) > 0 {
+		input = r.Decision.Input
+	}
+	name := r.ToolUse.Name
+	out := []string{t.summaryLine(name, input)}
+	if r.Decision != nil && r.Decision.Decision == session.Deny {
+		return append(out, t.line(theme.RoleError, previewIndent, "denied: "+r.Decision.Reason, false))
+	}
+	if r.Result == nil {
+		return append(out, t.line(theme.RoleMuted, previewIndent, "running", false))
+	}
+	if s := outcomes[r.Result.Outcome]; s != "" {
+		out = append(out, t.line(theme.RoleWarning, previewIndent, s, false))
+	}
+	// ToolCollapsed is the default; Expanded is what the user opened on top of it.
+	if r.Expanded || !t.opts.ToolCollapsed {
+		return append(out, t.expansion(input, r.Result)...)
+	}
+	return append(out, t.segments(t.preview(name, input, r.Result))...)
+}
+
+// outcomes name the two outcomes a preview cannot show for itself: the tool never
+// finished, so whatever came back is partial or absent.
+var outcomes = map[session.Outcome]string{
+	session.OutcomeKilled: "killed",
+	session.OutcomeLost:   "result lost",
+}
+
+// expansion is the whole call: the input pretty-printed and the whole result. Printing
+// is display only; the row's bytes are never rewritten.
+func (t *Transcript) expansion(input json.RawMessage, res *session.ToolResult) []string {
+	var out []string
+	for _, l := range prettyJSON(input) {
+		out = append(out, t.line(theme.RoleMuted, previewIndent, l, false))
+	}
+	for _, l := range splitLines(session.TextOf(res.Content)) {
+		out = append(out, t.line(theme.RoleText, previewIndent, l, false))
+	}
+	return out
+}
+
+// preview is the folded form of a result, at most ToolPreviewLines lines: the tail of a
+// command's output, the first hunk of an edit, a count for the tools that answer with a
+// list, and the head of anything else.
+func (t *Transcript) preview(name string, input json.RawMessage, res *session.ToolResult) []segment {
+	n := t.opts.ToolPreviewLines
+	if n <= 0 {
+		return nil
+	}
+	text := session.TextOf(res.Content)
+	switch name {
+	case "read":
+		return muted(count(text, "line", "lines"))
+	case "grep":
+		return muted(count(text, "match", "matches"))
+	case "glob":
+		return muted(count(text, "file", "files"))
+	case "write":
+		return muted(firstLine(text))
+	case "edit":
+		return t.diff(input, n)
+	case "bash":
+		return muted(tail(splitLines(text), n)...)
+	}
+	return muted(head(splitLines(text), n)...)
+}
+
+// segment is one preview line and the role that paints it.
+type segment struct {
+	text string
+	role theme.Role
+	// fill puts role in the background instead of the foreground.
+	fill bool
+}
+
+func muted(texts ...string) []segment {
+	out := make([]segment, 0, len(texts))
+	for _, s := range texts {
+		out = append(out, segment{text: s, role: theme.RoleMuted})
+	}
+	return out
+}
+
+func (t *Transcript) segments(segs []segment) []string {
+	out := make([]string, 0, len(segs))
+	for _, s := range segs {
+		out = append(out, t.line(s.role, previewIndent, s.text, s.fill))
+	}
+	return out
+}
+
+// diff previews an edit as the first hunk between the input's old and new text, added
+// lines in diff_add and removed ones in diff_del.
+func (t *Transcript) diff(input json.RawMessage, n int) []segment {
+	var a struct {
+		Old string `json:"old"`
+		New string `json:"new"`
+	}
+	if err := json.Unmarshal(input, &a); err != nil {
+		return nil
+	}
+	segs := make([]segment, 0, n)
+	for _, l := range head(firstHunk(udiff.Unified("old", "new", a.Old, a.New)), n) {
+		s := segment{text: l, role: theme.RoleMuted}
+		switch {
+		case strings.HasPrefix(l, "+"):
+			s.role, s.fill = theme.RoleDiffAdd, t.opts.DiffBackground
+		case strings.HasPrefix(l, "-"):
+			s.role, s.fill = theme.RoleDiffDel, t.opts.DiffBackground
+		}
+		segs = append(segs, s)
+	}
+	return segs
+}
+
+// firstHunk is the body of a unified diff's first hunk: the lines after its @@ header,
+// up to the next header or the end. The header carries line numbers a two-line preview
+// has no room for, and the design's screen does not show it.
+func firstHunk(u string) []string {
+	lines := splitLines(u)
+	start := -1
+	for i, l := range lines {
+		if !strings.HasPrefix(l, "@@") {
+			continue
+		}
+		if start >= 0 {
+			return lines[start:i]
+		}
+		start = i + 1
+	}
+	if start < 0 {
+		return nil
+	}
+	return lines[start:]
+}
+
+// prompt renders a permission question in the place of its tool row.
+func (t *Transcript) prompt(r *Row) []string {
+	p := r.Prompt
+	if p == nil {
+		return nil
+	}
+	return []string{
+		t.summaryLine(p.Tool, p.Input),
+		t.line(theme.RoleWarning, previewIndent, promptChoices, false),
+	}
+}
+
+// noteRoles map a note's own role vocabulary onto the theme's.
+var noteRoles = map[session.NoteRole]theme.Role{
+	session.NoteInfo:  theme.RoleText,
+	session.NoteMuted: theme.RoleMuted,
+	session.NoteWarn:  theme.RoleWarning,
+	session.NoteError: theme.RoleError,
+}
+
+// marker renders the entries that are not a message: a plugin's note, a compaction and
+// the two ways a turn can end badly.
+func (t *Transcript) marker(r *Row) []string {
+	switch p := r.Entry.Payload.(type) {
+	case session.Note:
+		return t.wrap(noteRoles[p.Role], 0, p.Text)
+	case session.Compaction:
+		// How many entries a compaction covered is a server-side count; the client has
+		// the summary, so the first line of it stands for the range.
+		return []string{t.line(theme.RoleMuted, 0, "compaction: "+firstLine(p.Summary), false)}
+	case session.TurnInterrupted:
+		return []string{t.line(theme.RoleMuted, 0, "interrupted ("+string(p.How)+")", false)}
+	case session.TurnFailed:
+		return t.wrap(theme.RoleError, 0, "turn failed ("+string(p.Class)+"): "+p.Message)
+	case session.PermissionDecision, session.ToolResult:
+		return []string{t.line(theme.RoleWarning, 0, r.Text+" for unknown tool_use", false)}
+	}
+	return nil
+}
+
+// summaryField names the one input field that stands for a built-in tool's call.
+var summaryField = map[string]string{
+	"bash":  "command",
+	"read":  "path",
+	"write": "path",
+	"edit":  "path",
+	"grep":  "pattern",
+	"glob":  "pattern",
+}
+
+// summaryLine opens a tool row and a permission question alike: the glyph, the tool and
+// what the call does.
+func (t *Transcript) summaryLine(name string, input json.RawMessage) string {
+	return t.line(theme.RoleTool, 0, toolGlyph+" "+name+"  "+summary(name, input), false)
+}
+
+// summary is a tool call in one line: the field that says what it does for the built-in
+// tools, the head of the raw input for anything else, including a tool whose input is
+// still streaming and so does not parse yet.
+func summary(name string, input json.RawMessage) string {
+	if f := summaryField[name]; f != "" {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(input, &fields) == nil {
+			var s string
+			if json.Unmarshal(fields[f], &s) == nil {
+				return s
+			}
+		}
+	}
+	return ansi.Truncate(strings.TrimSpace(string(input)), summaryMax, "")
+}
+
+// line is one display line: truncated to what is left of the width, indented and
+// painted. fill paints role as the background instead, which only the diff roles ask
+// for and only under ui.diff.style = "background".
+func (t *Transcript) line(role theme.Role, indent int, text string, fill bool) string {
+	if w := t.opts.Width - indent; w > 0 {
+		text = ansi.Truncate(text, w, "")
+	}
+	st := t.th.Style(role)
+	if fill {
+		st = t.th.Style(theme.RoleText).Background(t.th.Colors[role])
+	}
+	return strings.Repeat(" ", indent) + st.Render(text)
+}
+
+// wrap is line over text word wrapped to the width.
+func (t *Transcript) wrap(role theme.Role, indent int, text string) []string {
+	w := max(t.opts.Width-indent, 1)
+	var out []string
+	for _, l := range splitLines(ansi.Wordwrap(text, w, "")) {
+		out = append(out, t.line(role, indent, l, false))
+	}
+	return out
+}
+
+// markdown renders one answer block through glamour, with chroma on fences.
+func (t *Transcript) markdown(s string) ([]string, error) {
+	if t.md.r == nil && t.md.err == nil {
+		t.md.r, t.md.err = glamour.NewTermRenderer(
+			glamour.WithStyles(glamourStyle(t.th)),
+			glamour.WithWordWrap(t.opts.Width),
+		)
+	}
+	if t.md.err != nil {
+		return nil, t.md.err
+	}
+	out, err := t.md.r.Render(s)
+	if err != nil {
+		return nil, fmt.Errorf("transcript: render markdown: %w", err)
+	}
+	lines := splitLines(out)
+	for i, l := range lines {
+		// glamour pads every line out to the width. The padding is plain spaces, since
+		// glamourStyle keeps the block styles colorless, so it trims off cleanly.
+		lines[i] = strings.TrimRight(l, " ")
+	}
+	return trimBlank(lines), nil
+}
+
+// mdCache holds the glamour renderer for the current width. SetWidth drops it.
+type mdCache struct {
+	r   *glamour.TermRenderer
+	err error
+}
+
+// glamourStyle builds glamour's style from the theme: the answer text in the assistant
+// role, headings and links in accent, fences through the theme's chroma style, and no
+// painted background anywhere.
+func glamourStyle(th theme.Theme) glamourstyle.StyleConfig {
+	sc := styles.DarkStyleConfig
+	// The color goes on Text, not on Document or Paragraph, because glamour pads every
+	// line out to the width with the block's own style: colorless blocks pad with plain
+	// spaces the renderer can trim.
+	sc.Document.Color, sc.Paragraph.Color = nil, nil
+	sc.Text = glamourstyle.StylePrimitive{Color: hexOf(th, theme.RoleAssistant)}
+	accent := hexOf(th, theme.RoleAccent)
+	muted := hexOf(th, theme.RoleMuted)
+	sc.Heading.Color, sc.H1.Color, sc.H6.Color = accent, accent, accent
+	sc.Link.Color, sc.LinkText.Color = accent, accent
+	sc.BlockQuote.Color, sc.HorizontalRule.Color = muted, muted
+	sc.Image.Color, sc.ImageText.Color = muted, muted
+	sc.Code.Color = chromaText(th.Chroma)
+	sc.CodeBlock.Color, sc.CodeBlock.Chroma, sc.CodeBlock.Theme = nil, nil, th.Chroma
+	clearBackgrounds(&sc)
+	return sc
+}
+
+// clearBackgrounds nils every BackgroundColor in sc. glamour's built-in styles paint a
+// few (an H1 banner, an inline code span) and the design paints none. It does not follow
+// pointers, so nothing shared with the package-level style it was copied from moves.
+func clearBackgrounds(sc *glamourstyle.StyleConfig) {
+	var walk func(v reflect.Value)
+	walk = func(v reflect.Value) {
+		if v.Kind() != reflect.Struct {
+			return
+		}
+		for i := range v.NumField() {
+			if v.Type().Field(i).Name == "BackgroundColor" {
+				v.Field(i).Set(reflect.Zero(v.Field(i).Type()))
+				continue
+			}
+			walk(v.Field(i))
+		}
+	}
+	walk(reflect.ValueOf(sc).Elem())
+}
+
+// hexOf is a theme role as the "#rrggbb" string glamour's style config wants.
+func hexOf(th theme.Theme, role theme.Role) *string {
+	c := th.Colors[role]
+	if c == nil {
+		return nil
+	}
+	r, g, b, _ := c.RGBA()
+	s := fmt.Sprintf("#%02x%02x%02x", uint8(r>>8), uint8(g>>8), uint8(b>>8)) //nolint:gosec
+	return &s
+}
+
+// chromaText is a chroma style's own text color, which is what an inline code span
+// should be: the same ink the fences are highlighted in.
+func chromaText(name string) *string {
+	c := chromastyles.Get(name).Get(chroma.Text).Colour
+	if !c.IsSet() {
+		return nil
+	}
+	s := c.String()
+	return &s
+}
+
+// prettyJSON is input indented for reading. Unparseable bytes, a half-streamed input
+// among them, show as they are.
+func prettyJSON(input json.RawMessage) []string {
+	if len(input) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, input, "", "  "); err != nil {
+		return splitLines(string(input))
+	}
+	return splitLines(buf.String())
+}
+
+// count is "<n> <noun>" over the lines of a tool's answer.
+func count(text, one, many string) string {
+	n := len(splitLines(text))
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// splitLines is text as lines, without the empty one a trailing newline leaves.
+func splitLines(text string) []string {
+	if text == "" {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+}
+
+func firstLine(text string) string {
+	if l := splitLines(text); len(l) > 0 {
+		return l[0]
+	}
+	return ""
+}
+
+func head(lines []string, n int) []string {
+	if len(lines) > n {
+		return lines[:n]
+	}
+	return lines
+}
+
+func tail(lines []string, n int) []string {
+	if len(lines) > n {
+		return lines[len(lines)-n:]
+	}
+	return lines
+}
+
+// trimBlank drops the blank lines glamour puts around a document. Spacing between rows
+// is the transcript's own, from ui.transcript.block_gap.
+func trimBlank(lines []string) []string {
+	start, end := 0, len(lines)
+	for start < end && strings.TrimSpace(lines[start]) == "" {
+		start++
+	}
+	for end > start && strings.TrimSpace(lines[end-1]) == "" {
+		end--
+	}
+	return lines[start:end]
+}

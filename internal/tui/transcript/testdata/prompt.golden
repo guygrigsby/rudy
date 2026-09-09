@@ -1,0 +1,3 @@
+[38;2;122;162;247m› run the suite[m
+[38;2;86;95;137m▸ bash  go test ./internal/session -run TestFork -count=3[m
+    [38;2;224;175;104mallow once [y]  allow for session [a]  deny [n][m
