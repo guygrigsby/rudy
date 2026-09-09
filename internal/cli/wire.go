@@ -85,16 +85,32 @@ func Build(ctx context.Context, o BuildOptions) (*Built, error) {
 	httpc := httpx.New(o.Version)
 	notice := func(text string) { _, _ = fmt.Fprintln(stderr, "rudy:", text) }
 	plugins := plugin.NewRegistry(cfg.Plugins, notice)
+	plugins.Disable(cfg.PluginsDisabled...)
 	set := o.Plugins
 	if set == nil {
 		set = BuiltinPlugins(cfg, httpc, home, env)
 	}
-	plugins.Load(ctx, set...)
 	if err := os.MkdirAll(paths.Cache, 0o700); err != nil {
 		return nil, fmt.Errorf("cache dir: %w", err)
 	}
+	// The server is built before the plugins load, and takes its providers from them
+	// afterwards: a plugin's Host reaches the server through the protocol (Connect, Note,
+	// the status broadcasts), so the server has to exist by the time any Init runs.
+	registry := provider.NewRegistry(filepath.Join(paths.Cache, "registry.json"))
+	g := gate.New(cfg.Permissions.Dangerous)
+	srv := server.New(server.Deps{
+		Version:  o.Version,
+		Config:   cfg,
+		Store:    store,
+		Registry: registry,
+		Plugins:  plugins,
+		Gate:     g,
+		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
+	})
+	plugins.SetServices(srv.PluginServices())
+	plugins.Load(ctx, set...)
 	providers := plugins.Providers()
-	registry := provider.NewRegistry(filepath.Join(paths.Cache, "registry.json"), providers...)
+	registry.SetProviders(providers...)
 	if err := registry.LoadSnapshot(); err != nil {
 		return nil, err
 	}
@@ -125,16 +141,6 @@ func Build(ctx context.Context, o BuildOptions) (*Built, error) {
 	if refreshErr != nil {
 		notice("registry refresh: " + refreshErr.Error())
 	}
-	g := gate.New(cfg.Permissions.Dangerous)
-	srv := server.New(server.Deps{
-		Version:  o.Version,
-		Config:   cfg,
-		Store:    store,
-		Registry: registry,
-		Plugins:  plugins,
-		Gate:     g,
-		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
-	})
 	return &Built{
 		Version:  o.Version,
 		Paths:    paths,

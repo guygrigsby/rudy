@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
@@ -150,11 +153,7 @@ func newHarnessWith(t *testing.T, prov *scriptProvider, extra ...plugin.Plugin) 
 	}
 	fp := &fakePlugin{prov: prov}
 	plugins := plugin.NewRegistry(nil, func(string) {})
-	plugins.Load(ctx, append([]plugin.Plugin{fp}, extra...)...)
-	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"), plugins.Providers()...)
-	if err := reg.Refresh(ctx); err != nil {
-		t.Fatal(err)
-	}
+	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"))
 	cfg := &config.Config{}
 	cfg.Default.Provider = "fake"
 	cfg.Default.Model = "m1"
@@ -170,6 +169,14 @@ func newHarnessWith(t *testing.T, prov *scriptProvider, extra ...plugin.Plugin) 
 		Gate:     gate.New(nil),
 		Hooks:    plugin.NewHookRunner(plugins, 5*time.Second, func(string) {}),
 	})
+	// The wiring order wire.go uses: the server exists before Load so a plugin's Host can
+	// reach it, and the provider registry takes its providers from what Load committed.
+	plugins.SetServices(srv.PluginServices())
+	plugins.Load(ctx, append([]plugin.Plugin{fp}, extra...)...)
+	reg.SetProviders(plugins.Providers()...)
+	if err := reg.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	return &harness{srv: srv, ws: t.TempDir(), fp: fp}
 }
@@ -1151,5 +1158,139 @@ func TestSessionHooksFireOnceAndReachTheSystemPrompt(t *testing.T) {
 	}
 	if _, closed = hr.counts(); len(closed) != 1 {
 		t.Errorf("session_closed after shutdown %v", closed)
+	}
+}
+
+// hostPlugin captures the Host its Init receives so a test can drive Connect, Note and
+// SetStatus from outside, the way a long-lived plugin does after Load has returned.
+type hostPlugin struct{ host plugin.Host }
+
+func (p *hostPlugin) Name() string { return "p" }
+
+func (p *hostPlugin) Init(_ context.Context, h plugin.Host) error {
+	p.host = h
+	return nil
+}
+
+func code(t *testing.T, err error) int {
+	t.Helper()
+	var pe *protocol.Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("not a protocol error: %v", err)
+	}
+	return pe.Code
+}
+
+func TestPluginHostReachesTheServerOverTheProtocol(t *testing.T) {
+	hp := &hostPlugin{}
+	h := newHarnessWith(t, &scriptProvider{}, hp)
+	if hp.host == nil {
+		t.Fatal("Init never ran")
+	}
+	ctx := context.Background()
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+
+	// The host's own connection is caller class plugin, and answers a hello like any other.
+	pc, err := hp.host.Connect(ctx)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = pc.Close() }()
+	var hr protocol.ClientHelloResult
+	if err := pc.Call(ctx, protocol.MethodClientHello, protocol.ClientHelloParams{Client: "p", Version: "0"}, &hr); err != nil {
+		t.Fatalf("plugin hello: %v", err)
+	}
+	var list protocol.SessionListResult
+	if err := pc.Call(ctx, protocol.MethodSessionList, nil, &list); err != nil {
+		t.Fatalf("plugin session.list: %v", err)
+	}
+	if len(list.Sessions) != 1 {
+		t.Fatalf("sessions %+v", list.Sessions)
+	}
+
+	// A plugin may name a parent, so it reaches the branch that looks the parent up.
+	parent := &protocol.ParentRef{SessionID: session.NewID().String(), ToolUseID: "tu1"}
+	err = pc.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: h.ws, Parent: parent}, &protocol.SessionInfo{})
+	if got := code(t, err); got != protocol.CodeNotFound {
+		t.Fatalf("plugin open with parent: code %d (%v)", got, err)
+	}
+	// A client may not: parent is not part of its class.
+	err = cl.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: h.ws, Parent: parent}, &protocol.SessionInfo{})
+	if got := code(t, err); got != protocol.CodeInvalidArgument {
+		t.Fatalf("client open with parent: code %d (%v)", got, err)
+	}
+
+	// Note reaches the session log and every subscriber.
+	sid := ulid.MustParse(info.SessionID)
+	if err := hp.host.Note(sid, "hello", session.NoteInfo); err != nil {
+		t.Fatalf("note: %v", err)
+	}
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		if err := json.Unmarshal(n.Params, &ea); err != nil {
+			t.Fatal(err)
+		}
+		return ea.Entry.Kind == session.KindNote
+	})
+	es := entries(t, ns)
+	note, ok := es[len(es)-1].Payload.(session.Note)
+	if !ok {
+		t.Fatalf("last entry %+v", es[len(es)-1])
+	}
+	if note.Plugin != "p" || note.Text != "hello" || note.Role != session.NoteInfo {
+		t.Fatalf("note = %+v", note)
+	}
+
+	// A status item set after Init reaches every connection that is already attached.
+	hp.host.SetStatus("k", []plugin.Span{{Text: "one", Role: "muted"}})
+	ns = drain(t, cl, func(n protocol.Notification) bool { return n.Method == protocol.NotifyStatusUpdated })
+	var su protocol.StatusUpdated
+	if err := json.Unmarshal(ns[len(ns)-1].Params, &su); err != nil {
+		t.Fatal(err)
+	}
+	if len(su.Items) != 1 || su.Items[0].Owner != "p" || su.Items[0].Key != "k" || su.Items[0].Content[0].Text != "one" {
+		t.Fatalf("status items %+v", su.Items)
+	}
+
+	// A connection that arrives afterwards is told the same state right after its hello.
+	cl2 := h.dial(t, false)
+	states := map[string]string{}
+	drain(t, cl2, func(n protocol.Notification) bool {
+		switch n.Method {
+		case protocol.NotifyStatusUpdated:
+			var s2 protocol.StatusUpdated
+			if err := json.Unmarshal(n.Params, &s2); err != nil {
+				t.Fatal(err)
+			}
+			if len(s2.Items) != 1 || s2.Items[0].Owner != "p" {
+				t.Errorf("status on connect %+v", s2.Items)
+			}
+		case protocol.NotifyPluginState:
+			var ps protocol.PluginState
+			if err := json.Unmarshal(n.Params, &ps); err != nil {
+				t.Fatal(err)
+			}
+			states[ps.Name] = ps.State
+		}
+		return len(states) == 2
+	})
+	if states["fake"] != string(plugin.StateReady) || states["p"] != string(plugin.StateReady) {
+		t.Fatalf("plugin.state = %+v", states)
+	}
+}
+
+func TestAppendNoteRefusedFromAClient(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	err := cl.Call(context.Background(), protocol.MethodPluginAppendNote, protocol.PluginAppendNoteParams{
+		SessionID: info.SessionID, Text: "no", Role: session.NoteInfo,
+	}, &server.EntryIDResult{})
+	if got := code(t, err); got != protocol.CodeUnauthorized {
+		t.Fatalf("code %d (%v)", got, err)
 	}
 }

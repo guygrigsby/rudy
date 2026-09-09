@@ -21,10 +21,10 @@ func load(t *testing.T, p plugin.Plugin) tool.Tool {
 	if err := p.Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.Tools) != 1 {
-		t.Fatalf("registered %d tools", len(h.Tools))
+	if len(h.RegisteredTools) != 1 {
+		t.Fatalf("registered %d tools", len(h.RegisteredTools))
 	}
-	return h.Tools[0]
+	return h.RegisteredTools[0]
 }
 
 func call(t *testing.T, tl tool.Tool, root string, input string) tool.Result {

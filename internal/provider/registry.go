@@ -44,6 +44,21 @@ func NewRegistry(snapshotPath string, providers ...Provider) *Registry {
 	return r
 }
 
+// SetProviders replaces the provider set and keeps whatever models are already known: the
+// snapshot on disk was written by an earlier run and is still the best answer until the
+// first Refresh. Call it before the first Refresh, which is where wire.go calls it, once
+// plugin.Load has committed the provider plugins.
+func (r *Registry) SetProviders(ps ...Provider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.order = r.order[:0]
+	r.providers = map[string]Provider{}
+	for _, p := range ps {
+		r.order = append(r.order, p.Name())
+		r.providers[p.Name()] = p
+	}
+}
+
 // Refresh lists models on every provider concurrently. A provider that fails keeps its
 // previous models; every failure is joined into the returned error. The snapshot is
 // rewritten when at least one provider answered.
@@ -52,8 +67,7 @@ func (r *Registry) Refresh(ctx context.Context) error {
 	var mu sync.Mutex
 	var errs []error
 	results := map[string][]Model{}
-	for _, name := range r.order {
-		p := r.providers[name]
+	for _, p := range r.snapshotProviders() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -176,8 +190,23 @@ func (r *Registry) Resolve(spec string) (Model, error) {
 	return Model{}, fmt.Errorf("%w: %s matches %s", ErrAmbiguous, spec, strings.Join(names, ", "))
 }
 
-// Provider returns a configured provider by name.
+// Provider returns a configured provider by name. Locked, like every other reader: the set
+// is replaced wholesale by SetProviders once plugin.Load has committed.
 func (r *Registry) Provider(name string) (Provider, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	p, ok := r.providers[name]
 	return p, ok
+}
+
+// snapshotProviders is the provider set in order, for a caller that then works without the
+// lock (Refresh, which waits on the network).
+func (r *Registry) snapshotProviders() []Provider {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Provider, 0, len(r.order))
+	for _, name := range r.order {
+		out = append(out, r.providers[name])
+	}
+	return out
 }

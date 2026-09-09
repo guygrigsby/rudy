@@ -1,7 +1,9 @@
 package session
 
 // Recover appends the entries that make a log consistent after a crash and
-// returns how many it appended. See the recovery rule in the plan.
+// returns how many it appended. See the recovery rule in the plan. It runs inside Load,
+// before the session is shared with anyone, and takes no lock of its own: every method it
+// calls here is one of Session's self-locking ones.
 func Recover(s *Session) (int, error) {
 	n := 0
 	for _, b := range s.PendingToolUses() {
@@ -22,7 +24,7 @@ func Recover(s *Session) (int, error) {
 		n++
 	}
 	if n > 0 {
-		if err := s.log.Sync(); err != nil {
+		if err := s.Sync(); err != nil {
 			return n, err
 		}
 	}

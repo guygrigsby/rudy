@@ -20,7 +20,7 @@ func load(t *testing.T) tool.Tool {
 	if err := bash.New().Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	return h.Tools[0]
+	return h.RegisteredTools[0]
 }
 
 func TestBashRunsInWorkspaceAndReportsExit(t *testing.T) {

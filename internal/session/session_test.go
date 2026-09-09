@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -280,5 +281,29 @@ func TestAppendAfterCloseIsAnError(t *testing.T) {
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("second Close = %v", err)
+	}
+}
+
+// TestAppendIsSafeForTwoGoroutines is the note path: a plugin appends outside the turn's
+// goroutine while the turn (or a handler) is reading the same session.
+func TestAppendIsSafeForTwoGoroutines(t *testing.T) {
+	_, s := newSession(t)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				if _, err := s.Append(Note{Plugin: "t", Text: "x", Role: NoteInfo}); err != nil {
+					t.Error(err)
+				}
+				_ = s.Entries()
+				_ = s.Model()
+			}
+		}()
+	}
+	wg.Wait()
+	if n := len(s.Entries()); n != 101 {
+		t.Errorf("entries %d", n)
 	}
 }

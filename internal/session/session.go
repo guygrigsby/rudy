@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -21,7 +22,14 @@ func invariant(format string, args ...any) error {
 
 // Session is the aggregate over one log. Everything it reports is derived by
 // scanning entries; nothing is cached on disk.
+//
+// One session has two writers: the turn.Runner on its own goroutine, and a plugin
+// appending a note through the server at any moment (plugin.append_note). mu is what makes
+// that safe. Every exported method takes it and delegates to a Locked variant; nothing
+// holding mu ever calls an exported method, so the mutex never nests inside itself. It is
+// the innermost lock in the process: Session never calls back out while holding it.
 type Session struct {
+	mu        sync.Mutex
 	id        ulid.ULID
 	dir       string
 	log       *Log
@@ -145,13 +153,19 @@ func (s *Session) Blobs() *Blobs { return s.blobs }
 
 // Entries is the inherited chain followed by this log's entries.
 func (s *Session) Entries() []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.entriesLocked()
+}
+
+func (s *Session) entriesLocked() []Entry {
 	out := make([]Entry, 0, len(s.inherited)+len(s.own))
 	out = append(out, s.inherited...)
 	return append(out, s.own...)
 }
 
-func (s *Session) has(id ulid.ULID) bool {
-	for _, e := range s.Entries() {
+func (s *Session) hasLocked(id ulid.ULID) bool {
+	for _, e := range s.entriesLocked() {
 		if e.ID == id {
 			return true
 		}
@@ -162,6 +176,8 @@ func (s *Session) has(id ulid.ULID) bool {
 // Append validates p against the log's rules, writes it and returns the entry.
 // An allow permission_decision is fsynced before Append returns.
 func (s *Session) Append(p Payload) (Entry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := Validate(p); err != nil {
 		return Entry{}, invariant("%v", err)
 	}
@@ -175,21 +191,21 @@ func (s *Session) Append(p Payload) (Entry, error) {
 			return Entry{}, invariant("fork_point after the first entry")
 		}
 	case PermissionDecision:
-		if !s.isPending(v.ToolUseID) {
+		if !s.isPendingLocked(v.ToolUseID) {
 			return Entry{}, invariant("permission_decision for tool_use %q that is not pending", v.ToolUseID)
 		}
-		if _, ok := s.decisionFor(v.ToolUseID); ok {
+		if _, ok := s.decisionForLocked(v.ToolUseID); ok {
 			return Entry{}, invariant("second permission_decision for tool_use %q", v.ToolUseID)
 		}
 	case ToolResult:
-		if !s.isPending(v.ToolUseID) {
+		if !s.isPendingLocked(v.ToolUseID) {
 			return Entry{}, invariant("tool_result for tool_use %q that is not pending", v.ToolUseID)
 		}
-		if _, ok := s.decisionFor(v.ToolUseID); !ok {
+		if _, ok := s.decisionForLocked(v.ToolUseID); !ok {
 			return Entry{}, invariant("tool_result for tool_use %q before its permission_decision", v.ToolUseID)
 		}
 	case Compaction:
-		if !s.has(v.FirstEntryID) || !s.has(v.LastEntryID) || v.FirstEntryID.Compare(v.LastEntryID) > 0 {
+		if !s.hasLocked(v.FirstEntryID) || !s.hasLocked(v.LastEntryID) || v.FirstEntryID.Compare(v.LastEntryID) > 0 {
 			return Entry{}, invariant("compaction ids must name ordered entries of this session")
 		}
 	default:
@@ -214,16 +230,25 @@ func (s *Session) Append(p Payload) (Entry, error) {
 // buffer, so nothing a turn wrote is on disk until this runs (or until Close). Callers
 // sync at the boundaries that matter to them: the turn runner does it every time a turn
 // comes to rest, so a crash between turns cannot lose entries a user has already seen.
-func (s *Session) Sync() error { return s.log.Sync() }
+func (s *Session) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.log.Sync()
+}
 
 // Fork syncs this log, then creates a new session whose first entry is a
 // fork_point at `at`. Entries up to and including `at` are inherited by
 // reference, so the parent's bytes must be on disk before the child exists.
 func (s *Session) Fork(st *Store, at ulid.ULID) (*Session, error) {
+	// The parent is locked for the whole copy: the child inherits entries by reference, so
+	// an append landing between the sync and the copy would put an entry in the child that
+	// is not on the parent's disk yet.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.log.Sync(); err != nil {
 		return nil, err
 	}
-	all := s.Entries()
+	all := s.entriesLocked()
 	cut := -1
 	for i, e := range all {
 		if e.ID == at {
@@ -251,8 +276,8 @@ func (s *Session) Fork(st *Store, at ulid.ULID) (*Session, error) {
 	return child, nil
 }
 
-func (s *Session) opened() SessionOpened {
-	for _, e := range s.Entries() {
+func (s *Session) openedLocked() SessionOpened {
+	for _, e := range s.entriesLocked() {
 		if o, ok := e.Payload.(SessionOpened); ok {
 			return o
 		}
@@ -260,12 +285,23 @@ func (s *Session) opened() SessionOpened {
 	return SessionOpened{}
 }
 
-func (s *Session) Workspace() Workspace { return s.opened().Workspace }
-func (s *Session) Agent() string        { return s.opened().Agent }
+func (s *Session) Workspace() Workspace {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openedLocked().Workspace
+}
+
+func (s *Session) Agent() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openedLocked().Agent
+}
 
 func (s *Session) Model() ModelRef {
-	m := s.opened().Model
-	for _, e := range s.Entries() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.openedLocked().Model
+	for _, e := range s.entriesLocked() {
 		if c, ok := e.Payload.(ModelChange); ok {
 			m = c.Model
 		}
@@ -274,8 +310,10 @@ func (s *Session) Model() ModelRef {
 }
 
 func (s *Session) Mode() Mode {
-	m := s.opened().Mode
-	for _, e := range s.Entries() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m := s.openedLocked().Mode
+	for _, e := range s.entriesLocked() {
 		if c, ok := e.Payload.(ModeChange); ok {
 			m = c.Mode
 		}
@@ -284,8 +322,10 @@ func (s *Session) Mode() Mode {
 }
 
 func (s *Session) Thinking() ThinkingLevel {
-	l := s.opened().Thinking
-	for _, e := range s.Entries() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l := s.openedLocked().Thinking
+	for _, e := range s.entriesLocked() {
 		if c, ok := e.Payload.(ThinkingChange); ok {
 			l = c.Thinking
 		}
@@ -295,8 +335,10 @@ func (s *Session) Thinking() ThinkingLevel {
 
 // Title is the last title_change, or "" when none.
 func (s *Session) Title() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	t := ""
-	for _, e := range s.Entries() {
+	for _, e := range s.entriesLocked() {
 		if c, ok := e.Payload.(TitleChange); ok {
 			t = c.Title
 		}
@@ -307,8 +349,10 @@ func (s *Session) Title() string {
 // Usage sums every assistant_message and compaction usage, since both are provider calls
 // the session paid for.
 func (s *Session) Usage() Usage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var u Usage
-	for _, e := range s.Entries() {
+	for _, e := range s.entriesLocked() {
 		switch p := e.Payload.(type) {
 		case AssistantMessage:
 			u = u.Add(p.Usage)
@@ -321,8 +365,10 @@ func (s *Session) Usage() Usage {
 
 // Allowances are the matchers of allow decisions with session scope.
 func (s *Session) Allowances() []Matcher {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var out []Matcher
-	for _, e := range s.Entries() {
+	for _, e := range s.entriesLocked() {
 		if d, ok := e.Payload.(PermissionDecision); ok && d.Decision == Allow && d.Scope == ScopeSession {
 			out = append(out, d.Matcher)
 		}
@@ -333,7 +379,13 @@ func (s *Session) Allowances() []Matcher {
 // RequestContext is the last compaction entry followed by everything after
 // it, or every entry when there is no compaction.
 func (s *Session) RequestContext() []Entry {
-	all := s.Entries()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requestContextLocked()
+}
+
+func (s *Session) requestContextLocked() []Entry {
+	all := s.entriesLocked()
 	for i, e := range slices.Backward(all) {
 		if e.Kind == KindCompaction {
 			return all[i:]
@@ -344,9 +396,15 @@ func (s *Session) RequestContext() []Entry {
 
 // PendingToolUses returns tool_use blocks that have no tool_result yet, in order.
 func (s *Session) PendingToolUses() []Block {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingToolUsesLocked()
+}
+
+func (s *Session) pendingToolUsesLocked() []Block {
 	done := map[string]bool{}
 	var uses []Block
-	for _, e := range s.Entries() {
+	for _, e := range s.entriesLocked() {
 		switch v := e.Payload.(type) {
 		case AssistantMessage:
 			for _, b := range v.Content {
@@ -367,8 +425,8 @@ func (s *Session) PendingToolUses() []Block {
 	return out
 }
 
-func (s *Session) isPending(toolUseID string) bool {
-	for _, b := range s.PendingToolUses() {
+func (s *Session) isPendingLocked(toolUseID string) bool {
+	for _, b := range s.pendingToolUsesLocked() {
 		if b.ID == toolUseID {
 			return true
 		}
@@ -376,8 +434,15 @@ func (s *Session) isPending(toolUseID string) bool {
 	return false
 }
 
+// decisionFor is the self-locking form, for a caller that holds nothing (Recover).
 func (s *Session) decisionFor(toolUseID string) (PermissionDecision, bool) {
-	for _, e := range s.Entries() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.decisionForLocked(toolUseID)
+}
+
+func (s *Session) decisionForLocked(toolUseID string) (PermissionDecision, bool) {
+	for _, e := range s.entriesLocked() {
 		if d, ok := e.Payload.(PermissionDecision); ok && d.ToolUseID == toolUseID {
 			return d, true
 		}
@@ -390,6 +455,8 @@ func (s *Session) decisionFor(toolUseID string) (PermissionDecision, bool) {
 // budget ran out, gets ErrClosed from its next Append or Sync instead of dereferencing a nil
 // log and taking the process down. Closing twice is a no-op.
 func (s *Session) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	err := s.log.Close()
 	if s.unlock != nil {
 		s.unlock()

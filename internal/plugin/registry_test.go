@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/oklog/ulid/v2"
+
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -285,3 +287,134 @@ func TestLoadNeverExposesHalfLoadedPlugin(t *testing.T) {
 }
 
 var _ = session.Workspace{} // CommandCall carries one; keep the import honest
+
+// funcPlugin is a plugin whose whole body is its Init.
+type funcPlugin struct {
+	name string
+	init func(h Host) error
+}
+
+func (f funcPlugin) Name() string                         { return f.name }
+func (f funcPlugin) Init(_ context.Context, h Host) error { return f.init(h) }
+
+func TestStatusWidgetsAndDisable(t *testing.T) {
+	var statusCalls int
+	var widgets []Widget
+	r := NewRegistry(nil, nil)
+	r.SetServices(Services{
+		StatusChanged: func() { statusCalls++ },
+		WidgetChanged: func(w Widget) { widgets = append(widgets, w) },
+	})
+	r.Disable("skip")
+	r.Load(context.Background(),
+		funcPlugin{"a", func(h Host) error {
+			h.SetStatus("k", []Span{{Text: "one", Role: "muted"}})
+			if err := h.SetWidget("w", SlotHeader, []Span{{Text: "hi", Role: "text"}}); err != nil {
+				return err
+			}
+			return h.SetWidget("bad", "nowhere", nil)
+		}},
+		funcPlugin{"skip", func(h Host) error { t.Error("disabled plugin loaded"); return nil }},
+		funcPlugin{"b", func(h Host) error { h.SetStatus("k", []Span{{Text: "two", Role: "muted"}}); return nil }},
+	)
+	if len(r.Statuses()) != 2 {
+		t.Errorf("statuses %+v", r.Statuses())
+	}
+	if r.Statuses()[0].State != StateFailed || !strings.Contains(r.Statuses()[0].Reason, "unknown widget slot") {
+		t.Errorf("a should fail on the bad slot: %+v", r.Statuses()[0])
+	}
+	// a failed at Init, so its staged status and widget were discarded with the rest.
+	items := r.StatusItems()
+	if len(items) != 1 || items[0].Owner != "b" || items[0].Key != "k" || items[0].Content[0].Text != "two" {
+		t.Errorf("items %+v", items)
+	}
+	if statusCalls == 0 {
+		t.Error("StatusChanged never called")
+	}
+	if len(r.Widgets()) != 0 {
+		t.Errorf("widgets %+v", r.Widgets())
+	}
+	_ = widgets
+}
+
+func TestNoteAndConnectBeforeServices(t *testing.T) {
+	r := NewRegistry(nil, nil)
+	var gotErr error
+	r.Load(context.Background(), funcPlugin{"a", func(h Host) error {
+		gotErr = h.Note(ulid.Make(), "x", session.NoteInfo)
+		_, cerr := h.Connect(context.Background())
+		if !errors.Is(cerr, ErrNoServer) {
+			t.Errorf("connect: %v", cerr)
+		}
+		return nil
+	}})
+	if !errors.Is(gotErr, ErrNoServer) {
+		t.Errorf("note: %v", gotErr)
+	}
+}
+
+func TestFailWithdrawsEverythingThePluginOwns(t *testing.T) {
+	r, _ := newTestRegistry(nil)
+	var statusCalls int
+	r.SetServices(Services{StatusChanged: func() { statusCalls++ }})
+	r.Load(context.Background(),
+		funcPlugin{"a", func(h Host) error {
+			if err := h.RegisterTool(namedTool("read")); err != nil {
+				return err
+			}
+			if err := h.RegisterCommand(Command{Name: "init", Run: func(context.Context, CommandCall) (Action, error) { return NoAction{}, nil }}); err != nil {
+				return err
+			}
+			if err := h.RegisterProvider(fakeProvider{"aperture"}); err != nil {
+				return err
+			}
+			if err := h.RegisterHook(HookHandler{Point: HookBeforeTurn, Handle: func(context.Context, HookCall) (any, error) { return nil, nil }}); err != nil {
+				return err
+			}
+			h.SetStatus("k", []Span{{Text: "one", Role: "muted"}})
+			return h.SetWidget("w", SlotHeader, []Span{{Text: "hi", Role: "text"}})
+		}},
+		funcPlugin{"b", func(h Host) error {
+			h.SetStatus("k", []Span{{Text: "two", Role: "muted"}})
+			return h.RegisterTool(namedTool("bash"))
+		}},
+	)
+	before := statusCalls
+	r.Fail("a", "process exited")
+
+	if got := r.Tools(); len(got) != 1 || got[0].Name != "bash" {
+		t.Errorf("tools %+v", got)
+	}
+	if _, ok := r.Tool("read"); ok {
+		t.Error("read survived Fail")
+	}
+	if got := r.Commands(); len(got) != 0 {
+		t.Errorf("commands %+v", got)
+	}
+	if _, ok := r.Command("init"); ok {
+		t.Error("init survived Fail")
+	}
+	if got := r.Providers(); len(got) != 0 {
+		t.Errorf("providers %+v", got)
+	}
+	if got := r.Hooks(HookBeforeTurn); len(got) != 0 {
+		t.Errorf("hooks %+v", got)
+	}
+	items := r.StatusItems()
+	if len(items) != 1 || items[0].Owner != "b" {
+		t.Errorf("items %+v", items)
+	}
+	if got := r.Widgets(); len(got) != 0 {
+		t.Errorf("widgets %+v", got)
+	}
+	st := r.Statuses()
+	if len(st) != 2 || st[0].Name != "a" || st[0].State != StateFailed || st[0].Reason != "process exited" {
+		t.Errorf("statuses %+v", st)
+	}
+	if st[1].State != StateReady {
+		t.Errorf("b should still be ready: %+v", st[1])
+	}
+	if statusCalls == before {
+		t.Error("Fail did not report the status change")
+	}
+}

@@ -14,10 +14,20 @@ import (
 // notifications and responses leave in the order they were produced, and a slow client never
 // blocks whoever is producing them (the turn.Runner's Observer callbacks, in particular).
 type conn struct {
-	id    int
-	c     protocol.Conn
-	hello bool
-	asker bool
+	id int
+	c  protocol.Conn
+	// hello is whether this connection may dispatch anything but client.hello. A plugin
+	// connection starts true: the server handed it out itself, so there is nothing to
+	// introduce. greeted is whether a client.hello has actually been answered, which is
+	// what makes a second one a refusal.
+	hello   bool
+	greeted bool
+	asker   bool
+	// plugin is the caller class: the plugin's name on a connection the server itself
+	// handed out through Host.Connect (or, from Task 12, a spawned plugin's pipe), empty on
+	// every client connection. Only a plugin may append a note or name a parent session.
+	// Written once before the serve loop starts and read only from that loop.
+	plugin string
 
 	mu    sync.Mutex
 	queue []any

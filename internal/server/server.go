@@ -65,13 +65,14 @@ type Server struct {
 	live    map[ulid.ULID]*liveSession
 	loading map[ulid.ULID]chan struct{} // sids with a cold load in flight; see loadCold
 	closing map[ulid.ULID]chan struct{} // sids detach is closing; see detach, loadCold
+	conns   map[int]*conn               // every live connection, for the status and widget broadcasts
 	nextID  int
 }
 
 // New wires a Server. Deps must already be fully populated.
 func New(d Deps) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{d: d, ctx: ctx, cancel: cancel, live: map[ulid.ULID]*liveSession{}}
+	return &Server{d: d, ctx: ctx, cancel: cancel, live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{}}
 }
 
 // Serve runs one connection until it closes. client.hello must be its first request.
@@ -79,8 +80,21 @@ func New(d Deps) *Server {
 // order they were produced. Permission questions go to the first such connection whose hello
 // declared asker; none means no asker.
 func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
+	return s.serveConn(ctx, c, "")
+}
+
+// servePlugin runs one connection whose caller class is plugin: it needs no hello (one
+// arriving is answered normally) and may append notes and name a parent session. Only the
+// server hands these out, through Host.Connect.
+func (s *Server) servePlugin(ctx context.Context, c protocol.Conn, name string) error {
+	return s.serveConn(ctx, c, name)
+}
+
+// serveConn sets a connection up, runs its loop and tears it down. name is the caller class:
+// empty for a client, the plugin's name for a plugin connection.
+func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string) error {
 	// Tracked in the same WaitGroup as running turns, and registered under wgMu against
-	// shuttingDown for the same reason spawnTurn is (see spawnTurn): a Serve loop can be
+	// shuttingDown for the same reason spawnTurn is (see spawnTurn): a serve loop can be
 	// dispatching a request against a live session at any moment, so Shutdown must not
 	// close a session until every loop has returned. The Done below is deferred before the
 	// detach, so it fires only after this connection has released its sessions.
@@ -96,17 +110,26 @@ func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
 	s.mu.Lock()
 	s.nextID++
 	cn := newConn(s.nextID, c)
+	cn.plugin = name
+	cn.hello = name != ""
+	s.conns[cn.id] = cn
 	s.mu.Unlock()
 
 	pumpCtx, stopPump := context.WithCancel(ctx)
 	go cn.pump(pumpCtx)
 	defer func() {
+		s.mu.Lock()
+		delete(s.conns, cn.id)
+		s.mu.Unlock()
 		s.detachAll(cn)
 		stopPump()
 	}()
+	return s.serve(ctx, cn)
+}
 
+func (s *Server) serve(ctx context.Context, cn *conn) error {
 	for {
-		raw, err := c.Recv(ctx)
+		raw, err := cn.c.Recv(ctx)
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -132,6 +155,11 @@ func (s *Server) Serve(ctx context.Context, c protocol.Conn) error {
 			continue
 		}
 		cn.send(resp)
+		if req.Method == protocol.MethodClientHello {
+			// After the response is queued, never before: a client learns the server is
+			// there and then, in the same ordered outbox, what the plugins are showing.
+			s.sendConnectState(cn)
+		}
 	}
 }
 
@@ -273,6 +301,8 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 		return protocol.RegistryListResult{Models: s.d.Registry.Models()}, nil
 	case protocol.MethodCommandRun:
 		return s.handleCommandRun(ctx, cn, req.Params)
+	case protocol.MethodPluginAppendNote:
+		return s.handleAppendNote(cn, req.Params)
 	default:
 		return nil, perr(protocol.CodeNotFound, "unknown method "+req.Method)
 	}
@@ -283,10 +313,11 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	if e := decode(raw, &p); e != nil {
 		return nil, e
 	}
-	if cn.hello {
+	if cn.greeted {
 		return nil, perr(protocol.CodeRefusedByInvariant, "hello already received")
 	}
 	cn.hello = true
+	cn.greeted = true
 	cn.asker = p.Asker
 	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version}, nil
 }
@@ -461,6 +492,31 @@ func (s *Server) handleSetTitle(raw json.RawMessage) (any, *protocol.Error) {
 	})
 }
 
+// handleAppendNote is the plugin caller class's one write into a session log. A client
+// connection has no business asserting a note came from a plugin, so it is refused before
+// the params are even decoded.
+func (s *Server) handleAppendNote(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
+	if cn.plugin == "" {
+		return nil, perr(protocol.CodeUnauthorized, "plugin.append_note is for plugins")
+	}
+	var p protocol.PluginAppendNoteParams
+	if e := decode(raw, &p); e != nil {
+		return nil, e
+	}
+	sid, err := ulid.Parse(p.SessionID)
+	if err != nil {
+		return nil, perr(protocol.CodeInvalidArgument, "bad session id")
+	}
+	e, aerr := s.appendNote(sid, cn.plugin, p.Text, p.Role)
+	switch {
+	case errors.Is(aerr, errSessionNotOpen):
+		return nil, perr(protocol.CodeNotFound, aerr.Error())
+	case aerr != nil:
+		return nil, protocol.ErrorFrom(aerr)
+	}
+	return EntryIDResult{EntryID: e.ID.String()}, nil
+}
+
 func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMessage) (any, *protocol.Error) {
 	var p protocol.CommandRunParams
 	if e := decode(raw, &p); e != nil {
@@ -538,6 +594,12 @@ func (s *Server) setEntry(id string, kind session.Kind, f func(view protocol.Ses
 }
 
 func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Error) {
+	if p.Parent != nil {
+		if cn.plugin == "" {
+			return nil, perr(protocol.CodeInvalidArgument, "parent is for plugins")
+		}
+		return nil, perr(protocol.CodeNotFound, "child sessions arrive in Task 5")
+	}
 	ws, err := workspace.Detect(p.Cwd)
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, err.Error())

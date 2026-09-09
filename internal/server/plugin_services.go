@@ -1,0 +1,108 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/oklog/ulid/v2"
+
+	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/protocol"
+	"github.com/guygrigsby/rudy/internal/session"
+)
+
+// errSessionNotOpen is what a note for a session nobody holds live comes back as; the
+// dispatch path turns it into not_found.
+var errSessionNotOpen = errors.New("session not open")
+
+// originLinked is what plugin.state reports for a plugin compiled into the binary. Spawned
+// plugins arrive in Task 12 and carry their own origin then.
+const originLinked = "linked"
+
+// PluginServices is what the registry's hosts call. Connect returns the client end of a pipe
+// whose server end is served on s.ctx as caller class plugin; Note appends a note entry to a
+// live session; StatusChanged and WidgetChanged broadcast to every connection. It is the
+// whole of a plugin's private access to the server: everything else it wants, it asks for
+// over the protocol like any other caller.
+func (s *Server) PluginServices() plugin.Services {
+	return plugin.Services{
+		Note: func(sid ulid.ULID, name, text string, role session.NoteRole) error {
+			_, err := s.appendNote(sid, name, text, role)
+			return err
+		},
+		Connect:       s.connectPlugin,
+		StatusChanged: s.broadcastStatus,
+		WidgetChanged: s.broadcastWidget,
+	}
+}
+
+// connectPlugin gives a plugin the client end of an in-memory pipe. The server end runs on
+// s.ctx, not the caller's: a plugin's connection belongs to the server's lifetime, and
+// serveConn registers it in the same WaitGroup Shutdown waits on, so Shutdown still ends it.
+func (s *Server) connectPlugin(_ context.Context, name string) (protocol.Conn, error) {
+	clientEnd, serverEnd := protocol.Pipe()
+	s.wgMu.Lock()
+	if s.shuttingDown {
+		s.wgMu.Unlock()
+		return nil, ErrShuttingDown
+	}
+	s.wgMu.Unlock()
+	go func() { _ = s.servePlugin(s.ctx, serverEnd, name) }()
+	return clientEnd, nil
+}
+
+// appendNote appends outside any turn's goroutine. Session.Append is safe for that since it
+// carries its own mutex; the mirror is updated under obsMu and the entry broadcast like any
+// other. It takes no ls.mu: a note is display only, never sent to a model, so unlike every
+// other server-side append it does not have to wait for the turn to give the session back.
+func (s *Server) appendNote(sid ulid.ULID, owner, text string, role session.NoteRole) (session.Entry, error) {
+	s.mu.Lock()
+	ls, ok := s.live[sid]
+	s.mu.Unlock()
+	if !ok {
+		return session.Entry{}, fmt.Errorf("%w: %s", errSessionNotOpen, sid)
+	}
+	return ls.appendNote(owner, text, role)
+}
+
+// broadcastStatus sends the whole status line to every connection. The conns snapshot is
+// taken under mu and the notifies happen after releasing it: conn.mu is never nested inside
+// any of the server's locks (see the Server doc), and notify only enqueues anyway.
+func (s *Server) broadcastStatus() {
+	items := s.d.Plugins.StatusItems()
+	for _, cn := range s.snapshotConns() {
+		cn.notify(protocol.NotifyStatusUpdated, protocol.StatusUpdated{Items: items})
+	}
+}
+
+func (s *Server) broadcastWidget(w plugin.Widget) {
+	for _, cn := range s.snapshotConns() {
+		cn.notify(protocol.NotifyWidgetUpdated, w)
+	}
+}
+
+// sendConnectState tells one connection what every plugin is currently showing, right after
+// its hello response. A client that connects late renders the same status line, widgets and
+// plugin states as one that was there when they were set.
+func (s *Server) sendConnectState(cn *conn) {
+	cn.notify(protocol.NotifyStatusUpdated, protocol.StatusUpdated{Items: s.d.Plugins.StatusItems()})
+	for _, w := range s.d.Plugins.Widgets() {
+		cn.notify(protocol.NotifyWidgetUpdated, w)
+	}
+	for _, st := range s.d.Plugins.Statuses() {
+		cn.notify(protocol.NotifyPluginState, protocol.PluginState{
+			Name: st.Name, Origin: originLinked, State: string(st.State), Reason: st.Reason,
+		})
+	}
+}
+
+func (s *Server) snapshotConns() []*conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*conn, 0, len(s.conns))
+	for _, cn := range s.conns {
+		out = append(out, cn)
+	}
+	return out
+}

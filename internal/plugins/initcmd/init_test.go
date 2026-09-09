@@ -16,10 +16,10 @@ func TestInitSubmitsThePrompt(t *testing.T) {
 	if err := initcmd.New().Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.Commands) != 1 || h.Commands[0].Name != "init" {
-		t.Fatalf("commands = %+v", h.Commands)
+	if len(h.RegisteredCommands) != 1 || h.RegisteredCommands[0].Name != "init" {
+		t.Fatalf("commands = %+v", h.RegisteredCommands)
 	}
-	act, err := h.Commands[0].Run(context.Background(), plugin.CommandCall{Workspace: session.Workspace{Root: "/tmp/x"}})
+	act, err := h.RegisteredCommands[0].Run(context.Background(), plugin.CommandCall{Workspace: session.Workspace{Root: "/tmp/x"}})
 	if err != nil {
 		t.Fatal(err)
 	}

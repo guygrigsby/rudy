@@ -209,6 +209,22 @@ func (ls *liveSession) appendAndBroadcastLocked(p session.Payload) (session.Entr
 	return e, nil
 }
 
+// appendNote appends a plugin's note and broadcasts it. Unlike appendAndBroadcastLocked it
+// takes no mu and makes no active-turn check: a note is display only and never reaches a
+// model, so it may land in the middle of a turn, which is exactly when a plugin has
+// something to say. Session.Append is what makes that concurrent append safe.
+func (ls *liveSession) appendNote(owner, text string, role session.NoteRole) (session.Entry, error) {
+	e, err := ls.sess.Append(session.Note{Plugin: owner, Text: text, Role: role})
+	if err != nil {
+		return session.Entry{}, err
+	}
+	ls.obsMu.Lock()
+	ls.entries = append(ls.entries, e)
+	ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e})
+	ls.obsMu.Unlock()
+	return e, nil
+}
+
 // deriveInfo computes a SessionInfo by scanning entries the same way *session.Session's own
 // accessors scan its log, so the two never disagree.
 func deriveInfo(id ulid.ULID, entries []session.Entry) protocol.SessionInfo {
