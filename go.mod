@@ -3,6 +3,7 @@ module github.com/guygrigsby/rudy
 go 1.26.2
 
 require (
+	charm.land/bubbletea/v2 v2.0.9
 	charm.land/lipgloss/v2 v2.0.6
 	github.com/aeryx-ai/memory/memory-go v0.0.0
 	github.com/alecthomas/chroma/v2 v2.27.0

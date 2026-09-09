@@ -229,7 +229,7 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 	}
 	c.PluginsDisabled = v.GetStringSlice("plugins.disabled")
 	// ui.theme is a table of strings (name plus role overrides); merge the file's and
-	// overrides' values over the built-in defaults by hand, see uiThemeDefaults.
+	// overrides' values over the built-in defaults by hand, see themeDefaults.
 	c.UI.Theme = ThemeDefaults()
 	c.UI.Theme["name"] = "default"
 	for k, val := range v.GetStringMapString("ui.theme") {
