@@ -31,6 +31,26 @@ func appendString(dst []byte, s string) ([]byte, error) {
 	return append(dst, b...), nil
 }
 
+// appendRawJSON copies provider or hook bytes into a log line. They go through
+// untouched unless they carry a raw newline or carriage return, and then they
+// are compacted first: the log is JSONL, one entry to a line, so a newline
+// inside a tool input (a before_tool handler answering with json.MarshalIndent
+// output, a provider pretty-printing partial_json) would split the line in two
+// and cost ReadLog the whole session from there on. Insignificant whitespace
+// between tokens is the only legal place a newline can appear in valid JSON, so
+// compaction removes exactly that: key order, every string's bytes and every
+// number's spelling survive it.
+func appendRawJSON(dst, raw []byte) ([]byte, error) {
+	if !bytes.ContainsAny(raw, "\n\r") {
+		return append(dst, raw...), nil
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return nil, err
+	}
+	return append(dst, buf.Bytes()...), nil
+}
+
 // appendBlocks writes a block array by hand so tool_use input bytes are
 // copied verbatim rather than compacted by encoding/json.
 func appendBlocks(dst []byte, blocks []Block) ([]byte, error) {
@@ -80,7 +100,9 @@ func appendBlocks(dst []byte, blocks []Block) ([]byte, error) {
 				if !json.Valid(b.Input) {
 					return nil, fmt.Errorf("tool_use %q: input is not valid JSON", b.ID)
 				}
-				dst = append(dst, b.Input...)
+				if dst, err = appendRawJSON(dst, b.Input); err != nil {
+					return nil, fmt.Errorf("tool_use %q: %w", b.ID, err)
+				}
 			}
 		default:
 			return nil, fmt.Errorf("block: invalid type %q", b.Type)
@@ -213,7 +235,9 @@ func (e Entry) MarshalJSON() ([]byte, error) {
 	}
 	if len(input) > 0 {
 		out = append(out, `,"input":`...)
-		out = append(out, input...)
+		if out, err = appendRawJSON(out, input); err != nil {
+			return nil, fmt.Errorf("entry %s: input: %w", e.Kind, err)
+		}
 	}
 	if has {
 		out = append(out, `,"content":`...)

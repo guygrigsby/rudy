@@ -1,6 +1,8 @@
 package session
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -122,5 +124,66 @@ func TestReadLogMissingFile(t *testing.T) {
 	got, err := ReadLog(t.TempDir())
 	if err != nil || len(got) != 0 {
 		t.Fatalf("missing file: got %d entries, err %v; want 0, nil", len(got), err)
+	}
+}
+
+// TestLogCompactsInputWithNewlines: a raw newline inside a tool input (a before_tool handler
+// answering with indented bytes, a provider pretty-printing partial_json) would split a JSONL
+// line in two and cost ReadLog the whole session from there on. The write path compacts those
+// bytes, and only those; the keys, their order and every string survive it.
+func TestLogCompactsInputWithNewlines(t *testing.T) {
+	dir := t.TempDir()
+	l, err := OpenLog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indented := json.RawMessage("{\n  \"command\": \"go test ./...\",\n  \"note\": \"a\\nb\"\n}")
+	const compacted = `{"command":"go test ./...","note":"a\nb"}`
+	entries := []Entry{
+		testEntry(t, PermissionDecision{ToolUseID: "toolu_01", Tool: "bash", Mode: ModeStrict,
+			Matcher: Matcher{Tool: "bash"}, Decision: Allow, DecidedBy: ByHook, Scope: ScopeOnce,
+			Reason: "hook", Input: indented}),
+		testEntry(t, AssistantMessage{Model: ModelRef{"aperture", "m"}, Thinking: ThinkingOff,
+			Content: []Block{ToolUseBlock("toolu_01", "bash", indented)}, StopReason: StopToolUse}),
+		testEntry(t, TitleChange{Title: "still readable"}),
+	}
+	for _, e := range entries {
+		if err := l.Append(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, LogFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := bytes.Count(raw, []byte("\n")); n != len(entries) {
+		t.Fatalf("log has %d lines for %d entries:\n%s", n, len(entries), raw)
+	}
+	got, err := ReadLog(dir)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if len(got) != len(entries) {
+		t.Fatalf("read %d entries, want %d", len(got), len(entries))
+	}
+	pd, ok := got[0].Payload.(PermissionDecision)
+	if !ok {
+		t.Fatalf("entry 0 is %T", got[0].Payload)
+	}
+	if string(pd.Input) != compacted {
+		t.Errorf("permission_decision input = %s, want %s", pd.Input, compacted)
+	}
+	am, ok := got[1].Payload.(AssistantMessage)
+	if !ok {
+		t.Fatalf("entry 1 is %T", got[1].Payload)
+	}
+	if string(am.Content[0].Input) != compacted {
+		t.Errorf("tool_use input = %s, want %s", am.Content[0].Input, compacted)
+	}
+	if tc, ok := got[2].Payload.(TitleChange); !ok || tc.Title != "still readable" {
+		t.Errorf("entry after the compacted ones = %#v", got[2].Payload)
 	}
 }

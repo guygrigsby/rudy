@@ -574,7 +574,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		// Whatever the tool produced before its deadline is kept: it is often the half of
 		// the output that explains why the rest never came.
 		outcome = session.OutcomeError
-		content = []session.Block{session.TextBlock(fmt.Sprintf("%s\n[timed out after %s]", textOf(content), r.cfg.ToolTimeout))}
+		content = []session.Block{session.TextBlock(fmt.Sprintf("%s\n[timed out after %s]", session.TextOf(content), r.cfg.ToolTimeout))}
 	case invokeErr != nil:
 		outcome = session.OutcomeError
 		content = []session.Block{session.TextBlock(invokeErr.Error())}
@@ -635,17 +635,6 @@ func (r *Runner) askHooks(ctx context.Context, tu session.Block, safety tool.Saf
 		}
 	}
 	return input, modified, nil
-}
-
-// textOf is the text a tool result carries, which a timeout keeps alongside its own note.
-func textOf(blocks []session.Block) string {
-	var b strings.Builder
-	for _, bl := range blocks {
-		if bl.Type == session.BlockText {
-			b.WriteString(bl.Text)
-		}
-	}
-	return b.String()
 }
 
 // refuse records a tool_use that will not run: the deny the log requires ahead of any

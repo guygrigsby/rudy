@@ -201,7 +201,7 @@ func (out *turnOutcome) observe(n protocol.Notification, sessionID, turnID strin
 		}
 		switch pl := ea.Entry.Payload.(type) {
 		case session.AssistantMessage:
-			if t := textOf(pl.Content); t != "" {
+			if t := session.TextOf(pl.Content); t != "" {
 				out.text = t
 			}
 		case session.TurnFailed:
@@ -222,17 +222,4 @@ func (out *turnOutcome) observe(n protocol.Notification, sessionID, turnID strin
 		}
 	}
 	return false, nil
-}
-
-func textOf(blocks []session.Block) string {
-	var b strings.Builder
-	for _, bl := range blocks {
-		if bl.Type == session.BlockText {
-			if b.Len() > 0 {
-				b.WriteString("\n")
-			}
-			b.WriteString(bl.Text)
-		}
-	}
-	return b.String()
 }

@@ -841,7 +841,7 @@ func TestLogIsDurableWhenTheTurnRests(t *testing.T) {
 	}
 	found := false
 	for _, e := range onDisk {
-		if am, ok := e.Payload.(session.AssistantMessage); ok && textOf(am.Content) == "durable" {
+		if am, ok := e.Payload.(session.AssistantMessage); ok && session.TextOf(am.Content) == "durable" {
 			found = true
 		}
 	}

@@ -266,6 +266,21 @@ type Block struct {
 // TextBlock builds a text block.
 func TextBlock(s string) Block { return Block{Type: BlockText, Text: s} }
 
+// TextOf is the text of a block list: every text block, newline separated, everything else
+// skipped. It is the one spelling of "what does this content say" that the callers with no
+// opinion about the other block types share (a turn's timeout note, the subagent runner's
+// result, the print client's answer); the two codecs build on it but refuse an image first,
+// since sending one silently as nothing would lose what the user attached.
+func TextOf(blocks []Block) string {
+	parts := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Type == BlockText {
+			parts = append(parts, b.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
 // ToolUseBlock builds a tool_use block; input is kept verbatim.
 func ToolUseBlock(id, name string, input json.RawMessage) Block {
 	return Block{Type: BlockToolUse, ID: id, Name: name, Input: input}

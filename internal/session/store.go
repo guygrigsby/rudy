@@ -74,7 +74,11 @@ func (st *Store) List() ([]Summary, error) {
 			if err != nil {
 				continue
 			}
+			// The parent comes up the chain with the workspace and the model: a fork of a
+			// subagent's session is a child too, and a caller that skips children (rudy
+			// --continue) would otherwise resume one.
 			sum.Workspace, sum.Model = root.Workspace, root.Model
+			sum.ParentSessionID = root.ParentSessionID
 		default:
 			continue
 		}
