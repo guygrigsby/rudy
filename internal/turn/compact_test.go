@@ -2,6 +2,8 @@ package turn
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -19,17 +21,24 @@ func textWithUsage(s string, u session.Usage) []provider.Part {
 	return []provider.Part{text(s), {Type: provider.PartUsage, Usage: u}, stop(session.StopEndTurn, "stop")}
 }
 
+// appendPair appends one user message and its reply, labelled n, and returns both.
+func appendPair(t *testing.T, s *session.Session, n string) (session.Entry, session.Entry) {
+	t.Helper()
+	u := mustAppend(t, s, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("q" + n)}})
+	a := mustAppend(t, s, session.AssistantMessage{
+		Model: s.Model(), Thinking: s.Thinking(),
+		Content:    []session.Block{session.TextBlock("a" + n)},
+		Usage:      session.Usage{Input: 10, Output: 2},
+		StopReason: session.StopEndTurn, StopReasonRaw: "stop",
+	})
+	return u, a
+}
+
 // seedConversation appends n user/assistant pairs directly, without running a turn.
 func seedConversation(t *testing.T, s *session.Session, n int) {
 	t.Helper()
 	for i := range n {
-		mustAppend(t, s, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("q" + string(rune('1'+i)))}})
-		mustAppend(t, s, session.AssistantMessage{
-			Model: s.Model(), Thinking: s.Thinking(),
-			Content:    []session.Block{session.TextBlock("a" + string(rune('1'+i)))},
-			Usage:      session.Usage{Input: 10, Output: 2},
-			StopReason: session.StopEndTurn, StopReasonRaw: "stop",
-		})
+		appendPair(t, s, string(rune('1'+i)))
 	}
 }
 
@@ -137,5 +146,89 @@ func TestRunnerLeavesTheThresholdAloneBelowIt(t *testing.T) {
 	}
 	if len(fake.calls) != 0 {
 		t.Errorf("compacted below the threshold: %v", fake.calls)
+	}
+}
+
+// TestModelCompactorChainsFromThePreviousCompaction is the log a mid-turn compaction leaves
+// behind: c1 covers u1..a1 but is appended after u2 and a2, the turn that was running. The
+// next compaction covers c1, u2 and a2, and c1's entry id is younger than every other entry in
+// that set, so taking it as first_entry_id builds a range the log refuses. The new compaction
+// starts where c1 started instead.
+func TestModelCompactorChainsFromThePreviousCompaction(t *testing.T) {
+	s, prov, _ := newTurnFixture(t,
+		textWithUsage("SUMMARY ONE", session.Usage{Input: 5, Output: 3}),
+		textWithUsage("SUMMARY TWO", session.Usage{Input: 6, Output: 4}))
+	u1, a1 := appendPair(t, s, "1")
+	u2, a2 := appendPair(t, s, "2")
+	c := &ModelCompactor{Provider: prov, Model: provider.Model{Ref: s.Model()}, MaxTokens: 100}
+	e1, err := c.Compact(context.Background(), s, u2.ID, "one")
+	if err != nil {
+		t.Fatalf("first compaction: %v", err)
+	}
+	if cp := e1.Payload.(session.Compaction); cp.FirstEntryID != u1.ID || cp.LastEntryID != a1.ID {
+		t.Fatalf("first compaction range %s..%s", cp.FirstEntryID, cp.LastEntryID)
+	}
+	u3, a3 := appendPair(t, s, "3")
+	e2, err := c.Compact(context.Background(), s, u3.ID, "two")
+	if err != nil {
+		t.Fatalf("second compaction: %v", err)
+	}
+	cp := e2.Payload.(session.Compaction)
+	if cp.FirstEntryID != u1.ID || cp.LastEntryID != a2.ID {
+		t.Errorf("second compaction range %s..%s, want %s..%s", cp.FirstEntryID, cp.LastEntryID, u1.ID, a2.ID)
+	}
+	if cp.Summary != "SUMMARY TWO" {
+		t.Errorf("summary %q", cp.Summary)
+	}
+	var ids []ulid.ULID
+	for _, e := range s.RequestContext() {
+		ids = append(ids, e.ID)
+	}
+	if !reflect.DeepEqual(ids, []ulid.ULID{e2.ID, u3.ID, a3.ID}) {
+		t.Errorf("request context %v, want %v", ids, []ulid.ULID{e2.ID, u3.ID, a3.ID})
+	}
+}
+
+// TestModelCompactorUsesTheAfterToolOverrides: what an after_tool handler replaced is what the
+// model saw and is what it must summarize. The stored result, which the log keeps verbatim,
+// would otherwise be copied into the summary and persisted there.
+func TestModelCompactorUsesTheAfterToolOverrides(t *testing.T) {
+	s, prov, _ := newTurnFixture(t, textWithUsage("SUMMARY", session.Usage{Input: 5, Output: 3}))
+	mustAppend(t, s, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("run it")}})
+	mustAppend(t, s, session.AssistantMessage{
+		Model: s.Model(), Thinking: s.Thinking(),
+		Content:    []session.Block{session.ToolUseBlock("tu1", "echo", json.RawMessage(`{}`))},
+		StopReason: session.StopToolUse, StopReasonRaw: "tool_calls",
+	})
+	mustAppend(t, s, session.PermissionDecision{
+		ToolUseID: "tu1", Tool: "echo", Mode: s.Mode(), Matcher: session.Matcher{Tool: "echo"},
+		Decision: session.Allow, DecidedBy: session.ByClass, Scope: session.ScopeOnce, Reason: "test",
+	})
+	mustAppend(t, s, session.ToolResult{ToolUseID: "tu1", Outcome: session.OutcomeOK, Content: []session.Block{session.TextBlock("SECRET")}})
+	mustAppend(t, s, session.AssistantMessage{
+		Model: s.Model(), Thinking: s.Thinking(),
+		Content:    []session.Block{session.TextBlock("done")},
+		StopReason: session.StopEndTurn, StopReasonRaw: "stop",
+	})
+	c := &ModelCompactor{
+		Provider: prov, Model: provider.Model{Ref: s.Model()}, MaxTokens: 100,
+		Overrides: map[string][]session.Block{"tu1": {session.TextBlock("REDACTED")}},
+	}
+	if _, err := c.Compact(context.Background(), s, ulid.ULID{}, "go"); err != nil {
+		t.Fatal(err)
+	}
+	var result *provider.Message
+	for i, m := range prov.requests[0].Messages {
+		if m.Role == provider.RoleToolResult {
+			result = &prov.requests[0].Messages[i]
+		}
+		for _, b := range m.Content {
+			if strings.Contains(b.Text, "SECRET") {
+				t.Fatalf("the stored result reached the summary request: %+v", m)
+			}
+		}
+	}
+	if result == nil || result.Content[0].Text != "REDACTED" {
+		t.Fatalf("tool result message %+v", result)
 	}
 }

@@ -36,7 +36,8 @@ type Deps struct {
 	Hooks    *plugin.HookRunner // nil means no hooks fire
 }
 
-// EntryIDResult answers session.set_model, set_mode, set_thinking and set_title.
+// EntryIDResult answers session.set_model, set_mode, set_thinking, set_title and
+// session.compact.
 type EntryIDResult struct {
 	EntryID string `json:"entry_id"`
 }
@@ -551,8 +552,15 @@ func (s *Server) compact(ctx context.Context, ls *liveSession, instructions stri
 	if !ok {
 		return session.Entry{}, 0, perr(protocol.CodeUnavailable, "provider not loaded: "+ls.model.Ref.Provider)
 	}
+	// The summary request answers to the server's own shutdown as well as to the caller: it
+	// runs under ls.mu, and Shutdown closes every live session, which needs that lock. Without
+	// this the caller's context is the only way out, and a shutdown would wait on a provider
+	// nobody is going to answer, long past the budget its own caller gave it.
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(s.ctx, cancel)()
 	n := len(turn.Cover(ls.sess, ulid.ULID{}))
-	e, err := s.compactor(prov, ls.model).Compact(ctx, ls.sess, ulid.ULID{}, instructions)
+	e, err := s.compactorLocked(prov, ls).Compact(cctx, ls.sess, ulid.ULID{}, instructions)
 	if err != nil {
 		return session.Entry{}, 0, protocol.ErrorFrom(err)
 	}
@@ -570,9 +578,18 @@ func (s *Server) compact(ctx context.Context, ls *liveSession, instructions stri
 	return e, n, nil
 }
 
-// compactor is the Compactor the turn loop and session.compact share.
-func (s *Server) compactor(prov provider.Provider, m provider.Model) *turn.ModelCompactor {
-	return &turn.ModelCompactor{Provider: prov, Model: m, Hooks: s.hookFirer(), MaxTokens: s.d.Config.MaxTokens}
+// compactorLocked is the Compactor the turn loop and session.compact share. Caller holds
+// ls.mu, which guards ls.model; ls.overrides is the session-lived map after_tool handlers
+// write, and reading it here is safe on both paths: the turn loop's compactor runs on the same
+// goroutine that owns it, and session.compact has already refused an active turn.
+func (s *Server) compactorLocked(prov provider.Provider, ls *liveSession) *turn.ModelCompactor {
+	return &turn.ModelCompactor{
+		Provider:  prov,
+		Model:     ls.model,
+		Hooks:     s.hookFirer(),
+		MaxTokens: s.d.Config.MaxTokens,
+		Overrides: ls.overrides,
+	}
 }
 
 // handleAppendNote is the plugin caller class's one write into a session log. A client
@@ -1103,7 +1120,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		System:      turn.SystemPrompt(view.Workspace, s.d.Version) + ls.hookContextSuffixLocked(),
 		MaxTokens:   s.d.Config.MaxTokens,
 		Hooks:       s.hookFirer(),
-		Compactor:   s.compactor(prov, ls.model),
+		Compactor:   s.compactorLocked(prov, ls),
 		CompactAt:   s.d.Config.Sessions.CompactAt,
 		ToolTimeout: time.Duration(s.d.Config.ToolTimeoutMS) * time.Millisecond,
 		Overrides:   ls.overrides,

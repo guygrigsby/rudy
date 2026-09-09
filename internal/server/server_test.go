@@ -33,6 +33,21 @@ type scriptProvider struct {
 	block    chan struct{}
 	textOnly bool               // answer every call with text, never a tool_use
 	reqs     []provider.Request // every request, in order
+	// A compaction's summary request (the one carrying the summary system prompt) waits on
+	// summary when it is non-nil, so a test can hold a compaction open. summaryHit is signalled
+	// once when such a request arrives, summaryDone is closed when it returns, and summaryErr
+	// is what it returned.
+	summary     chan struct{}
+	summaryHit  chan struct{}
+	summaryDone chan struct{}
+	summaryErr  error
+}
+
+// summaryOutcome is what the blocked summary request returned, once it has returned.
+func (p *scriptProvider) summaryOutcome() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.summaryErr
 }
 
 func (p *scriptProvider) lastRequest() provider.Request {
@@ -64,6 +79,25 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 	p.reqs = append(p.reqs, req)
 	textOnly := p.textOnly
 	p.mu.Unlock()
+	if p.summary != nil && strings.Contains(req.System, "summarize") {
+		select {
+		case p.summaryHit <- struct{}{}:
+		default:
+		}
+		var err error
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-p.summary:
+		}
+		p.mu.Lock()
+		p.summaryErr = err
+		p.mu.Unlock()
+		close(p.summaryDone)
+		if err != nil {
+			return err
+		}
+	}
 	if p.block != nil {
 		if err := emit(provider.Part{Type: provider.PartTextDelta, Text: "thinking"}); err != nil {
 			return err
@@ -1558,5 +1592,89 @@ func TestCompactCommandThroughCommandRun(t *testing.T) {
 	}
 	if again.Notice != "nothing to compact" {
 		t.Fatalf("second /compact notice %q", again.Notice)
+	}
+}
+
+// TestCompactTwiceWithATurnBetween is the log a second compaction has to cope with: the first
+// compaction is the oldest entry of the request context but the youngest entry of the range it
+// belongs to, so the second one must take its span, not its entry id.
+func TestCompactTwiceWithATurnBetween(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	h := newHarness(t, prov)
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	for range 2 {
+		runTurn(t, cl, info.SessionID, "go")
+	}
+	var first server.EntryIDResult
+	if err := cl.Call(ctx, protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}, &first); err != nil {
+		t.Fatalf("first compact: %v", err)
+	}
+	c1 := lastCompaction(t, cl).Payload.(session.Compaction)
+
+	runTurn(t, cl, info.SessionID, "again")
+	var second server.EntryIDResult
+	if err := cl.Call(ctx, protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}, &second); err != nil {
+		t.Fatalf("second compact: %v", err)
+	}
+	if second.EntryID == "" || second.EntryID == first.EntryID {
+		t.Fatalf("second compact entry id %q, first %q", second.EntryID, first.EntryID)
+	}
+	c2 := lastCompaction(t, cl).Payload.(session.Compaction)
+	if c2.FirstEntryID != c1.FirstEntryID {
+		t.Errorf("second compaction starts at %s, want the first one's start %s", c2.FirstEntryID, c1.FirstEntryID)
+	}
+	if c2.LastEntryID.Compare(c1.LastEntryID) <= 0 {
+		t.Errorf("second compaction ends at %s, not after %s", c2.LastEntryID, c1.LastEntryID)
+	}
+}
+
+// TestShutdownYieldsACompactionInFlight: session.compact holds ls.mu across the summary
+// request, and Shutdown closes every live session, which needs that lock. The compaction has
+// to see the server's own cancellation, not only the caller's, or Shutdown blocks on ls.mu
+// forever, long past the budget its caller gave it.
+func TestShutdownYieldsACompactionInFlight(t *testing.T) {
+	prov := &scriptProvider{
+		textOnly:    true,
+		summary:     make(chan struct{}),
+		summaryHit:  make(chan struct{}, 1),
+		summaryDone: make(chan struct{}),
+	}
+	defer close(prov.summary) // releases the summary request if the shutdown never does
+	h := newHarness(t, prov)
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	for range 2 {
+		runTurn(t, cl, info.SessionID, "go")
+	}
+	go func() {
+		var res server.EntryIDResult
+		_ = cl.Call(context.Background(), protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}, &res)
+	}()
+	select {
+	case <-prov.summaryHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the summary request never started")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		done <- h.srv.Shutdown(ctx)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown blocked on the session lock a compaction was holding")
+	}
+	select {
+	case <-prov.summaryDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the summary request was never cancelled")
+	}
+	if err := prov.summaryOutcome(); err == nil {
+		t.Error("the summary request must end in cancellation, not in a summary")
 	}
 }

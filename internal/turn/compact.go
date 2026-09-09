@@ -26,6 +26,11 @@ type ModelCompactor struct {
 	Model     provider.Model
 	Hooks     HookFirer // nil means no hooks
 	MaxTokens int
+	// Overrides is what after_tool handlers replaced, by tool_use id, the same map the turn's
+	// requests are assembled with (see Config.Overrides). The summary is written from what the
+	// model was shown, never from what the log kept: a result a handler redacted must not come
+	// back through a compaction that then persists it.
+	Overrides map[string][]session.Block
 }
 
 // isConversation reports whether an entry is one a compaction covers. The rest of the log,
@@ -47,8 +52,13 @@ func isConversation(e session.Entry) bool {
 func Cover(s *session.Session, before ulid.ULID) []session.Entry {
 	var cover []session.Entry
 	for _, e := range s.RequestContext() {
+		// Skipped, not stopped at: the request context is not ordered by id. Its leading
+		// compaction was appended after the entries that follow it, the turn that was running
+		// when it happened, so a break here would end the walk on that first entry whenever a
+		// compaction is younger than before, and a second compaction in one turn would be a
+		// silent no-op.
 		if !before.IsZero() && e.ID.Compare(before) >= 0 {
-			break
+			continue
 		}
 		if isConversation(e) {
 			cover = append(cover, e)
@@ -66,12 +76,20 @@ func (c *ModelCompactor) Compact(ctx context.Context, s *session.Session, before
 		return session.Entry{}, nil
 	}
 	first, last := cover[0], cover[len(cover)-1]
+	firstID := first.ID
+	if prev, ok := first.Payload.(session.Compaction); ok {
+		// The new summary subsumes the old one's span, so it starts where that one started.
+		// The compaction entry's own id will not do: a compaction is appended after the
+		// entries it covers, so whenever nothing was said between it and before, its id is
+		// younger than every other entry in this set and the log refuses the range.
+		firstID = prev.FirstEntryID
+	}
 	summary, usage := "", session.Usage{}
 	// Instructions skip the hook entirely: the caller said what this summary is for, and a
 	// handler's canned summary would answer a different question.
 	if instructions == "" && c.Hooks != nil {
 		for _, res := range c.Hooks.Fire(ctx, plugin.HookCall{Point: plugin.HookBeforeCompaction, SessionID: s.ID().String(), Payload: &plugin.BeforeCompactionPayload{
-			SessionID: s.ID().String(), FirstEntryID: first.ID.String(), LastEntryID: last.ID.String(), PromptTokens: promptTokensOf(cover), ContextWindow: c.Model.ContextWindow,
+			SessionID: s.ID().String(), FirstEntryID: firstID.String(), LastEntryID: last.ID.String(), PromptTokens: promptTokensOf(cover), ContextWindow: c.Model.ContextWindow,
 		}}) {
 			if r, ok := res.(*plugin.BeforeCompactionResult); ok && r.Summary != "" {
 				summary = r.Summary
@@ -86,7 +104,7 @@ func (c *ModelCompactor) Compact(ctx context.Context, s *session.Session, before
 			return session.Entry{}, err
 		}
 	}
-	return s.Append(session.Compaction{Summary: summary, FirstEntryID: first.ID, LastEntryID: last.ID, Model: c.Model.Ref, Usage: usage})
+	return s.Append(session.Compaction{Summary: summary, FirstEntryID: firstID, LastEntryID: last.ID, Model: c.Model.Ref, Usage: usage})
 }
 
 // summarize sends the covered entries as the conversation and asks for the summary as a final
@@ -94,7 +112,7 @@ func (c *ModelCompactor) Compact(ctx context.Context, s *session.Session, before
 // the budget goes to the summary itself.
 func (c *ModelCompactor) summarize(ctx context.Context, s *session.Session, cover []session.Entry, instructions string) (string, session.Usage, error) {
 	req := provider.Request{Model: c.Model.Ref, System: summarySystem, Thinking: session.ThinkingOff, MaxTokens: c.MaxTokens, SessionID: s.ID()}
-	req.Messages = messagesOf(cover, nil)
+	req.Messages = messagesOf(cover, c.Overrides)
 	ask := "Summarize the conversation above for a continuation of this session."
 	if instructions != "" {
 		ask += " Instructions: " + instructions

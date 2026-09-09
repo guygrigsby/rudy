@@ -14,7 +14,7 @@
 | Asker | Whoever can answer a permission question; an attached client. No asker means deny | Session |
 | Dangerous set | The tools and shell shapes that still ask in permissive mode | Session |
 | Compaction | A summary entry that stands in for earlier entries when building the next request | Session |
-| Request context | The entries after the last compaction plus its summary, translated for a provider | Session, derived |
+| Request context | The newest compaction's summary, then every entry after the last one it covers, older compactions dropped, translated for a provider | Session, derived |
 | Provider | A named endpoint speaking one wire kind, with an auth reference | Provider |
 | Wire kind | `anthropic_messages` or `openai_chat`; a codec | Provider |
 | Dialect | A provider's deviations from a wire kind, applied by its plugin | Provider |
