@@ -47,7 +47,7 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, statusError(resp)
+		return nil, c.statusError(resp)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxModelsBody))
 	if err != nil {

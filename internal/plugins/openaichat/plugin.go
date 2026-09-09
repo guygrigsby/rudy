@@ -29,8 +29,10 @@ func New(providers map[string]config.ProviderConfig, http *httpx.Client, resolve
 
 func (p *providerPlugin) Name() string { return "openai_chat" }
 
-// Init registers one provider per openai_chat entry. An entry whose secret cannot be resolved
-// is skipped with a notice; the plugin stays ready so the other providers keep working.
+// Init registers one provider per openai_chat entry whose dialect is unset; an entry naming a
+// dialect (clinepass today) is that dialect plugin's job, since it bends the shared codec in a
+// way this plugin does not know about. An entry whose secret cannot be resolved is skipped
+// with a notice; the plugin stays ready so the other providers keep working.
 func (p *providerPlugin) Init(ctx context.Context, h plugin.Host) error {
 	names := make([]string, 0, len(p.providers))
 	for name := range p.providers {
@@ -39,7 +41,7 @@ func (p *providerPlugin) Init(ctx context.Context, h plugin.Host) error {
 	sort.Strings(names)
 	for _, name := range names {
 		pc := p.providers[name]
-		if pc.Wire != "openai_chat" {
+		if pc.Wire != "openai_chat" || pc.Dialect != "" {
 			continue
 		}
 		token, err := p.resolve(pc.Auth)

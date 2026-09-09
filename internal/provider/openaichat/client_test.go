@@ -231,8 +231,8 @@ func TestCompleteOpenAIErrorObject(t *testing.T) {
 func TestCompleteNonStreamingBody(t *testing.T) {
 	// The recorded clinepass body wraps the completion in {"data": …}. The plain
 	// completion inside it is what a standards-following server would return
-	// when it ignores stream: true; the envelope itself is the dialect the
-	// clinepass plugin handles in the next plan.
+	// when it ignores stream: true; the envelope itself is refused without a
+	// dialect and unwrapped with one (see the WithDialect tests below).
 	raw := fixture(t, "clinepass-nonstream.json")
 	var env struct {
 		Data json.RawMessage `json:"data"`
@@ -269,6 +269,96 @@ func TestCompleteNonStreamingBody(t *testing.T) {
 	var perr *provider.Error
 	if !errors.As(err, &perr) || perr.Class != session.ErrProvider || perr.Message != "response is neither an event stream nor a chat completion" {
 		t.Fatalf("envelope should be refused, got %v", err)
+	}
+}
+
+// dialectStub is a test Dialect whose two methods are supplied per test; a nil field means
+// that method is never called.
+type dialectStub struct {
+	unwrap func([]byte) []byte
+	errMsg func(int, []byte) string
+}
+
+func (d dialectStub) UnwrapJSON(body []byte) []byte {
+	if d.unwrap == nil {
+		return body
+	}
+	return d.unwrap(body)
+}
+
+func (d dialectStub) ErrorMessage(status int, body []byte) string {
+	if d.errMsg == nil {
+		return ""
+	}
+	return d.errMsg(status, body)
+}
+
+// unwrapClinepassData is the clinepass dialect's UnwrapJSON logic, duplicated here so the
+// codec's test does not import the plugin package that ships it.
+func unwrapClinepassData(body []byte) []byte {
+	var env struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(body, &env) != nil || len(env.Data) == 0 {
+		return body
+	}
+	return env.Data
+}
+
+func TestCompleteNonStreamingBodyWithDialectUnwrapsData(t *testing.T) {
+	raw := fixture(t, "clinepass-nonstream.json")
+	c, _ := serve(t, 200, "application/json", raw)
+	c.opts.Dialect = dialectStub{unwrap: unwrapClinepassData}
+
+	parts := collect(t, c, simpleRequest())
+	var text strings.Builder
+	thinking := 0
+	for _, p := range parts {
+		switch p.Type {
+		case provider.PartTextDelta:
+			text.WriteString(p.Text)
+		case provider.PartThinkingDelta:
+			thinking++
+		case provider.PartUsage:
+			if p.Usage.Output != 20 || p.Usage.Input != 9 {
+				t.Fatalf("usage = %+v", p.Usage)
+			}
+		}
+	}
+	if text.String() != "ok" || thinking != 1 {
+		t.Fatalf("text=%q thinking=%d", text.String(), thinking)
+	}
+	if last := parts[len(parts)-1]; last.Type != provider.PartStop || last.StopReason != session.StopEndTurn {
+		t.Fatalf("last = %+v", last)
+	}
+}
+
+func TestCompleteEmptyContent500WithDialectNamesTokenBudget(t *testing.T) {
+	raw := string(fixture(t, "clinepass-empty-500.json"))
+	lines := strings.Split(strings.TrimSpace(raw), "\n")
+	body := lines[0]
+	if lines[len(lines)-1] != "500" {
+		t.Fatalf("fixture status line = %q", lines[len(lines)-1])
+	}
+	c, _ := serve(t, 500, "application/json", []byte(body))
+	c.opts.Dialect = dialectStub{errMsg: func(status int, b []byte) string {
+		if status == 500 && strings.Contains(string(b), "empty response content") {
+			return "empty response content; max_tokens may be too small for the model's reasoning"
+		}
+		return ""
+	}}
+
+	err := c.Complete(context.Background(), simpleRequest(), func(provider.Part) error { return nil })
+	var perr *provider.Error
+	if !errors.As(err, &perr) {
+		t.Fatalf("want *provider.Error, got %T %v", err, err)
+	}
+	want := "empty response content; max_tokens may be too small for the model's reasoning"
+	if perr.Class != session.ErrProvider || perr.Status != 500 || perr.Message != want {
+		t.Fatalf("got %+v", perr)
+	}
+	if string(perr.Body) != body {
+		t.Fatalf("body not kept verbatim: %q", perr.Body)
 	}
 }
 

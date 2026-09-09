@@ -16,6 +16,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	anthropicplugin "github.com/guygrigsby/rudy/internal/plugins/anthropic"
+	"github.com/guygrigsby/rudy/internal/plugins/clinepass"
 	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
@@ -255,7 +256,8 @@ func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []erro
 
 // BuiltinPlugins is the linked-in set: the six tools, the agent tool, /init, /compact,
 // /skills, /memory, the kernel's own slash commands (/model, /help, /fork, /plugins), the
-// MCP servers from mcp.toml and the openai_chat and anthropic_messages providers.
+// MCP servers from mcp.toml, the openai_chat and anthropic_messages providers, and the
+// clinepass dialect over openai_chat.
 func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
@@ -263,7 +265,8 @@ func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client,
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
 		newMCPPlugin(cfg, paths, resolve, version),
 		openaichatplugin.New(cfg.Providers, httpc, resolve),
-		anthropicplugin.New(cfg.Providers, httpc, resolve))
+		anthropicplugin.New(cfg.Providers, httpc, resolve),
+		clinepass.New(cfg.Providers, httpc, resolve))
 }
 
 // newMCPPlugin is the mcp plugin over the user and project mcp.toml files. Plugins load once

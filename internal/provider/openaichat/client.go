@@ -1,3 +1,11 @@
+// Package openaichat is the openai_chat codec: the OpenAI chat-completions wire shape, shared
+// by every server that speaks it closely enough (OpenAI itself, aperture, mlx, llama.cpp).
+// Requests go out through httpx so they carry rudy's retry policy and headers.
+//
+// Dialects: an endpoint that bends the shape passes a Dialect through Options.Dialect. The one
+// dialect today is clinepass (internal/plugins/clinepass), aperture's cline-pass route, which
+// wraps a non-streaming response in {"data": …} and reports an empty completion as a bare 500
+// instead of an empty one.
 package openaichat
 
 import (
@@ -22,12 +30,24 @@ const (
 	maxJSONBody  = 8 << 20
 )
 
+// Dialect adjusts the codec for an endpoint that bends the chat-completions shape. Every
+// method has a no-op default when Dialect is nil.
+type Dialect interface {
+	// UnwrapJSON returns the chat.completion object inside a non-streaming body, or the
+	// body unchanged.
+	UnwrapJSON(body []byte) []byte
+	// ErrorMessage extracts a message from an error body the codec's own parser did not
+	// understand; "" defers to the default.
+	ErrorMessage(status int, body []byte) string
+}
+
 type Options struct {
 	Name    string
 	BaseURL string            // ends with /v1
 	Token   string            // "" sends no Authorization
 	Headers map[string]string // extra, verbatim
 	HTTP    *httpx.Client
+	Dialect Dialect // nil means the plain chat-completions shape
 }
 
 type Client struct {
@@ -89,7 +109,7 @@ func (c *Client) Complete(ctx context.Context, req provider.Request, emit func(p
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return statusError(resp)
+		return c.statusError(resp)
 	}
 	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		return unwrapEmit(c.completeJSON(resp, emit))
@@ -131,13 +151,16 @@ type completion struct {
 	Usage *wireUsage `json:"usage"`
 }
 
-// completeJSON handles a server that ignored stream: true. The body must be a
-// plain chat.completion; the clinepass {"data": …} envelope is refused here and
-// unwrapped by the clinepass provider plugin in the next plan.
+// completeJSON handles a server that ignored stream: true. The body must be a plain
+// chat.completion once the dialect, if any, has unwrapped it; a body with no dialect and the
+// clinepass {"data": …} envelope is refused.
 func (c *Client) completeJSON(resp *http.Response, emit func(provider.Part) error) error {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONBody))
 	if err != nil {
 		return &provider.Error{Class: session.ErrTransport, Message: err.Error(), Attempts: httpx.AttemptsOf(resp)}
+	}
+	if c.opts.Dialect != nil {
+		body = c.opts.Dialect.UnwrapJSON(body)
 	}
 	var comp completion
 	if err := json.Unmarshal(body, &comp); err != nil || len(comp.Choices) == 0 {
@@ -180,13 +203,19 @@ func transportError(ctx context.Context, err error) error {
 	return &provider.Error{Class: session.ErrTransport, Message: err.Error(), Attempts: attempts}
 }
 
-// statusError reads a non-2xx body and extracts the message from either the
-// OpenAI error object {"error":{"message":…}} or the aperture envelope
-// {"error":"…","success":false}. The body is kept verbatim. Attempts is how many
-// times httpx sent the request before this response came back.
-func statusError(resp *http.Response) error {
+// statusError reads a non-2xx body and extracts the message from either the OpenAI error
+// object {"error":{"message":…}} or the aperture envelope {"error":"…","success":false}. A
+// dialect's own extraction wins when it returns non-empty, since it understands a body shape
+// the default parser does not. The body is kept verbatim. Attempts is how many times httpx
+// sent the request before this response came back.
+func (c *Client) statusError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 	msg := errorMessage(body)
+	if c.opts.Dialect != nil {
+		if dm := c.opts.Dialect.ErrorMessage(resp.StatusCode, body); dm != "" {
+			msg = dm
+		}
+	}
 	if msg == "" {
 		msg = http.StatusText(resp.StatusCode)
 	}
