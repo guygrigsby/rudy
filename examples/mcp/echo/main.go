@@ -7,6 +7,8 @@ import (
 	"context"
 	"log"
 	"os"
+	"strconv"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -35,9 +37,17 @@ func fail(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.Call
 }
 
 func main() {
+	// ECHO_DELAY_MS holds the handshake back, which is how a test sees whether the client
+	// connects its servers concurrently or one after another.
+	if ms, err := strconv.Atoi(os.Getenv("ECHO_DELAY_MS")); err == nil && ms > 0 {
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
 	server := mcp.NewServer(&mcp.Implementation{Name: "echo", Version: "0.1.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{Name: "echo", Description: "Echo the text back."}, echo)
 	mcp.AddTool(server, &mcp.Tool{Name: "fail", Description: "Always fail."}, fail)
+	// A tool whose name carries "__" cannot be named unambiguously as mcp__echo__<tool>; a
+	// client is expected to skip it, and this is what a test skips.
+	mcp.AddTool(server, &mcp.Tool{Name: "bad__name", Description: "Unusable name."}, fail)
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatal(err)
 	}

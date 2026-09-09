@@ -63,6 +63,31 @@ func TestMCPAddWritesTheUserFile(t *testing.T) {
 	}
 }
 
+// TestMCPAddRefusesAMisplacedFlag: everything after the server name goes to the server, so a
+// rudy flag written there would be silently stored as an argument. The command says so
+// instead.
+func TestMCPAddRefusesAMisplacedFlag(t *testing.T) {
+	tempXDG(t)
+	for _, args := range [][]string{
+		{"mcp", "add", "name", "/bin/cmd", "--scope", "project"},
+		{"mcp", "add", "name", "/bin/cmd", "--scope=project"},
+		{"mcp", "add", "name", "/bin/cmd", "--transport", "http"},
+		{"mcp", "add", "name", "--env", "K=v", "/bin/cmd"},
+	} {
+		_, err := runMCP(t, args...)
+		if err == nil {
+			t.Errorf("%v: no error", args)
+			continue
+		}
+		if !strings.Contains(err.Error(), "rudy flags go before the server name") {
+			t.Errorf("%v: error %q does not name the rule", args, err)
+		}
+	}
+	if _, err := os.Stat(userMCPPath(t)); !os.IsNotExist(err) {
+		t.Errorf("a refused add wrote the file anyway: %v", err)
+	}
+}
+
 func TestMCPAddProjectScope(t *testing.T) {
 	tempXDG(t)
 	t.Chdir(t.TempDir())

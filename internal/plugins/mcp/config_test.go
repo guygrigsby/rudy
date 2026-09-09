@@ -112,6 +112,11 @@ func TestValidate(t *testing.T) {
 		{"no url on http", ServerConfig{Name: "a", Transport: TransportHTTP}, "url"},
 		{"unknown transport", ServerConfig{Name: "a", Transport: "carrier pigeon"}, "transport"},
 		{"empty name", ServerConfig{Transport: TransportStdio, Command: "/bin/x"}, "name"},
+		// The name becomes half of mcp__<server>__<tool>, which every provider validates.
+		{"space in name", ServerConfig{Name: "my server", Transport: TransportStdio, Command: "/bin/x"}, "name"},
+		{"dot in name", ServerConfig{Name: "my.server", Transport: TransportStdio, Command: "/bin/x"}, "name"},
+		{"double underscore in name", ServerConfig{Name: "a__b", Transport: TransportStdio, Command: "/bin/x"}, "name"},
+		{"dashes and digits are fine", ServerConfig{Name: "my-server_2", Transport: TransportStdio, Command: "/bin/x"}, ""},
 	}
 	for _, c := range cases {
 		err := c.cfg.Validate()

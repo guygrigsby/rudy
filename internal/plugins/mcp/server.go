@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -72,7 +74,11 @@ func transportFor(cfg ServerConfig, resolve func(string) (string, error)) (sdk.T
 		if err != nil {
 			return nil, err
 		}
-		hc := &http.Client{Transport: &headerTransport{base: http.DefaultTransport, headers: headers}}
+		u, err := url.Parse(cfg.URL)
+		if err != nil {
+			return nil, fmt.Errorf("url: %w", err)
+		}
+		hc := &http.Client{Transport: &headerTransport{base: http.DefaultTransport, host: u.Host, headers: headers}}
 		return &sdk.StreamableClientTransport{Endpoint: cfg.URL, HTTPClient: hc}, nil
 	default:
 		return nil, fmt.Errorf("transport %q is not stdio or http", cfg.Transport)
@@ -83,9 +89,9 @@ func transportFor(cfg ServerConfig, resolve func(string) (string, error)) (sdk.T
 // longer a secret reference.
 type entry struct{ key, value string }
 
-// resolveAll resolves every value of a secret-reference table, in key order so a failure
-// names the same entry every run. Env and headers are the same kind of table, and the only
-// difference is where the resolved pair is written.
+// resolveAll resolves every value of a table, in key order so a failure names the same entry
+// every run. Env and headers are the same kind of table, and the only difference is where the
+// resolved pair is written.
 func resolveAll(refs map[string]string, resolve func(string) (string, error)) ([]entry, error) {
 	keys := make([]string, 0, len(refs))
 	for k := range refs {
@@ -94,7 +100,7 @@ func resolveAll(refs map[string]string, resolve func(string) (string, error)) ([
 	sort.Strings(keys)
 	out := make([]entry, 0, len(keys))
 	for _, k := range keys {
-		v, err := resolve(refs[k])
+		v, err := resolveRef(refs[k], resolve)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", k, err)
 		}
@@ -103,14 +109,29 @@ func resolveAll(refs map[string]string, resolve func(string) (string, error)) ([
 	return out, nil
 }
 
-// headerTransport adds the configured headers to every request. The values are already
-// resolved; the round tripper never sees a reference.
+// resolveRef is what an mcp.toml env or header value means: "env:NAME" and "cache:KEY" are
+// references and go to the resolver, and anything else is the value itself. A literal is the
+// third form the contract gives these tables, and the only one a provider token never has.
+func resolveRef(ref string, resolve func(string) (string, error)) (string, error) {
+	if strings.HasPrefix(ref, "env:") || strings.HasPrefix(ref, "cache:") {
+		return resolve(ref)
+	}
+	return ref, nil
+}
+
+// headerTransport adds the configured headers to every request to the server's own host. The
+// values are already resolved, and a redirect to another host gets none of them: a header
+// configured for one endpoint is that endpoint's secret, not the redirect target's.
 type headerTransport struct {
 	base    http.RoundTripper
+	host    string // the endpoint's host:port
 	headers []entry
 }
 
 func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !strings.EqualFold(req.URL.Host, t.host) {
+		return t.base.RoundTrip(req)
+	}
 	clone := req.Clone(req.Context())
 	for _, h := range t.headers {
 		clone.Header.Set(h.key, h.value)

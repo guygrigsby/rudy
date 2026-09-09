@@ -38,7 +38,12 @@ func mcpFilePaths() (mcpPaths, error) {
 	if err != nil {
 		return mcpPaths{}, err
 	}
-	user, project := mcpplugin.Paths(config.XDG(os.Getenv, home).Config)
+	cwd, err := os.Getwd()
+	if err != nil {
+		// No working directory is no project scope, not a reason to refuse the command.
+		cwd = ""
+	}
+	user, project := mcpplugin.Paths(config.XDG(os.Getenv, home).Config, cwd)
 	return mcpPaths{user: user, project: project}, nil
 }
 
@@ -68,6 +73,10 @@ func newMCPAddCommand() *cobra.Command {
 			"server as its own arguments.",
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			known := func(n string) bool { return cmd.Flags().Lookup(n) != nil }
+			if err := refuseMisplacedFlag(known, args[1:]); err != nil {
+				return err
+			}
 			paths, err := mcpFilePaths()
 			if err != nil {
 				return err
@@ -111,6 +120,25 @@ func newMCPAddCommand() *cobra.Command {
 	// Everything after the name is the server's own argument list, flags included.
 	cmd.Flags().SetInterspersed(false)
 	return cmd
+}
+
+// refuseMisplacedFlag refuses an argument that names one of add's own long flags.
+// Interspersing is off, so a rudy flag written after the server name is silently stored as an
+// argument to the server instead; refusing it is the difference between a typo and a server
+// started with flags nobody meant. The names come from the flag set itself, so they cannot
+// drift from the flags the command actually parses.
+func refuseMisplacedFlag(known func(string) bool, args []string) error {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "--") {
+			continue
+		}
+		name, _, _ := strings.Cut(strings.TrimPrefix(a, "--"), "=")
+		if !known(name) {
+			continue
+		}
+		return fmt.Errorf("%s would be passed to the server: rudy flags go before the server name", a)
+	}
+	return nil
 }
 
 // keyValueFlag parses repeated "KEY<sep>value" flag values into a table. Values are secret

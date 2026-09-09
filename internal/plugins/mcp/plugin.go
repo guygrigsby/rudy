@@ -55,43 +55,68 @@ func (p *mcpPlugin) Init(ctx context.Context, h plugin.Host) error {
 	if len(configs) == 0 {
 		return nil
 	}
+	// Every server connects at once: a slow one costs its own timeout, not everyone else's
+	// as well, and boot waits for the slowest rather than the sum.
+	connected := make([]*server, len(configs))
+	failures := make([]error, len(configs))
+	var wg sync.WaitGroup
+	for i, cfg := range configs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			connected[i], failures[i] = p.connect(ctx, cfg)
+		}()
+	}
+	wg.Wait()
+	// Registration is sequential and in Merged order, so which server answered first never
+	// changes the tool list a model sees.
 	ready := 0
-	for _, cfg := range configs {
-		if err := p.start(ctx, h, cfg); err != nil {
-			h.Notice(fmt.Sprintf("server %s: %v", cfg.Name, err))
+	var live []*server
+	for i, cfg := range configs {
+		if failures[i] != nil {
+			h.Notice(fmt.Sprintf("server %s: %v", cfg.Name, failures[i]))
 			continue
 		}
+		live = append(live, connected[i])
+		p.register(h, cfg, connected[i])
 		ready++
 	}
+	p.mu.Lock()
+	p.servers = append(p.servers, live...)
+	p.mu.Unlock()
 	h.SetStatus("servers", []plugin.Span{{Text: fmt.Sprintf("mcp %d/%d", ready, len(configs)), Role: "muted"}})
 	return nil
 }
 
-// start connects one server and registers what it advertised. A duplicate tool name is the
-// one failure that does not cost the whole server: the rest of its tools still register.
-func (p *mcpPlugin) start(ctx context.Context, h plugin.Host, cfg ServerConfig) error {
+// connect validates one entry and dials it under its own share of the connect timeout.
+func (p *mcpPlugin) connect(ctx context.Context, cfg ServerConfig) (*server, error) {
 	if err := cfg.Validate(); err != nil {
-		return err
+		return nil, err
 	}
 	connectCtx, cancel := context.WithTimeout(ctx, p.connectTimeout)
 	defer cancel()
-	srv, err := connect(connectCtx, cfg, p.resolve, p.version)
-	if err != nil {
-		return err
-	}
-	p.mu.Lock()
-	p.servers = append(p.servers, srv)
-	p.mu.Unlock()
+	return connect(connectCtx, cfg, p.resolve, p.version)
+}
+
+// register hands the model everything one server advertised. A tool that cannot be
+// registered, whether its name is unusable or already taken, is a notice and the server's
+// other tools still register.
+func (p *mcpPlugin) register(h plugin.Host, cfg ServerConfig, srv *server) {
 	for _, t := range srv.tools {
+		name := t.Name
+		fail := func(err error) { h.Notice(fmt.Sprintf("server %s: tool %s: %v", cfg.Name, name, err)) }
+		if err := validName("tool", name); err != nil {
+			fail(err)
+			continue
+		}
 		// The schema is the server's own, handed to the model as it described it. It
 		// arrives already decoded, so this marshal is canonical rather than byte exact;
 		// nothing durable is keyed on it.
 		schema, err := json.Marshal(t.InputSchema)
 		if err != nil {
-			h.Notice(fmt.Sprintf("server %s: tool %s: %v", cfg.Name, t.Name, err))
+			fail(err)
 			continue
 		}
-		name := t.Name
 		if err := h.RegisterTool(tool.Tool{
 			Name:        toolPrefix + cfg.Name + "__" + name,
 			Description: t.Description,
@@ -103,10 +128,9 @@ func (p *mcpPlugin) start(ctx context.Context, h plugin.Host, cfg ServerConfig) 
 				return srv.call(ctx, name, call.Input)
 			},
 		}); err != nil {
-			h.Notice(fmt.Sprintf("server %s: tool %s: %v", cfg.Name, name, err))
+			fail(err)
 		}
 	}
-	return nil
 }
 
 // Close ends every server session, which is what stops a stdio server's child process. The

@@ -213,7 +213,12 @@ func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client,
 // at boot, before any session, so the project scope is the workspace rudy was started in; no
 // workspace there means the user scope is all there is, never a reason to fail the build.
 func newMCPPlugin(cfg *config.Config, paths config.Paths, resolve func(string) (string, error), version string) plugin.Plugin {
-	user, project := mcpplugin.Paths(paths.Config)
+	cwd, err := os.Getwd()
+	if err != nil {
+		// No working directory is no project scope, never a reason to fail the build.
+		cwd = ""
+	}
+	user, project := mcpplugin.Paths(paths.Config, cwd)
 	return mcpplugin.New(user, project, time.Duration(cfg.MCP.ConnectTimeoutMS)*time.Millisecond, resolve, version)
 }
 

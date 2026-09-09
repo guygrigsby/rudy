@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
+	"strings"
 
 	toml "github.com/pelletier/go-toml/v2"
 
@@ -119,12 +121,11 @@ func WriteFile(path string, f File) error {
 }
 
 // Paths are the two files the plugin reads and rudy mcp writes: the user scope next to
-// config.toml, and the project scope in the workspace the process is running in. The project
-// path is "" when there is no workspace, which means the user scope is all there is.
-func Paths(configDir string) (user, project string) {
+// config.toml, and the project scope in the workspace cwd sits in. The project path is ""
+// when cwd is empty or has no workspace, which means the user scope is all there is.
+func Paths(configDir, cwd string) (user, project string) {
 	user = filepath.Join(configDir, "mcp.toml")
-	cwd, err := os.Getwd()
-	if err != nil {
+	if cwd == "" {
 		return user, ""
 	}
 	ws, err := workspace.Detect(cwd)
@@ -178,12 +179,32 @@ func sortedNames(servers map[string]ServerConfig) []string {
 	return names
 }
 
+// nameRe is the character set a tool name may use. Every provider validates the tool names a
+// request carries, so a server whose name is not in it makes every request fail, not just its
+// own calls.
+var nameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// validName refuses a server or tool name that cannot be half of mcp__<server>__<tool>: one
+// outside the tool-name character set, or one carrying "__" itself, which would leave
+// mcp__a__b__c ambiguous between server a's b__c and server a__b's c.
+func validName(kind, name string) error {
+	switch {
+	case name == "":
+		return fmt.Errorf("mcp: %s name is empty", kind)
+	case strings.Contains(name, "__"):
+		return fmt.Errorf("mcp: %s name %q contains __, which would make its tool name ambiguous", kind, name)
+	case !nameRe.MatchString(name):
+		return fmt.Errorf("mcp: %s name %q is not letters, digits, dashes and underscores", kind, name)
+	}
+	return nil
+}
+
 // Validate refuses an entry carrying anything but the fields of its transport. A field that
 // belongs to the other transport is a mistake worth naming at write time, not one to
 // discover as a server that silently ignores its environment.
 func (c ServerConfig) Validate() error {
-	if c.Name == "" {
-		return errors.New("mcp: server name is empty")
+	if err := validName("server", c.Name); err != nil {
+		return err
 	}
 	switch c.Transport {
 	case TransportStdio:
