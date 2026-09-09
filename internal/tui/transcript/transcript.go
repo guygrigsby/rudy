@@ -291,31 +291,68 @@ func (t *Transcript) Answered(toolUseID string) {
 	}
 }
 
-// Commit renders the rows of turnID in order, removes them and returns the lines, for
-// the client to print above the live region. An unknown turn returns nil.
-func (t *Transcript) Commit(turnID string) []string {
-	var lines []string
+// Line is one rendered line and the row it came from. A blank line between two blocks
+// belongs to no row, so its Row is nil. It is what lets a client map a mouse click at a
+// screen line back to the row under it.
+type Line struct {
+	Text string
+	Row  *Row
+}
+
+// Layout renders every row on screen in order, gaps included: what a client draws in the
+// region it owns, and what it traces a click through.
+func (t *Transcript) Layout() []Line { return t.layout(t.rows) }
+
+// Wrap renders text at the transcript's width in one theme role, wrapped and sanitized
+// the way a marker row's text is, and adds no row. It is how a client draws its own
+// chrome, a notice for instance, in the same column and with the same safety as the rows
+// above it.
+func (t *Transcript) Wrap(role theme.Role, text string) []string {
+	return t.wrap(role, 0, text)
+}
+
+// layout renders rows in order with the gaps between them, one Line per drawn line. A row
+// that renders nothing takes no line and no gap.
+func (t *Transcript) layout(rows []*Row) []Line {
+	var out []Line
 	var prev *Row
-	kept := make([]*Row, 0, len(t.rows))
-	going := make([]*Row, 0, len(t.rows))
-	for _, r := range t.rows {
-		if r.TurnID != turnID {
-			kept = append(kept, r)
-			continue
-		}
-		going = append(going, r)
-		// Render before anything leaves the index: a row can look at its neighbours,
-		// the way a tool row checks whether a permission question stands in its place.
+	for _, r := range rows {
 		rl := t.Render(r)
 		if len(rl) == 0 {
 			continue
 		}
-		lines = append(lines, t.gap(prev, r)...)
-		lines = append(lines, rl...)
+		for _, blank := range t.gap(prev, r) {
+			out = append(out, Line{Text: blank})
+		}
+		for _, l := range rl {
+			out = append(out, Line{Text: l, Row: r})
+		}
 		prev = r
+	}
+	return out
+}
+
+// Commit renders the rows of turnID in order, removes them and returns the lines, for
+// the client to print above the live region. An unknown turn returns nil.
+func (t *Transcript) Commit(turnID string) []string {
+	kept := make([]*Row, 0, len(t.rows))
+	going := make([]*Row, 0, len(t.rows))
+	for _, r := range t.rows {
+		if r.TurnID == turnID {
+			going = append(going, r)
+			continue
+		}
+		kept = append(kept, r)
 	}
 	if len(going) == 0 {
 		return nil
+	}
+	// Render before anything leaves the index: a row can look at its neighbours, the way
+	// a tool row checks whether a permission question stands in its place.
+	laid := t.layout(going)
+	lines := make([]string, 0, len(laid))
+	for _, l := range laid {
+		lines = append(lines, l.Text)
 	}
 	for _, r := range going {
 		delete(t.byKey, r.Key)
