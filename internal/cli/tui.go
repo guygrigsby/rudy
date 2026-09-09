@@ -146,11 +146,16 @@ func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch la
 	switch err := launch(ctx, run); {
 	case err == nil:
 		return 0
-	case errors.Is(err, tea.ErrInterrupted), errors.Is(err, tea.ErrProgramKilled):
-		// A SIGINT reaches the program two ways once the handler above is installed: its
-		// own, which answers ErrInterrupted, and the cancelled context, which kills it and
-		// answers ErrProgramKilled. Both are the operator pressing Ctrl-C, and neither is
-		// news worth printing; 130 is what --print reports for the same thing.
+	case errors.Is(err, tea.ErrInterrupted):
+		// The program's own SIGINT handler. Not news worth printing; 130 is what --print
+		// reports for the same thing.
+		return 130
+	case errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil:
+		// The other half of the same interrupt: the handler above cancelled ctx, which
+		// kills the program. The ctx check is what separates it from everything else that
+		// answers ErrProgramKilled, since Bubble Tea wraps every non-nil event-loop error
+		// in it (a TTY that could not be read, a recovered panic). A run whose context is
+		// still live was killed by a failure, and a failure gets printed.
 		return 130
 	default:
 		_, _ = fmt.Fprintln(stderr, err)

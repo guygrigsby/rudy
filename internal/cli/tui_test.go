@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -258,6 +259,60 @@ func TestTUIInterruptCancelsTheRunAndExits130(t *testing.T) {
 	if got.info.SessionID != opened {
 		t.Fatalf("resumed %q want %q", got.info.SessionID, opened)
 	}
+}
+
+// TestTUIKilledProgramIs130OnlyWhenTheContextEnded pins both arms of tea.ErrProgramKilled.
+// Bubble Tea wraps every non-nil event-loop error in it (tea.go, Run: a TTY that could not
+// be read, a resize query that failed, a recovered panic), so mapping it to a silent 130
+// whatever happened would swallow a real failure. Only a run whose context has ended is the
+// operator's Ctrl-C.
+func TestTUIKilledProgramIs130OnlyWhenTheContextEnded(t *testing.T) {
+	t.Run("a live context is a failure, printed and 1", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		build := testBuilder(t, &fakeProvider{})
+		fakeTerminal(t, true)
+		prev := launchTUI
+		launchTUI = func(ctx context.Context, r clientRun) error {
+			return fmt.Errorf("%w: %w", tea.ErrProgramKilled, errors.New("could not open TTY"))
+		}
+		t.Cleanup(func() { launchTUI = prev })
+		out, err := runRoot(t, build)
+		if code := exitCode(t, err); code != 1 {
+			t.Fatalf("exit %d, out %q", code, out)
+		}
+		if !strings.Contains(out, "could not open TTY") {
+			t.Fatalf("a failure has to be printed: %q", out)
+		}
+	})
+	t.Run("an ended context is an interrupt, silent and 130", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		build := testBuilder(t, &fakeProvider{})
+		fakeTerminal(t, true)
+		prev := launchTUI
+		launchTUI = func(ctx context.Context, r clientRun) error {
+			self, err := os.FindProcess(os.Getpid())
+			if err != nil {
+				return err
+			}
+			if err := self.Signal(os.Interrupt); err != nil {
+				return err
+			}
+			select {
+			case <-ctx.Done():
+				return tea.ErrProgramKilled
+			case <-time.After(10 * time.Second):
+				return errors.New("SIGINT did not cancel the run context")
+			}
+		}
+		t.Cleanup(func() { launchTUI = prev })
+		out, err := runRoot(t, build)
+		if code := exitCode(t, err); code != 130 {
+			t.Fatalf("exit %d, out %q", code, out)
+		}
+		if strings.Contains(out, "killed") {
+			t.Fatalf("an interrupt is not news: %q", out)
+		}
+	})
 }
 
 func TestTUIResumeAndContinueResolveTheNamedSession(t *testing.T) {
