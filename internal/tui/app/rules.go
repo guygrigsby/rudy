@@ -13,7 +13,8 @@ import (
 // The composer's rules: a line above it and a line below it, so the input area reads as its
 // own region rather than as the next transcript row. The lower one carries how much of the
 // context window the last request filled, which is the one number a person checks while
-// typing and the only place it is drawn (ADR 0017).
+// typing and the only place it is drawn (ADR 0017); the upper one carries the session's
+// name, which is what /rename sets (ADR 0019).
 const (
 	ruleChar = "─"
 	// ruleGap is the space each side of the label sitting in the rule.
@@ -56,7 +57,9 @@ func (m *Model) composerRules() (above, below []string) {
 	if !m.cfg.UI.Input.Rules {
 		return nil, nil
 	}
-	top := m.rule("")
+	// The upper rule carries the session's name once it has one, which is what /rename
+	// gives it: the box the header drew has scrolled away by then (ADR 0019).
+	top := m.rule(m.session.Title)
 	bottom := m.rule(m.ic.Label(icons.Context, contextLabel(contextPercent(m.model.ContextWindow, m.lastPrompt))))
 	if top == "" || bottom == "" {
 		return nil, nil

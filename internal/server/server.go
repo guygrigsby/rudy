@@ -675,11 +675,18 @@ func (s *Server) handleSetTitle(raw json.RawMessage) (any, *protocol.Error) {
 	if e := decode(raw, &p); e != nil {
 		return nil, e
 	}
-	if p.Title == "" {
+	return s.setTitle(p.SessionID, p.Title)
+}
+
+// setTitle names a session, the body session.set_title and the /rename command share: the
+// same refusal of an empty title and the same title_change entry, so a command cannot name
+// a session something the method would not.
+func (s *Server) setTitle(sessionID, title string) (any, *protocol.Error) {
+	if title == "" {
 		return nil, perr(protocol.CodeInvalidArgument, "empty title")
 	}
-	return s.setEntry(p.SessionID, session.KindTitleChange, func(view protocol.SessionInfo) (bool, session.Payload) {
-		return view.Title == p.Title, session.TitleChange{Title: p.Title}
+	return s.setEntry(sessionID, session.KindTitleChange, func(view protocol.SessionInfo) (bool, session.Payload) {
+		return view.Title == title, session.TitleChange{Title: title}
 	})
 }
 
@@ -864,6 +871,13 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 			return nil, serr
 		}
 		notice := "model set to " + m.Ref.String()
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
+		return protocol.CommandRunResult{Notice: notice}, nil
+	case plugin.SetTitle:
+		if _, e := s.setTitle(p.SessionID, a.Title); e != nil {
+			return nil, e
+		}
+		notice := "session named " + a.Title
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
 		return protocol.CommandRunResult{Notice: notice}, nil
 	case plugin.Fork:

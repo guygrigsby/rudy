@@ -617,6 +617,56 @@ func TestInterruptCancelMidStream(t *testing.T) {
 // TestCommandListAnswersEveryRegisteredCommand is the surface a client completes from. The
 // set is frozen once every plugin has answered plugin.init, so one query is the whole list
 // and there is no notification for it (docs/specs/rudy-contracts.md, command.list).
+// TestRenameNamesTheSession is /rename through the same path session.set_title takes: one
+// title_change entry, the same refusal of an empty name, and the notice a client draws.
+func TestRenameNamesTheSession(t *testing.T) {
+	h := newHarnessWith(t, &scriptProvider{}, commands.New())
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	ctx := context.Background()
+
+	var cr protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "rename", Args: "  the flaky fork test  ",
+	}, &cr); err != nil {
+		t.Fatalf("/rename: %v", err)
+	}
+	if cr.Notice != "session named the flaky fork test" {
+		t.Errorf("notice %q", cr.Notice)
+	}
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.Entry.Kind == session.KindTitleChange
+	})
+	es := entries(t, ns)
+	tc, ok := es[len(es)-1].Payload.(session.TitleChange)
+	if !ok || tc.Title != "the flaky fork test" {
+		t.Fatalf("title_change = %+v", es[len(es)-1].Payload)
+	}
+
+	// A name it already has appends nothing, the way the method is idempotent for the
+	// same value, and an empty one is refused rather than recorded.
+	var again protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "rename", Args: "the flaky fork test",
+	}, &again); err != nil {
+		t.Fatalf("/rename again: %v", err)
+	}
+	var usage protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "rename",
+	}, &usage); err != nil {
+		t.Fatalf("/rename with no name: %v", err)
+	}
+	if usage.Notice != "usage: /rename <name>" {
+		t.Errorf("a command with no argument says how to use it: %q", usage.Notice)
+	}
+}
+
 func TestCommandListAnswersEveryRegisteredCommand(t *testing.T) {
 	h := newHarnessWith(t, &scriptProvider{}, commands.New())
 	cl := h.dial(t, true)

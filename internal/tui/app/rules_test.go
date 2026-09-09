@@ -106,3 +106,17 @@ func TestANarrowTerminalDrawsThePlainRule(t *testing.T) {
 		}
 	}
 }
+
+// TestTheUpperRuleCarriesTheSessionName is what /rename shows for itself: the header's box
+// has scrolled away by the time anybody renames a session, so the name lands on the rule
+// over the composer (ADR 0019).
+func TestTheUpperRuleCarriesTheSessionName(t *testing.T) {
+	h := newHarness(t, nil)
+	if got := ruleLines(h)[0]; strings.ContainsAny(got, "abcdefghijklmnopqrstuvwxyz") {
+		t.Errorf("an unnamed session leaves the rule plain: %q", got)
+	}
+	h.appended(session.TitleChange{Title: "the flaky fork test"})
+	if got := ruleLines(h)[0]; !strings.Contains(got, "the flaky fork test") {
+		t.Errorf("a named one says so: %q", got)
+	}
+}

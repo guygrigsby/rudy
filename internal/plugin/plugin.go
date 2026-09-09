@@ -70,6 +70,10 @@ type Compact struct{ Instructions string }
 // a provider:id spec or a bare id unique across providers.
 type SetModel struct{ Model string }
 
+// SetTitle has the server name this session, the body of session.set_title. A title is
+// what a person calls the session; an empty one is refused, as the method refuses it.
+type SetTitle struct{ Title string }
+
 // Fork has the server fork this session at AtEntryID and attach the caller to the result, the
 // body of session.fork. An empty AtEntryID means the newest entry of any kind.
 type Fork struct{ AtEntryID string }
@@ -80,6 +84,7 @@ func (SubmitPrompt) isAction() {}
 func (Notice) isAction()       {}
 func (Compact) isAction()      {}
 func (SetModel) isAction()     {}
+func (SetTitle) isAction()     {}
 func (Fork) isAction()         {}
 func (NoAction) isAction()     {}
 

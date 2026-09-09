@@ -1,4 +1,5 @@
-// Package commands is the kernel's own slash commands: /model, /help, /fork and /plugins. They
+// Package commands is the kernel's own slash commands: /model, /help, /rename, /fork and
+// /plugins. They
 // have no private path to the server either, each is a plugin.Command registered through the
 // same Host interface a spawned plugin's /foo would use.
 package commands
@@ -34,6 +35,13 @@ func (cmdPlugin) Init(ctx context.Context, h plugin.Host) error {
 				fmt.Fprintf(&b, "/%s  %s\n", cmd.Name, cmd.Description)
 			}
 			return plugin.Notice{Text: strings.TrimRight(b.String(), "\n")}, nil
+		}},
+		{Name: "rename", Description: "Name this session: /rename <name>", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
+			name := strings.TrimSpace(c.Args)
+			if name == "" {
+				return plugin.Notice{Text: "usage: /rename <name>"}, nil
+			}
+			return plugin.SetTitle{Title: name}, nil
 		}},
 		{Name: "fork", Description: "Fork this session at an entry: /fork [entry id], default the newest", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
 			at := strings.TrimSpace(c.Args)
