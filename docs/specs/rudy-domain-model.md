@@ -652,6 +652,7 @@ Value object, a sum. One event from a provider stream. The adapter emits these i
 |---|---|---|
 | `text_delta` | `text string` | A chunk of assistant text |
 | `thinking_delta` | `text string` | A chunk of reasoning |
+| `thinking_signature` | `signature string` | The provider's signature over the thinking block that just streamed, byte-exact |
 | `tool_use_start` | `id string`, `name string` | A tool call begins |
 | `tool_use_delta` | `argsFragment []byte` | A fragment of tool input, byte-exact |
 | `message_done` | `usage Usage`, `stopReason StopReason` | The completion ended |

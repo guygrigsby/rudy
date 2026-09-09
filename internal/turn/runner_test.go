@@ -1308,3 +1308,27 @@ func TestRunnerStepLimit(t *testing.T) {
 		t.Errorf("turn_failed %+v", last)
 	}
 }
+
+func TestAccumulatorFoldsThinkingSignature(t *testing.T) {
+	a := newAccumulator()
+	a.add(provider.Part{Type: provider.PartThinkingDelta, Text: "a"})
+	a.add(provider.Part{Type: provider.PartThinkingDelta, Text: "b"})
+	a.add(provider.Part{Type: provider.PartThinkingSignature, Signature: "SIG"})
+	want := []session.Block{{Type: session.BlockThinking, Text: "ab", Signature: "SIG"}}
+	if got := a.blocks(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocks %+v\nwant   %+v", got, want)
+	}
+}
+
+func TestAccumulatorSignatureWithoutThinkingOpensABlock(t *testing.T) {
+	a := newAccumulator()
+	a.add(provider.Part{Type: provider.PartTextDelta, Text: "hi"})
+	a.add(provider.Part{Type: provider.PartThinkingSignature, Signature: "SIG"})
+	want := []session.Block{
+		{Type: session.BlockText, Text: "hi"},
+		{Type: session.BlockThinking, Signature: "SIG"},
+	}
+	if got := a.blocks(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("blocks %+v\nwant   %+v", got, want)
+	}
+}

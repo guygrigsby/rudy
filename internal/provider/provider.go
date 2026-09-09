@@ -53,11 +53,15 @@ type PartType string
 const (
 	PartTextDelta     PartType = "text_delta"
 	PartThinkingDelta PartType = "thinking_delta"
-	PartToolUseStart  PartType = "tool_use_start" // ID, Name
-	PartToolUseDelta  PartType = "tool_use_delta" // ID, Input fragment in Text
-	PartToolUseEnd    PartType = "tool_use_end"   // ID
-	PartUsage         PartType = "usage"
-	PartStop          PartType = "stop"
+	// PartThinkingSignature carries the provider's signature over the thinking block that
+	// just streamed, in Signature. It arrives after that block's deltas and its bytes are
+	// kept verbatim: a re-encoded signature is rejected when the block is sent back.
+	PartThinkingSignature PartType = "thinking_signature"
+	PartToolUseStart      PartType = "tool_use_start" // ID, Name
+	PartToolUseDelta      PartType = "tool_use_delta" // ID, Input fragment in Text
+	PartToolUseEnd        PartType = "tool_use_end"   // ID
+	PartUsage             PartType = "usage"
+	PartStop              PartType = "stop"
 )
 
 // Part is one streamed piece of a completion.
@@ -66,6 +70,7 @@ type Part struct {
 	Text          string             `json:"text,omitempty"`
 	ID            string             `json:"id,omitempty"`
 	Name          string             `json:"name,omitempty"`
+	Signature     string             `json:"signature,omitempty"`
 	Usage         session.Usage      `json:"usage"`
 	StopReason    session.StopReason `json:"stop_reason,omitempty"`
 	StopReasonRaw string             `json:"stop_reason_raw,omitempty"`

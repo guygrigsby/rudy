@@ -903,6 +903,8 @@ func (a *accumulator) add(p provider.Part) {
 		a.appendText(session.BlockText, p.Text)
 	case provider.PartThinkingDelta:
 		a.appendText(session.BlockThinking, p.Text)
+	case provider.PartThinkingSignature:
+		a.signThinking(p.Signature)
 	case provider.PartToolUseStart:
 		a.open[p.ID] = len(a.blocksOut)
 		a.inputs[p.ID] = &strings.Builder{}
@@ -928,6 +930,19 @@ func (a *accumulator) appendText(t session.BlockType, s string) {
 		return
 	}
 	a.blocksOut = append(a.blocksOut, session.Block{Type: t, Text: s})
+}
+
+// signThinking attaches a signature to the thinking block it covers, which is the one that
+// just streamed. A signature that arrives with no thinking block open opens an empty one
+// rather than being dropped: the provider will refuse the block on the next request if the
+// signature it issued does not come back.
+func (a *accumulator) signThinking(sig string) {
+	n := len(a.blocksOut)
+	if n > 0 && a.blocksOut[n-1].Type == session.BlockThinking {
+		a.blocksOut[n-1].Signature = sig
+		return
+	}
+	a.blocksOut = append(a.blocksOut, session.Block{Type: session.BlockThinking, Signature: sig})
 }
 
 func (a *accumulator) finishToolUse(id string) {

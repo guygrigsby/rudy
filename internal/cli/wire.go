@@ -12,6 +12,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	anthropicplugin "github.com/guygrigsby/rudy/internal/plugins/anthropic"
 	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
@@ -188,12 +189,13 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 
 // BuiltinPlugins is the linked-in set: the six tools, the agent tool, /init, /compact,
 // /skills, the kernel's own slash commands (/model, /help, /fork, /plugins) and the
-// openai_chat providers.
+// openai_chat and anthropic_messages providers.
 func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
 	return append(BuiltinTools(), subagents.New(paths.Config), initcmd.New(), compactcmd.New(), commands.New(),
-		skillsplugin.New(cfg.Skills.Dirs), openaichatplugin.New(cfg.Providers, httpc, resolve))
+		skillsplugin.New(cfg.Skills.Dirs), openaichatplugin.New(cfg.Providers, httpc, resolve),
+		anthropicplugin.New(cfg.Providers, httpc, resolve))
 }
 
 // BuiltinTools is the six tool plugins alone, for tests that supply their own provider.
