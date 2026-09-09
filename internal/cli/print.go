@@ -287,7 +287,10 @@ func openOrResume(ctx context.Context, client *protocol.Client, b *Built, o prin
 	return info, 0, nil
 }
 
-// newestFor returns the newest session opened on cwd.
+// newestFor returns the newest session opened on cwd, skipping child sessions: a subagent's
+// session sits on the same workspace and is newer than the session that opened it, so
+// --continue after any agent tool call would otherwise resume the subagent instead of the
+// user's own session.
 func newestFor(st *session.Store, cwd string) (string, error) {
 	want, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
@@ -302,7 +305,7 @@ func newestFor(st *session.Store, cwd string) (string, error) {
 		if err != nil {
 			root = s.Workspace.Root
 		}
-		if root == want {
+		if root == want && s.ParentSessionID == "" {
 			return s.ID.String(), nil
 		}
 	}

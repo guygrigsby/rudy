@@ -413,3 +413,38 @@ func TestPrintReleasesTheSessionLock(t *testing.T) {
 	}
 	_ = s.Close()
 }
+
+// A subagent's child session is opened on the same workspace as its parent and is newer, so
+// the newest session for a directory is a child whenever the last thing the user ran used the
+// agent tool. --continue means the session the user was in, never the one a tool opened
+// underneath it.
+func TestNewestForSkipsChildSessions(t *testing.T) {
+	root := t.TempDir()
+	st, err := session.OpenStore(filepath.Join(t.TempDir(), "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := openTestSession(t, st, root)
+	child, err := session.Open(st, session.SessionOpened{
+		SchemaVersion:   1,
+		RudyVersion:     "test",
+		Workspace:       session.Workspace{Root: root, ProjectID: "local/" + filepath.Base(root)},
+		Model:           session.ModelRef{Provider: "fake", Model: "m"},
+		Thinking:        session.ThinkingOff,
+		Mode:            session.ModeOff,
+		Agent:           "default",
+		ParentSessionID: parent.ID().String(),
+		ParentToolUseID: "agent_0_abc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = child.Close() })
+	got, err := newestFor(st, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != parent.ID().String() {
+		t.Fatalf("newestFor = %s, want the parent %s, not the child %s", got, parent.ID(), child.ID())
+	}
+}
