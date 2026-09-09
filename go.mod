@@ -3,6 +3,7 @@ module github.com/guygrigsby/rudy
 go 1.26.2
 
 require (
+	github.com/aeryx-ai/memory/memory-go v0.0.0
 	github.com/anthropics/anthropic-sdk-go v1.71.0
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/oklog/ulid/v2 v2.1.2
@@ -37,3 +38,5 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
+
+replace github.com/aeryx-ai/memory/memory-go => ../memory/memory-go

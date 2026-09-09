@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/guygrigsby/rudy/internal/config"
@@ -16,6 +17,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
+	memoryplugin "github.com/guygrigsby/rudy/internal/plugins/memory"
 	openaichatplugin "github.com/guygrigsby/rudy/internal/plugins/openaichat"
 	skillsplugin "github.com/guygrigsby/rudy/internal/plugins/skills"
 	"github.com/guygrigsby/rudy/internal/plugins/subagents"
@@ -97,9 +99,13 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	notice := func(text string) { _, _ = fmt.Fprintln(stderr, "rudy:", text) }
 	plugins := plugin.NewRegistry(cfg.Plugins, notice)
 	plugins.Disable(cfg.PluginsDisabled...)
+	// The provider registry is built here rather than below because the memory plugin folds
+	// through a model: its summarize closure captures the registry and resolves a provider at
+	// call time, long after Load has filled it.
+	registry := provider.NewRegistry(filepath.Join(paths.Cache, "registry.json"))
 	set := o.Plugins
 	if set == nil {
-		set = BuiltinPlugins(cfg, paths, httpc, home, env)
+		set = BuiltinPlugins(cfg, paths, httpc, home, env, o.Version, summarizeWith(cfg, registry, notice))
 	}
 	if err := os.MkdirAll(paths.Cache, 0o700); err != nil {
 		return nil, fmt.Errorf("cache dir: %w", err)
@@ -107,7 +113,6 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	// The server is built before the plugins load, and takes its providers from them
 	// afterwards: a plugin's Host reaches the server through the protocol (Connect, Note,
 	// the status broadcasts), so the server has to exist by the time any Init runs.
-	registry := provider.NewRegistry(filepath.Join(paths.Cache, "registry.json"))
 	g := gate.New(cfg.Permissions.Dangerous)
 	srv := server.New(server.Deps{
 		Version:  o.Version,
@@ -188,14 +193,64 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 }
 
 // BuiltinPlugins is the linked-in set: the six tools, the agent tool, /init, /compact,
-// /skills, the kernel's own slash commands (/model, /help, /fork, /plugins) and the
+// /skills, /memory, the kernel's own slash commands (/model, /help, /fork, /plugins) and the
 // openai_chat and anthropic_messages providers.
-func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string) []plugin.Plugin {
+func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
 	return append(BuiltinTools(), subagents.New(paths.Config), initcmd.New(), compactcmd.New(), commands.New(),
-		skillsplugin.New(cfg.Skills.Dirs), openaichatplugin.New(cfg.Providers, httpc, resolve),
+		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
+		openaichatplugin.New(cfg.Providers, httpc, resolve),
 		anthropicplugin.New(cfg.Providers, httpc, resolve))
+}
+
+// summarizeWith is the one prompt the memory plugin runs through a model. Nothing is resolved
+// at wire time: the provider registry is filled by plugin.Load, which happens after this
+// closure is built, so both the model and its provider are looked up per call.
+func summarizeWith(cfg *config.Config, registry *provider.Registry, notice func(string)) memoryplugin.Summarize {
+	// A misconfigured summary_model is a configuration fact, not a per-fold event: saying it
+	// once keeps a fold on every turn from filling the operator's terminal with one message.
+	var once sync.Once
+	warn := func(text string) { once.Do(func() { notice(text) }) }
+	return func(ctx context.Context, prompt string) (string, error) {
+		m, err := summaryModel(cfg, registry, warn)
+		if err != nil {
+			return "", err
+		}
+		prov, ok := registry.Provider(m.Ref.Provider)
+		if !ok {
+			return "", fmt.Errorf("memory: no provider %q for summary model %s", m.Ref.Provider, m.Ref)
+		}
+		var b strings.Builder
+		err = prov.Complete(ctx, provider.Request{
+			Model:     m.Ref,
+			Messages:  []provider.Message{{Role: provider.RoleUser, Content: []session.Block{session.TextBlock(prompt)}}},
+			Thinking:  session.ThinkingOff,
+			MaxTokens: cfg.MaxTokens,
+		}, func(part provider.Part) error {
+			if part.Type == provider.PartTextDelta {
+				b.WriteString(part.Text)
+			}
+			return nil
+		})
+		if err != nil {
+			return "", err
+		}
+		return b.String(), nil
+	}
+}
+
+// summaryModel is memory.summary_model when it resolves and the session default otherwise: a
+// configured model that has gone out of the registry costs a notice, not a failed fold.
+func summaryModel(cfg *config.Config, registry *provider.Registry, warn func(string)) (provider.Model, error) {
+	if spec := cfg.Memory.SummaryModel; spec != "" {
+		m, err := registry.Resolve(spec)
+		if err == nil {
+			return m, nil
+		}
+		warn(fmt.Sprintf("memory: summary_model %s: %v; folding with %s:%s instead", spec, err, cfg.Default.Provider, cfg.Default.Model))
+	}
+	return registry.Resolve(cfg.Default.Provider + ":" + cfg.Default.Model)
 }
 
 // BuiltinTools is the six tool plugins alone, for tests that supply their own provider.

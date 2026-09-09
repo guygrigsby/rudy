@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -295,5 +296,92 @@ func TestBuildFailsWithNoModels(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error with no providers and no snapshot")
+	}
+}
+
+// summarizeFixture is a registry holding the fake provider's one model, ready for the memory
+// plugin's summarize closure.
+func summarizeFixture(t *testing.T, script ...[]provider.Part) (*fakeProvider, *provider.Registry, *config.Config) {
+	t.Helper()
+	fp := &fakeProvider{script: script}
+	reg := provider.NewRegistry(filepath.Join(t.TempDir(), "registry.json"), fp)
+	if err := reg.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	cfg := &config.Config{MaxTokens: 4096}
+	cfg.Default.Provider, cfg.Default.Model = "fake", "m"
+	return fp, reg, cfg
+}
+
+// TestSummarizeRunsOnePromptWithThinkingOff pins the request the fold makes: the default model,
+// the prompt as a single user message, no thinking, and only the text deltas collected.
+func TestSummarizeRunsOnePromptWithThinkingOff(t *testing.T) {
+	fp, reg, cfg := summarizeFixture(t, []provider.Part{
+		{Type: provider.PartThinkingDelta, Text: "ignored"},
+		{Type: provider.PartTextDelta, Text: "[high] a | id"},
+		{Type: provider.PartTextDelta, Text: "\n"},
+		{Type: provider.PartStop, StopReason: session.StopEndTurn},
+	})
+	out, err := summarizeWith(cfg, reg, func(string) {})(context.Background(), "observe this")
+	if err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+	if out != "[high] a | id\n" {
+		t.Errorf("out %q", out)
+	}
+	req := fp.request(0)
+	if req.Model != (session.ModelRef{Provider: "fake", Model: "m"}) {
+		t.Errorf("model %+v", req.Model)
+	}
+	if req.Thinking != session.ThinkingOff {
+		t.Errorf("thinking %q", req.Thinking)
+	}
+	if req.System != "" || len(req.Tools) != 0 {
+		t.Errorf("request carries a system prompt or tools: %+v", req)
+	}
+	if len(req.Messages) != 1 || req.Messages[0].Role != provider.RoleUser ||
+		len(req.Messages[0].Content) != 1 || req.Messages[0].Content[0].Text != "observe this" {
+		t.Errorf("messages %+v", req.Messages)
+	}
+	if req.MaxTokens != 4096 {
+		t.Errorf("max tokens %d", req.MaxTokens)
+	}
+}
+
+// TestSummarizeFallsBackToTheDefaultModelOnce: a summary_model that is not in the registry
+// still folds, on the default model, and says so once rather than once per turn.
+func TestSummarizeFallsBackToTheDefaultModelOnce(t *testing.T) {
+	fp, reg, cfg := summarizeFixture(t, say("one"), say("two"))
+	cfg.Memory.SummaryModel = "gone:away"
+	var notices []string
+	summarize := summarizeWith(cfg, reg, func(s string) { notices = append(notices, s) })
+	for range 2 {
+		if _, err := summarize(context.Background(), "observe this"); err != nil {
+			t.Fatalf("summarize: %v", err)
+		}
+	}
+	if len(notices) != 1 || !strings.Contains(notices[0], "gone:away") {
+		t.Fatalf("notices %q", notices)
+	}
+	if got := fp.request(1).Model.Model; got != "m" {
+		t.Errorf("second call model %q, want the default", got)
+	}
+}
+
+// TestSummarizeResolvesTheConfiguredModel: when summary_model does resolve it is what the fold
+// runs on, and nothing is said.
+func TestSummarizeResolvesTheConfiguredModel(t *testing.T) {
+	fp, reg, cfg := summarizeFixture(t, say("one"))
+	cfg.Default.Model = "unused"
+	cfg.Memory.SummaryModel = "fake:m"
+	var notices []string
+	if _, err := summarizeWith(cfg, reg, func(s string) { notices = append(notices, s) })(context.Background(), "p"); err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+	if len(notices) != 0 {
+		t.Errorf("notices %q", notices)
+	}
+	if got := fp.request(0).Model.Model; got != "m" {
+		t.Errorf("model %q", got)
 	}
 }
