@@ -448,3 +448,42 @@ func findDecision(t *testing.T, entries []session.Entry, tool string) session.Pe
 	t.Fatalf("no permission_decision for %s in %d entries", tool, len(entries))
 	return session.PermissionDecision{}
 }
+
+// TestATurnRestingDuringAReplayDoesNotPrint is the guard commitTurns already keeps, on the
+// other path a commit can be reached by. A turn.state buffered while a session switch is
+// in flight is folded during the replay, and the one ordered print at the end of that
+// replay is what puts those rows in scrollback; a second print from turnChanged would be
+// batched against it, and a tea.Batch does not order its commands.
+func TestATurnRestingDuringAReplayDoesNotPrint(t *testing.T) {
+	h := newHarness(t, nil) // inline is the default
+	h.fold(session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("first question")}})
+	h.fold(session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
+		Content: []session.Block{session.TextBlock("first answer")},
+	})
+	turn := h.m.tr.Turn()
+	rested := protocol.TurnStateChanged{SessionID: h.m.session.SessionID, TurnID: turn, State: stateCompleted}
+
+	h.m.replaying = true
+	for _, msg := range runAll(t, h.m.turnChanged(rested)) {
+		if line, ok := printLine(msg); ok {
+			t.Errorf("a turn resting inside a replay must not print: %q", line)
+		}
+	}
+	if rows := h.m.tr.Rows(); len(rows) != 2 {
+		t.Fatalf("the rows are left for the replay's own print: %+v", rows)
+	}
+
+	// Off the replay the same notification commits, which is what the guard must not have
+	// broken.
+	h.m.replaying = false
+	var printed string
+	for _, msg := range runAll(t, h.m.turnChanged(rested)) {
+		if line, ok := printLine(msg); ok {
+			printed = ansi.Strip(line)
+		}
+	}
+	if !strings.Contains(printed, "first answer") {
+		t.Errorf("a turn resting outside a replay commits, printed %q", printed)
+	}
+}

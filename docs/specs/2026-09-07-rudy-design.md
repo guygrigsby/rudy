@@ -213,10 +213,14 @@ Rules: no painted backgrounds, the terminal's black shows through. User message
 is one prefix glyph and no padding. One blank line between assistant blocks.
 Tool calls fold to one row plus a two-line preview; bash shows the last two
 lines of output, edits show the first hunk as red and green text, read, grep and
-glob show a one-line count. Thinking hidden. Status under the input, vim mode
-first. Enter or a click expands a row. A permission question renders inline
-where the tool row would be. Assistant markdown renders through glamour with
-chroma on fences.
+glob show a one-line count. Thinking hidden. Every row and the status line sit
+one column in, the gutter the screen above draws. Status under the input, vim
+mode first and `turn` last: a spinner and one word for what the turn is doing
+(`thinking` until an answer streams, then `streaming`, `tool`, `steering`,
+`waiting`), drawing nothing at rest. Enter or a click expands a row. A permission
+question renders inline where the tool row would be. Assistant markdown renders
+through glamour with chroma on fences, sanitized on the way in so nothing a model
+wrote can move the cursor.
 
 Every choice is a config field with the default that produces that screen:
 
@@ -240,7 +244,7 @@ block_gap = 1
 style = "text"
 
 [ui.status]
-items = ["vim_mode", "model", "permission_mode", "context", "cost", "workspace"]
+items = ["vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"]
 
 [ui.notices]
 max = 3

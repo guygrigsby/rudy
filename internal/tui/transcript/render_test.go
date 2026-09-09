@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -237,5 +239,38 @@ func TestNoPaintedBackgrounds(t *testing.T) {
 		if painted != want {
 			t.Errorf("%s paints a background: %v, want %v", f, painted, want)
 		}
+	}
+}
+
+// escapeDoc is an answer carrying the two things a model must never be able to write into
+// a terminal: an ANSI sequence, here the one that clears the screen, and a C0 byte.
+const escapeDoc = "clear \x1b[2Jthis \aand this\n"
+
+// TestAnAnswerCarriesNoEscapes covers both halves of an assistant row, which take
+// different paths: the live one wraps and sanitizes, the committed one renders through
+// glamour, whose escape replacer is for markdown syntax and leaves an ANSI sequence and a
+// C0 byte exactly as they arrived. The committed row is the one an inline client writes
+// into the terminal's own scrollback through tea.Println, so it is the one that would
+// clear the screen.
+func TestAnAnswerCarriesNoEscapes(t *testing.T) {
+	tr, turn := start(t, defaults(), "say something")
+	tr.Delta(turn, provider.Part{Type: provider.PartTextDelta, Text: escapeDoc})
+	live := strings.Join(tr.Render(tr.Rows()[1]), "\n")
+	tr.Apply(entry(t, session.AssistantMessage{Model: ref, Thinking: session.ThinkingOff, StopReason: session.StopEndTurn, Content: []session.Block{
+		session.TextBlock(escapeDoc),
+	}}))
+	committed := strings.Join(tr.Commit(turn), "\n")
+	for _, c := range []struct{ name, got string }{{"live", live}, {"committed", committed}} {
+		t.Run(c.name, func(t *testing.T) {
+			if strings.Contains(c.got, "\x1b[2J") {
+				t.Errorf("the row carries the erase sequence: %q", c.got)
+			}
+			if strings.ContainsRune(c.got, '\a') {
+				t.Errorf("the row carries a C0 byte: %q", c.got)
+			}
+			if plain := ansi.Strip(c.got); !strings.Contains(plain, "clear this and this") {
+				t.Errorf("the row lost the text it was safe to draw: %q", plain)
+			}
+		})
 	}
 }

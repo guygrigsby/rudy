@@ -186,7 +186,7 @@ func Defaults() map[string]any {
 		"ui.transcript.user_prefix":        "›",
 		"ui.transcript.block_gap":          1,
 		"ui.diff.style":                    "text",
-		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace"},
+		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"},
 		"ui.notices.max":                   3,
 	}
 }
@@ -403,6 +403,11 @@ func (c *Config) validate() error {
 			errs = append(errs, fmt.Errorf("config: providers.%s.dialect %q requires wire openai_chat, got %q", name, p.Dialect, p.Wire))
 		}
 	}
+	if c.Permissions.DoublePressMS <= 0 {
+		// Zero is not "no window": it is a window no two presses can fall inside, which
+		// leaves the double-Esc cancel of the TurnControl table unreachable.
+		errs = append(errs, fmt.Errorf("config: permissions.double_press_ms %d must be positive", c.Permissions.DoublePressMS))
+	}
 	if c.HookTimeoutMS <= 0 {
 		errs = append(errs, fmt.Errorf("config: hook_timeout_ms %d must be positive", c.HookTimeoutMS))
 	}
@@ -432,11 +437,11 @@ var validDiffStyles = map[string]bool{"text": true, "background": true}
 var legalSlots = map[string]bool{"header": true, "transcript": true, "input": true, "status": true}
 var requiredSlots = []string{"transcript", "input", "status"}
 
-// builtinStatusItems are ui.status.items' six built-in keys; anything else must be a
+// builtinStatusItems are ui.status.items' seven built-in keys; anything else must be a
 // non-empty "<plugin>:<key>" pair.
 var builtinStatusItems = map[string]bool{
 	"vim_mode": true, "model": true, "permission_mode": true,
-	"context": true, "cost": true, "workspace": true,
+	"context": true, "cost": true, "workspace": true, "turn": true,
 }
 
 func (c *Config) validateUI() []error {
@@ -452,6 +457,9 @@ func (c *Config) validateUI() []error {
 	}
 	if c.UI.Transcript.ToolPreviewLines < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.transcript.tool_preview_lines %d must be zero or positive", c.UI.Transcript.ToolPreviewLines))
+	}
+	if c.UI.Transcript.BlockGap < 0 {
+		errs = append(errs, fmt.Errorf("config: ui.transcript.block_gap %d must be zero or positive", c.UI.Transcript.BlockGap))
 	}
 	if c.UI.Notices.Max < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.notices.max %d must be zero or positive", c.UI.Notices.Max))

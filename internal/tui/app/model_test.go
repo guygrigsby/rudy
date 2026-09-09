@@ -769,7 +769,7 @@ func TestModelAndModeChangesMoveTheStatusLine(t *testing.T) {
 	h.appended(session.ModelChange{Model: session.ModelRef{Provider: "fake", Model: "m2"}})
 	h.appended(session.ModeChange{Mode: session.ModePermissive})
 	got := ansi.Strip(h.m.statusLine())
-	if got != "fake:m2  permissive" {
+	if got != " fake:m2  permissive" {
 		t.Fatalf("status %q", got)
 	}
 }
@@ -1268,5 +1268,93 @@ func TestAgainstARealServerATurnBecomesRows(t *testing.T) {
 	}
 	if h.m.usage != (session.Usage{Input: 10, Output: 2}) {
 		t.Errorf("usage %+v", h.m.usage)
+	}
+}
+
+// rowsOn are the "row N" indices the frame is showing, in the order they are drawn.
+func rowsOn(v string) []int {
+	var out []int
+	for _, l := range strings.Split(ansi.Strip(v), "\n") {
+		_, after, ok := strings.Cut(l, "row ")
+		if !ok {
+			continue
+		}
+		if n, err := strconv.Atoi(strings.TrimSpace(after)); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// TestAltscreenFollowsTheNewestRowAndScrolls is ui.render = "altscreen"'s half of the
+// transcript. Inline lives in the terminal's own scrollback, so a row that lands is
+// already at the bottom; altscreen keeps every row in a viewport, which has to be moved
+// to them and moved back by the tui.altScreen actions ADR 0013 decision 5 binds.
+func TestAltscreenFollowsTheNewestRowAndScrolls(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	const rows = 60
+	for i := range rows {
+		h.appended(session.UserMessage{
+			Source: session.SourceTyped, Content: []session.Block{session.TextBlock("row " + strconv.Itoa(i))},
+		})
+	}
+	before := rowsOn(h.view())
+	if len(before) == 0 || before[len(before)-1] != rows-1 {
+		t.Fatalf("altscreen shows the newest row, showing %v", before)
+	}
+	h.press("pageUp")
+	after := rowsOn(h.view())
+	if len(after) == 0 || after[0] >= before[0] {
+		t.Fatalf("pageUp reveals earlier rows: showed %v, now %v", before, after)
+	}
+	if slices.Contains(after, rows-1) {
+		t.Errorf("a scrolled viewport stays where it was left, showing %v", after)
+	}
+	// A row landing under a viewport the user scrolled up does not drag it back down; one
+	// landing under a viewport at the bottom does.
+	h.appended(session.UserMessage{
+		Source: session.SourceTyped, Content: []session.Block{session.TextBlock("row " + strconv.Itoa(rows))},
+	})
+	if got := rowsOn(h.view()); slices.Contains(got, rows) {
+		t.Errorf("a scrolled viewport is not dragged to the newest row, showing %v", got)
+	}
+	h.press("end")
+	if got := rowsOn(h.view()); !slices.Contains(got, rows) {
+		t.Errorf("end returns to the newest row, showing %v", got)
+	}
+	h.press("home")
+	if got := rowsOn(h.view()); len(got) == 0 || got[0] != 0 {
+		t.Errorf("home goes to the oldest row, showing %v", got)
+	}
+}
+
+// TestInlineLeavesTheScrollKeysToTheEditor is the other side of that binding: pi binds
+// home to tui.editor.cursorLineStart as well as to tui.altScreen.top, and inline has no
+// viewport, so the key has to reach the editor exactly as it did before.
+func TestInlineLeavesTheScrollKeysToTheEditor(t *testing.T) {
+	h := newHarness(t, nil) // inline is the default
+	h.typeText("hello")
+	h.press("home")
+	h.typeText("X")
+	if got := h.m.ed.Text(); got != "Xhello" {
+		t.Errorf("inline leaves home to the editor, text %q", got)
+	}
+	if off := h.m.vp.YOffset(); off != 0 {
+		t.Errorf("inline scrolls no viewport, offset %d", off)
+	}
+	al := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	al.typeText("hello")
+	al.press("home")
+	al.typeText("X")
+	if got := al.m.ed.Text(); got != "helloX" {
+		t.Errorf("altscreen takes home for the viewport, text %q", got)
+	}
+}
+
+// TestSuspendSuspendsTheProgram is app.suspend, bound to ctrl+z by pi's defaults.
+func TestSuspendSuspendsTheProgram(t *testing.T) {
+	h := newHarness(t, nil)
+	if _, ok := runCmd(t, h.press("ctrl+z")).(tea.SuspendMsg); !ok {
+		t.Fatal("app.suspend must suspend the program")
 	}
 }

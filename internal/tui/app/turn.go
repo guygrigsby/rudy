@@ -45,6 +45,42 @@ type turnControl struct {
 	// asked is the question whose answer is in flight, kept so a call that never reached
 	// the server can put the question back.
 	asked *protocol.PermissionRequested
+	// streamed is set once text has streamed in this turn. The server reports one
+	// streaming state for both halves of it, and what the turn status item says while it
+	// runs is thinking until an answer begins and streaming after (ADR 0013 decision 3).
+	streamed bool
+}
+
+// turnWords name what the turn item says for each state the server reports that is not
+// rest. streaming is not here: it is the one state that reads two ways, see word.
+var turnWords = map[string]string{
+	stateRunningTool:        "tool",
+	stateAwaitingPermission: "waiting",
+	stateSteering:           "steering",
+}
+
+// word is what the turn is doing, in one word, or "" for a turn at rest. It is the whole
+// of what says whether the turn item draws anything and whether the spinner is turning.
+func (t turnControl) word() string {
+	if w, ok := turnWords[t.state]; ok {
+		return w
+	}
+	if t.state != stateStreaming {
+		return ""
+	}
+	if t.streamed {
+		return "streaming"
+	}
+	return "thinking"
+}
+
+// set moves the mirror to one state of one turn. A turn id this client has not seen
+// before is a new turn, and what the turn before it streamed is not its.
+func (t *turnControl) set(state, turnID string) {
+	if turnID != t.turnID {
+		t.streamed = false
+	}
+	t.state, t.turnID = state, turnID
 }
 
 // running is a turn the server is working on: streaming, running a tool, or waiting for
@@ -71,22 +107,27 @@ func (t turnControl) resting() bool { return !t.running() && !t.steering() }
 // sends whatever was queued behind it. Altscreen keeps every row where it is, so it only
 // sends the queue.
 func (m *Model) turnChanged(p protocol.TurnStateChanged) tea.Cmd {
-	m.turn.state, m.turn.turnID = p.State, p.TurnID
+	m.turn.set(p.State, p.TurnID)
+	spin := m.spinTick()
 	if !m.turn.resting() {
-		return nil
+		return spin
 	}
 	// A turn that ended answers no question: an interrupt denies what it was waiting on
 	// and the decision is already in the log, so the question goes with the turn.
 	m.turn.prompt, m.turn.asked = nil, nil
 	var commit tea.Cmd
-	if m.inline() {
+	// The same guard commitTurns keeps: a turn.state buffered during a session switch is
+	// folded while the switch replays, and the one ordered print at the end of that replay
+	// is what puts those rows in scrollback. A second print from here would batch against
+	// it, and a tea.Batch does not order its commands.
+	if m.inline() && !m.replaying {
 		// One Println for the whole turn: the program writes each one above the frame as
 		// its own block, and a turn's rows are one block, in order.
 		if lines := m.tr.Commit(p.TurnID); len(lines) > 0 {
 			commit = tea.Println(strings.Join(lines, "\n"))
 		}
 	}
-	return tea.Batch(commit, m.sendQueued())
+	return tea.Batch(spin, commit, m.sendQueued())
 }
 
 // sendQueued sends the oldest message waiting behind the turn that just rested, down the
@@ -383,9 +424,10 @@ func commandIn(s string) (name, args string, ok bool) {
 // them lands, so a second Enter in that window is queued rather than refused by the
 // server. A turn the mirror has already heard about is left alone, which is what keeps an
 // answer that arrives after its turn already finished from reviving it.
-func (m *Model) started(turnID string) {
+func (m *Model) started(turnID string) tea.Cmd {
 	if turnID == "" || m.turn.turnID == turnID {
-		return
+		return nil
 	}
-	m.turn.turnID, m.turn.state = turnID, stateStreaming
+	m.turn.set(stateStreaming, turnID)
+	return m.spinTick()
 }

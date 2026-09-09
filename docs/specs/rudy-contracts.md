@@ -467,7 +467,7 @@ rudy-k0.27).
 | `tool_timeout_ms` | int | 600000 | per tool invocation |
 | `permissions.mode` | PermissionMode | `strict` | |
 | `permissions.dangerous` | [string] | see open list | matchers that always ask unless the mode is off, ahead of any session allowance; each is `tool` or `tool:prefix`. Pass 1 entries are plain shell command prefixes for bash; the `tool:prefix` form is deferred |
-| `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it |
+| `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it; must be positive, since zero is a window no two presses fall inside and the double-Esc cancel would be unreachable |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
 | `server.socket` | path | `$XDG_RUNTIME_DIR/rudy/rudy.sock` | |
@@ -480,9 +480,9 @@ rudy-k0.27).
 | `ui.transcript.tool_preview_lines` | int | 2 | |
 | `ui.transcript.thinking` | `hidden`, `shown` | `hidden` | |
 | `ui.transcript.user_prefix` | string | `›` | |
-| `ui.transcript.block_gap` | int | 1 | blank lines between assistant blocks |
+| `ui.transcript.block_gap` | int | 1 | blank lines between assistant blocks; zero or positive |
 | `ui.diff.style` | `text`, `background` | `text` | |
-| `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "context", "cost", "workspace"]` | built-in keys plus `plugin:key` for plugin items |
+| `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"]` | built-in keys plus `plugin:key` for plugin items; `turn` is a spinner and one word (`thinking`, `streaming`, `tool`, `steering`, `waiting`) while a turn runs and nothing at rest |
 | `ui.notices.max` | int | 3 | notice lines the client draws under the transcript, newest first; `0` draws none |
 | `ui.theme.name` | string | `default` | a file under `themes/` or the built-in |
 | `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes |

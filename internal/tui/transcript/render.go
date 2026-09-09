@@ -20,6 +20,13 @@ import (
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 )
 
+// Gutter is the design's one-column left margin (docs/specs/2026-09-07-rudy-design.md,
+// the Client screen: " › fix the flaky fork test", " ▸ bash", " INSERT"). Every row starts
+// one column in, continuation lines included, so the transcript reads as a column rather
+// than as text pushed against the terminal's edge. A client draws its own chrome one
+// column in too, which is what keeps the status line under the rows it belongs to.
+const Gutter = 1
+
 const (
 	// toolGlyph opens a tool row, as in the design's default screen.
 	toolGlyph = "▸"
@@ -71,7 +78,12 @@ func (t *Transcript) assistant(r *Row) []string {
 	if r.Live {
 		return t.wrap(theme.RoleAssistant, mdMargin, r.Text)
 	}
-	out, err := t.markdown(r.Text)
+	// Sanitized before glamour rather than after. glamour's escape replacer covers
+	// markdown syntax and leaves an ANSI sequence and a C0 byte in the text exactly as the
+	// model wrote them, and the styling it adds on top is what a sanitize of its output
+	// would strip; a committed row is written into the terminal's own scrollback by
+	// tea.Println, where a \x1b[2J the client never owned would clear the screen.
+	out, err := t.markdown(sanitize(r.Text))
 	if err != nil {
 		return t.wrap(theme.RoleAssistant, mdMargin, r.Text)
 	}
@@ -318,11 +330,13 @@ func summary(name string, input json.RawMessage) string {
 }
 
 // line is one display line: sanitized, truncated to what is left of the width, indented
-// and painted. The role resolves through StyleFor, so a role name the theme does not
-// know, a note's own vocabulary among them, falls back to text rather than to no color
-// at all. fill paints role as the background instead, which only the diff roles ask for
-// and only under ui.diff.style = "background".
+// and painted. The indent is Gutter plus whatever the row kind asks for, so every line a
+// transcript draws sits in the design's left margin. The role resolves through StyleFor,
+// so a role name the theme does not know, a note's own vocabulary among them, falls back
+// to text rather than to no color at all. fill paints role as the background instead,
+// which only the diff roles ask for and only under ui.diff.style = "background".
 func (t *Transcript) line(role theme.Role, indent int, text string, fill bool) string {
+	indent += Gutter
 	text = sanitize(text)
 	if w := t.opts.Width - indent; w > 0 {
 		text = ansi.Truncate(text, w, "")
@@ -339,7 +353,7 @@ func (t *Transcript) line(role theme.Role, indent int, text string, fill bool) s
 // truncate it and lose the rest. Wrap is the word wrap with a hard break inside a token
 // that does not fit, so prose is never cut.
 func (t *Transcript) wrap(role theme.Role, indent int, text string) []string {
-	w := max(t.opts.Width-indent, 1)
+	w := max(t.opts.Width-indent-Gutter, 1)
 	var out []string
 	for _, l := range splitLines(ansi.Wrap(sanitize(text), w, "")) {
 		// A wrap that lands on a space leaves it at the end of the line, where it is
@@ -354,8 +368,8 @@ func (t *Transcript) wrap(role theme.Role, indent int, text string) []string {
 // are, and one embedded reset or cursor motion corrupts the inline region the client
 // owns. ANSI sequences go, and so do the control characters that move the cursor by
 // themselves; tab and newline stay, since previews, diffs and read's output are built
-// out of them. Assistant markdown does not come through here: glamour escapes it and
-// then adds the styling this must not remove.
+// out of them. Committed assistant markdown comes through here on the way in to glamour,
+// never on the way out: glamour adds the styling this would otherwise remove.
 func sanitize(s string) string {
 	s = ansi.Strip(s)
 	if !strings.ContainsFunc(s, isControl) {
@@ -379,7 +393,9 @@ func (t *Transcript) markdown(s string) ([]string, error) {
 	if t.md.r == nil && t.md.err == nil {
 		t.md.r, t.md.err = glamour.NewTermRenderer(
 			glamour.WithStyles(glamourStyle(t.th)),
-			glamour.WithWordWrap(t.opts.Width),
+			// One column narrower than the row, since every line it draws is moved into
+			// the gutter below; wrapping to the full width would overflow by that column.
+			glamour.WithWordWrap(t.opts.Width-Gutter),
 		)
 	}
 	if t.md.err != nil {
@@ -393,7 +409,13 @@ func (t *Transcript) markdown(s string) ([]string, error) {
 	for i, l := range lines {
 		// glamour pads every line out to the width. The padding is plain spaces, since
 		// glamourStyle keeps the block styles colorless, so it trims off cleanly.
-		lines[i] = strings.TrimRight(l, " ")
+		l = strings.TrimRight(l, " ")
+		if l != "" {
+			// The gutter line adds for every other row kind. A blank line stays blank
+			// rather than carrying a column of trailing space nothing draws.
+			l = strings.Repeat(" ", Gutter) + l
+		}
+		lines[i] = l
 	}
 	return trimBlank(lines), nil
 }

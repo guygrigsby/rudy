@@ -87,6 +87,10 @@ func screen(t *testing.T, over map[string]any, drive func(tm *teatest.TestModel,
 	// program ran would flip one cell of the frame. Focusing it again puts the cursor
 	// back in its shown state, so the golden is the frame and not the clock.
 	_ = final.ed.Focus()
+	// The turn spinner is a clock too: the permutation that leaves a turn running spins
+	// one, and a tick that landed before the program quit would move the glyph. A fresh
+	// spinner stands at its first frame, which is the frame these goldens pin.
+	final.spin = newSpinner()
 	return final.View().Content
 }
 

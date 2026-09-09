@@ -305,7 +305,7 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	if c.UI.Diff.Style != "text" {
 		t.Errorf("diff %+v", c.UI.Diff)
 	}
-	want := []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace"}
+	want := []string{"vim_mode", "model", "permission_mode", "context", "cost", "workspace", "turn"}
 	if !reflect.DeepEqual(c.UI.Status.Items, want) {
 		t.Errorf("status %v", c.UI.Status.Items)
 	}
@@ -406,6 +406,7 @@ func TestUIValidation(t *testing.T) {
 		"thinking":      {"ui.transcript.thinking": "maybe"},
 		"diff":          {"ui.diff.style": "neon"},
 		"preview":       {"ui.transcript.tool_preview_lines": -1},
+		"block gap":     {"ui.transcript.block_gap": -1},
 		"notices":       {"ui.notices.max": -1},
 		"slots missing": {"ui.layout.slots": []string{"transcript", "status"}},
 		"slots unknown": {"ui.layout.slots": []string{"transcript", "input", "status", "sidebar"}},
@@ -440,6 +441,10 @@ func TestWaveValidation(t *testing.T) {
 		"compact_at 1.5":  {"sessions.compact_at": 1.5},
 		"hook timeout":    {"hook_timeout_ms": 0},
 		"tool timeout":    {"tool_timeout_ms": -1},
+		// Zero is a window no two presses can fall inside, which leaves the double-Esc
+		// cancel of the TurnControl table unreachable.
+		"double press 0":  {"permissions.double_press_ms": 0},
+		"double press -1": {"permissions.double_press_ms": -1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := map[string]any{}

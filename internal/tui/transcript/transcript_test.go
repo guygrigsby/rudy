@@ -507,7 +507,7 @@ func TestUnknownNoteRoleFallsBackToText(t *testing.T) {
 	e := session.Entry{ID: session.NewID(), Kind: session.KindNote, Payload: session.Note{Plugin: "p", Text: "hello", Role: session.NoteRole("shouty")}}
 	tr.Apply(e)
 	got := strings.Join(tr.Render(tr.Rows()[0]), "\n")
-	want := theme.Default().Style(theme.RoleText).Render("hello")
+	want := strings.Repeat(" ", Gutter) + theme.Default().Style(theme.RoleText).Render("hello")
 	if got != want {
 		t.Errorf("note %q, want %q", got, want)
 	}

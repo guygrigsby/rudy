@@ -13,10 +13,11 @@ import (
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
+	"github.com/guygrigsby/rudy/internal/tui/transcript"
 )
 
-// The six built-in ui.status.items ids (config.builtinStatusItems). Anything else in the
-// list is a plugin's "<owner>:<key>".
+// The seven built-in ui.status.items ids (config.builtinStatusItems). Anything else in
+// the list is a plugin's "<owner>:<key>".
 const (
 	itemVimMode        = "vim_mode"
 	itemModel          = "model"
@@ -24,14 +25,16 @@ const (
 	itemContext        = "context"
 	itemCost           = "cost"
 	itemWorkspace      = "workspace"
+	itemTurn           = "turn"
 )
 
 // statusGap separates two items, as the design's screen spaces them.
 const statusGap = "  "
 
-// statusLine draws ui.status.items in order. An item with nothing to say draws nothing
-// and takes no separator with it, so a session with no cost yet does not leave a gap
-// where the cost will be.
+// statusLine draws ui.status.items in order, one column in: the design's screen puts the
+// status line in the same left gutter every transcript row sits in. An item with nothing
+// to say draws nothing and takes no separator with it, so a session with no cost yet does
+// not leave a gap where the cost will be.
 func (m *Model) statusLine() string {
 	parts := make([]string, 0, len(m.cfg.UI.Status.Items))
 	for _, id := range m.cfg.UI.Status.Items {
@@ -42,7 +45,7 @@ func (m *Model) statusLine() string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return m.clamp(strings.Join(parts, statusGap))
+	return m.clamp(strings.Repeat(" ", transcript.Gutter) + strings.Join(parts, statusGap))
 }
 
 // statusItem renders one ui.status.items entry, styled, or "" when it has nothing to say.
@@ -64,6 +67,8 @@ func (m *Model) statusItem(id string) string {
 		return m.styled(theme.RoleMuted, cost(m.model.Pricing, m.usage))
 	case itemWorkspace:
 		return m.styled(theme.RoleMuted, m.workspace)
+	case itemTurn:
+		return m.styled(theme.RoleMuted, m.turnCell())
 	}
 	// A plugin's item. One no plugin has set renders nothing rather than a placeholder:
 	// the config placed a cell, the plugin decides whether there is anything in it.
@@ -82,6 +87,18 @@ func (m *Model) styled(r theme.Role, text string) string {
 		return ""
 	}
 	return m.th.Style(r).Render(spanText(text))
+}
+
+// turnCell is the turn item: the spinner's glyph and what the turn is doing, in one word
+// (ADR 0013 decision 3, where thinking deltas count toward a spinner). At rest it says
+// nothing and the spinner is not turning, so a client that is not working on anything
+// draws the same status line it drew before this item existed.
+func (m *Model) turnCell() string {
+	word := m.turn.word()
+	if word == "" {
+		return ""
+	}
+	return m.spin.View() + " " + word
 }
 
 // vimMode is the editor's mode as the status line spells it, upper case. Vim disabled has

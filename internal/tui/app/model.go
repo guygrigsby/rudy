@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -117,6 +118,10 @@ type Model struct {
 	// vp scrolls the transcript in altscreen. Inline rendering has no viewport: the
 	// terminal's own scrollback is the scroll.
 	vp viewport.Model
+	// spin is the glyph the turn status item draws while a turn runs, and spinning is
+	// whether its tick loop is armed: a client at rest schedules nothing (status.go).
+	spin     spinner.Model
+	spinning bool
 
 	// status holds the plugin half of the status line, keyed "<owner>:<key>", which is
 	// also how ui.status.items names one.
@@ -209,6 +214,7 @@ func New(o Options) *Model {
 		m.ed.SetText(o.Prompt)
 	}
 	m.vp = viewport.New(viewport.WithWidth(defaultWidth), viewport.WithHeight(defaultHeight))
+	m.spin = newSpinner()
 	m.model = pickModel(m.models, m.session.Model)
 	if m.workspace == "" {
 		m.workspace = detectWorkspace(m.session.Workspace.GitRoot, m.cwd)
@@ -291,6 +297,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseWheelMsg:
 		m.wheel(msg.Button)
 		return m, nil
+	case spinner.TickMsg:
+		return m, m.spinTicked(msg)
 	}
 	// Everything else, a cursor blink among it, belongs to the editor.
 	return m, m.ed.Update(msg)
@@ -329,6 +337,11 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 	case protocol.NotifyStreamDelta:
 		var p protocol.StreamDelta
 		if m.decode(n, &p) {
+			// What separates the turn item's "thinking" from its "streaming" is whether
+			// an answer has begun; the server reports both as the streaming state.
+			if p.Part.Type == provider.PartTextDelta {
+				m.turn.streamed = true
+			}
 			m.tr.Delta(p.TurnID, p.Part)
 		}
 	case protocol.NotifyTurnState:
@@ -485,7 +498,7 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		if !m.result(r, &res) {
 			return nil
 		}
-		m.started(res.TurnID)
+		return m.started(res.TurnID)
 	case protocol.MethodCommandRun:
 		var res protocol.CommandRunResult
 		if !m.result(r, &res) {
@@ -512,7 +525,7 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 				return m.call(protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: res.SessionID})
 			}
 		}
-		m.started(res.TurnID)
+		return m.started(res.TurnID)
 	}
 	return nil
 }
@@ -671,6 +684,7 @@ func (m *Model) switched(info protocol.SessionInfo) tea.Cmd {
 	m.session = info
 	m.tr = m.newTranscript()
 	m.turn = turnControl{}
+	m.spinning = false
 	m.usage, m.lastPrompt = session.Usage{}, 0
 	m.seen = make(map[string]bool)
 	m.awaitLog = true
@@ -940,6 +954,20 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 			return m.forkSession()
 		case keys.AppSessionResume:
 			return m.listSessions()
+		case keys.AppSuspend:
+			// The program stops itself and resumes on SIGCONT; nothing here has to be put
+			// away first, since the frame is redrawn when it comes back.
+			return tea.Suspend
+		case keys.TUIAltScreenLineUp, keys.TUIAltScreenLineDown,
+			keys.TUIAltScreenPageUp, keys.TUIAltScreenPageDown,
+			keys.TUIAltScreenHalfPageUp, keys.TUIAltScreenHalfPageDown,
+			keys.TUIAltScreenTop, keys.TUIAltScreenBottom:
+			// Only altscreen has a viewport to move. Inline rendering lives in the
+			// terminal's own scrollback, so the key falls through to the editor, which is
+			// where pageUp and home are bound as well.
+			if m.scroll(a) {
+				return nil
+			}
 		case keys.TUIInputTab:
 			// A tab that completed nothing is the editor's, which is what indents a
 			// draft that is not a command.
@@ -1005,6 +1033,72 @@ func (m *Model) wheel(b tea.MouseButton) {
 	case tea.MouseWheelDown:
 		m.vp.ScrollDown(m.vp.MouseWheelDelta)
 	}
+}
+
+// scroll moves the viewport for one tui.altScreen action and reports whether it did.
+// Inline is false for every one of them: the scroll there is the terminal's, and the key
+// belongs to whatever else it is bound to.
+//
+// A scroll away from the bottom is what stops transcriptBlock following new rows, and
+// bottom is what starts it again; both fall out of the viewport's own offset, so nothing
+// here has to remember which it was.
+func (m *Model) scroll(a keys.Action) bool {
+	if m.inline() {
+		return false
+	}
+	switch a {
+	case keys.TUIAltScreenLineUp:
+		m.vp.ScrollUp(1)
+	case keys.TUIAltScreenLineDown:
+		m.vp.ScrollDown(1)
+	case keys.TUIAltScreenPageUp:
+		m.vp.PageUp()
+	case keys.TUIAltScreenPageDown:
+		m.vp.PageDown()
+	case keys.TUIAltScreenHalfPageUp:
+		m.vp.HalfPageUp()
+	case keys.TUIAltScreenHalfPageDown:
+		m.vp.HalfPageDown()
+	case keys.TUIAltScreenTop:
+		m.vp.GotoTop()
+	case keys.TUIAltScreenBottom:
+		m.vp.GotoBottom()
+	default:
+		return false
+	}
+	return true
+}
+
+// newSpinner is the turn item's glyph: one cell, unstyled, so the item paints the glyph
+// and its word in one role the way every other built-in item paints itself.
+func newSpinner() spinner.Model {
+	return spinner.New(spinner.WithSpinner(spinner.MiniDot))
+}
+
+// spinTick arms or disarms the turn spinner against what the turn is now doing. It returns
+// the first tick when a resting client starts a turn and nothing at all otherwise: an idle
+// client schedules no timer, and a turn already running does not start a second loop.
+func (m *Model) spinTick() tea.Cmd {
+	running := m.turn.word() != ""
+	if running == m.spinning {
+		return nil
+	}
+	m.spinning = running
+	if !running {
+		return nil
+	}
+	return m.spin.Tick
+}
+
+// spinTicked advances the spinner one frame and asks for the next tick, unless the turn
+// has come to rest, in which case the loop ends here.
+func (m *Model) spinTicked(msg spinner.TickMsg) tea.Cmd {
+	if !m.spinning {
+		return nil
+	}
+	var cmd tea.Cmd
+	m.spin, cmd = m.spin.Update(msg)
+	return cmd
 }
 
 // View draws the slots. AltScreen and the mouse mode are the view's own, so the program
@@ -1116,7 +1210,14 @@ func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 		content[i] = l.Text
 	}
 	m.vp.SetHeight(max(h-len(notices), 1))
+	// A viewport sitting at the bottom follows the rows that land under it; one the user
+	// scrolled up stays where they left it. Read before the content changes: afterwards
+	// every offset short of the new bottom looks scrolled.
+	follow := m.vp.AtBottom()
 	m.vp.SetContentLines(content)
+	if follow {
+		m.vp.GotoBottom()
+	}
 	view := strings.Split(m.vp.View(), "\n")
 	rows := make([]*transcript.Row, len(view))
 	for i := range view {

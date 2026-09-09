@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/vt"
 	"github.com/charmbracelet/x/xpty"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -54,6 +55,11 @@ const (
 
 // screenTail is how much of the terminal a failed wait prints.
 const screenTail = 4000
+
+// scrollbackLines is how much of what has scrolled off the emulated terminal is kept. A
+// rested turn's rows are committed into the scrollback by the inline client, so an answer
+// leaves the screen as soon as enough happens after it; this run never gets near the cap.
+const scrollbackLines = 2000
 
 func TestRealTUIOverPTY(t *testing.T) {
 	if os.Getenv(realEnv) != "1" {
@@ -201,32 +207,58 @@ func buildRudy(t *testing.T, root string) string {
 	return bin
 }
 
-// ptyLog is everything the client has drawn since it started. Inline rendering repaints
-// the live region rather than scrolling it, so what matters is not what is on screen at
-// one instant but whether the terminal has ever been shown a thing: the log keeps the
-// bytes and strips the escape sequences on demand, whole, so a sequence split across two
-// reads is never half stripped.
+// ptyLog is a terminal emulator fed the client's own output, which is what the test reads
+// its assertions off. Stripping the escape sequences out of the raw stream is not the same
+// thing: Bubble Tea's renderer repaints the live region as a diff, emitting a character
+// here and a cursor motion there, so a prompt the user typed is almost never a contiguous
+// run of bytes on the wire. On a screen those cells sit next to each other, which is what
+// a person reading the terminal sees and what a test about the real path should match.
 type ptyLog struct {
 	mu  sync.Mutex
-	raw []byte
+	emu *vt.Emulator
+}
+
+func newPtyLog() *ptyLog {
+	emu := vt.NewEmulator(ptyWidth, ptyHeight)
+	emu.SetScrollbackSize(scrollbackLines)
+	log := &ptyLog{emu: emu}
+	// The emulator answers the mode and device queries a client sends by writing to an
+	// unbuffered pipe of its own, and blocks in Write until somebody reads it. Nothing
+	// here wants those answers: the client under test is talking to a pty, which is what
+	// it hears from, and this emulator is only reading over its shoulder. So the replies
+	// are drained and dropped, and the client sees exactly what a pty with nobody
+	// answering shows it, which is what it saw before this emulator existed. Without the
+	// drain the first query deadlocks the reader against every screen the test reads.
+	go func() { _, _ = io.Copy(io.Discard, emu) }()
+	return log
 }
 
 func (l *ptyLog) write(b []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.raw = append(l.raw, b...)
+	_, _ = l.emu.Write(b)
 }
 
+// text is the whole terminal as plain text: what has scrolled off it, oldest first, then
+// what is on it. Both halves matter, because inline rendering commits a rested turn's rows
+// above the live region and they scroll away as the session goes on.
 func (l *ptyLog) text() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return ansi.Strip(string(l.raw))
+	var b strings.Builder
+	sb := l.emu.Scrollback()
+	for i := range sb.Len() {
+		b.WriteString(sb.Line(i).String())
+		b.WriteByte('\n')
+	}
+	b.WriteString(l.emu.String())
+	return b.String()
 }
 
-// drain reads the pty until the client closes it, which is what ends the goroutine: a
-// terminal nobody reads fills its buffer and stalls the process writing to it.
+// drain reads the pty into the emulator until the client closes it, which is what ends the
+// goroutine: a terminal nobody reads fills its buffer and stalls the process writing to it.
 func drain(pty xpty.Pty) *ptyLog {
-	log := &ptyLog{}
+	log := newPtyLog()
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -253,14 +285,14 @@ func waitFor(t *testing.T, log *ptyLog, want string, d time.Duration, match func
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("waited %s for %s, never saw it; the terminal ended with:\n%s", d, want, tail(log.text()))
+			t.Fatalf("waited %s for %s, never saw it; the terminal read:\n%s", d, want, tail(log.text()))
 		}
 		time.Sleep(pollEvery)
 	}
 }
 
-// hasLine matches a terminal that has drawn want as a whole line. Trimmed, because a row
-// is indented and a pty line ends in a carriage return.
+// hasLine matches a terminal showing want as a whole line. Trimmed, because every row is
+// drawn in the design's left gutter.
 func hasLine(want string) func(string) bool {
 	return func(s string) bool {
 		for line := range strings.SplitSeq(s, "\n") {
@@ -272,8 +304,8 @@ func hasLine(want string) func(string) bool {
 	}
 }
 
-// tail is the last of what was drawn, for a failure message: the whole log is every
-// repaint since the client started and says less than its end does.
+// tail is the end of the terminal, for a failure message: the screen and the last of what
+// scrolled off it, which is what a person would have been looking at.
 func tail(s string) string {
 	if len(s) <= screenTail {
 		return s
@@ -281,8 +313,8 @@ func tail(s string) string {
 	return "..." + s[len(s)-screenTail:]
 }
 
-// typeIn types text and waits for the editor to draw it, so the Enter that follows lands on
-// a draft the client has already read.
+// typeIn types text and waits for the editor to draw it on the terminal, so the Enter that
+// follows lands on a draft the client has already read and redrawn.
 func typeIn(t *testing.T, pty xpty.Pty, log *ptyLog, text string) {
 	t.Helper()
 	press(t, pty, text)
@@ -308,9 +340,9 @@ func waitExit(t *testing.T, cmd *exec.Cmd, log *ptyLog) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("rudy exited %v after ctrl+d; the terminal ended with:\n%s", err, tail(log.text()))
+			t.Fatalf("rudy exited %v after ctrl+d; the terminal read:\n%s", err, tail(log.text()))
 		}
 	case <-time.After(exitWait):
-		t.Fatalf("rudy did not exit within %s of ctrl+d; the terminal ended with:\n%s", exitWait, tail(log.text()))
+		t.Fatalf("rudy did not exit within %s of ctrl+d; the terminal read:\n%s", exitWait, tail(log.text()))
 	}
 }
