@@ -8,8 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -20,6 +23,10 @@ import (
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
+// defaultIdle is how long a stream may go without a byte before the request is cancelled.
+// Same name and value as openaichat's: a stalled provider fails the same way either way.
+const defaultIdle = 120 * time.Second
+
 // Options is one configured Messages endpoint.
 type Options struct {
 	Name    string
@@ -29,28 +36,31 @@ type Options struct {
 	HTTP    *httpx.Client
 }
 
-type Client struct{ opts Options }
+type Client struct {
+	opts Options
+	idle time.Duration
+}
 
 func New(o Options) *Client {
 	o.BaseURL = strings.TrimRight(o.BaseURL, "/")
-	return &Client{opts: o}
+	return &Client{opts: o, idle: defaultIdle}
 }
 
 func (c *Client) Name() string { return c.opts.Name }
 
-// sdk builds the SDK client for one request. Its transport is httpx bound to the session id,
-// so every request carries rudy's User-Agent, X-Rudy-Session and retry policy and the SDK
+// sdk builds the SDK client for one request, sending through the doer the caller built.
+// Every request carries rudy's User-Agent, X-Rudy-Session and retry policy and the SDK
 // retries nothing itself. WithoutEnvironmentDefaults turns off the SDK's own credential
 // autoload (ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL, ANTHROPIC_PROFILE, the profile files under
 // the home directory): what rudy sends is what config.toml configured, never what happens to
 // be in the environment. headers are the extra headers a before_request hook produced and are
 // applied last, so a hook can override a configured header.
-func (c *Client) sdk(sessionID ulid.ULID, headers map[string]string) anthropic.Client {
+func (c *Client) sdk(d *doer, headers map[string]string) anthropic.Client {
 	opts := []option.RequestOption{
 		option.WithoutEnvironmentDefaults(),
 		option.WithBaseURL(c.opts.BaseURL),
 		option.WithMaxRetries(0),
-		option.WithHTTPClient(&doer{c: c.opts.HTTP, sid: sessionID}),
+		option.WithHTTPClient(d),
 	}
 	if c.opts.APIKey != "" {
 		opts = append(opts, option.WithAPIKey(c.opts.APIKey))
@@ -64,23 +74,44 @@ func (c *Client) sdk(sessionID ulid.ULID, headers map[string]string) anthropic.C
 	return anthropic.NewClient(opts...)
 }
 
-// doer is the SDK's option.HTTPClient over httpx. The SDK builds the request and carries the
-// caller's context on it, which is the context httpx sends it under.
+// doer is the SDK's option.HTTPClient over httpx, and the only place that holds a response:
+// the SDK owns everything from there on, so the idle timeout and the attempt count are read
+// back off the doer rather than off a response the codec never sees. One doer serves one
+// Complete or one ListModels, whose requests it makes in the caller's own goroutine.
 type doer struct {
-	c   *httpx.Client
-	sid ulid.ULID
+	c    *httpx.Client
+	sid  ulid.ULID
+	idle time.Duration
+	body io.ReadCloser // the last response body, wrapped with the idle timeout
+	sent int           // attempts httpx made for the last response
 }
 
+// Do sends under a context of its own so the idle timer can cancel this one request without
+// touching the caller's. The SDK carries the caller's context on the request it built.
 func (d *doer) Do(req *http.Request) (*http.Response, error) {
-	return d.c.Do(req.Context(), req, d.sid)
+	ctx, cancel := context.WithCancel(req.Context())
+	resp, err := d.c.Do(ctx, req, d.sid)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	d.sent = httpx.AttemptsOf(resp)
+	d.body = httpx.IdleBody(resp.Body, d.idle, cancel)
+	resp.Body = d.body
+	return resp, nil
 }
+
+// idleFired reports whether the last response died of silence rather than anything the
+// provider said.
+func (d *doer) idleFired() bool { return httpx.IdleFired(d.body) }
 
 func (c *Client) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
 	params, err := buildParams(req)
 	if err != nil {
 		return err
 	}
-	sdk := c.sdk(req.SessionID, req.Headers)
+	d := &doer{c: c.opts.HTTP, sid: req.SessionID, idle: c.idle}
+	sdk := c.sdk(d, req.Headers)
 	stream := sdk.Messages.NewStreaming(ctx, params)
 	defer func() { _ = stream.Close() }()
 	st := newStreamState(emit)
@@ -91,6 +122,13 @@ func (c *Client) Complete(ctx context.Context, req provider.Request, emit func(p
 		}
 	}
 	if err := stream.Err(); err != nil {
+		if d.idleFired() {
+			return &provider.Error{
+				Class:    session.ErrTransport,
+				Message:  fmt.Sprintf("idle timeout after %s", c.idle),
+				Attempts: attempts(d.sent),
+			}
+		}
 		return classify(ctx, err)
 	}
 	return st.finish()
@@ -142,5 +180,9 @@ func errorMessage(body []byte, status int) string {
 	if err := json.Unmarshal(body, &env); err == nil && env.Error.Message != "" {
 		return env.Error.Message
 	}
-	return http.StatusText(status)
+	if text := http.StatusText(status); text != "" {
+		return text
+	}
+	// 529 and the rest of the unregistered statuses have no text at all.
+	return fmt.Sprintf("HTTP %d", status)
 }

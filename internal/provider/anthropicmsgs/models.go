@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -16,7 +15,7 @@ import (
 // registry shows a model without a cost. Every model the Messages API serves takes tools,
 // images and extended thinking, so the capabilities are not a guess.
 func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
-	sdk := c.sdk(ulid.ULID{}, nil)
+	sdk := c.sdk(&doer{c: c.opts.HTTP, idle: c.idle}, nil)
 	pager := sdk.Models.ListAutoPaging(ctx, anthropic.ModelListParams{})
 	var out []provider.Model
 	for pager.Next() {

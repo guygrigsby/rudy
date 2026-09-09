@@ -11,7 +11,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -21,13 +23,14 @@ import (
 
 func TestCompleteStreamsTextAndToolUse(t *testing.T) {
 	var got struct {
+		raw     []byte
 		body    map[string]any
 		headers http.Header
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got.headers = r.Header.Clone()
-		b, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(b, &got.body)
+		got.raw, _ = io.ReadAll(r.Body)
+		_ = json.Unmarshal(got.raw, &got.body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		f, _ := os.ReadFile("testdata/text-tool-stream.sse")
 		_, _ = w.Write(f)
@@ -55,11 +58,15 @@ func TestCompleteStreamsTextAndToolUse(t *testing.T) {
 	if got.body["stream"] != true || got.body["max_tokens"] != float64(100) || got.body["model"] != "claude-sonnet-5" {
 		t.Errorf("body %v", got.body)
 	}
-	tools := got.body["tools"].([]any)
-	schema, _ := json.Marshal(tools[0].(map[string]any)["input_schema"])
-	if string(schema) != `{"additionalProperties":false,"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"}` {
-		t.Errorf("schema re-encoded differently: %s", schema)
+	// The schema and the tool input are asserted on the bytes that left, not on a map they
+	// were decoded into: a codec that re-encoded either one would pass that.
+	if !strings.Contains(string(got.raw), `"input_schema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`) {
+		t.Errorf("schema not verbatim on the wire: %s", got.raw)
 	}
+	if !strings.Contains(string(got.raw), `{"type":"tool_use","id":"toolu_00","name":"read","input":{"path":"a"}}`) {
+		t.Errorf("tool_use input not verbatim on the wire: %s", got.raw)
+	}
+	tools := got.body["tools"].([]any)
 	if tools[0].(map[string]any)["name"] != "read" || tools[0].(map[string]any)["description"] != "Read" {
 		t.Errorf("tool %v", tools[0])
 	}
@@ -69,11 +76,8 @@ func TestCompleteStreamsTextAndToolUse(t *testing.T) {
 	}
 	msgs := got.body["messages"].([]any)
 	asst := msgs[1].(map[string]any)["content"].([]any)
-	if asst[0].(map[string]any)["signature"] != "SIG" || asst[1].(map[string]any)["input"].(map[string]any)["path"] != "a" {
+	if asst[0].(map[string]any)["signature"] != "SIG" || asst[0].(map[string]any)["thinking"] != "hm" {
 		t.Errorf("assistant content %v", asst)
-	}
-	if asst[1].(map[string]any)["id"] != "toolu_00" || asst[1].(map[string]any)["name"] != "read" || asst[1].(map[string]any)["type"] != "tool_use" {
-		t.Errorf("tool_use block %v", asst[1])
 	}
 	if len(msgs) != 3 || msgs[2].(map[string]any)["role"] != "user" {
 		t.Errorf("tool result must be its own user message: %v", msgs)
@@ -237,5 +241,159 @@ func TestCompleteRefusesImageBlocks(t *testing.T) {
 	err := c.Complete(context.Background(), req, func(provider.Part) error { return nil })
 	if !errors.Is(err, errImageUnsupported) {
 		t.Fatalf("error %v", err)
+	}
+}
+
+func TestBuildParamsSkipsUnsignedThinking(t *testing.T) {
+	req := provider.Request{
+		Model: session.ModelRef{Provider: "anth", Model: "claude-sonnet-5"}, MaxTokens: 100,
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("hi")}},
+			{Role: provider.RoleAssistant, Content: []session.Block{
+				{Type: session.BlockThinking, Text: "unsigned reasoning"},
+				{Type: session.BlockThinking, Text: "signed reasoning", Signature: "SIG"},
+				session.TextBlock("answer"),
+			}},
+		},
+	}
+	p, err := buildParams(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A thinking block with no signature is refused by the API, and a session that moved here
+	// from a provider that signs nothing carries one on every request.
+	if strings.Contains(string(body), "unsigned reasoning") {
+		t.Errorf("unsigned thinking reached the wire: %s", body)
+	}
+	if !strings.Contains(string(body), `{"signature":"SIG","thinking":"signed reasoning","type":"thinking"}`) {
+		t.Errorf("signed thinking must still be sent: %s", body)
+	}
+	if !strings.Contains(string(body), `{"text":"answer","type":"text"}`) {
+		t.Errorf("text must still be sent: %s", body)
+	}
+}
+
+func TestMapStop(t *testing.T) {
+	cases := map[string]session.StopReason{
+		"end_turn":                      session.StopEndTurn,
+		"stop_sequence":                 session.StopEndTurn,
+		"tool_use":                      session.StopToolUse,
+		"max_tokens":                    session.StopMaxTokens,
+		"refusal":                       session.StopRefused,
+		"model_context_window_exceeded": session.StopOther,
+		"":                              session.StopOther,
+	}
+	for raw, want := range cases {
+		if got := mapStop(raw); got != want {
+			t.Errorf("mapStop(%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestStreamRefusalKeepsTheRawStopReason(t *testing.T) {
+	var parts []provider.Part
+	s := newStreamState(func(p provider.Part) error { parts = append(parts, p); return nil })
+	var ev anthropic.MessageStreamEventUnion
+	if err := json.Unmarshal([]byte(`{"type":"message_delta","delta":{"stop_reason":"refusal"},"usage":{"output_tokens":3}}`), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.event(ev); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.finish(); err != nil {
+		t.Fatal(err)
+	}
+	stop := parts[len(parts)-1]
+	if stop.Type != provider.PartStop || stop.StopReason != session.StopRefused || stop.StopReasonRaw != "refusal" {
+		t.Fatalf("stop %+v", stop)
+	}
+}
+
+func TestCompleteIdleTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":25}}}\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := New(Options{Name: "anth", BaseURL: srv.URL, APIKey: "k", HTTP: httpx.New("test")})
+	c.idle = 50 * time.Millisecond
+
+	var got []provider.Part
+	start := time.Now()
+	err := c.Complete(context.Background(), provider.Request{
+		Model:     session.ModelRef{Provider: "anth", Model: "claude-sonnet-5"},
+		MaxTokens: 100,
+		Messages:  []provider.Message{{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("hi")}}},
+		SessionID: ulid.Make(),
+	}, func(p provider.Part) error { got = append(got, p); return nil })
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("waited %s for a 50ms idle timeout", d)
+	}
+	var perr *provider.Error
+	if !errors.As(err, &perr) || perr.Class != session.ErrTransport || !strings.Contains(perr.Message, "idle timeout") {
+		t.Fatalf("want idle transport error, got %v", err)
+	}
+	if len(got) != 1 || got[0].Type != provider.PartUsage {
+		t.Fatalf("parts before the timeout = %+v", got)
+	}
+}
+
+func TestRetriedStatusCarriesTheAttemptCount(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"Upstream busy"}}`)
+	}))
+	defer srv.Close()
+	h := httpx.New("test")
+	h.Sleep = func(time.Duration) {}
+	c := New(Options{Name: "anth", BaseURL: srv.URL, APIKey: "k", HTTP: h})
+
+	err := c.Complete(context.Background(), provider.Request{
+		Model:     session.ModelRef{Provider: "anth", Model: "claude-sonnet-5"},
+		MaxTokens: 100,
+		Messages:  []provider.Message{{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("hi")}}},
+		SessionID: ulid.Make(),
+	}, func(provider.Part) error { return nil })
+	var perr *provider.Error
+	if !errors.As(err, &perr) {
+		t.Fatalf("error %v (%T)", err, err)
+	}
+	// httpx retries 503 five times and hands back the last response; the SDK adds none.
+	if perr.Class != session.ErrProvider || perr.Status != http.StatusServiceUnavailable || perr.Message != "Upstream busy" || perr.Attempts != 5 {
+		t.Errorf("provider error %+v", perr)
+	}
+	if hits != 5 {
+		t.Errorf("server saw %d requests, want 5", hits)
+	}
+}
+
+func TestErrorMessageFallsBackToTheStatus(t *testing.T) {
+	cases := []struct {
+		body   string
+		status int
+		want   string
+	}{
+		{`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`, 529, "Overloaded"},
+		// 529 is not a registered status, so http.StatusText has nothing to say about it.
+		{`{"type":"error","error":{"type":"overloaded_error"}}`, 529, "HTTP 529"},
+		{"", 503, "Service Unavailable"},
+		{"<html>gateway</html>", 502, "Bad Gateway"},
+	}
+	for _, c := range cases {
+		if got := errorMessage([]byte(c.body), c.status); got != c.want {
+			t.Errorf("errorMessage(%q, %d) = %q, want %q", c.body, c.status, got, c.want)
+		}
 	}
 }

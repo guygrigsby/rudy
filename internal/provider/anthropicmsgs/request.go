@@ -99,6 +99,13 @@ func buildMessage(m provider.Message) (anthropic.MessageParam, error) {
 			case session.BlockText:
 				blocks = append(blocks, anthropic.NewTextBlock(b.Text))
 			case session.BlockThinking:
+				// A thinking block without its signature is refused by the API, and one
+				// turns up whenever a session moves here from a provider that signs
+				// nothing. Dropping it costs the model that reasoning; sending it costs
+				// the whole request.
+				if b.Signature == "" {
+					continue
+				}
 				blocks = append(blocks, anthropic.NewThinkingBlock(b.Signature, b.Text))
 			case session.BlockToolUse:
 				blocks = append(blocks, param.Override[anthropic.ContentBlockParamUnion](rawToolUse{

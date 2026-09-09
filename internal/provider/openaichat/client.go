@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -96,13 +95,13 @@ func (c *Client) Complete(ctx context.Context, req provider.Request, emit func(p
 		return unwrapEmit(c.completeJSON(resp, emit))
 	}
 
-	idle := newIdleReader(resp.Body, c.idle, cancel)
-	defer idle.stop()
+	idle := httpx.IdleBody(resp.Body, c.idle, cancel)
+	defer func() { _ = idle.Close() }()
 	err = readSSE(idle, newStreamState(emit))
 	switch {
 	case err == nil:
 		return nil
-	case idle.fired():
+	case httpx.IdleFired(idle):
 		return &provider.Error{Class: session.ErrTransport, Message: fmt.Sprintf("idle timeout after %s", c.idle), Attempts: httpx.AttemptsOf(resp)}
 	case parent.Err() != nil:
 		return parent.Err()
@@ -213,30 +212,3 @@ func errorMessage(body []byte) string {
 	}
 	return ""
 }
-
-// idleReader cancels the request when no bytes arrive for d. The cancel makes
-// the blocked Read return, and fired tells the caller why.
-type idleReader struct {
-	r     io.Reader
-	d     time.Duration
-	timer *time.Timer
-	fire  atomic.Bool
-}
-
-func newIdleReader(r io.Reader, d time.Duration, cancel context.CancelFunc) *idleReader {
-	ir := &idleReader{r: r, d: d}
-	ir.timer = time.AfterFunc(d, func() {
-		ir.fire.Store(true)
-		cancel()
-	})
-	return ir
-}
-
-func (ir *idleReader) Read(p []byte) (int, error) {
-	n, err := ir.r.Read(p)
-	ir.timer.Reset(ir.d)
-	return n, err
-}
-
-func (ir *idleReader) stop()       { ir.timer.Stop() }
-func (ir *idleReader) fired() bool { return ir.fire.Load() }

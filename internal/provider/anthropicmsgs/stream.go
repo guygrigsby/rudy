@@ -89,6 +89,8 @@ func mapStop(raw string) session.StopReason {
 		return session.StopToolUse
 	case "max_tokens":
 		return session.StopMaxTokens
+	case "refusal":
+		return session.StopRefused
 	}
 	return session.StopOther
 }
