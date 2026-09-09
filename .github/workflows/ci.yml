@@ -8,15 +8,14 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
-      # rudy's go.mod replaces github.com/aeryx-ai/memory/memory-go with ../memory/memory-go
-      # and github.com/guygrigsby/vimbubble/v2 with ../vimbubble/v2, so the three
-      # repositories are checked out side by side under the workspace: rudy/, memory/ and
-      # vimbubble/, which makes both relative paths resolve from rudy/. A path outside the
-      # workspace is not allowed, so no checkout can use ../.
+      # rudy's go.mod replaces github.com/aeryx-ai/memory/memory-go with ../memory/memory-go,
+      # so the two repositories are checked out side by side under the workspace: rudy/ and
+      # memory/, which makes ../memory/memory-go resolve from rudy/. A path outside the
+      # workspace is not allowed, so neither checkout can use ../.
       #
-      # This job cannot pass until both siblings are pushed. aeryx-ai/memory does not exist
-      # yet, so its checkout 404s; guygrigsby/vimbubble exists but its origin/main has no
-      # v2/ directory yet, so ../vimbubble/v2 will not resolve until the v2 port is pushed.
+      # This job cannot pass until the memory repository is pushed to aeryx-ai/memory; the
+      # checkout below fails with a 404 against a repository that does not exist yet.
+      # vimbubble v2 is required from GitHub, no sibling needed.
       - uses: actions/checkout@v4
         with:
           path: rudy
@@ -24,10 +23,6 @@ jobs:
         with:
           repository: aeryx-ai/memory
           path: memory
-      - uses: actions/checkout@v4
-        with:
-          repository: guygrigsby/vimbubble
-          path: vimbubble
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"

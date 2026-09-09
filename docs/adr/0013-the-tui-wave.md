@@ -103,7 +103,9 @@ the plan for the client surfaced decisions ADR 0006 leaves open:
 - Inline mode cannot re-expand a row once its turn committed; altscreen
   can. Documented in the design's Client section.
 - Two local `replace` directives now (memory-go, vimbubble v2) until both
-  are pushed; `make check` needs both sibling checkouts.
+  are pushed; `make check` needs both sibling checkouts. 2026-09-09: vimbubble
+  v2 pushed; rudy requires it by pseudo-version and the replace is gone, so
+  only the memory-go sibling remains.
 - A standing permission question takes `y`, `a` and `n` ahead of the editor's
   mode, so the answer lands in vim normal mode as well as in insert. A
   divergence from ADR 0006's Esc layering, where the mode reads a key first,

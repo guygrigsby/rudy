@@ -17,7 +17,7 @@ require (
 	github.com/charmbracelet/x/exp/teatest/v2 v2.0.0-20260906004030-3986e9119cf9
 	github.com/charmbracelet/x/vt v0.0.0-20260906004030-3986e9119cf9
 	github.com/charmbracelet/x/xpty v0.1.4
-	github.com/guygrigsby/vimbubble/v2 v2.0.0
+	github.com/guygrigsby/vimbubble/v2 v2.0.0-20260909172522-60c478e36763
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/oklog/ulid/v2 v2.1.2
 	github.com/pelletier/go-toml/v2 v2.2.4
@@ -83,5 +83,3 @@ require (
 )
 
 replace github.com/aeryx-ai/memory/memory-go => ../memory/memory-go
-
-replace github.com/guygrigsby/vimbubble/v2 => ../vimbubble/v2
