@@ -106,8 +106,15 @@ func TestRealServeAcrossProcesses(t *testing.T) {
 	waitFor(t, rlog, "the resumed transcript to carry the answer through "+countLast, firstFrameWait, func(s string) bool {
 		return strings.Contains(strings.ToLower(s), countLast)
 	})
-	press(t, rpty, keyCtrlD)
+	// /exit rather than ctrl+d: the client's own command closes the client and nothing
+	// else, so the daemon and the session it holds are still there to be stopped below
+	// (ADR 0015 decision 3).
+	typeIn(t, rpty, rlog, slashCommand)
+	press(t, rpty, keyEnter)
 	waitExit(t, resumed, rlog)
+	if !daemonAlive(d) {
+		t.Fatal("/exit closes the client, never the daemon it was attached to")
+	}
 
 	// The daemon stops clean on a signal and takes its socket with it.
 	stopDaemon(t, d)
@@ -197,6 +204,20 @@ func startDaemon(t *testing.T, bin, dir string, env []string, socket string) *da
 }
 
 // stopDaemon sends the signal an operator's Ctrl-C sends and takes the exit code.
+// daemonAlive reports whether the daemon is still running: its Wait has not answered yet.
+// A client that exited is the only thing that could have taken it down, which is what the
+// caller is asserting it did not.
+func daemonAlive(d *daemon) bool {
+	select {
+	case err := <-d.done:
+		// Put it back, so stopDaemon reads the same answer and reports it.
+		d.done <- err
+		return false
+	default:
+		return true
+	}
+}
+
 func stopDaemon(t *testing.T, d *daemon) {
 	t.Helper()
 	if err := d.cmd.Process.Signal(os.Interrupt); err != nil {

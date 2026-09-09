@@ -1079,6 +1079,23 @@ stateDiagram-v2
     visual --> normal: Esc, an operator
 ```
 
+## CommandMenu
+
+Value object on the client, derived from the draft. The slash completion standing between `above_editor` and `input`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `commands` | [{name, description}] | What `command.list` answered, in registration order, then the client's own |
+| `selected` | int | The row the keyboard is on, inside the rows the draft matches now |
+| `dismissedFor` | string | The draft an Esc dismissed the menu for; any other draft opens it again |
+
+### Invariants
+
+- It stands only while the draft opens with `/` and carries no whitespace: a draft past the name is an argument, and arguments have no completion source.
+- The editor keeps the keyboard while it stands. The menu takes the select keys, tab and Enter, and leaves every other key to the draft being typed.
+- Enter completes a name that is still a prefix and submits one already whole.
+- `exit` and `quit` are the client's own: they never reach the server, and they shadow a registered command of the same name. ADR 0015.
+
 ## TurnControl
 
 Value object on the client. What Esc does depends on it.
@@ -1125,6 +1142,7 @@ erDiagram
     REGISTRY_SNAPSHOT ||--|{ MODEL : contains
     PLUGIN ||--|{ TOOL : owns
     PLUGIN ||--|{ SLASH_COMMAND : owns
+    COMMAND_MENU }o--o{ SLASH_COMMAND : lists
     PLUGIN ||--|{ HOOK_HANDLER : owns
     PLUGIN ||--|{ WIDGET : owns
     PLUGIN ||--|{ STATUS_ITEM : owns

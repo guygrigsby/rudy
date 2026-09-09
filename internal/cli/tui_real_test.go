@@ -53,6 +53,14 @@ const (
 	keyCtrlD = "\x04"
 )
 
+// altScreenEnter is the sequence a client sends to take the whole terminal, which is what
+// ui.render = "altscreen" means on the wire and what the default now does (ADR 0015).
+const altScreenEnter = "\x1b[?1049h"
+
+// slashCommand is the one this run completes and then runs: /exit is the client's own, so
+// it needs no provider and it is what ends the process.
+const slashCommand = "/exit"
+
 // screenTail is how much of the terminal a failed wait prints.
 const screenTail = 4000
 
@@ -98,6 +106,12 @@ func TestRealTUIOverPTY(t *testing.T) {
 		return strings.Contains(s, "INSERT") && strings.Contains(s, ref)
 	})
 
+	// Full screen: the client took the alternate buffer, which is what every other
+	// harness does on startup and what the default ui.render now asks for.
+	if !log.wrote(altScreenEnter) {
+		t.Fatalf("the client opens full screen; it never entered the alternate buffer. the terminal read:\n%s", tail(log.text()))
+	}
+
 	const prompt = "Reply with exactly: ok"
 	typeIn(t, pty, log, prompt)
 	press(t, pty, keyEnter)
@@ -114,9 +128,20 @@ func TestRealTUIOverPTY(t *testing.T) {
 		return strings.Contains(s, "compacted ") || strings.Contains(s, "nothing to compact")
 	})
 
-	// No Esc pair: the compact notice means the turn rested, and app.exit does not care
-	// about the editor's mode, only that it is empty, which submitting left it.
-	press(t, pty, keyCtrlD)
+	// The slash menu: a lone slash lists every registered command with what it does, and
+	// the client's own two under them (ADR 0015 decision 4).
+	typeIn(t, pty, log, "/")
+	waitFor(t, log, "the slash menu", drawWait, func(s string) bool {
+		return strings.Contains(s, "/help") && strings.Contains(s, "List the slash commands")
+	})
+	// Typing the rest filters it to one, and Enter on a name already whole runs it rather
+	// than completing what is already complete. ctrl+d is the other way out and is proven
+	// in this package's unit tests; a run has only one exit to spend.
+	typeIn(t, pty, log, strings.TrimPrefix(slashCommand, "/"))
+	waitFor(t, log, "the menu filtered to "+slashCommand, drawWait, func(s string) bool {
+		return strings.Contains(s, "Close the client") && !strings.Contains(s, "List the slash commands")
+	})
+	press(t, pty, keyEnter)
 	waitExit(t, cmd, log)
 }
 
@@ -216,6 +241,10 @@ func buildRudy(t *testing.T, root string) string {
 type ptyLog struct {
 	mu  sync.Mutex
 	emu *vt.Emulator
+	// raw is every byte the client wrote, kept beside the decoded screen for the
+	// assertions a screen cannot make: entering the alternate buffer is a sequence, not
+	// a character anybody can read off the terminal.
+	raw []byte
 }
 
 func newPtyLog() *ptyLog {
@@ -236,6 +265,7 @@ func newPtyLog() *ptyLog {
 func (l *ptyLog) write(b []byte) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.raw = append(l.raw, b...)
 	_, _ = l.emu.Write(b)
 }
 
@@ -253,6 +283,14 @@ func (l *ptyLog) text() string {
 	}
 	b.WriteString(l.emu.String())
 	return b.String()
+}
+
+// wrote reports whether the client has written this sequence, whatever the screen made
+// of it.
+func (l *ptyLog) wrote(seq string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Contains(string(l.raw), seq)
 }
 
 // drain reads the pty into the emulator until the client closes it, which is what ends the
@@ -340,9 +378,9 @@ func waitExit(t *testing.T, cmd *exec.Cmd, log *ptyLog) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("rudy exited %v after ctrl+d; the terminal read:\n%s", err, tail(log.text()))
+			t.Fatalf("rudy exited %v after the exit command; the terminal read:\n%s", err, tail(log.text()))
 		}
 	case <-time.After(exitWait):
-		t.Fatalf("rudy did not exit within %s of ctrl+d; the terminal read:\n%s", exitWait, tail(log.text()))
+		t.Fatalf("rudy did not exit within %s of the exit command; the terminal read:\n%s", exitWait, tail(log.text()))
 	}
 }
