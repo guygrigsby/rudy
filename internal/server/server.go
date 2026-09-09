@@ -456,7 +456,12 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	}
 	cn.hello = true
 	cn.greeted = true
-	cn.asker = p.Asker
+	// A plugin connection is never an asker, whatever it claims: the plugin that opens a
+	// child session is the one waiting on that child's tool call, so routing that child's
+	// permission question back to it would park the question behind its own answer. The
+	// human's connection is the only one that can answer, and firstAsker skips plugin
+	// connections for the same reason.
+	cn.asker = p.Asker && cn.plugin == ""
 	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version}, nil
 }
 
@@ -681,7 +686,21 @@ func (s *Server) handleCompact(ctx context.Context, raw json.RawMessage) (any, *
 // mu is exactly what stops a turn from starting underneath. No Runner method is called while
 // it is held, and the active-turn check reads the mirrored state, as liveSession's lock
 // discipline requires.
+//
+// A detach landing during that call finds ls.mu held and leaves the session alone rather than
+// waiting on it (see claimCloseIfIdle), so the close check runs again here once the lock is
+// free: otherwise a session whose last subscriber left mid-compaction would stay live, and
+// hold its flock, for the rest of the process.
 func (s *Server) compact(ctx context.Context, ls *liveSession, instructions string) (session.Entry, int, *protocol.Error) {
+	e, n, cerr := s.compactHoldingSession(ctx, ls, instructions)
+	s.mu.Lock()
+	s.closeIfUnusedLocked(ls)
+	return e, n, cerr
+}
+
+// compactHoldingSession is compact's body, under ls.mu from the first check to the mirrored
+// entry.
+func (s *Server) compactHoldingSession(ctx context.Context, ls *liveSession, instructions string) (session.Entry, int, *protocol.Error) {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	if ls.closed {
@@ -948,9 +967,11 @@ func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agen
 }
 
 // applyAgent stamps a definition onto a session that is not yet shared: its tool view, its
-// system prompt and its step limit. A child never sees the agent tool, which is what keeps
-// subagent depth at one - with no tool to call, a child cannot open a grandchild, so no
-// further check is needed anywhere else.
+// system prompt and its step limit. A child never sees the agent tool, even when its
+// definition lists it, and this deny is the only place that removal happens: it is what keeps
+// subagent depth at one, and with no tool to call a child cannot open a grandchild, so no
+// further check is needed anywhere else. A root session under the same definition keeps the
+// tool; dispatching subagents is what such a definition is for.
 func (s *Server) applyAgent(ls *liveSession, def agentdef.Definition) {
 	var deny []string
 	if ls.parent != nil || openedAsChild(ls.entries) {
@@ -982,17 +1003,20 @@ func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 
 // parentSessionIDOf reads the parent a session was opened under off the log rather than off
 // the live parent, which a resumed session no longer has: a child resumed long after the
-// session that spawned it is gone is still a child. A forked session, whose first entry is a
-// fork_point, has no parent in this sense.
+// session that spawned it is gone is still a child.
+//
+// It is the first session_opened in the entries, not the first entry: a fork begins with a
+// fork_point and carries the entries it inherited behind it, session_opened included, so a
+// fork of a child is a child too. It has the same parent, the same agent deny and the same
+// standing with a plugin folding memory over root sessions; reading entry zero made it look
+// like a root.
 func parentSessionIDOf(entries []session.Entry) string {
-	if len(entries) == 0 {
-		return ""
+	for _, e := range entries {
+		if o, ok := e.Payload.(session.SessionOpened); ok {
+			return o.ParentSessionID
+		}
 	}
-	o, ok := entries[0].Payload.(session.SessionOpened)
-	if !ok {
-		return ""
-	}
-	return o.ParentSessionID
+	return ""
 }
 
 // openedAsChild is parentSessionIDOf as the predicate the open path gates on: a child has no

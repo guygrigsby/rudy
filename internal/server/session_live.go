@@ -167,10 +167,15 @@ func (ls *liveSession) hookContextSuffixLocked() string {
 // obsMu); the walk up the parent chain takes each ancestor's obsMu in turn, never holding two
 // at once, and the chain is only ever one link long (a child has no agent tool to open a
 // grandchild with).
+//
+// A plugin connection is never the asker, whatever its hello said: the plugin that opened a
+// child session is the one waiting on that child's answer, so routing the child's question
+// back to it would park the question behind the tool call it is the answer to. handleHello
+// refuses the claim at the door too; this is the second half of the same rule.
 func (ls *liveSession) firstAsker() *conn {
 	ls.obsMu.Lock()
 	for _, c := range ls.conns {
-		if c.asker {
+		if c.asker && c.plugin == "" {
 			ls.obsMu.Unlock()
 			return c
 		}
@@ -317,8 +322,16 @@ func (ls *liveSession) closeIfOpen(before func()) error {
 // it, refusing while a turn still owns the session or somebody else has already claimed it.
 // detach uses it instead of closeIfOpen because it has to make that decision while still
 // holding Server.mu, and do the closing itself after releasing it (see detach).
+//
+// The lock is tried, not taken: the caller holds Server.mu, and session.compact holds ls.mu
+// across a whole provider request, so waiting here would stall every session lookup in the
+// process for the length of a summary. A held ls.mu is read as busy, which is what it means:
+// a compaction owns the session the way a turn does, and compact runs this again once it has
+// let go, so a session whose last subscriber left mid-compaction still closes.
 func (ls *liveSession) claimCloseIfIdle() bool {
-	ls.mu.Lock()
+	if !ls.mu.TryLock() {
+		return false
+	}
 	defer ls.mu.Unlock()
 	st, _ := ls.mirroredState()
 	if ls.closed || (ls.runner != nil && isActive(st)) {

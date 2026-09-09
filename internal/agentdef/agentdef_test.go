@@ -47,8 +47,10 @@ func TestLoadRejectsBadFrontmatter(t *testing.T) {
 	if len(errs) != 2 || len(defs) != 1 {
 		t.Fatalf("defs %v errs %v", defs, errs)
 	}
-	if !reflect.DeepEqual(defs["agent"].Tools, []string{"read"}) {
-		t.Errorf("agent never in tools: %v", defs["agent"].Tools)
+	// The definition is read as written: a root session under it may call agent. Only a child
+	// is denied the tool, and the server is what denies it.
+	if !reflect.DeepEqual(defs["agent"].Tools, []string{"agent", "read"}) {
+		t.Errorf("tools list must be kept as written: %v", defs["agent"].Tools)
 	}
 }
 

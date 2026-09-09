@@ -1,11 +1,13 @@
 package server
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/turn"
@@ -75,5 +77,56 @@ func TestMarkStartingBeforeAnyObserverCallback(t *testing.T) {
 	ls.mu.Unlock()
 	if !installed {
 		t.Fatal("runner not installed")
+	}
+}
+
+// TestFirstAskerNeverAPluginConnection: a plugin connection can send a hello of its own, and
+// the one that opened a child session is the connection subscribed to it. Routing that child's
+// permission question there would park it behind the tool call it is the answer to, so the
+// question walks up to the parent's human instead. handleHello refuses the claim at the door
+// as well; both halves are asserted here.
+func TestFirstAskerNeverAPluginConnection(t *testing.T) {
+	srv := New(Deps{Version: "test"})
+
+	pluginConn := newConn(1, nil)
+	pluginConn.plugin = "subagents"
+	pluginConn.hello = true
+	raw, err := json.Marshal(protocol.ClientHelloParams{Client: "subagents", Version: "test", Asker: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, e := srv.handleHello(pluginConn, raw); e != nil {
+		t.Fatalf("hello: %v", e)
+	}
+	if pluginConn.asker {
+		t.Error("a plugin connection claimed asker and the server believed it")
+	}
+
+	clientConn := newConn(2, nil)
+	if _, e := srv.handleHello(clientConn, raw); e != nil {
+		t.Fatalf("hello: %v", e)
+	}
+	if !clientConn.asker {
+		t.Fatal("a client connection that declared asker must be one")
+	}
+
+	// The plugin subscribed first, so order alone would pick it.
+	parent := &liveSession{}
+	parent.conns = []*conn{pluginConn, clientConn}
+	child := &liveSession{parent: parent}
+	// Even with the flag set by hand, the walk skips a plugin connection.
+	pluginConn.asker = true
+	child.conns = []*conn{pluginConn}
+	if got := child.firstAsker(); got != clientConn {
+		t.Errorf("child asker = %+v, want the parent's client connection", got)
+	}
+	if got := parent.firstAsker(); got != clientConn {
+		t.Errorf("parent asker = %+v, want its client connection", got)
+	}
+	// A session whose only subscriber is a plugin has no asker at all, which is a deny.
+	lone := &liveSession{}
+	lone.conns = []*conn{pluginConn}
+	if got := lone.firstAsker(); got != nil {
+		t.Errorf("lone plugin session asker = %+v, want none", got)
 	}
 }

@@ -2084,6 +2084,77 @@ func TestShutdownYieldsACompactionInFlight(t *testing.T) {
 	}
 }
 
+// TestDetachDuringCompactionClosesTheSession: a compaction holds the session lock across a
+// whole provider request. The connection that leaves in the middle of one must not wait on
+// that lock (it is held while Server.mu is held, so waiting would stall every session lookup
+// in the process), and the session it left must still close once the compaction is done.
+func TestDetachDuringCompactionClosesTheSession(t *testing.T) {
+	prov := &scriptProvider{
+		textOnly:    true,
+		summary:     make(chan struct{}),
+		summaryHit:  make(chan struct{}, 1),
+		summaryDone: make(chan struct{}),
+	}
+	h := newHarness(t, prov)
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	sid := mustULID(t, info.SessionID)
+	for range 2 {
+		runTurn(t, cl, info.SessionID, "go")
+	}
+	// The compaction runs on a second connection: dispatch is serial per connection, so the
+	// close below would queue behind it on this one whatever the locks did.
+	other := h.dial(t, false)
+	go func() {
+		var res server.EntryIDResult
+		_ = other.Call(context.Background(), protocol.MethodSessionCompact, protocol.SessionCompactParams{SessionID: info.SessionID}, &res)
+	}()
+	select {
+	case <-prov.summaryHit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the summary request never started")
+	}
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- cl.Call(context.Background(), protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{})
+	}()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		close(prov.summary)
+		t.Fatal("session.close waited on the lock the compaction was holding")
+	}
+	// Still live: the compaction owns the session the way a turn does, so the detach left it
+	// alone rather than closing it underneath.
+	if s, err := session.Load(h.store, sid); !errors.Is(err, session.ErrLocked) {
+		if err == nil {
+			_ = s.Close()
+		}
+		close(prov.summary)
+		t.Fatalf("session should still be held while it is being compacted, got %v", err)
+	}
+	close(prov.summary)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s, err := session.Load(h.store, sid)
+		if err == nil {
+			_ = s.Close()
+			return
+		}
+		if !errors.Is(err, session.ErrLocked) {
+			t.Fatalf("load: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the session was never closed after the compaction ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // agentProvider scripts two sessions at once, by session id: the first session it sees (the
 // root) calls the agent tool and then answers with text; every other session (the child the
 // agent tool opened) calls the unsafe echo tool and then answers "child done".
@@ -2155,7 +2226,7 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 		parts = call("tu_probe", "probe", `{}`)
 	case root:
 		parts = answer("root done")
-	case n == 1:
+	case n == 1 && !hasToolUse(req.Messages, "tu_echo"):
 		parts = call("tu_echo", "echo", `{}`)
 	default:
 		parts = answer("child done")
@@ -2166,6 +2237,20 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 		}
 	}
 	return nil
+}
+
+// hasToolUse reports whether the request's transcript already carries this tool_use id. A
+// fork inherits its parent's entries, so a forked child's first request already holds the
+// echo call the child made; calling it again would reuse an id the log has answered.
+func hasToolUse(msgs []provider.Message, id string) bool {
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == session.BlockToolUse && b.ID == id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // echoPlugin is the agentProvider plus one unsafe tool the explorer definition allows, one it
@@ -2312,9 +2397,10 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	prov := &agentProvider{}
 	ep := &echoPlugin{prov: prov, otherWS: t.TempDir()}
 	cp := &capturingPlugin{}
+	hr := &hookRecorder{}
 	cfg := testConfig()
 	cfg.ConfigDir = t.TempDir()
-	srv, store := newServerWith(t, cfg, ep, cp, subagents.New(cfg.ConfigDir))
+	srv, store := newServerWith(t, cfg, ep, cp, subagents.New(cfg.ConfigDir), hr)
 	ep.otherHost = cp.host
 
 	ctx := context.Background()
@@ -2478,6 +2564,40 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 		t.Errorf("resumed child system = %q", hreqs[2].System)
 	}
 
+	// A fork of a child is still a child. Its inherited entries carry the session_opened that
+	// names its parent, so the agent tool stays denied: a fork is not a way around depth one.
+	var forkInfo protocol.SessionInfo
+	if err := cl.Call(ctx, protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: helperSID}, &forkInfo); err != nil {
+		t.Fatalf("fork the child: %v", err)
+	}
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: forkInfo.SessionID, Content: []session.Block{session.TextBlock("carry on")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit to the fork: %v", err)
+	}
+	drain(t, cl, completedOn(forkInfo.SessionID))
+	freqs := prov.requestsFor(forkInfo.SessionID)
+	if len(freqs) == 0 {
+		t.Fatal("the fork of the child ran no request")
+	}
+	if names := toolNames(freqs[0].Tools); slices.Contains(names, "agent") {
+		t.Errorf("fork of a child tools = %v, want no agent tool", names)
+	}
+
+	// session_opened told the hooks which session has a parent: the memory plugin folds a
+	// root session's transcript and skips a child's, and this payload is all it has to go on.
+	hookOpened, _ := hr.counts()
+	byID := map[string]plugin.SessionOpenedPayload{}
+	for _, o := range hookOpened {
+		byID[o.SessionID] = o
+	}
+	if p, ok := byID[childSID]; !ok || p.ParentSessionID != info.SessionID {
+		t.Errorf("session_opened for the child = %+v, want parent_session_id %s", p, info.SessionID)
+	}
+	if p, ok := byID[info.SessionID]; !ok || p.ParentSessionID != "" {
+		t.Errorf("session_opened for the root = %+v, want no parent_session_id", p)
+	}
+
 	// A resumed root session is no child: it runs the default agent and the whole tool set.
 	if err := cl.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{}); err != nil {
 		t.Fatalf("close root: %v", err)
@@ -2579,6 +2699,33 @@ func TestForkKeepsTheAgentDefinition(t *testing.T) {
 	}
 	if !strings.HasPrefix(req.System, "You explore and report.") {
 		t.Errorf("fork system = %q", req.System)
+	}
+}
+
+// TestRootSessionKeepsTheAgentToolItsDefinitionLists: the agent tool is denied to a child
+// session, which is what keeps subagent depth at one; it is not denied to every session under
+// a definition that names it. A lead agent whose whole job is dispatching subagents is exactly
+// what a tools list with agent in it says, and stripping the name while reading the file took
+// it from the root session too.
+func TestRootSessionKeepsTheAgentToolItsDefinitionLists(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	h := newHarnessWith(t, prov, subagents.New(t.TempDir()))
+	if err := os.MkdirAll(filepath.Join(h.ws, ".rudy", "agents"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	def := "---\ndescription: Dispatches the work\ntools: [danger, agent]\n---\nYou dispatch.\n"
+	if err := os.WriteFile(filepath.Join(h.ws, ".rudy", "agents", "lead.md"), []byte(def), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cl := h.dial(t, false)
+	var info protocol.SessionInfo
+	if err := cl.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: h.ws, Agent: "lead"}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	runTurn(t, cl, info.SessionID, "go")
+	names := toolNames(prov.lastRequest().Tools)
+	if !slices.Contains(names, "agent") || !slices.Contains(names, "danger") {
+		t.Errorf("root tools = %v, want the definition's list, agent included", names)
 	}
 }
 

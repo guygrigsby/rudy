@@ -122,10 +122,11 @@ func parse(stem string, data []byte) (Definition, error) {
 		MaxTurns:    fm.MaxTurns,
 	}
 	if fm.Tools != nil {
-		// The agent tool is never among a subagent's tools: depth stays one, and a
-		// definition that asks for it gets the rest of its list rather than a refusal.
-		tools := slices.DeleteFunc(slices.Clone(*fm.Tools), func(t string) bool { return t == "agent" })
-		d.Tools = tools
+		// The list is kept as written, agent included. A child session is where the agent
+		// tool is refused, and the server denies it there (see applyAgent): a root session
+		// under a definition that lists it is entitled to it, and stripping it here took it
+		// away from that session too.
+		d.Tools = slices.Clone(*fm.Tools)
 	}
 	return d, nil
 }
