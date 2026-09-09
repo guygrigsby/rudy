@@ -614,6 +614,37 @@ func TestInterruptCancelMidStream(t *testing.T) {
 	}
 }
 
+// TestCommandListAnswersEveryRegisteredCommand is the surface a client completes from. The
+// set is frozen once every plugin has answered plugin.init, so one query is the whole list
+// and there is no notification for it (docs/specs/rudy-contracts.md, command.list).
+func TestCommandListAnswersEveryRegisteredCommand(t *testing.T) {
+	h := newHarnessWith(t, &scriptProvider{}, commands.New())
+	cl := h.dial(t, true)
+	var res protocol.CommandListResult
+	if err := cl.Call(context.Background(), protocol.MethodCommandList, nil, &res); err != nil {
+		t.Fatalf("command.list: %v", err)
+	}
+	got := map[string]string{}
+	for _, c := range res.Commands {
+		got[c.Name] = c.Description
+	}
+	// The fake plugin's own, then the kernel's four, each with the description a menu
+	// draws beside it.
+	for _, want := range []string{"hello", "model", "help", "fork", "plugins"} {
+		if got[want] == "" {
+			t.Errorf("command.list is missing %q or its description: %+v", res.Commands, want)
+		}
+	}
+	if got["hello"] != "submits hi" {
+		t.Errorf("description is the plugin's own, got %q", got["hello"])
+	}
+	// Registration order, which is the order a menu lists them in: the fake plugin loads
+	// ahead of the kernel's commands plugin.
+	if len(res.Commands) == 0 || res.Commands[0].Name != "hello" {
+		t.Errorf("registration order, got %+v", res.Commands)
+	}
+}
+
 func TestCommandRunSubmitsPrompt(t *testing.T) {
 	h := newHarness(t, &scriptProvider{})
 	cl := h.dial(t, true)

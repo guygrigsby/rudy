@@ -343,6 +343,8 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 			cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "registry refresh: " + err.Error()})
 		}
 		return protocol.RegistryListResult{Models: s.d.Registry.Models()}, nil
+	case protocol.MethodCommandList:
+		return commandList(s.d.Plugins.Commands()), nil
 	case protocol.MethodCommandRun:
 		return s.handleCommandRun(ctx, cn, req.Params)
 	case protocol.MethodPluginAppendNote:
@@ -804,6 +806,17 @@ func (s *Server) handleAppendNote(cn *conn, raw json.RawMessage) (any, *protocol
 		return nil, protocol.ErrorFrom(aerr)
 	}
 	return EntryIDResult{EntryID: e.ID.String()}, nil
+}
+
+// commandList is the registered commands as a client reads them. Name and description and
+// nothing else: a Command's Run is the server's, and its arguments have no completion
+// source yet (docs/specs/rudy-contracts.md, plugin.register_command).
+func commandList(cmds []plugin.Command) protocol.CommandListResult {
+	out := make([]protocol.CommandInfo, 0, len(cmds))
+	for _, c := range cmds {
+		out = append(out, protocol.CommandInfo{Name: c.Name, Description: c.Description})
+	}
+	return protocol.CommandListResult{Commands: out}
 }
 
 func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMessage) (any, *protocol.Error) {

@@ -31,6 +31,7 @@ const (
 	MethodRegistryList       = "registry.list"
 	MethodRegistryRefresh    = "registry.refresh"
 	MethodCommandRun         = "command.run"
+	MethodCommandList        = "command.list"
 )
 
 // Methods, plugin to server. A connection may send these only when its caller class is
@@ -242,6 +243,20 @@ type SessionCompactParams struct {
 
 type RegistryListResult struct {
 	Models []provider.Model `json:"models"`
+}
+
+// CommandInfo is one registered slash command as a client sees it: what to type and what
+// it does. A client asks for the set once (see MethodCommandList) and completes from it.
+type CommandInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// CommandListResult is every registered command in registration order. The set is fixed
+// once every plugin has answered plugin.init, so there is no notification that changes it.
+// The client's own commands are not in it: /exit and /quit never reach a server.
+type CommandListResult struct {
+	Commands []CommandInfo `json:"commands"`
 }
 
 type CommandRunParams struct {
