@@ -3,14 +3,19 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/protocol"
+	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
@@ -20,6 +25,7 @@ type launched struct {
 	called bool
 	info   protocol.SessionInfo
 	look   look
+	prompt string
 }
 
 // fakeLauncher swaps the client launcher for one that records and draws nothing, so a
@@ -29,7 +35,7 @@ func fakeLauncher(t *testing.T) *launched {
 	got := &launched{}
 	prev := launchTUI
 	launchTUI = func(ctx context.Context, r clientRun) error {
-		got.called, got.info, got.look = true, r.info, r.look
+		got.called, got.info, got.look, got.prompt = true, r.info, r.look, r.prompt
 		return nil
 	}
 	t.Cleanup(func() { launchTUI = prev })
@@ -117,6 +123,140 @@ func TestTUIOpensANewSessionOnTheWorkingDirectory(t *testing.T) {
 	}
 	if got.look.keys == nil {
 		t.Fatal("the launcher must be handed a resolved key table")
+	}
+}
+
+// TestTUIPositionalPromptSeedsTheEditor pins `rudy "fix the flaky fork test"` as a draft
+// handed to the client, not a prompt dropped on the floor.
+func TestTUIPositionalPromptSeedsTheEditor(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fakeTerminal(t, true)
+	got := fakeLauncher(t)
+	if out, err := runRoot(t, testBuilder(t, &fakeProvider{}), "fix", "the", "flaky", "fork", "test"); err != nil {
+		t.Fatalf("execute: %v\n%s", err, out)
+	}
+	if got.prompt != "fix the flaky fork test" {
+		t.Fatalf("the launcher was handed prompt %q", got.prompt)
+	}
+}
+
+// TestTUIDialDeclaresAsker drives an unsafe tool through the real dial and expects the
+// question to reach this client. The hello has to say asker: true; without it the gate
+// denies every unsafe call by no-asker and no question is ever sent, which nothing else
+// here would notice.
+func TestTUIDialDeclaresAsker(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fp := &fakeProvider{script: [][]provider.Part{
+		callTool("t1", "bash", `{"command":"echo hi"}`),
+		say("done"),
+	}}
+	build := testBuilderOver(t, fp, map[string]any{"permissions.mode": "strict"})
+	fakeTerminal(t, true)
+
+	var asked protocol.PermissionRequested
+	prev := launchTUI
+	launchTUI = func(ctx context.Context, r clientRun) error {
+		var res protocol.SessionSubmitResult
+		params := protocol.SessionSubmitParams{
+			SessionID: r.info.SessionID,
+			Content:   []session.Block{session.TextBlock("run it")},
+			Source:    session.SourceTyped,
+		}
+		if err := r.client.Call(context.Background(), protocol.MethodSessionSubmit, params, &res); err != nil {
+			return err
+		}
+		deadline := time.After(10 * time.Second)
+		for {
+			select {
+			case n, ok := <-r.client.Notifications():
+				if !ok {
+					return errors.New("server closed the connection")
+				}
+				switch n.Method {
+				case protocol.NotifyPermissionRequested:
+					if err := json.Unmarshal(n.Params, &asked); err != nil {
+						return err
+					}
+					// Denied rather than left standing: the turn has to come to rest
+					// before this returns, or the shutdown below waits out its budget
+					// with a tool still asking.
+					answer := protocol.SessionAnswerParams{
+						SessionID: r.info.SessionID, ToolUseID: asked.ToolUseID,
+						Decision: session.Deny, Scope: session.ScopeOnce, Reason: "asker",
+					}
+					if err := r.client.Call(context.Background(), protocol.MethodSessionAnswer, answer, nil); err != nil {
+						return err
+					}
+				case protocol.NotifyTurnState:
+					var ts protocol.TurnStateChanged
+					if err := json.Unmarshal(n.Params, &ts); err != nil {
+						return err
+					}
+					switch ts.State {
+					case "completed", "failed", "idle":
+						return nil
+					}
+				}
+			case <-deadline:
+				return errors.New("no permission question arrived")
+			}
+		}
+	}
+	t.Cleanup(func() { launchTUI = prev })
+
+	if out, err := runRoot(t, build); err != nil {
+		t.Fatalf("execute: %v\n%s", err, out)
+	}
+	if asked.Tool != "bash" || asked.ToolUseID == "" {
+		t.Fatalf("the client must be asked about the unsafe call, got %+v", asked)
+	}
+}
+
+// TestTUIInterruptCancelsTheRunAndExits130 raises SIGINT while the client is drawing. The
+// signal handler runTUI installs is what keeps the default disposition from killing the
+// process outright, so the unwind (the client close, then b.Close) still runs: the session
+// this run opened is resumable afterwards, which it would not be with its flock still held.
+// tea.ErrInterrupted is 130 and prints nothing, as --print reports the same thing.
+func TestTUIInterruptCancelsTheRunAndExits130(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	build := testBuilder(t, &fakeProvider{})
+	fakeTerminal(t, true)
+
+	var opened string
+	prev := launchTUI
+	launchTUI = func(ctx context.Context, r clientRun) error {
+		opened = r.info.SessionID
+		self, err := os.FindProcess(os.Getpid())
+		if err != nil {
+			return err
+		}
+		if err := self.Signal(os.Interrupt); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return tea.ErrInterrupted
+		case <-time.After(10 * time.Second):
+			return errors.New("SIGINT did not cancel the run context")
+		}
+	}
+	t.Cleanup(func() { launchTUI = prev })
+
+	out, err := runRoot(t, build)
+	if code := exitCode(t, err); code != 130 {
+		t.Fatalf("exit %d, out %q", code, out)
+	}
+	if strings.Contains(out, "interrupted") || strings.Contains(out, "killed") {
+		t.Fatalf("an interrupt is not news: %q", out)
+	}
+	// The session opened above is resumable, so the unwind released its flock.
+	got := fakeLauncher(t)
+	if out, err := runRoot(t, build, "--resume", opened); err != nil {
+		t.Fatalf("resume after the interrupt: %v\n%s", err, out)
+	}
+	if got.info.SessionID != opened {
+		t.Fatalf("resumed %q want %q", got.info.SessionID, opened)
 	}
 }
 
@@ -234,6 +374,21 @@ func TestSessionsForkRejectsAnIDThatIsNotOne(t *testing.T) {
 		t.Fatalf("exit %d, out %q", got, out)
 	}
 	if !strings.Contains(out, `"nope" is not a session id`) {
+		t.Fatalf("stderr %q", out)
+	}
+}
+
+// TestSessionsResumeNamesTheVerbNotTheFlag: the id came from a positional argument, so the
+// message says what the operator typed rather than a --resume they did not.
+func TestSessionsResumeNamesTheVerbNotTheFlag(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fakeTerminal(t, true)
+	fakeLauncher(t)
+	out, err := runRoot(t, testBuilder(t, &fakeProvider{}), "sessions", "resume", "nope")
+	if got := exitCode(t, err); got != 2 {
+		t.Fatalf("exit %d, out %q", got, out)
+	}
+	if !strings.Contains(out, `sessions resume "nope" is not a session id`) || strings.Contains(out, "--resume") {
 		t.Fatalf("stderr %q", out)
 	}
 }

@@ -14,8 +14,9 @@ jobs:
       # vimbubble/, which makes both relative paths resolve from rudy/. A path outside the
       # workspace is not allowed, so no checkout can use ../.
       #
-      # This job cannot pass until the memory repository is pushed to aeryx-ai/memory; the
-      # checkout below fails with a 404 against a repository that does not exist yet.
+      # This job cannot pass until both siblings are pushed. aeryx-ai/memory does not exist
+      # yet, so its checkout 404s; guygrigsby/vimbubble exists but its origin/main has no
+      # v2/ directory yet, so ../vimbubble/v2 will not resolve until the v2 port is pushed.
       - uses: actions/checkout@v4
         with:
           path: rudy

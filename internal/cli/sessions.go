@@ -43,7 +43,7 @@ func newSessionsCommand(build buildFunc) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stderr := cmd.ErrOrStderr()
-			return tuiExit(runTUI(cmd.Context(), build, resumeWith(printOptions{Resume: args[0]}), launchTUI, stderr))
+			return tuiExit(runTUI(cmd.Context(), build, resumeWith(printOptions{Resume: args[0]}, "sessions resume"), launchTUI, "", stderr))
 		},
 	}
 	var at string
@@ -53,7 +53,7 @@ func newSessionsCommand(build buildFunc) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stderr := cmd.ErrOrStderr()
-			return tuiExit(runTUI(cmd.Context(), build, forkAt(args[0], at), launchTUI, stderr))
+			return tuiExit(runTUI(cmd.Context(), build, forkAt(args[0], at), launchTUI, "", stderr))
 		},
 	}
 	fork.Flags().StringVar(&at, "at", "", "entry id to fork at; the newest entry by default")

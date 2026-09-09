@@ -2,11 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/protocol"
@@ -36,6 +39,9 @@ type clientRun struct {
 	look   look
 	info   protocol.SessionInfo
 	cwd    string
+	// prompt is the positional words of `rudy <prompt>`, seeded into the editor as a
+	// draft. Empty for every command that takes no prompt.
+	prompt string
 	stderr io.Writer
 }
 
@@ -47,11 +53,12 @@ type launchFunc func(ctx context.Context, r clientRun) error
 // session a command resolved, the way stdinIsTerminal is replaced to pretend about stdin.
 var launchTUI launchFunc = launchApp
 
-// resumeWith resolves the session the root command opens on: a new one, or the one
-// --resume or --continue names, with --model, --mode and --thinking applied to it.
-func resumeWith(o printOptions) resolveFunc {
+// resumeWith resolves the session a command opens on: a new one, or the one --resume or
+// --continue names, with --model, --mode and --thinking applied to it. source names the
+// flag or verb the session id came from, for the error a bad one gets.
+func resumeWith(o printOptions, source string) resolveFunc {
 	return func(ctx context.Context, client *protocol.Client, b *Built, cwd string) (protocol.SessionInfo, int, error) {
-		return openOrResume(ctx, client, b, o, cwd)
+		return openOrResume(ctx, client, b, o, cwd, source)
 	}
 }
 
@@ -84,19 +91,29 @@ func forkAt(id, at string) resolveFunc {
 // The order matters. The terminal is checked before anything is built, so a piped run
 // costs no plugin load; the theme and the keys are resolved before the connection, so a
 // configuration error never leaves a session open behind a client that cannot draw.
-func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch launchFunc, stderr io.Writer) int {
+func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch launchFunc, prompt string, stderr io.Writer) int {
 	// The TUI takes over the terminal; a pipe or a redirect means the caller wanted the
 	// headless client and did not say so.
 	if !stdinIsTerminal() {
 		_, _ = fmt.Fprintln(stderr, "the TUI needs a terminal; use --print")
 		return 2
 	}
+	// The signal handler covers the windows the program's own does not: the build, which
+	// loads plugins and refreshes the registry, and the close budget after the program has
+	// given the terminal back. While the program is drawing, the terminal is raw and
+	// Ctrl-C is a key (app.clear), not a signal.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
 	b, err := build(ctx, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
 	defer func() {
+		// stop() first, as --print does: it puts SIGINT back to its default disposition,
+		// so a second Ctrl-C during the shutdown kills the process instead of cancelling
+		// a context nothing is reading any more.
+		stop()
 		shutdownCtx, done := context.WithTimeout(context.Background(), clientShutdownBudget)
 		defer done()
 		_ = b.Close(shutdownCtx)
@@ -125,14 +142,20 @@ func runTUI(ctx context.Context, build buildFunc, resolve resolveFunc, launch la
 		_, _ = fmt.Fprintln(stderr, err)
 		return code
 	}
-	// Signals are the program's own: Bubble Tea installs a SIGINT handler and quits on it,
-	// which is what Ctrl-C has to do while a client is drawing.
-	run := clientRun{built: b, client: client, look: lk, info: info, cwd: cwd, stderr: stderr}
-	if err := launch(ctx, run); err != nil {
+	run := clientRun{built: b, client: client, look: lk, info: info, cwd: cwd, prompt: prompt, stderr: stderr}
+	switch err := launch(ctx, run); {
+	case err == nil:
+		return 0
+	case errors.Is(err, tea.ErrInterrupted), errors.Is(err, tea.ErrProgramKilled):
+		// A SIGINT reaches the program two ways once the handler above is installed: its
+		// own, which answers ErrInterrupted, and the cancelled context, which kills it and
+		// answers ErrProgramKilled. Both are the operator pressing Ctrl-C, and neither is
+		// news worth printing; 130 is what --print reports for the same thing.
+		return 130
+	default:
 		_, _ = fmt.Fprintln(stderr, err)
 		return 1
 	}
-	return 0
 }
 
 // tuiExit carries runTUI's exit code out through cobra. Whatever went wrong has already
@@ -179,5 +202,6 @@ func launchApp(ctx context.Context, r clientRun) error {
 		Models:  reg.Models,
 		Version: r.built.Version,
 		Cwd:     r.cwd,
+		Prompt:  r.prompt,
 	})
 }

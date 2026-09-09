@@ -80,6 +80,11 @@ type Options struct {
 	Models  []provider.Model     // for the picker and the context percent
 	Version string
 	Cwd     string
+	// Prompt seeds the editor with a draft rather than sending it. The positional words
+	// of `rudy <prompt>` land here: the design opens ready to type, and a prompt written
+	// on the command line is a draft the user has already typed, not a turn they have
+	// already sent, so Enter is still what sends it.
+	Prompt string
 	// Workspace overrides the workspace status item. Empty means read it from git in
 	// Cwd, which is what a run does; a test sets it so drawing a status line never
 	// depends on the directory the test happens to run in.
@@ -200,6 +205,9 @@ func New(o Options) *Model {
 	}
 	m.tr = m.newTranscript()
 	m.ed = input.New(cfg.UI.Vim, o.Theme, defaultWidth, table)
+	if o.Prompt != "" {
+		m.ed.SetText(o.Prompt)
+	}
 	m.vp = viewport.New(viewport.WithWidth(defaultWidth), viewport.WithHeight(defaultHeight))
 	m.model = pickModel(m.models, m.session.Model)
 	if m.workspace == "" {
@@ -1027,6 +1035,13 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 			at = len(blocks)
 			blocks = append(blocks, nil)
 		case slotInput:
+			// The design leaves one blank line between the transcript and the composer,
+			// so the input area reads as its own block and not as the next transcript
+			// row. Only when something is above it: input as the first slot opens the
+			// frame, and a frame does not open on a blank line.
+			if len(blocks) > 0 {
+				blocks = append(blocks, []string{""})
+			}
 			// A picker stands where the editor is, not over it: it is what the keyboard
 			// is pointed at, and the draft it hides is still there when it closes.
 			editor := strings.Split(m.ed.View(), "\n")

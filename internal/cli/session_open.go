@@ -44,8 +44,10 @@ func serveInMemory(b *Built, name string, asker bool) (*protocol.Client, func(),
 }
 
 // openOrResume opens a new session or resumes one named by --resume or --continue and applies
-// the --model, --mode and --thinking flags to it.
-func openOrResume(ctx context.Context, client *protocol.Client, b *Built, o printOptions, cwd string) (protocol.SessionInfo, int, error) {
+// the --model, --mode and --thinking flags to it. source is how the caller named the session
+// it is asking for ("--resume", "sessions resume"), so a bad id is reported against the thing
+// the operator actually typed.
+func openOrResume(ctx context.Context, client *protocol.Client, b *Built, o printOptions, cwd, source string) (protocol.SessionInfo, int, error) {
 	var info protocol.SessionInfo
 	id := o.Resume
 	if o.Continue && id == "" {
@@ -63,7 +65,7 @@ func openOrResume(ctx context.Context, client *protocol.Client, b *Built, o prin
 		return info, 0, nil
 	}
 	if _, err := ulid.Parse(id); err != nil {
-		return info, 2, fmt.Errorf("--resume %q is not a session id", id)
+		return info, 2, fmt.Errorf("%s %q is not a session id", source, id)
 	}
 	if err := client.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: id}, &info); err != nil {
 		return info, 1, fmt.Errorf("resume %s: %w", id, err)

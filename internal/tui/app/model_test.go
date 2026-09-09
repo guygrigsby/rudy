@@ -100,6 +100,13 @@ type recorded struct {
 
 func newHarness(t *testing.T, over map[string]any) *harness {
 	t.Helper()
+	return newHarnessPrompt(t, over, "")
+}
+
+// newHarnessPrompt is newHarness with a draft already in the editor, the way a positional
+// prompt on the command line reaches the client.
+func newHarnessPrompt(t *testing.T, over map[string]any, prompt string) *harness {
+	t.Helper()
 	cc, sc := protocol.Pipe()
 	cl := protocol.NewClient(cc)
 	t.Cleanup(func() { _ = cl.Close(); _ = sc.Close() })
@@ -118,6 +125,7 @@ func newHarness(t *testing.T, over map[string]any) *harness {
 		Models:    testModels(),
 		Version:   "test",
 		Cwd:       "/w",
+		Prompt:    prompt,
 		Workspace: "rudy main*",
 	})
 	h := &harness{t: t, m: m, srv: sc, cl: cl}
@@ -307,6 +315,21 @@ func TestInitStartsThePumpAndReachesTheEditor(t *testing.T) {
 	h.typeText("hi")
 	if h.m.ed.Text() != "hi" {
 		t.Fatalf("editor holds %q", h.m.ed.Text())
+	}
+}
+
+// TestPromptSeedsTheEditor pins the positional prompt as a draft, not a turn: it is in the
+// editor, it is on screen, and nothing was submitted for it.
+func TestPromptSeedsTheEditor(t *testing.T) {
+	h := newHarnessPrompt(t, nil, "fix the flaky fork test")
+	if got := h.m.ed.Text(); got != "fix the flaky fork test" {
+		t.Fatalf("editor holds %q", got)
+	}
+	if !strings.Contains(ansi.Strip(h.view()), "fix the flaky fork test") {
+		t.Errorf("the draft must be on screen:\n%s", h.view())
+	}
+	if len(h.m.tr.Rows()) != 0 {
+		t.Errorf("a seeded draft is not a turn: %+v", h.m.tr.Rows())
 	}
 }
 

@@ -210,10 +210,11 @@ func TestGoldenVimModes(t *testing.T) {
 	golden(t, "vim_off", screen(t, map[string]any{"ui.vim": false}, nil))
 }
 
-// TestGoldenPermissionPrompt pins the question standing where the tool's row will be, in
-// strict mode, which is what an unsafe tool costs before it runs.
+// TestGoldenPermissionPrompt pins the question standing where the tool's row will be,
+// which is what an unsafe tool costs before it runs. The session opened strict (the
+// harness's SessionInfo), which is the only mode the client reads.
 func TestGoldenPermissionPrompt(t *testing.T) {
-	golden(t, "permission_prompt", screen(t, map[string]any{"permissions.mode": "strict"}, func(tm *teatest.TestModel, sid string) {
+	golden(t, "permission_prompt", screen(t, nil, func(tm *teatest.TestModel, sid string) {
 		turn := session.NewID().String()
 		tm.Send(appendedMsg(t, sid, session.AssistantMessage{
 			Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
@@ -231,9 +232,9 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 	}))
 }
 
-// TestGoldenWidgetsAndStatus pins a plugin's status item and widgets in the slots config
-// placed them in, and nothing else: a widget in a slot ui.layout.slots left out draws
-// nowhere.
+// TestGoldenWidgetsAndStatus pins a plugin's status item and its widgets where config put
+// them: the header widget in the header slot ui.layout.slots added, the hint above the
+// editor, and the memory:servers cell in the place ui.status.items gave it.
 func TestGoldenWidgetsAndStatus(t *testing.T) {
 	over := map[string]any{
 		"ui.layout.slots": []string{"header", "transcript", "input", "status"},
