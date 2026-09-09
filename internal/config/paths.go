@@ -12,6 +12,7 @@ type Paths struct {
 	Data    string // $XDG_DATA_HOME/rudy
 	Runtime string // $XDG_RUNTIME_DIR/rudy
 	Cache   string // $XDG_CACHE_HOME/rudy
+	Home    string // the user's home directory, for expanding "~/" in config values
 }
 
 // XDG resolves the four directories from env, falling back to the XDG defaults under home.
@@ -28,5 +29,6 @@ func XDG(env func(string) string, home string) Paths {
 		Data:    pick("XDG_DATA_HOME", filepath.Join(home, ".local", "share")),
 		Runtime: pick("XDG_RUNTIME_DIR", os.TempDir()),
 		Cache:   pick("XDG_CACHE_HOME", filepath.Join(home, ".cache")),
+		Home:    home,
 	}
 }

@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -31,7 +32,7 @@ func TestXDGDefaultsAndOverrides(t *testing.T) {
 		"XDG_CONFIG_HOME": "/x/cfg", "XDG_DATA_HOME": "/x/data",
 		"XDG_RUNTIME_DIR": "/x/run", "XDG_CACHE_HOME": "/x/cache",
 	}), "/home/guy")
-	want := config.Paths{Config: "/x/cfg/rudy", Data: "/x/data/rudy", Runtime: "/x/run/rudy", Cache: "/x/cache/rudy"}
+	want := config.Paths{Config: "/x/cfg/rudy", Data: "/x/data/rudy", Runtime: "/x/run/rudy", Cache: "/x/cache/rudy", Home: "/home/guy"}
 	if p != want {
 		t.Errorf("got %+v want %+v", p, want)
 	}
@@ -179,5 +180,105 @@ func TestResolveSecret(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%q: got %q want %q", c.ref, got, c.want)
 		}
+	}
+}
+
+func TestWaveDefaults(t *testing.T) {
+	home := t.TempDir()
+	paths := config.XDG(func(string) string { return "" }, home)
+	c, err := config.Load(paths, map[string]any{"default.provider": "p", "default.model": "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Agent != "default" || c.HookTimeoutMS != 5000 || c.ToolTimeoutMS != 600000 || c.Sessions.CompactAt != 0.8 || c.MCP.ConnectTimeoutMS != 10000 {
+		t.Errorf("defaults: %+v", c)
+	}
+	if c.Sessions.Dir != filepath.Join(paths.Data, "sessions") {
+		t.Errorf("sessions.dir = %q", c.Sessions.Dir)
+	}
+	if c.Memory.Dir != filepath.Join(home, ".agents", "memory") || !c.Memory.Enabled {
+		t.Errorf("memory: %+v", c.Memory)
+	}
+	want := []string{filepath.Join(home, ".agents", "skills"), ".agents/skills"}
+	if !reflect.DeepEqual(c.Skills.Dirs, want) {
+		t.Errorf("skills.dirs = %v", c.Skills.Dirs)
+	}
+	wantFrom := []string{filepath.Join(home, ".claude", "skills"), filepath.Join(home, ".pi", "agent", "skills")}
+	if !reflect.DeepEqual(c.Skills.MigrateFrom, wantFrom) {
+		t.Errorf("skills.migrate_from = %v", c.Skills.MigrateFrom)
+	}
+}
+
+func TestPluginsDisabledAndTables(t *testing.T) {
+	home := t.TempDir()
+	paths := config.XDG(func(string) string { return "" }, home)
+	os.MkdirAll(paths.Config, 0o700)
+	os.WriteFile(filepath.Join(paths.Config, "config.toml"), []byte(`
+[default]
+provider = "p"
+model = "m"
+[providers.p]
+wire = "openai_chat"
+base_url = "http://x/v1"
+dialect = "clinepass"
+[providers.a]
+wire = "anthropic_messages"
+base_url = "http://y"
+[plugins]
+disabled = ["mcp"]
+[plugins.memory]
+verbose = true
+[memory]
+enabled = false
+summary_model = "p:small"
+[memory.fold]
+observe_after_tokens = 10
+`), 0o600)
+	c, err := config.Load(paths, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(c.PluginsDisabled, []string{"mcp"}) {
+		t.Errorf("disabled = %v", c.PluginsDisabled)
+	}
+	if _, ok := c.Plugins["disabled"]; ok {
+		t.Error("disabled leaked into the plugin tables")
+	}
+	if c.Plugins["memory"]["verbose"] != true {
+		t.Errorf("plugins.memory = %v", c.Plugins["memory"])
+	}
+	if c.Providers["p"].Dialect != "clinepass" || c.Providers["a"].Wire != "anthropic_messages" {
+		t.Errorf("providers = %+v", c.Providers)
+	}
+	if c.Memory.Enabled || c.Memory.SummaryModel != "p:small" || c.Memory.Fold["observe_after_tokens"] != 10 {
+		t.Errorf("memory = %+v", c.Memory)
+	}
+}
+
+func TestWaveValidation(t *testing.T) {
+	home := t.TempDir()
+	paths := config.XDG(func(string) string { return "" }, home)
+	base := map[string]any{"default.provider": "p", "default.model": "m", "providers.p.wire": "openai_chat", "providers.p.base_url": "http://x/v1"}
+	for name, over := range map[string]map[string]any{
+		"bad wire":        {"providers.p.wire": "grpc"},
+		"bad dialect":     {"providers.p.dialect": "openrouter"},
+		"dialect on anth": {"providers.p.wire": "anthropic_messages", "providers.p.dialect": "clinepass"},
+		"compact_at 0":    {"sessions.compact_at": 0.0},
+		"compact_at 1.5":  {"sessions.compact_at": 1.5},
+		"hook timeout":    {"hook_timeout_ms": 0},
+		"tool timeout":    {"tool_timeout_ms": -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := map[string]any{}
+			for k, v := range base {
+				m[k] = v
+			}
+			for k, v := range over {
+				m[k] = v
+			}
+			if _, err := config.Load(paths, m); err == nil {
+				t.Error("want error")
+			}
+		})
 	}
 }

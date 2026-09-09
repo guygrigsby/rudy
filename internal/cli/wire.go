@@ -78,7 +78,7 @@ func Build(ctx context.Context, o BuildOptions) (*Built, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := session.OpenStore(filepath.Join(paths.Data, "sessions"))
+	store, err := session.OpenStore(cfg.Sessions.Dir)
 	if err != nil {
 		return nil, err
 	}
