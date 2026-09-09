@@ -68,6 +68,11 @@ type SessionOpenedPayload struct {
 	Mode      session.Mode          `json:"mode"`
 	Thinking  session.ThinkingLevel `json:"thinking"`
 	Resumed   bool                  `json:"resumed"`
+	// ParentSessionID is the session whose tool call opened this one; empty means a root
+	// session. A plugin that does per-session work once needs it: every child fires this
+	// point too, and a subagent's session is a detail of its parent's turn, not a session
+	// of its own for anything that writes.
+	ParentSessionID string `json:"parent_session_id"`
 }
 
 type SessionOpenedResult struct {

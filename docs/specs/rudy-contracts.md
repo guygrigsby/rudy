@@ -185,7 +185,7 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 
 | point | fires on | payload | handler may return |
 |---|---|---|---|
-| `session_opened` | `SessionOpened`, also on `session.resume` first attach | `{session_id, workspace, model, mode, thinking, resumed: bool}` | `{context: string}` appended to the system prompt for the session |
+| `session_opened` | `SessionOpened`, also on `session.resume` first attach | `{session_id, workspace, model, mode, thinking, resumed: bool, parent_session_id: string}`; `parent_session_id` is the session whose tool call opened this one, empty for a root session, so a handler that writes once per session can tell a subagent apart from the session it belongs to | `{context: string}` appended to the system prompt for the session |
 | `before_turn` | `UserMessageAppended` with source typed or queued | `{session_id, turn_id, message: Entry}` | `{system_prompt_additions: [string]}` |
 | `before_request` | `TurnStarted`, `TurnResumed` and every subsequent request in the turn | `{session_id, turn_id, provider, model, headers: table, body_size: int}` | `{headers: table}` merged over the request headers; body is not exposed in pass 1 |
 | `after_response` | `AssistantMessageAppended` | `{session_id, turn_id, message: Entry}` | nothing |

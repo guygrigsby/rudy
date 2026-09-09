@@ -6,6 +6,10 @@
 // Every bundle read and write goes through memory-go, which owns the OKF invariants; this
 // package only decides when to call it and what a session means. It is the only package in
 // the tree that imports the SDK.
+//
+// Nothing slow happens on a hook's or a tool's own goroutine. A fold makes a model call and a
+// write job pushes to a git remote, either of which can take minutes; both run in the
+// background and report through notes, and Close is what waits for them.
 package memory
 
 import (
@@ -15,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	memory "github.com/aeryx-ai/memory/memory-go"
 
@@ -28,6 +33,23 @@ import (
 // outside this package has to know the SDK exists.
 type Summarize func(ctx context.Context, prompt string) (string, error)
 
+// sessionState is what session_opened learned about a session, plus the fold machinery's own
+// bookkeeping for it. Every field is read and written under memPlugin.mu.
+type sessionState struct {
+	project string
+	model   session.ModelRef
+	// child is true when this session answers a parent's tool call. A subagent fires every
+	// hook its parent does; letting each one fold would leave one Session Summary and one
+	// push per subagent behind a single turn of the session that spawned them.
+	child bool
+	// folding is true while a fold goroutine owns this session, and finalize records a close
+	// that arrived while one was running. A turn's fold may be dropped when one is already in
+	// flight, since FoldDue covers the same delta next time; a finalize may not, because
+	// nothing will ever ask for it again.
+	folding  bool
+	finalize bool
+}
+
 type memPlugin struct {
 	cfg         config.MemoryConfig
 	sessionsDir string
@@ -36,11 +58,11 @@ type memPlugin struct {
 	host        plugin.Host
 	b           *memory.Bundle
 
-	// mu guards the per-session bookkeeping: session_opened fills it, session_closed drops
-	// it, and the tool invocations read it from whatever goroutine the loop is on.
+	// wg counts the folds and write jobs in flight, which is what Close waits on.
+	wg sync.WaitGroup
+
 	mu       sync.Mutex
-	projects map[string]string           // session id -> project id
-	models   map[string]session.ModelRef // session id -> the model the session opened with
+	sessions map[string]*sessionState
 }
 
 // New builds the plugin. sessionsDir locates a session's entries.jsonl for the fold; version
@@ -48,7 +70,7 @@ type memPlugin struct {
 func New(cfg config.MemoryConfig, sessionsDir string, version string, summarize Summarize) plugin.Plugin {
 	return &memPlugin{
 		cfg: cfg, sessionsDir: sessionsDir, version: version, summarize: summarize,
-		projects: map[string]string{}, models: map[string]session.ModelRef{},
+		sessions: map[string]*sessionState{},
 	}
 }
 
@@ -77,9 +99,25 @@ func (p *memPlugin) Init(ctx context.Context, h plugin.Host) error {
 	return errors.Join(p.registerTools(h), h.RegisterCommand(p.command()))
 }
 
+// Close waits for the folds and write jobs already in flight, so a process that is exiting
+// does not leave a concept half written or a commit unmade. It is bounded: a summarizer that
+// never answers must not hold the exit open forever. Registry.Close calls it.
+func (p *memPlugin) Close() error {
+	done := make(chan struct{})
+	go func() { p.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(closeTimeout):
+		return fmt.Errorf("memory: gave up after %s waiting for folds and write jobs", closeTimeout)
+	}
+}
+
 // onOpened records what the session is working on and answers with the bundle's context
-// render. A workspace with no project id has nowhere to read or write, so memory is off for
-// that session; the operator hears about it once, not once per turn.
+// render. A child session gets the render too, cheaply and usefully, but is recorded as one
+// so nothing later writes on its behalf. A workspace with no project id has nowhere to read
+// or write, so memory is off for that session; the operator hears about it once, not once
+// per turn.
 func (p *memPlugin) onOpened(ctx context.Context, call plugin.HookCall) (any, error) {
 	payload, ok := call.Payload.(*plugin.SessionOpenedPayload)
 	if !ok || payload == nil {
@@ -87,8 +125,15 @@ func (p *memPlugin) onOpened(ctx context.Context, call plugin.HookCall) (any, er
 	}
 	sid := payload.SessionID
 	p.mu.Lock()
-	_, seen := p.models[sid]
-	p.projects[sid], p.models[sid] = payload.Workspace.ProjectID, payload.Model
+	// The entry is updated in place rather than replaced: this point also fires on a resume,
+	// which can land while a fold from the previous attach is still running, and a fresh
+	// struct would drop the flags that fold is about to read.
+	st, seen := p.sessions[sid]
+	if !seen {
+		st = &sessionState{}
+		p.sessions[sid] = st
+	}
+	st.project, st.model, st.child = payload.Workspace.ProjectID, payload.Model, payload.ParentSessionID != ""
 	p.mu.Unlock()
 	if payload.Workspace.ProjectID == "" {
 		if !seen {
@@ -107,47 +152,49 @@ func (p *memPlugin) onOpened(ctx context.Context, call plugin.HookCall) (any, er
 	return &plugin.SessionOpenedResult{Context: text}, nil
 }
 
-// onTurnCompleted folds synchronously: the hook runner already bounds a handler by
-// hook_timeout_ms, and the fold checkpoints only after a success, so a fold cut short by
-// that deadline is retried on the next turn rather than losing the delta.
+// onTurnCompleted hands the fold to the background and returns. The fold's long part is a
+// model call, which no hook deadline can accommodate: bounding it by hook_timeout_ms cancels
+// the summarizer, which the SDK counts as a summarizer failure, and three of those abandon
+// the delta outright.
 func (p *memPlugin) onTurnCompleted(ctx context.Context, call plugin.HookCall) (any, error) {
 	payload, ok := call.Payload.(*plugin.TurnCompletedPayload)
 	if !ok || payload == nil {
 		return nil, nil
 	}
-	p.fold(ctx, payload.SessionID, false)
+	p.startFold(payload.SessionID, false)
 	return nil, nil
 }
 
-// onClosed folds one last time with Finalize, which promotes the summary out of draft, and
-// then forgets the session.
+// onClosed queues the finalize fold, which promotes the summary out of draft, and hands the
+// session's bookkeeping to it: whoever runs last forgets the session, so a finalize waiting
+// behind a running fold still knows what project it is for.
 func (p *memPlugin) onClosed(ctx context.Context, call plugin.HookCall) (any, error) {
 	payload, ok := call.Payload.(*plugin.SessionClosedPayload)
 	if !ok || payload == nil {
 		return nil, nil
 	}
-	p.fold(ctx, payload.SessionID, true)
-	p.mu.Lock()
-	delete(p.projects, payload.SessionID)
-	delete(p.models, payload.SessionID)
-	p.mu.Unlock()
+	if !p.startFold(payload.SessionID, true) {
+		p.mu.Lock()
+		delete(p.sessions, payload.SessionID)
+		p.mu.Unlock()
+	}
 	return nil, nil
 }
 
 // onBeforeCompaction hands the compactor what memory already knows about this session, so
 // the summary the model is about to write starts from the observations rather than from the
-// transcript alone.
+// transcript alone. A child session has no summary of its own and never will.
 func (p *memPlugin) onBeforeCompaction(ctx context.Context, call plugin.HookCall) (any, error) {
 	payload, ok := call.Payload.(*plugin.BeforeCompactionPayload)
 	if !ok || payload == nil {
 		return nil, nil
 	}
 	sid := payload.SessionID
-	project, _ := p.session(sid)
-	if project == "" {
+	st, ok := p.session(sid)
+	if !ok || st.project == "" || st.child {
 		return nil, nil
 	}
-	c := p.sessionSummary(project, sessionName(sid))
+	c := p.sessionSummary(st.project, sessionName(sid))
 	if c == nil {
 		return nil, nil
 	}
@@ -155,12 +202,16 @@ func (p *memPlugin) onBeforeCompaction(ctx context.Context, call plugin.HookCall
 	return &plugin.BeforeCompactionResult{Summary: "Memory of this session so far:\n\n" + body}, nil
 }
 
-// session reads the bookkeeping session_opened filled. An unknown session id, or one whose
-// workspace had no project, reports an empty project: every caller treats that as off.
-func (p *memPlugin) session(sid string) (project string, model session.ModelRef) {
+// session is a copy of the bookkeeping session_opened filled. ok is false for a session that
+// never opened or has already been forgotten; an empty project means memory is off for it.
+func (p *memPlugin) session(sid string) (sessionState, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.projects[sid], p.models[sid]
+	st, ok := p.sessions[sid]
+	if !ok {
+		return sessionState{}, false
+	}
+	return *st, true
 }
 
 // sessionSummary is the running Session Summary concept for sess in the project directory,

@@ -27,7 +27,7 @@ func newModelsCommand(build buildFunc) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer func() { _ = b.Server.Shutdown(context.Background()) }()
+			defer func() { _ = b.Close(context.Background()) }()
 			models := b.Registry.Models()
 			if asJSON {
 				return json.NewEncoder(cmd.OutOrStdout()).Encode(models)

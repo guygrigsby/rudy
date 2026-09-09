@@ -468,3 +468,39 @@ func TestToolViewFiltersAllowAndDeny(t *testing.T) {
 		t.Errorf("empty allow = %v", names(got))
 	}
 }
+
+// closerPlugin is a plugin with work outliving Init, the shape Registry.Close exists for.
+type closerPlugin struct {
+	name   string
+	init   error
+	closed *[]string
+	err    error
+}
+
+func (c closerPlugin) Name() string                           { return c.name }
+func (c closerPlugin) Init(ctx context.Context, h Host) error { return c.init }
+func (c closerPlugin) Close() error {
+	*c.closed = append(*c.closed, c.name)
+	return c.err
+}
+
+// TestCloseClosesEveryLoadedCloser: a plugin doing background work has no other way to hear
+// that the process is going away. One that is not a Closer is skipped, one that never loaded
+// is never closed, and a failing Close does not stop the ones behind it.
+func TestCloseClosesEveryLoadedCloser(t *testing.T) {
+	var closed []string
+	r := NewRegistry(nil, func(string) {})
+	r.Load(context.Background(),
+		closerPlugin{name: "first", closed: &closed, err: errors.New("boom")},
+		fakePlugin{name: "plain", init: func(context.Context, Host) error { return nil }},
+		closerPlugin{name: "failed", init: errors.New("no"), closed: &closed},
+		closerPlugin{name: "second", closed: &closed},
+	)
+	err := r.Close()
+	if err == nil || !strings.Contains(err.Error(), "plugin first: boom") {
+		t.Errorf("close error %v", err)
+	}
+	if got := strings.Join(closed, ","); got != "first,second" {
+		t.Errorf("closed %q, want first,second: a plugin whose Init failed is not loaded", got)
+	}
+}

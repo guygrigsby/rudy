@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +26,7 @@ import (
 const (
 	fixtureProject = "github.com/golden/alpha"
 	fixtureSession = "01K4N0000000000000000000S1"
+	parentSession  = "01K4N0000000000000000000P1"
 	entryA2        = "01K4N0000000000000000000A2"
 	entryA6        = "01K4N0000000000000000000A6"
 	entryA8        = "01K4N0000000000000000000A8"
@@ -42,23 +45,51 @@ var fixtureModel = session.ModelRef{Provider: "aperture", Model: "cline-pass/kim
 const wantActor = "rudy/cline-pass-kimi-k3"
 
 // recorder is the server side of the plugin: what it summarized, noted and noticed. Every
-// field is behind the mutex because a hook handler runs on the runner's goroutine.
+// field is behind the mutex because folds and write jobs run on their own goroutines.
 type recorder struct {
 	mu      sync.Mutex
 	notes   []session.Note
 	notices []string
 	prompts []string
 	err     error
+
+	gate    chan struct{} // non-nil makes summarize block until it is closed
+	entered chan struct{} // closed the first time a summarize call reaches the gate
+	once    *sync.Once
+	boom    bool // makes summarize panic, standing in for a bug anywhere under the fold
 }
 
-func (r *recorder) summarize(_ context.Context, prompt string) (string, error) {
+func (r *recorder) summarize(ctx context.Context, prompt string) (string, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.prompts = append(r.prompts, prompt)
-	if r.err != nil {
-		return "", r.err
+	gate, entered, once, err, boom := r.gate, r.entered, r.once, r.err, r.boom
+	r.mu.Unlock()
+	if boom {
+		panic("summarizer exploded")
+	}
+	if gate != nil {
+		once.Do(func() { close(entered) })
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	if err != nil {
+		return "", err
 	}
 	return observerOut, nil
+}
+
+// hold makes every summarize call block. entered is closed once a call has reached the gate,
+// so a test can wait for the fold to really be in flight rather than sleeping; release lets
+// it and every later call through.
+func (r *recorder) hold() (entered <-chan struct{}, release func()) {
+	gate, arrived := make(chan struct{}), make(chan struct{})
+	r.mu.Lock()
+	r.gate, r.entered, r.once = gate, arrived, &sync.Once{}
+	r.mu.Unlock()
+	return arrived, func() { close(gate) }
 }
 
 func (r *recorder) note(_ ulid.ULID, pluginName, text string, role session.NoteRole) error {
@@ -78,6 +109,12 @@ func (r *recorder) fail(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.err = err
+}
+
+func (r *recorder) panics(on bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.boom = on
 }
 
 func (r *recorder) takeNotes() []session.Note {
@@ -109,12 +146,20 @@ type harness struct {
 	reg         *plugin.Registry
 	runner      *plugin.HookRunner
 	rec         *recorder
+	plug        *memPlugin
 }
 
-// newHarness builds a bundle, a project directory with one Project concept and a session
-// directory holding the rudy transcript fixture, all under a temporary HOME so nothing
-// reaches the real ~/.agents/memory and RecallObservation's home check has a real boundary.
 func newHarness(t *testing.T, fold map[string]int) *harness {
+	t.Helper()
+	return newHarnessWithHookTimeout(t, fold, 60*time.Second)
+}
+
+// newHarnessWithHookTimeout builds a bundle, a project directory with one Project concept and
+// a session directory holding the rudy transcript fixture, all under a temporary HOME so
+// nothing reaches the real ~/.agents/memory and RecallObservation's home check has a real
+// boundary. hookTimeout is what the runner gives a handler, which after fix round 1 must no
+// longer bound the fold.
+func newHarnessWithHookTimeout(t *testing.T, fold map[string]int, hookTimeout time.Duration) *harness {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -154,25 +199,51 @@ func newHarness(t *testing.T, fold map[string]int) *harness {
 	reg := plugin.NewRegistry(nil, rec.notice)
 	reg.SetServices(plugin.Services{Note: rec.note})
 	cfg := config.MemoryConfig{Dir: root, Enabled: true, Fold: fold}
-	reg.Load(context.Background(), New(cfg, sessionsDir, "0.1.0", rec.summarize))
+	p := New(cfg, sessionsDir, "0.1.0", rec.summarize)
+	reg.Load(context.Background(), p)
 	if st := reg.Statuses()[0]; st.State != plugin.StateReady {
 		t.Fatalf("plugin failed to load: %+v", st)
 	}
-	return &harness{
+	h := &harness{
 		t: t, b: b, projDir: projDir, sessionsDir: sessionsDir, home: home,
-		reg: reg, runner: plugin.NewHookRunner(reg, 60*time.Second, rec.notice), rec: rec,
+		reg: reg, runner: plugin.NewHookRunner(reg, hookTimeout, rec.notice), rec: rec,
+		plug: p.(*memPlugin),
+	}
+	t.Cleanup(func() { _ = h.plug.Close() })
+	return h
+}
+
+// settle waits for every fold and write job the plugin has started, which is what Close does.
+// Folds are asynchronous now, so a test asserting on their effects has to wait for one.
+func (h *harness) settle() {
+	h.t.Helper()
+	if err := h.plug.Close(); err != nil {
+		h.t.Fatalf("close: %v", err)
 	}
 }
 
-func (h *harness) open(projectID string) []any {
+// breakGit removes the bundle's repository, so every Job.Run fails at CommitAll while the
+// concept writes underneath it keep working. It is how a "write completion" failure is
+// produced without stubbing the SDK.
+func (h *harness) breakGit() {
+	h.t.Helper()
+	if err := os.RemoveAll(filepath.Join(h.b.Root, ".git")); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *harness) open(projectID string) []any { return h.openUnder(projectID, "") }
+
+func (h *harness) openUnder(projectID, parent string) []any {
 	h.t.Helper()
 	return h.runner.Fire(context.Background(), plugin.HookCall{
 		Point:     plugin.HookSessionOpened,
 		SessionID: fixtureSession,
 		Payload: &plugin.SessionOpenedPayload{
-			SessionID: fixtureSession,
-			Workspace: session.Workspace{Root: h.home, ProjectID: projectID},
-			Model:     fixtureModel,
+			SessionID:       fixtureSession,
+			Workspace:       session.Workspace{Root: h.home, ProjectID: projectID},
+			Model:           fixtureModel,
+			ParentSessionID: parent,
 		},
 	})
 }
@@ -219,6 +290,16 @@ func (h *harness) summary() *memory.Concept {
 	return nil
 }
 
+// projectIndex is the project directory's index.md, which only a write job regenerates.
+func (h *harness) projectIndex() string {
+	h.t.Helper()
+	raw, err := os.ReadFile(filepath.Join(h.projDir.Abs, "index.md"))
+	if err != nil {
+		h.t.Fatalf("index: %v", err)
+	}
+	return string(raw)
+}
+
 func (h *harness) tool(name string) tool.Tool {
 	h.t.Helper()
 	for _, tl := range h.reg.Tools() {
@@ -263,6 +344,18 @@ func onlyNote(t *testing.T, notes []session.Note) session.Note {
 	return notes[0]
 }
 
+// noteWith finds the note whose text has prefix, or fails naming what was recorded.
+func noteWith(t *testing.T, notes []session.Note, prefix string) session.Note {
+	t.Helper()
+	for _, n := range notes {
+		if strings.HasPrefix(n.Text, prefix) {
+			return n
+		}
+	}
+	t.Fatalf("no note starting %q in %+v", prefix, notes)
+	return session.Note{}
+}
+
 // TestSessionOpenedInjectsTheRenderedContext holds the SDK as the oracle: whatever
 // RenderContext produces for this bundle and session is exactly what the hook returns.
 func TestSessionOpenedInjectsTheRenderedContext(t *testing.T) {
@@ -303,11 +396,50 @@ func TestSessionOpenedWithoutProjectIDNoticesOnce(t *testing.T) {
 	// The hooks stay quiet for that session rather than folding into the bundle root.
 	h.turn()
 	h.closed()
+	h.settle()
 	if notes := h.rec.takeNotes(); len(notes) != 0 {
 		t.Fatalf("notes %+v", notes)
 	}
 	if h.summary() != nil {
 		t.Fatal("wrote a session summary for a session with no project")
+	}
+}
+
+// TestChildSessionReadsButNeverWrites is finding 1: a subagent's session fires the same hooks
+// as the session it belongs to. It gets the context render, and its tools work, but it must
+// not fold, summarize or finalize, or five subagents leave six session summaries and five
+// pushes behind one turn.
+func TestChildSessionReadsButNeverWrites(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	results := h.openUnder(fixtureProject, parentSession)
+	if len(results) != 1 {
+		t.Fatalf("a child session got no context render: %v", results)
+	}
+	if _, ok := results[0].(*plugin.SessionOpenedResult); !ok {
+		t.Fatalf("result type %T", results[0])
+	}
+	h.turn()
+	h.settle()
+	if notes := h.rec.takeNotes(); len(notes) != 0 {
+		t.Fatalf("a child session's turn noted %+v", notes)
+	}
+	if h.summary() != nil {
+		t.Fatal("a child session's turn wrote a session summary")
+	}
+	if results := h.compaction(); len(results) != 0 {
+		t.Fatalf("a child session supplied a compaction summary: %v", results)
+	}
+	// The tools still work: a subagent reads and records into the same project.
+	if res := h.call("memory_recall", `{"query":"alpha"}`); res.IsError {
+		t.Errorf("recall in a child session: %q", resultText(t, res))
+	}
+	h.closed()
+	h.settle()
+	if h.summary() != nil {
+		t.Fatal("a child session's close created a session summary")
+	}
+	if notes := h.rec.takeNotes(); len(notes) != 0 {
+		t.Fatalf("a child session's close noted %+v", notes)
 	}
 }
 
@@ -320,6 +452,7 @@ func TestTurnCompletedFoldsTheTranscript(t *testing.T) {
 	if results := h.turn(); len(results) != 0 {
 		t.Fatalf("turn_completed returns nothing, got %v", results)
 	}
+	h.settle()
 	note := onlyNote(t, h.rec.takeNotes())
 	if note.Text != "memory: folded 2 observations" || note.Role != session.NoteMuted {
 		t.Errorf("note %+v", note)
@@ -362,11 +495,85 @@ func TestTurnCompletedSkipsWhenNotDue(t *testing.T) {
 	h := newHarness(t, nil)
 	h.open(fixtureProject)
 	h.turn()
+	h.settle()
 	if notes := h.rec.takeNotes(); len(notes) != 0 {
 		t.Fatalf("a skipped fold noted %+v", notes)
 	}
 	if h.summary() != nil {
 		t.Fatal("a skipped fold wrote a session summary")
+	}
+}
+
+// TestFoldRunsOffTheHookPath is finding 4: turn_completed hands the fold to a goroutine with
+// its own deadline, so the hook returns at once and the runner's timeout, here 100ms against
+// a summarizer that never answers until released, never reaches the fold.
+func TestFoldRunsOffTheHookPath(t *testing.T) {
+	h := newHarnessWithHookTimeout(t, map[string]int{"observe_after_tokens": 1}, 100*time.Millisecond)
+	h.open(fixtureProject)
+	entered, release := h.rec.hold()
+	start := time.Now()
+	h.turn()
+	elapsed := time.Since(start)
+	<-entered // the fold really is in flight, and really is blocked
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("turn_completed took %s; the fold is still on the hook's critical path", elapsed)
+	}
+	release()
+	h.settle()
+	if n := h.rec.noticed("timed out"); n != 0 {
+		t.Errorf("the hook runner timed out %d times; its deadline still reaches the fold", n)
+	}
+	note := onlyNote(t, h.rec.takeNotes())
+	if note.Text != "memory: folded 2 observations" {
+		t.Errorf("note %+v", note)
+	}
+	if c := h.summary(); c == nil || len(memory.ParseSummaryBody(c.Body).Observations) != 2 {
+		t.Errorf("the fold did not land: %+v", c)
+	}
+}
+
+// TestSessionClosedQueuesBehindARunningFold is the other half of finding 4: a turn's fold may
+// be dropped when one is already running, since FoldDue covers the same delta next time, but
+// the finalize never can be. Nothing else will ever ask for it.
+func TestSessionClosedQueuesBehindARunningFold(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	h.open(fixtureProject)
+	entered, release := h.rec.hold()
+	h.turn()
+	<-entered
+	h.closed() // queued behind the fold that is blocked in the summarizer
+	release()
+	h.settle()
+	c := h.summary()
+	if c == nil {
+		t.Fatal("no session summary")
+	}
+	if c.Status != "stable" {
+		t.Errorf("status %q, want stable: the finalize queued behind the running fold was lost", c.Status)
+	}
+}
+
+// TestCloseWaitsForAFoldInFlight: Close is what a CLI exit path calls, and it must not return
+// while a fold is still writing into the bundle.
+func TestCloseWaitsForAFoldInFlight(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	h.open(fixtureProject)
+	entered, release := h.rec.hold()
+	h.turn()
+	<-entered
+	done := make(chan error, 1)
+	go func() { done <- h.plug.Close() }()
+	select {
+	case err := <-done:
+		t.Fatalf("Close returned (%v) while a fold was in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if c := h.summary(); c == nil || len(memory.ParseSummaryBody(c.Body).Observations) != 2 {
+		t.Errorf("the fold did not finish before Close returned: %+v", c)
 	}
 }
 
@@ -409,6 +616,7 @@ func TestBeforeCompactionSuppliesTheRunningSummary(t *testing.T) {
 		t.Fatalf("results before any fold %v", results)
 	}
 	h.turn()
+	h.settle()
 	h.rec.takeNotes()
 	results := h.compaction()
 	if len(results) != 1 {
@@ -430,8 +638,10 @@ func TestSessionClosedFinalizesTheSummary(t *testing.T) {
 	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
 	h.open(fixtureProject)
 	h.turn()
+	h.settle()
 	h.rec.takeNotes()
 	h.closed()
+	h.settle()
 	c := h.summary()
 	if c == nil {
 		t.Fatal("no session summary")
@@ -450,6 +660,7 @@ func TestFoldFailureNotesAndRecovers(t *testing.T) {
 	if results := h.turn(); len(results) != 0 {
 		t.Fatalf("results %v", results)
 	}
+	h.settle()
 	note := onlyNote(t, h.rec.takeNotes())
 	if note.Text != "memory: fold failed: boom" || note.Role != session.NoteWarn {
 		t.Errorf("note %+v", note)
@@ -459,9 +670,66 @@ func TestFoldFailureNotesAndRecovers(t *testing.T) {
 	}
 	h.rec.fail(nil)
 	h.turn()
+	h.settle()
 	note = onlyNote(t, h.rec.takeNotes())
 	if note.Text != "memory: folded 2 observations" || note.Role != session.NoteMuted {
 		t.Errorf("note after recovery %+v", note)
+	}
+}
+
+// TestFoldPanicIsANote: the fold no longer runs under the hook runner, which recovers around
+// plugin code, so it has to recover for itself. A panic anywhere under a fold must cost one
+// note and the next fold, not the process.
+func TestFoldPanicIsANote(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	h.open(fixtureProject)
+	h.rec.panics(true)
+	h.turn()
+	h.settle()
+	note := onlyNote(t, h.rec.takeNotes())
+	if !strings.HasPrefix(note.Text, "memory: fold panicked: ") || note.Role != session.NoteWarn {
+		t.Fatalf("note %+v", note)
+	}
+	h.rec.panics(false)
+	h.turn()
+	h.settle()
+	note = onlyNote(t, h.rec.takeNotes())
+	if note.Text != "memory: folded 2 observations" {
+		t.Errorf("note after recovery %+v", note)
+	}
+}
+
+// TestFoldCommitFailureIsANoteBesideTheFold is finding 3. A commit that fails after the
+// observations were written and the checkpoint advanced is not a failed fold: reporting it as
+// one drops the folded note and clobbers the checkpoint the SDK just cleared, so the next
+// fold re-reads a delta it already recorded.
+func TestFoldCommitFailureIsANoteBesideTheFold(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	h.open(fixtureProject)
+	h.breakGit()
+	h.turn()
+	h.settle()
+	notes := h.rec.takeNotes()
+	if len(notes) != 2 {
+		t.Fatalf("notes %+v, want the fold and the commit failure", notes)
+	}
+	folded := noteWith(t, notes, "memory: folded ")
+	if folded.Text != "memory: folded 2 observations" || folded.Role != session.NoteMuted {
+		t.Errorf("fold note %+v", folded)
+	}
+	commit := noteWith(t, notes, "memory: fold committed nothing: ")
+	if commit.Role != session.NoteWarn {
+		t.Errorf("commit note %+v", commit)
+	}
+	if strings.Contains(commit.Text, "write completion:") {
+		t.Errorf("commit note repeats the SDK's prefix: %q", commit.Text)
+	}
+	c := h.summary()
+	if c == nil || len(memory.ParseSummaryBody(c.Body).Observations) != 2 {
+		t.Fatalf("the observations were not written: %+v", c)
+	}
+	if msg := foldStateError(t, h.b, sessionName(fixtureSession)); msg != "" {
+		t.Errorf("checkpoint lastError %q; a commit failure must not clobber a cleared checkpoint", msg)
 	}
 }
 
@@ -474,6 +742,7 @@ func TestFoldHardErrorMarksTheCheckpoint(t *testing.T) {
 	if results := h.turn(); len(results) != 0 {
 		t.Fatalf("results %v", results)
 	}
+	h.settle()
 	note := onlyNote(t, h.rec.takeNotes())
 	if !strings.HasPrefix(note.Text, "memory: fold failed: ") || note.Role != session.NoteWarn {
 		t.Fatalf("note %+v", note)
@@ -484,11 +753,15 @@ func TestFoldHardErrorMarksTheCheckpoint(t *testing.T) {
 	}
 }
 
-// foldStateError reads the message the SDK's own checkpoint holds for a session.
+// foldStateError reads the message the SDK's own checkpoint holds for a session, or "" when
+// it holds none.
 func foldStateError(t *testing.T, b *memory.Bundle, sess string) string {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join(b.Root, ".state"))
 	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
 		t.Fatalf("state dir: %v", err)
 	}
 	for _, e := range entries {
@@ -507,7 +780,6 @@ func foldStateError(t *testing.T, b *memory.Bundle, sess string) string {
 		}
 		return st.LastError.Message
 	}
-	t.Fatalf("no checkpoint with an error for %s", sess)
 	return ""
 }
 
@@ -522,17 +794,102 @@ func TestRememberWritesAndRunsTheJob(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(h.projDir.Abs, "feedback", "use-pnpm.md")); err != nil {
 		t.Errorf("concept file: %v", err)
 	}
-	index, err := os.ReadFile(filepath.Join(h.projDir.Abs, "index.md"))
-	if err != nil {
-		t.Fatalf("index: %v", err)
-	}
-	if !strings.Contains(string(index), "use-pnpm") {
-		t.Errorf("index does not name the concept:\n%s", index)
+	h.settle()
+	if !strings.Contains(h.projectIndex(), "use-pnpm") {
+		t.Errorf("index does not name the concept:\n%s", h.projectIndex())
 	}
 	// A second write of the same title revises rather than creates.
 	got = resultText(t, h.call("memory_remember", `{"type":"Feedback","title":"Use pnpm","body":"still never npm"}`))
 	if got != "revised "+rel {
 		t.Errorf("second result %q, want %q", got, "revised "+rel)
+	}
+}
+
+// slowGit puts a git shim first on PATH that sleeps before handing off to the real git, so a
+// write job takes long enough that a synchronous one is unmistakable. The real job's slow part
+// is a push to a remote; this stands in for it without a network.
+func slowGit(t *testing.T, d time.Duration) {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\nsleep " + strconv.FormatFloat(d.Seconds(), 'f', 3, 64) + "\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestRememberJobRunsOffTheToolCall is finding 2: the job indexes, commits and pushes, up to
+// sixty seconds of network with no context behind it, and a safe tool must not hold a turn
+// open for that. With every git call sleeping 250ms the tool still answers at once, and the
+// index it did not wait for appears afterwards.
+func TestRememberJobRunsOffTheToolCall(t *testing.T) {
+	h := newHarness(t, nil)
+	h.open(fixtureProject)
+	slowGit(t, 250*time.Millisecond)
+	rel := "projects/" + fixtureProject + "/feedback/use-pnpm.md"
+	start := time.Now()
+	got := resultText(t, h.call("memory_remember", `{"type":"Feedback","title":"Use pnpm","body":"never npm"}`))
+	elapsed := time.Since(start)
+	if got != "remembered "+rel {
+		t.Fatalf("result %q", got)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("the tool waited %s on the write job", elapsed)
+	}
+	if strings.Contains(h.projectIndex(), "use-pnpm") {
+		t.Fatal("the index was regenerated before the tool answered")
+	}
+	h.settle()
+	if !strings.Contains(h.projectIndex(), "use-pnpm") {
+		t.Errorf("the job never ran:\n%s", h.projectIndex())
+	}
+}
+
+// TestRememberJobSkipsSilentlyWhenTheGitLockIsHeld: a job that finds the lock held ran
+// nothing and says nothing, because the next job commits everything pending.
+func TestRememberJobSkipsSilentlyWhenTheGitLockIsHeld(t *testing.T) {
+	h := newHarness(t, nil)
+	h.open(fixtureProject)
+	lock := filepath.Join(h.b.Root, ".locks", "git")
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h.call("memory_remember", `{"type":"Feedback","title":"Use pnpm","body":"never npm"}`)
+	h.settle()
+	if strings.Contains(h.projectIndex(), "use-pnpm") {
+		t.Fatal("the job ran even though the git lock was held")
+	}
+	if notes := h.rec.takeNotes(); len(notes) != 0 {
+		t.Errorf("a job that found the lock held said %+v", notes)
+	}
+	if err := os.RemoveAll(lock); err != nil {
+		t.Fatal(err)
+	}
+	h.call("memory_remember", `{"type":"Reference","title":"Make test","body":"make test"}`)
+	h.settle()
+	index := h.projectIndex()
+	if !strings.Contains(index, "use-pnpm") || !strings.Contains(index, "make-test") {
+		t.Errorf("the next job did not commit what was pending:\n%s", index)
+	}
+}
+
+// TestRememberJobFailureIsAWarnNote: the write succeeded and the model was told so; the
+// index and commit that failed afterwards are the operator's problem, on the session.
+func TestRememberJobFailureIsAWarnNote(t *testing.T) {
+	h := newHarness(t, nil)
+	h.open(fixtureProject)
+	h.breakGit()
+	if res := h.call("memory_remember", `{"type":"Feedback","title":"Use pnpm","body":"never npm"}`); res.IsError {
+		t.Fatalf("the tool failed on a job that had not run yet: %q", resultText(t, res))
+	}
+	h.settle()
+	note := onlyNote(t, h.rec.takeNotes())
+	if !strings.HasPrefix(note.Text, "memory: remember job: ") || note.Role != session.NoteWarn {
+		t.Errorf("note %+v", note)
 	}
 }
 
@@ -599,6 +956,7 @@ func TestRecallObservationAnswersTheSourceEntries(t *testing.T) {
 	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
 	h.open(fixtureProject)
 	h.turn()
+	h.settle()
 	h.rec.takeNotes()
 	obs := memory.ParseSummaryBody(h.summary().Body).Observations
 	if len(obs) != 2 {
@@ -627,6 +985,7 @@ func TestMemoryCommandReportsRootProjectAndCounts(t *testing.T) {
 	h := newHarness(t, nil)
 	h.open(fixtureProject)
 	h.call("memory_remember", `{"type":"Feedback","title":"Use pnpm","body":"never npm"}`)
+	h.settle()
 	cmds := h.reg.Commands()
 	if len(cmds) != 1 || cmds[0].Name != "memory" {
 		t.Fatalf("commands %+v", cmds)

@@ -11,7 +11,6 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/fsroot"
-	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
 )
 
@@ -101,29 +100,29 @@ func (p *memPlugin) registerTools(h plugin.Host) error {
 	return nil
 }
 
-// decode unpacks a tool's arguments and resolves the session's project in one step, since
-// every memory tool needs both and neither is worth doing without the other. The second
-// result is the failure to answer with when it is not empty.
-func decode[T any](p *memPlugin, call tool.Call, a *T) (project string, model session.ModelRef, fail *tool.Result) {
-	if err := json.Unmarshal(call.Input, a); err != nil {
-		res := fsroot.Fail("%s: bad input: %v", call.Name, err)
-		return "", model, &res
-	}
-	project, model = p.session(call.SessionID.String())
-	if project == "" {
+// scopeOf resolves the session a tool call came from. A session that never opened, or one
+// whose workspace had no project id, has nowhere to read or write, and saying so is a better
+// answer than guessing at the bundle root. A child session is not special here: a subagent
+// reads and records into its parent's project like any other caller.
+func (p *memPlugin) scopeOf(call tool.Call) (sessionState, *tool.Result) {
+	st, ok := p.session(call.SessionID.String())
+	if !ok || st.project == "" {
 		res := fsroot.Fail("memory is off for this session")
-		return "", model, &res
+		return st, &res
 	}
-	return project, model, nil
+	return st, nil
 }
 
 func (p *memPlugin) remember(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var a rememberArgs
-	project, model, fail := decode(p, call, &a)
+	if err := json.Unmarshal(call.Input, &a); err != nil {
+		return fsroot.Fail("memory_remember: bad input: %v", err), nil
+	}
+	st, fail := p.scopeOf(call)
 	if fail != nil {
 		return *fail, nil
 	}
-	target := project
+	target := st.project
 	if a.Scope == "root" {
 		target = ""
 	}
@@ -135,30 +134,31 @@ func (p *memPlugin) remember(ctx context.Context, call tool.Call) (tool.Result, 
 	if a.Tags != nil {
 		in.Tags = &a.Tags
 	}
-	res, err := memory.Remember(p.b, dir, actorFor(model), time.Now(), in)
+	res, err := memory.Remember(p.b, dir, actorFor(st.model), time.Now(), in)
 	if err != nil {
 		return fsroot.Fail("memory_remember: %v", err), nil
 	}
+	// The concept is on disk; the model is told so now. Regenerating the index, committing
+	// and pushing is a separate job with a git remote at the end of it, and a safe tool does
+	// not hold a turn open on network egress. A failure there becomes a note.
+	p.runJob(call.SessionID.String(), res.Job)
 	verb := "revised"
 	if res.Created {
 		verb = "remembered"
 	}
-	// The job regenerates the index and commits. It runs here rather than in a goroutine so
-	// the model's next recall sees the index this write produced.
-	text := verb + " " + res.Rel
-	if _, err := res.Job.Run(p.b); err != nil {
-		text += "; index and commit failed: " + err.Error()
-	}
-	return fsroot.Text(text), nil
+	return fsroot.Text(verb + " " + res.Rel), nil
 }
 
 func (p *memPlugin) recall(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var a recallArgs
-	project, _, fail := decode(p, call, &a)
+	if err := json.Unmarshal(call.Input, &a); err != nil {
+		return fsroot.Fail("memory_recall: bad input: %v", err), nil
+	}
+	st, fail := p.scopeOf(call)
 	if fail != nil {
 		return *fail, nil
 	}
-	hits, err := memory.Recall(p.b, project, a.Type, a.Query, a.Deprecated)
+	hits, err := memory.Recall(p.b, st.project, a.Type, a.Query, a.Deprecated)
 	if err != nil {
 		return fsroot.Fail("memory_recall: %v", err), nil
 	}
@@ -167,7 +167,10 @@ func (p *memPlugin) recall(ctx context.Context, call tool.Call) (tool.Result, er
 
 func (p *memPlugin) recallObservation(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var a observationArgs
-	project, _, fail := decode(p, call, &a)
+	if err := json.Unmarshal(call.Input, &a); err != nil {
+		return fsroot.Fail("memory_recall_observation: bad input: %v", err), nil
+	}
+	st, fail := p.scopeOf(call)
 	if fail != nil {
 		return *fail, nil
 	}
@@ -177,7 +180,7 @@ func (p *memPlugin) recallObservation(ctx context.Context, call tool.Call) (tool
 	if err != nil {
 		return fsroot.Fail("memory_recall_observation: %v", err), nil
 	}
-	hit, err := memory.RecallObservation(p.b, project, a.ID, home)
+	hit, err := memory.RecallObservation(p.b, st.project, a.ID, home)
 	if err != nil {
 		return fsroot.Fail("memory_recall_observation: %v", err), nil
 	}

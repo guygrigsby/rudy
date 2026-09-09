@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"sync"
 
@@ -43,6 +44,7 @@ type Registry struct {
 	providers   map[string]owned[provider.Provider]
 	provOrder   []string
 	hooks       []OwnedHook // load order; Hooks sorts a point's handlers by priority
+	loaded      []Plugin    // every plugin whose Init returned nil, in load order, for Close
 	statuses    []Status
 	status      map[ownerKey]StatusItem
 	statusOrder []ownerKey // first-set order
@@ -108,8 +110,32 @@ func (r *Registry) Load(ctx context.Context, plugins ...Plugin) {
 			continue
 		}
 		r.commit(h)
+		r.mu.Lock()
+		r.loaded = append(r.loaded, p)
+		r.mu.Unlock()
 		r.statusAt(idx, Status{Name: name, State: StateReady})
 	}
+}
+
+// Close shuts down every loaded plugin that has work outliving a call: a plugin doing
+// background work (the memory plugin's folds) has no other way to hear that the process is
+// going away, and the kernel has no private path to ask it. Plugins that are not io.Closer
+// are skipped, every Close runs even when an earlier one failed, and the errors are joined.
+func (r *Registry) Close() error {
+	r.mu.RLock()
+	loaded := append([]Plugin(nil), r.loaded...)
+	r.mu.RUnlock()
+	var errs []error
+	for _, p := range loaded {
+		c, ok := p.(io.Closer)
+		if !ok {
+			continue
+		}
+		if err := c.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("plugin %s: %w", p.Name(), err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func safeInit(ctx context.Context, p Plugin, h Host) (err error) {

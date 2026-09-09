@@ -140,7 +140,7 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 		cancelSrv()
 		shutdownCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
 		defer done()
-		_ = b.Server.Shutdown(shutdownCtx)
+		_ = b.Close(shutdownCtx)
 	}()
 	clientConn, serverConn := protocol.Pipe()
 	served := make(chan struct{})

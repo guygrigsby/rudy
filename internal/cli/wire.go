@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -123,11 +124,12 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		Gate:     g,
 		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
 	})
+	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv}
 	defer func() {
 		if err != nil {
 			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)
 			defer cancel()
-			_ = srv.Shutdown(shutCtx)
+			_ = built.Close(shutCtx)
 		}
 	}()
 	services := srv.PluginServices()
@@ -168,15 +170,16 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	if refreshErr != nil {
 		notice("registry refresh: " + refreshErr.Error())
 	}
-	return &Built{
-		Version:  o.Version,
-		Paths:    paths,
-		Config:   cfg,
-		Store:    store,
-		Registry: registry,
-		Plugins:  plugins,
-		Server:   srv,
-	}, nil
+	return built, nil
+}
+
+// Close unwinds what Build wired, in the order that keeps it safe: the server first, so
+// every session is detached and closed and no hook can fire again, then the plugins, whose
+// background work (a memory fold, a bundle commit) has to be waited on before the process
+// exits or a half-written concept is what the next run finds. Both halves always run; the
+// errors are joined.
+func (b *Built) Close(ctx context.Context) error {
+	return errors.Join(b.Server.Shutdown(ctx), b.Plugins.Close())
 }
 
 // storeFromEnv opens the session store without wiring the rest of the server; commands that

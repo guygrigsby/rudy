@@ -385,3 +385,30 @@ func TestSummarizeResolvesTheConfiguredModel(t *testing.T) {
 		t.Errorf("model %q", got)
 	}
 }
+
+// closingPlugin records that Built.Close reached the plugin registry.
+type closingPlugin struct{ closed chan struct{} }
+
+func (closingPlugin) Name() string                            { return "closing" }
+func (closingPlugin) Init(context.Context, plugin.Host) error { return nil }
+func (c closingPlugin) Close() error                          { close(c.closed); return nil }
+
+// TestBuiltCloseShutsTheServerAndThePlugins: every CLI exit path goes through Built.Close, and
+// a plugin with work outliving a hook (a memory fold, a bundle commit) is only waited on
+// because that path reaches the registry as well as the server.
+func TestBuiltCloseShutsTheServerAndThePlugins(t *testing.T) {
+	fp := &fakeProvider{}
+	c := closingPlugin{closed: make(chan struct{})}
+	b, err := testBuilder(t, fp, c)(context.Background(), io.Discard)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if err := b.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	select {
+	case <-c.closed:
+	default:
+		t.Fatal("Built.Close did not close the plugins")
+	}
+}

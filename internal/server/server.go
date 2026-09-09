@@ -852,16 +852,24 @@ func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 	s.applyAgent(ls, def)
 }
 
-// openedAsChild reads child-ness off the log rather than off the live parent, which a
-// resumed session no longer has: a child resumed long after the session that spawned it is
-// gone is still a child, and still has no business opening one of its own.
-func openedAsChild(entries []session.Entry) bool {
+// parentSessionIDOf reads the parent a session was opened under off the log rather than off
+// the live parent, which a resumed session no longer has: a child resumed long after the
+// session that spawned it is gone is still a child. A forked session, whose first entry is a
+// fork_point, has no parent in this sense.
+func parentSessionIDOf(entries []session.Entry) string {
 	if len(entries) == 0 {
-		return false
+		return ""
 	}
 	o, ok := entries[0].Payload.(session.SessionOpened)
-	return ok && o.ParentSessionID != ""
+	if !ok {
+		return ""
+	}
+	return o.ParentSessionID
 }
+
+// openedAsChild is parentSessionIDOf as the predicate the open path gates on: a child has no
+// business opening one of its own.
+func openedAsChild(entries []session.Entry) bool { return parentSessionIDOf(entries) != "" }
 
 // parentOf resolves the parent a child session hangs off, and is the whole of the authority
 // to open one. A plugin may name a parent only through a tool call it is itself running: the
@@ -1106,12 +1114,13 @@ func (s *Server) fireSessionOpened(ctx context.Context, ls *liveSession, resumed
 	}
 	view := deriveInfo(ls.sess.ID(), ls.entries)
 	p := &plugin.SessionOpenedPayload{
-		SessionID: view.SessionID,
-		Workspace: view.Workspace,
-		Model:     view.Model,
-		Mode:      view.Mode,
-		Thinking:  view.Thinking,
-		Resumed:   resumed,
+		SessionID:       view.SessionID,
+		Workspace:       view.Workspace,
+		Model:           view.Model,
+		Mode:            view.Mode,
+		Thinking:        view.Thinking,
+		Resumed:         resumed,
+		ParentSessionID: parentSessionIDOf(ls.entries),
 	}
 	for _, res := range s.d.Hooks.Fire(ctx, plugin.HookCall{Point: plugin.HookSessionOpened, SessionID: p.SessionID, Payload: p}) {
 		if so, ok := res.(*plugin.SessionOpenedResult); ok && so.Context != "" {
