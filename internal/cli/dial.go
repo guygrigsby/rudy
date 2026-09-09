@@ -80,9 +80,11 @@ func dial(ctx context.Context, build buildFunc, o BuildOptions, d dialOptions, n
 		case err == nil:
 			return attached, 0, nil
 		case !errors.Is(err, protocol.ErrNoServer):
-			// A socket that is there and will not talk is not the same as an absent one:
-			// answering that by starting a second server over the same store would split the
-			// sessions between two processes rather than report the failure.
+			// A socket that answered and then would not talk is not the same as an absent one:
+			// a daemon that died between the connect and the hello, a listener that is not
+			// rudy, a peer the transport refused. Answering any of those by starting a second
+			// server over the same store would split the sessions between two processes rather
+			// than report the failure.
 			return nil, code, err
 		}
 	}
@@ -93,6 +95,14 @@ func dial(ctx context.Context, build buildFunc, o BuildOptions, d dialOptions, n
 // is closed again on any failure, since a caller that got an error will never call the Close
 // it did not receive.
 func attach(o BuildOptions, socket string, timeout time.Duration, name string, asker bool) (*dialed, int, error) {
+	// The local config comes first, before anything is connected: a config.toml that will not
+	// parse is this process's problem and no daemon needs to hear about it. Loading it after
+	// the hello would greet a server, take a connection off its accept loop and drop it again,
+	// all to report an error that was true before the client started.
+	paths, cfg, err := localConfig(o)
+	if err != nil {
+		return nil, 1, err
+	}
 	// The connect is bounded by its own timeout and by nothing else, not by the caller's
 	// context: an interrupt that arrived before the client got going would otherwise turn
 	// "nothing is serving that path" into a dial failure, and the run would report a cancelled
@@ -107,11 +117,6 @@ func attach(o BuildOptions, socket string, timeout time.Duration, name string, a
 	client := protocol.NewClient(conn)
 	closeClient := func() { _ = client.Close() }
 	hello, err := greet(client, name, Version(), asker)
-	if err != nil {
-		closeClient()
-		return nil, 1, err
-	}
-	paths, cfg, err := localConfig(o)
 	if err != nil {
 		closeClient()
 		return nil, 1, err

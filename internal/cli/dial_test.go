@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/config"
@@ -184,6 +186,116 @@ func TestDialRefusesSocketAndEmbedTogether(t *testing.T) {
 	}
 }
 
+// deaf is a listener that answers a connect and then hangs up without speaking the protocol:
+// a daemon that died between the probe and the hello, a socket some other program is holding,
+// a peer the transport refused. It counts what it accepted, so a test can tell a client that
+// never connected from one that connected and failed.
+type deaf struct {
+	mu      sync.Mutex
+	accepts int
+}
+
+func (d *deaf) accepted() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.accepts
+}
+
+// listenDeaf binds socket with a plain net.Listen, not protocol.ListenUnix: the point is a
+// path that answers and says nothing, which a real server never does. The count is bumped
+// before the close, and the close is what the client's hello read finally fails on, so a
+// connection is always counted before the dial it belongs to returns.
+func listenDeaf(t *testing.T, socket string) *deaf {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(socket), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatalf("listen %s: %v", socket, err)
+	}
+	d := &deaf{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			d.mu.Lock()
+			d.accepts++
+			d.mu.Unlock()
+			_ = c.Close()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+	})
+	return d
+}
+
+// TestDialSocketThatAnswersButWillNotTalk pins the branch between the two easy answers. The
+// probe connected, so this is not the absent socket that means "be your own server"; the hello
+// failed, so there is no server here either. Embedding would put a second server on the same
+// store behind a path something else is holding, which is the one outcome worse than the
+// failure.
+func TestDialSocketThatAnswersButWillNotTalk(t *testing.T) {
+	t.Chdir(t.TempDir())
+	testBuilder(t, &fakeProvider{}) // for the XDG roots; the builder itself must never run
+	env := runtimeEnv(sockDir(t))
+	socket := config.XDG(env, t.TempDir()).Socket()
+	listener := listenDeaf(t, socket)
+
+	refuse := refuseToBuild(t, "a socket that answered and then hung up is a failure, not an empty path")
+	d, code, err := dial(context.Background(), refuse,
+		BuildOptions{Stderr: io.Discard, Env: env, Home: t.TempDir()}, dialOptions{}, "dial-test", false)
+	if err == nil {
+		d.Close()
+		t.Fatal("a socket that will not speak the protocol has to fail rather than embed")
+	}
+	if d != nil {
+		t.Fatalf("a failed dial returns no client: %+v", d)
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if errors.Is(err, protocol.ErrNoServer) {
+		t.Fatalf("the socket answered, so this is not ErrNoServer: %v", err)
+	}
+	if listener.accepted() == 0 {
+		t.Fatal("nothing ever connected, so this test is not exercising the hello it means to")
+	}
+}
+
+// TestDialBrokenConfigNeverOpensAConnection: the theme, the keys and the ui.* settings are this
+// process's own, and a config.toml that will not parse is known before any server is involved.
+// Loading it after the hello would take a connection off a daemon's accept loop and drop it
+// again to report something that was already true.
+func TestDialBrokenConfigNeverOpensAConnection(t *testing.T) {
+	t.Chdir(t.TempDir())
+	testBuilder(t, &fakeProvider{}) // for the XDG roots; the builder itself must never run
+	writeConfig(t, "[default\nprovider = \"fake\"\n")
+	env := runtimeEnv(sockDir(t))
+	socket := config.XDG(env, t.TempDir()).Socket()
+	listener := listenDeaf(t, socket)
+
+	refuse := refuseToBuild(t, "a config that will not parse is answered before anything is wired")
+	d, code, err := dial(context.Background(), refuse,
+		BuildOptions{Stderr: io.Discard, Env: env, Home: t.TempDir()}, dialOptions{}, "dial-test", false)
+	if err == nil {
+		d.Close()
+		t.Fatal("a config.toml that will not parse has to fail")
+	}
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if got := listener.accepted(); got != 0 {
+		t.Fatalf("%d connections opened; a broken config is known before any server is dialed", got)
+	}
+}
+
 // TestPrintAttachedRunsATurnInTheDaemon drives the real --print path over a socket: the turn
 // runs in the daemon's server, against the daemon's provider, and the session it opened is
 // in the store that daemon holds. The builder fails the test if it is called, so nothing
@@ -306,6 +418,8 @@ func TestLockedSessionPrintsTheSocketHint(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 
+	want := "session " + info.SessionID + " is held by another process; attach with --socket " + holder.Paths.Socket()
+
 	var errb bytes.Buffer
 	code, err := runPrint(context.Background(), printOptions{Output: "text", Resume: info.SessionID},
 		dialOptions{Embed: true}, "hi", build, io.Discard, &errb)
@@ -313,10 +427,26 @@ func TestLockedSessionPrintsTheSocketHint(t *testing.T) {
 		t.Fatalf("runPrint = %d, %v", code, err)
 	}
 	if code != 1 {
-		t.Fatalf("code = %d, want 1; stderr %q", code, errb.String())
+		t.Fatalf("resume: code = %d, want 1; stderr %q", code, errb.String())
 	}
-	want := "session " + info.SessionID + " is held by another process; attach with --socket " + holder.Paths.Socket()
 	if !strings.Contains(errb.String(), want) {
-		t.Fatalf("stderr %q, want %q", errb.String(), want)
+		t.Fatalf("resume: stderr %q, want %q", errb.String(), want)
+	}
+
+	// A fork reads the parent through the same cold load and answers the same unavailable, so
+	// it gets the same instruction. Without it the operator is told a lock is held and nothing
+	// about the process holding it.
+	fakeTerminal(t, true)
+	var forkErr bytes.Buffer
+	never := func(context.Context, clientRun) error {
+		t.Error("a fork of a session another process holds must not reach the client")
+		return nil
+	}
+	if code := runTUI(context.Background(), build, dialOptions{Embed: true},
+		forkAt(info.SessionID, ""), never, "", &forkErr); code != 1 {
+		t.Fatalf("fork: code = %d, want 1; stderr %q", code, forkErr.String())
+	}
+	if !strings.Contains(forkErr.String(), want) {
+		t.Fatalf("fork: stderr %q, want %q", forkErr.String(), want)
 	}
 }
