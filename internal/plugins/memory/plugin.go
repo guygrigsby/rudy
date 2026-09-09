@@ -28,10 +28,12 @@ import (
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
-// Summarize runs one prompt through a model and returns the text. wire binds it to the
-// provider registry and memory.summary_model; the plugin never sees a provider, so nothing
-// outside this package has to know the SDK exists.
-type Summarize func(ctx context.Context, prompt string) (string, error)
+// Summarize runs one prompt through a model for a session and returns the text. wire binds it
+// to the provider registry and memory.summary_model; the plugin never sees a provider, so
+// nothing outside this package has to know the SDK exists. The session id travels with the
+// prompt because the request is made on that session's behalf and carries its X-Rudy-Session
+// header like any other.
+type Summarize func(ctx context.Context, sessionID string, prompt string) (string, error)
 
 // sessionState is what session_opened learned about a session, plus the fold machinery's own
 // bookkeeping for it. Every field is read and written under memPlugin.mu.
@@ -99,15 +101,24 @@ func (p *memPlugin) Init(ctx context.Context, h plugin.Host) error {
 	return errors.Join(p.registerTools(h), h.RegisterCommand(p.command()))
 }
 
-// Close waits for the folds and write jobs already in flight, so a process that is exiting
-// does not leave a concept half written or a commit unmade. It is bounded: a summarizer that
-// never answers must not hold the exit open forever. Registry.Close calls it.
-func (p *memPlugin) Close() error {
+// Close is CloseContext with no deadline but the plugin's own, for a caller that has none to
+// give.
+func (p *memPlugin) Close() error { return p.CloseContext(context.Background()) }
+
+// CloseContext waits for the folds and write jobs already in flight, so a process that is
+// exiting does not leave a concept half written or a commit unmade. The wait ends at
+// whichever comes first: the work, the plugin's own closeTimeout (a summarizer that never
+// answers must not hold the exit open forever) or ctx, which is the process saying it has
+// run out of patience, a second Ctrl-C during shutdown being exactly that. Registry.Close
+// calls it.
+func (p *memPlugin) CloseContext(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() { p.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("memory: stopped waiting for folds and write jobs: %w", ctx.Err())
 	case <-time.After(closeTimeout):
 		return fmt.Errorf("memory: gave up after %s waiting for folds and write jobs", closeTimeout)
 	}

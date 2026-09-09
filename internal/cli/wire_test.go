@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -322,7 +324,8 @@ func TestSummarizeRunsOnePromptWithThinkingOff(t *testing.T) {
 		{Type: provider.PartTextDelta, Text: "\n"},
 		{Type: provider.PartStop, StopReason: session.StopEndTurn},
 	})
-	out, err := summarizeWith(cfg, reg, func(string) {})(context.Background(), "observe this")
+	sid := ulid.Make()
+	out, err := summarizeWith(cfg, reg, func(string) {})(context.Background(), sid.String(), "observe this")
 	if err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
@@ -346,6 +349,11 @@ func TestSummarizeRunsOnePromptWithThinkingOff(t *testing.T) {
 	if req.MaxTokens != 4096 {
 		t.Errorf("max tokens %d", req.MaxTokens)
 	}
+	// The fold is made on a session's behalf, and the request says so: the provider sends it
+	// as X-Rudy-Session like every other request that session makes.
+	if req.SessionID != sid {
+		t.Errorf("session id %s, want %s", req.SessionID, sid)
+	}
 }
 
 // TestSummarizeFallsBackToTheDefaultModelOnce: a summary_model that is not in the registry
@@ -356,7 +364,7 @@ func TestSummarizeFallsBackToTheDefaultModelOnce(t *testing.T) {
 	var notices []string
 	summarize := summarizeWith(cfg, reg, func(s string) { notices = append(notices, s) })
 	for range 2 {
-		if _, err := summarize(context.Background(), "observe this"); err != nil {
+		if _, err := summarize(context.Background(), ulid.Make().String(), "observe this"); err != nil {
 			t.Fatalf("summarize: %v", err)
 		}
 	}
@@ -375,7 +383,7 @@ func TestSummarizeResolvesTheConfiguredModel(t *testing.T) {
 	cfg.Default.Model = "unused"
 	cfg.Memory.SummaryModel = "fake:m"
 	var notices []string
-	if _, err := summarizeWith(cfg, reg, func(s string) { notices = append(notices, s) })(context.Background(), "p"); err != nil {
+	if _, err := summarizeWith(cfg, reg, func(s string) { notices = append(notices, s) })(context.Background(), "not-a-ulid", "p"); err != nil {
 		t.Fatalf("summarize: %v", err)
 	}
 	if len(notices) != 0 {

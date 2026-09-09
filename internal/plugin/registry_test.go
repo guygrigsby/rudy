@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 
@@ -496,11 +497,63 @@ func TestCloseClosesEveryLoadedCloser(t *testing.T) {
 		closerPlugin{name: "failed", init: errors.New("no"), closed: &closed},
 		closerPlugin{name: "second", closed: &closed},
 	)
-	err := r.Close()
+	err := r.Close(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "plugin first: boom") {
 		t.Errorf("close error %v", err)
 	}
 	if got := strings.Join(closed, ","); got != "first,second" {
 		t.Errorf("closed %q, want first,second: a plugin whose Init failed is not loaded", got)
+	}
+}
+
+// blockingCloser waits out its own budget in Close and answers ctx in CloseContext, which is
+// the shape the memory plugin has: background work worth waiting for, but not past the point
+// the process says it has waited long enough.
+type blockingCloser struct {
+	name    string
+	release chan struct{}
+}
+
+func (blockingCloser) Init(context.Context, Host) error { return nil }
+func (c blockingCloser) Name() string                   { return c.name }
+func (c blockingCloser) Close() error                   { <-c.release; return nil }
+
+func (c blockingCloser) CloseContext(ctx context.Context) error {
+	select {
+	case <-c.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// TestCloseHandsTheContextToAContextCloser: Close runs on the way out of the process, and a
+// caller whose context is already done (a second Ctrl-C during shutdown) must not wait out a
+// plugin's own budget. A plugin that only has Close is still called as before.
+func TestCloseHandsTheContextToAContextCloser(t *testing.T) {
+	var closed []string
+	release := make(chan struct{})
+	defer close(release)
+	r := NewRegistry(nil, func(string) {})
+	r.Load(context.Background(),
+		blockingCloser{name: "slow", release: release},
+		closerPlugin{name: "plain", closed: &closed},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Close(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("close error %v, want the context's", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited on a plugin after its context was already done")
+	}
+	// The one behind it still ran: an expired context is not a reason to skip a close that
+	// costs nothing.
+	if got := strings.Join(closed, ","); got != "plain" {
+		t.Errorf("closed %q, want plain", got)
 	}
 }

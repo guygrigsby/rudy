@@ -100,7 +100,7 @@ func newSpawnHarness(t *testing.T, prov *scriptProvider, env map[string]string) 
 	preg.SetServices(services)
 	t.Cleanup(func() {
 		_ = srv.Shutdown(context.Background())
-		_ = preg.Close()
+		_ = preg.Close(context.Background())
 	})
 	h := &spawnHarness{srv: srv, ws: t.TempDir(), prov: prov}
 	h.notices = func() []string {

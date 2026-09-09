@@ -94,7 +94,7 @@ func loadServers(t *testing.T, servers map[string]ServerConfig) *harness {
 	}
 	reg.Load(context.Background(), New(userPath, "", 20*time.Second, resolve, "test"))
 	t.Cleanup(func() {
-		if err := reg.Close(); err != nil {
+		if err := reg.Close(context.Background()); err != nil {
 			t.Errorf("close: %v", err)
 		}
 	})
@@ -230,7 +230,7 @@ func TestCloseEndsTheSessions(t *testing.T) {
 	if !ok {
 		t.Fatal("no echo tool")
 	}
-	if err := h.reg.Close(); err != nil {
+	if err := h.reg.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 	if _, err := echo.Invoke(context.Background(), tool.Call{Name: echo.Name, Input: json.RawMessage(`{"text":"hi"}`)}); err == nil {

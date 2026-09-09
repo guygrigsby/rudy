@@ -168,8 +168,8 @@ func TestPrintToolRoundTrip(t *testing.T) {
 	if last.Role != provider.RoleToolResult || last.ToolUseID != "tu_1" {
 		t.Fatalf("last message %+v", last)
 	}
-	if !strings.Contains(textOf(last.Content), "a.txt") {
-		t.Fatalf("tool result %q", textOf(last.Content))
+	if !strings.Contains(session.TextOf(last.Content), "a.txt") {
+		t.Fatalf("tool result %q", session.TextOf(last.Content))
 	}
 }
 
@@ -229,7 +229,7 @@ func TestPrintSlashCommand(t *testing.T) {
 	if out.String() != "ok\n" {
 		t.Fatalf("stdout %q", out.String())
 	}
-	if got := textOf(fp.request(0).Messages[0].Content); got != "hi there" {
+	if got := session.TextOf(fp.request(0).Messages[0].Content); got != "hi there" {
 		t.Fatalf("submitted prompt %q", got)
 	}
 }

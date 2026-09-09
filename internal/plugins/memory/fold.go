@@ -42,14 +42,18 @@ var actorClean = regexp.MustCompile(`[^A-Za-z0-9._:-]`)
 func actorFor(m session.ModelRef) string { return "rudy/" + actorClean.ReplaceAllString(m.Model, "-") }
 
 // sdkSummarizer adapts the injected prompt runner to the SDK's Summarizer port. The context
-// travels on the struct because Summarize takes only a prompt; it is the fold's own context,
-// so the model call is bounded by foldTimeout and by nothing else.
+// and the session travel on the struct because the port passes only a prompt; the context is
+// the fold's own, so the model call is bounded by foldTimeout and by nothing else, and the
+// session is the one being folded, which is what the request reports itself as.
 type sdkSummarizer struct {
 	ctx context.Context
+	sid string
 	run Summarize
 }
 
-func (s sdkSummarizer) Summarize(prompt string) (string, error) { return s.run(s.ctx, prompt) }
+func (s sdkSummarizer) Summarize(prompt string) (string, error) {
+	return s.run(s.ctx, s.sid, prompt)
+}
 
 // settingsFrom maps the [memory.fold] config keys onto FoldSettings. A key the config omits
 // indexes to zero, which is exactly how the SDK's own defaults are asked for.
@@ -140,7 +144,7 @@ func (p *memPlugin) fold(sid string, finalize bool) {
 		Format:     "rudy",
 		ProjectID:  state.project,
 		Finalize:   finalize,
-		Summarizer: sdkSummarizer{ctx: ctx, run: p.summarize},
+		Summarizer: sdkSummarizer{ctx: ctx, sid: sid, run: p.summarize},
 		Settings:   settingsFrom(p.cfg.Fold),
 		Now:        time.Now(),
 	}

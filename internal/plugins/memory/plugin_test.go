@@ -47,11 +47,12 @@ const wantActor = "rudy/cline-pass-kimi-k3"
 // recorder is the server side of the plugin: what it summarized, noted and noticed. Every
 // field is behind the mutex because folds and write jobs run on their own goroutines.
 type recorder struct {
-	mu      sync.Mutex
-	notes   []session.Note
-	notices []string
-	prompts []string
-	err     error
+	mu       sync.Mutex
+	notes    []session.Note
+	notices  []string
+	prompts  []string
+	promptSy []string // the session id each prompt was summarized for
+	err      error
 
 	gate    chan struct{} // non-nil makes summarize block until it is closed
 	entered chan struct{} // closed the first time a summarize call reaches the gate
@@ -59,9 +60,10 @@ type recorder struct {
 	boom    bool // makes summarize panic, standing in for a bug anywhere under the fold
 }
 
-func (r *recorder) summarize(ctx context.Context, prompt string) (string, error) {
+func (r *recorder) summarize(ctx context.Context, sessionID string, prompt string) (string, error) {
 	r.mu.Lock()
 	r.prompts = append(r.prompts, prompt)
+	r.promptSy = append(r.promptSy, sessionID)
 	gate, entered, once, err, boom := r.gate, r.entered, r.once, r.err, r.boom
 	r.mu.Unlock()
 	if boom {
@@ -574,6 +576,30 @@ func TestCloseWaitsForAFoldInFlight(t *testing.T) {
 	}
 	if c := h.summary(); c == nil || len(memory.ParseSummaryBody(c.Body).Observations) != 2 {
 		t.Errorf("the fold did not finish before Close returned: %+v", c)
+	}
+}
+
+// TestCloseContextGivesUpWhenTheCallerIsOutOfTime: the process gets to say when it has waited
+// long enough (a second Ctrl-C during shutdown is exactly that), and the wait ends there
+// rather than at the plugin's own 30 second budget.
+func TestCloseContextGivesUpWhenTheCallerIsOutOfTime(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	h.open(fixtureProject)
+	entered, release := h.rec.hold()
+	h.turn()
+	<-entered
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.plug.CloseContext(ctx) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("CloseContext error %v, want the context's", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseContext waited on a fold after its context was already done")
 	}
 }
 

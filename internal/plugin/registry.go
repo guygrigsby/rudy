@@ -124,21 +124,36 @@ func (r *Registry) Load(ctx context.Context, plugins ...Plugin) {
 	}
 }
 
+// ContextCloser is a plugin whose shutdown can take long enough to be worth bounding: the
+// caller's context is how long the process is willing to wait for it. A plugin that
+// implements it is closed through CloseContext and never through Close.
+type ContextCloser interface {
+	CloseContext(ctx context.Context) error
+}
+
 // Close shuts down every loaded plugin that has work outliving a call: a plugin doing
 // background work (the memory plugin's folds) has no other way to hear that the process is
-// going away, and the kernel has no private path to ask it. Plugins that are not io.Closer
-// are skipped, every Close runs even when an earlier one failed, and the errors are joined.
-func (r *Registry) Close() error {
+// going away, and the kernel has no private path to ask it. A ContextCloser is given ctx, so
+// a caller that is already out of time (a second Ctrl-C during shutdown) does not wait out
+// the plugin's own budget; a plain io.Closer is called as it is, and a plugin that is
+// neither is skipped. Every close runs even when an earlier one failed, and the errors are
+// joined.
+func (r *Registry) Close(ctx context.Context) error {
 	r.mu.RLock()
 	loaded := append([]Plugin(nil), r.loaded...)
 	r.mu.RUnlock()
 	var errs []error
 	for _, p := range loaded {
-		c, ok := p.(io.Closer)
-		if !ok {
+		var err error
+		switch c := p.(type) {
+		case ContextCloser:
+			err = c.CloseContext(ctx)
+		case io.Closer:
+			err = c.Close()
+		default:
 			continue
 		}
-		if err := c.Close(); err != nil {
+		if err != nil {
 			errs = append(errs, fmt.Errorf("plugin %s: %w", p.Name(), err))
 		}
 	}

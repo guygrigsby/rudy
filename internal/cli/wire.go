@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -190,7 +192,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 // exits or a half-written concept is what the next run finds. Both halves always run; the
 // errors are joined.
 func (b *Built) Close(ctx context.Context) error {
-	return errors.Join(b.Server.Shutdown(ctx), b.Plugins.Close())
+	return errors.Join(b.Server.Shutdown(ctx), b.Plugins.Close(ctx))
 }
 
 // storeFromEnv opens the session store without wiring the rest of the server; commands that
@@ -290,11 +292,14 @@ func summarizeWith(cfg *config.Config, registry *provider.Registry, notice func(
 	// once keeps a fold on every turn from filling the operator's terminal with one message.
 	var once sync.Once
 	warn := func(text string) { once.Do(func() { notice(text) }) }
-	return func(ctx context.Context, prompt string) (string, error) {
+	return func(ctx context.Context, sessionID string, prompt string) (string, error) {
 		m, err := summaryModel(cfg, registry, warn)
 		if err != nil {
 			return "", err
 		}
+		// A session id that will not parse costs the header, not the fold: the summary is
+		// still the right answer for the session that asked for it.
+		sid, _ := ulid.Parse(sessionID)
 		prov, ok := registry.Provider(m.Ref.Provider)
 		if !ok {
 			return "", fmt.Errorf("memory: no provider %q for summary model %s", m.Ref.Provider, m.Ref)
@@ -305,6 +310,7 @@ func summarizeWith(cfg *config.Config, registry *provider.Registry, notice func(
 			Messages:  []provider.Message{{Role: provider.RoleUser, Content: []session.Block{session.TextBlock(prompt)}}},
 			Thinking:  session.ThinkingOff,
 			MaxTokens: cfg.MaxTokens,
+			SessionID: sid,
 		}, func(part provider.Part) error {
 			if part.Type == provider.PartTextDelta {
 				b.WriteString(part.Text)

@@ -22,6 +22,10 @@ import (
 
 const maxStdin = 10 << 20
 
+// printShutdownBudget bounds the unwind at the end of a --print run: the server's own
+// shutdown plus whatever background work the plugins are still finishing.
+const printShutdownBudget = 5 * time.Second
+
 // ExitError carries a process exit code out of a cobra RunE. main maps it to os.Exit.
 type ExitError struct{ Code int }
 
@@ -137,8 +141,13 @@ func runPrint(ctx context.Context, o printOptions, prompt string, build buildFun
 	}
 	srvCtx, cancelSrv := context.WithCancel(context.Background())
 	defer func() {
+		// stop() first, before anything that waits: it puts SIGINT back to its default
+		// disposition, so a second Ctrl-C during the shutdown kills the process. While the
+		// handler is still installed a second one only cancels a context nothing is reading
+		// any more, and the operator watches a plugin's close budget run out in silence.
+		stop()
 		cancelSrv()
-		shutdownCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, done := context.WithTimeout(context.Background(), printShutdownBudget)
 		defer done()
 		_ = b.Close(shutdownCtx)
 	}()
@@ -374,7 +383,7 @@ func (t *turnOutput) observe(n protocol.Notification) (bool, error) {
 		}
 		switch p := ea.Entry.Payload.(type) {
 		case session.AssistantMessage:
-			t.text = textOf(p.Content)
+			t.text = session.TextOf(p.Content)
 			t.usage = t.usage.Add(p.Usage)
 			t.stopReason = p.StopReason
 		case session.TurnFailed:
@@ -424,15 +433,4 @@ func (t *turnOutput) finish(o printOptions, b *Built, info protocol.SessionInfo,
 		return 130, nil
 	}
 	return 0, nil
-}
-
-// textOf joins the text blocks of a message.
-func textOf(blocks []session.Block) string {
-	var parts []string
-	for _, b := range blocks {
-		if b.Type == session.BlockText {
-			parts = append(parts, b.Text)
-		}
-	}
-	return strings.Join(parts, "\n")
 }
