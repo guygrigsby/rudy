@@ -680,11 +680,7 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
 		return protocol.CommandRunResult{Notice: notice}, nil
 	case plugin.Fork:
-		at := a.AtEntryID
-		if at == "" {
-			at = ls.latestEntryID()
-		}
-		info, ferr := s.forkAt(cn, ls, at)
+		info, ferr := s.forkAt(cn, ls, a.AtEntryID)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -952,13 +948,21 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 // shared by fork, which loads it cold from a session id, and command.run's /fork, which already
 // has it live from the command's own session_id. at is the entry id to fork at, as a string so
 // a caller can pass an unparsed one straight through and get invalid_argument back rather than
-// having to parse it itself.
+// having to parse it itself; empty means the newest entry of any kind. That default is resolved
+// here, after parent.mu is taken, not by a caller reading it beforehand: a command racing on
+// the same session (another /fork, a /model, a set_title) could append between such a read and
+// this lock, landing the fork one entry stale. obsMu, which latestEntryID takes, nests inside mu
+// (see liveSession's doc), so taking it here while already holding parent.mu is safe.
 func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.SessionInfo, *protocol.Error) {
+	parent.mu.Lock()
+	if at == "" {
+		at = parent.latestEntryID()
+	}
 	atID, err := ulid.Parse(at)
 	if err != nil {
+		parent.mu.Unlock()
 		return protocol.SessionInfo{}, perr(protocol.CodeInvalidArgument, "bad entry id")
 	}
-	parent.mu.Lock()
 	st, _ := parent.mirroredState()
 	active := parent.runner != nil && isActive(st)
 	closed := parent.closed

@@ -630,22 +630,23 @@ func TestCommandRunForksAtTheNewestEntry(t *testing.T) {
 	info := h.open(t, cl)
 	ctx := context.Background()
 
-	var sub protocol.SessionSubmitResult
-	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
-		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
-	}, &sub); err != nil {
-		t.Fatal(err)
+	runTurn(t, cl, info.SessionID, "go")
+
+	// Appended right before the bare /fork, so it is the newest entry when /fork runs, not
+	// whatever was newest before it. forkAt must resolve "newest" itself under parent.mu,
+	// not from a value a caller read earlier: reading it outside that lock (as command.run
+	// once did, before calling forkAt) leaves a window where an append like this one lands
+	// after the read and before the lock, and the fork would land one entry stale, missing
+	// this title_change entirely.
+	var setRes server.EntryIDResult
+	if err := cl.Call(ctx, protocol.MethodSessionSetTitle, protocol.SessionSetTitleParams{
+		SessionID: info.SessionID, Title: "renamed",
+	}, &setRes); err != nil {
+		t.Fatalf("set_title: %v", err)
 	}
-	ns := drain(t, cl, func(n protocol.Notification) bool {
-		if n.Method != protocol.NotifyTurnState {
-			return false
-		}
-		var ts protocol.TurnStateChanged
-		_ = json.Unmarshal(n.Params, &ts)
-		return ts.State == "completed"
-	})
-	turnEntries := entries(t, ns)
-	newest := turnEntries[len(turnEntries)-1].ID
+	if setRes.EntryID == "" {
+		t.Fatal("empty entry id")
+	}
 
 	var res protocol.CommandRunResult
 	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
@@ -674,8 +675,8 @@ func TestCommandRunForksAtTheNewestEntry(t *testing.T) {
 	if !ok {
 		t.Fatalf("last replayed child entry kind = %v, want fork_point", last.Kind)
 	}
-	if fp.ParentSessionID.String() != info.SessionID || fp.ParentEntryID != newest {
-		t.Fatalf("fork_point = %+v, want parent %s at %s", fp, info.SessionID, newest)
+	if fp.ParentSessionID.String() != info.SessionID || fp.ParentEntryID.String() != setRes.EntryID {
+		t.Fatalf("fork_point = %+v, want parent %s at %s (the set_title entry, the newest)", fp, info.SessionID, setRes.EntryID)
 	}
 }
 
