@@ -104,10 +104,8 @@ type rawMsg struct {
 
 func rawDialAs(t *testing.T, srv *server.Server, asker bool) *rawClient {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	cc, sc := protocol.Pipe()
-	go func() { _ = srv.Serve(ctx, sc) }()
-	t.Cleanup(func() { _ = cc.Close(); cancel() })
+	cc := dialConn(t, srv)
+	t.Cleanup(func() { _ = cc.Close() })
 	r := &rawClient{t: t, conn: cc}
 	if _, before := r.call(protocol.MethodClientHello, protocol.ClientHelloParams{Client: "raw", Version: "0", Asker: asker}); len(sessionNotes(before)) > 0 {
 		t.Fatalf("hello brought session notifications: %v", rawMethods(before))

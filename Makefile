@@ -8,6 +8,7 @@ build:
 
 test:
 	CGO_ENABLED=0 go test -race ./...
+	CGO_ENABLED=0 RUDY_TEST_TRANSPORT=socket go test -race -count=1 ./internal/server/
 
 lint:
 	golangci-lint run ./...

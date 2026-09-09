@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -279,16 +280,98 @@ func (h *harness) dial(t *testing.T, asker bool) *protocol.Client {
 	return dialAs(t, h.srv, asker)
 }
 
+// transportSocket picks the transport every dial in this package makes: the unix socket
+// when RUDY_TEST_TRANSPORT=socket, an in-memory pipe for anything else (including unset).
+// Read once at package init, not per test, so one run never mixes the two.
+var transportSocket = os.Getenv("RUDY_TEST_TRANSPORT") == "socket"
+
+// socketByServer is the one socket listener each *server.Server gets in socket mode, for as
+// long as the test that started it is running. dialConn's t.Cleanup removes the entry when
+// that test ends, and no test in this package runs with t.Parallel, so a bare mutex is
+// enough to guard it.
+var (
+	socketMu       sync.Mutex
+	socketByServer = map[*server.Server]string{}
+)
+
+// shortTempDir is sockDir from internal/protocol/unixsock_test.go: a socket path is 104
+// bytes on darwin, and t.TempDir() spends most of that on a long subtest name before a file
+// is even named, so the socket transport needs its own short directory under /tmp.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "rudy-sock-")
+	if err != nil {
+		t.Fatalf("socket temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// socketFor is the path to dial srv over in socket mode. The first call for a given srv
+// listens and starts an accept loop that hands every accepted connection to srv.Serve, on
+// its own goroutine, until the listener closes; later calls for the same srv, from the same
+// or a later dial in the same test, reuse that listener.
+func socketFor(t *testing.T, srv *server.Server) string {
+	t.Helper()
+	socketMu.Lock()
+	defer socketMu.Unlock()
+	if path, ok := socketByServer[srv]; ok {
+		return path
+	}
+	path := filepath.Join(shortTempDir(t), "s.sock")
+	l, err := protocol.ListenUnix(path)
+	if err != nil {
+		t.Fatalf("listen socket: %v", err)
+	}
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				continue
+			}
+			go func() { _ = srv.Serve(context.Background(), c) }()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = l.Close()
+		socketMu.Lock()
+		delete(socketByServer, srv)
+		socketMu.Unlock()
+	})
+	socketByServer[srv] = path
+	return path
+}
+
+// dialConn opens one connection to srv: over the socket in socket mode, over an in-memory
+// pipe (with srv.Serve running the server half) otherwise. It is the one place both dialAs
+// and rawDialAs open a connection, so both run over either transport the same way.
+func dialConn(t *testing.T, srv *server.Server) protocol.Conn {
+	t.Helper()
+	if !transportSocket {
+		ctx, cancel := context.WithCancel(context.Background())
+		cc, sc := protocol.Pipe()
+		go func() { _ = srv.Serve(ctx, sc) }()
+		t.Cleanup(cancel)
+		return cc
+	}
+	conn, err := protocol.DialUnix(context.Background(), socketFor(t, srv), time.Second)
+	if err != nil {
+		t.Fatalf("dial socket: %v", err)
+	}
+	return conn
+}
+
 // dialAs opens one connection to srv and greets it as a client of the given asker class.
 func dialAs(t *testing.T, srv *server.Server, asker bool) *protocol.Client {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	cc, sc := protocol.Pipe()
-	go func() { _ = srv.Serve(ctx, sc) }()
+	cc := dialConn(t, srv)
 	cl := protocol.NewClient(cc)
-	t.Cleanup(func() { _ = cl.Close(); cancel() })
+	t.Cleanup(func() { _ = cl.Close() })
 	var hr protocol.ClientHelloResult
-	if err := cl.Call(ctx, protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0", Asker: asker}, &hr); err != nil {
+	if err := cl.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0", Asker: asker}, &hr); err != nil {
 		t.Fatalf("hello: %v", err)
 	}
 	return cl
