@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 )
@@ -74,8 +75,7 @@ func (p *Peer) read(responses chan<- Response) {
 	for {
 		raw, err := p.c.Recv(ctx)
 		if err != nil {
-			p.cl.fail(err)
-			p.inc.stop(err)
+			p.end(err)
 			return
 		}
 		var m incoming
@@ -83,11 +83,34 @@ func (p *Peer) read(responses chan<- Response) {
 			continue
 		}
 		if m.Method != "" {
-			p.inc.push(raw)
+			if err := p.inc.push(raw); err != nil {
+				p.end(err)
+				return
+			}
 			continue
 		}
 		responses <- Response{JSONRPC: Version, ID: m.ID, Result: m.Result, Error: m.Error}
 	}
+}
+
+// maxIncoming caps the Incoming queue. The queue is what lets the reader run ahead of a busy
+// consumer; without a cap it is also what lets a hostile or broken child turn the parent's
+// memory into its own buffer, which is exactly the backpressure the stream transport has and
+// this would throw away. A peer that gets this far ahead is not one worth keeping.
+const maxIncoming = 4096
+
+// ErrIncomingOverflow ends a connection whose peer sent more unread messages than the queue
+// holds.
+var ErrIncomingOverflow = fmt.Errorf("protocol: peer sent more than %d unread messages", maxIncoming)
+
+// end stops the peer: pending calls fail, the consumer drains what is queued and then sees
+// err, and the transport is closed. Closing it is what tells the other side to stop, which
+// matters most when the transport is a child's stdio and the child is still running: without
+// it a peer whose reader has given up leaves the child talking to nobody.
+func (p *Peer) end(err error) {
+	p.cl.fail(err)
+	p.inc.stop(err)
+	_ = p.c.Close()
 }
 
 // queued is one message waiting for the Incoming consumer, or a barrier: a marker with no
@@ -116,11 +139,18 @@ type queueConn struct {
 	downOnce sync.Once
 }
 
-func (q *queueConn) push(msg json.RawMessage) {
+// push queues one message for the consumer. It never blocks; past the cap it refuses, and the
+// reader ends the connection.
+func (q *queueConn) push(msg json.RawMessage) error {
 	q.mu.Lock()
+	if len(q.q) >= maxIncoming {
+		q.mu.Unlock()
+		return ErrIncomingOverflow
+	}
 	q.q = append(q.q, queued{msg: msg})
 	q.mu.Unlock()
 	q.signal()
+	return nil
 }
 
 func (q *queueConn) signal() {

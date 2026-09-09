@@ -119,3 +119,81 @@ func TestPeerCloseEndsPeerRecvAndFailsCalls(t *testing.T) {
 		t.Fatal("the pending call never returned")
 	}
 }
+
+func TestPeerRefusesAFloodOfUnreadMessages(t *testing.T) {
+	ac, bc := Pipe()
+	a := NewPeer(ac)
+	t.Cleanup(func() { _ = a.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// b is a hostile peer: it sends notifications and never reads anything. Nothing drains
+	// a's Incoming queue, so the flood is what the cap is for.
+	note, err := NewNotification("tool.progress", map[string]string{"tool_use_id": "tu1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendErr := make(chan error, 1)
+	go func() {
+		for range maxIncoming * 4 {
+			if err := bc.Send(ctx, note); err != nil {
+				sendErr <- err
+				return
+			}
+		}
+		sendErr <- nil
+	}()
+
+	// Nothing reads until the flood has been cut off, which is the point: the cap, not the
+	// consumer, is what stops it.
+	select {
+	case err := <-sendErr:
+		if err == nil {
+			t.Fatal("the flooding peer was never cut off")
+		}
+	case <-ctx.Done():
+		t.Fatal("the flooding peer is still sending")
+	}
+	// The queue still delivers what it holds, and then reports the overflow.
+	var got error
+	delivered := 0
+	for range maxIncoming * 4 {
+		if _, err := a.Incoming().Recv(ctx); err != nil {
+			got = err
+			break
+		}
+		delivered++
+	}
+	if !errors.Is(got, ErrIncomingOverflow) {
+		t.Fatalf("Recv ended with %v after %d messages, want the overflow error", got, delivered)
+	}
+	if delivered > maxIncoming {
+		t.Fatalf("queued %d messages, over the %d cap", delivered, maxIncoming)
+	}
+}
+
+func TestPeerClosesTheConnWhenItsReaderEnds(t *testing.T) {
+	ac, bc := Pipe()
+	a := NewPeer(ac)
+	t.Cleanup(func() { _ = a.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// b goes away. a's reader must close its own end rather than sit on a dead conn: the
+	// caller above it (a spawned plugin's adapter) is what decides the plugin has failed, and
+	// it hears about it through the closed connection.
+	if err := bc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Incoming().Recv(ctx); err == nil {
+		t.Fatal("Recv succeeded after the peer went away")
+	}
+	if err := a.Incoming().Send(ctx, note()); !errors.Is(err, ErrConnClosed) && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Send on a dead peer = %v", err)
+	}
+}
+
+func note() Request {
+	r, _ := NewNotification("tool.progress", nil)
+	return r
+}

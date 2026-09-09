@@ -458,3 +458,19 @@ func TestDiscoverPluginsWithoutALockKeepsEverything(t *testing.T) {
 		t.Fatalf("manifests = %+v, errors = %v", ms, errs)
 	}
 }
+
+func TestDiscoverPluginsSpawnsNothingWhenTheLockIsCorrupt(t *testing.T) {
+	data := t.TempDir()
+	writeManifest(t, data, "hello", "hello")
+	lock := filepath.Join(data, "plugins.lock.toml")
+	if err := os.WriteFile(lock, []byte("[plugins.hello\nenabled = \"yes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ms, errs := discoverPlugins([]string{data}, lock)
+	if len(ms) != 0 {
+		t.Fatalf("manifests = %+v, want none while the lock is unreadable", ms)
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "spawning no plugins until it is fixed") {
+		t.Fatalf("errors = %v", errs)
+	}
+}

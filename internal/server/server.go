@@ -346,22 +346,57 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 	}
 }
 
-// authorizePlugin is the caller class table for the plugin class, in one place. A plugin
-// asserts things about itself and about the sessions it opened: it never lists or resumes
-// somebody else's session, never answers a permission question, and never refreshes the
-// registry the whole process shares. Everything session-shaped it may do, it may do only to a
-// session on its own connection.
+// pluginMethods is the caller class table for the plugin class: everything a plugin may ask
+// for. It is an allowlist rather than a list of refusals so that a method added later is
+// refused until somebody decides a plugin may call it, instead of being granted by having
+// been forgotten.
+var pluginMethods = map[string]bool{
+	protocol.MethodClientHello:            true,
+	protocol.MethodSessionOpen:            true,
+	protocol.MethodSessionSubmit:          true, // own sessions; handleSubmit checks, after its lookup
+	protocol.MethodSessionInterrupt:       true,
+	protocol.MethodSessionClose:           true,
+	protocol.MethodSessionSetModel:        true,
+	protocol.MethodSessionSetMode:         true,
+	protocol.MethodSessionSetThinking:     true,
+	protocol.MethodSessionSetTitle:        true,
+	protocol.MethodSessionCompact:         true,
+	protocol.MethodCommandRun:             true,
+	protocol.MethodRegistryList:           true,
+	protocol.MethodPluginAppendNote:       true,
+	protocol.MethodPluginRegisterTool:     true,
+	protocol.MethodPluginRegisterCommand:  true,
+	protocol.MethodPluginRegisterHook:     true,
+	protocol.MethodPluginRegisterWidget:   true,
+	protocol.MethodPluginRegisterProvider: true,
+	protocol.MethodPluginSetStatus:        true,
+}
+
+// pluginOwnSession is the subset of pluginMethods a plugin may only aim at a session it
+// opened. session.submit belongs here too by rule, but its check stays in handleSubmit, which
+// answers not_found for a session that does not exist at all rather than unauthorized.
+var pluginOwnSession = map[string]bool{
+	protocol.MethodSessionInterrupt:   true,
+	protocol.MethodSessionClose:       true,
+	protocol.MethodSessionSetModel:    true,
+	protocol.MethodSessionSetMode:     true,
+	protocol.MethodSessionSetThinking: true,
+	protocol.MethodSessionSetTitle:    true,
+	protocol.MethodSessionCompact:     true,
+	protocol.MethodCommandRun:         true,
+}
+
+// authorizePlugin applies that table. A plugin asserts things about itself and about the
+// sessions it opened: it never lists, resumes or forks somebody else's session, never answers
+// a permission question, and never refreshes the registry the whole process shares.
 func (s *Server) authorizePlugin(cn *conn, req protocol.Request) *protocol.Error {
 	if cn.plugin == "" {
 		return nil
 	}
-	switch req.Method {
-	case protocol.MethodSessionList, protocol.MethodSessionResume, protocol.MethodSessionFork,
-		protocol.MethodSessionAnswer, protocol.MethodRegistryRefresh:
+	if !pluginMethods[req.Method] {
 		return perr(protocol.CodeUnauthorized, "a plugin may not call "+req.Method)
-	case protocol.MethodSessionInterrupt, protocol.MethodSessionClose, protocol.MethodSessionSetModel,
-		protocol.MethodSessionSetMode, protocol.MethodSessionSetThinking, protocol.MethodSessionSetTitle,
-		protocol.MethodSessionCompact, protocol.MethodCommandRun:
+	}
+	if pluginOwnSession[req.Method] {
 		return s.ownSession(cn, req)
 	}
 	return nil

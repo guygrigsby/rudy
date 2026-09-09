@@ -4,7 +4,10 @@
 package pluginstore
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"sort"
 
 	toml "github.com/pelletier/go-toml/v2"
 )
@@ -24,17 +27,22 @@ type entry struct {
 	Enabled *bool `toml:"enabled"`
 }
 
-// DisabledFromLock returns the plugin names the lock at path marks disabled. A missing or
-// unparsable lock disables nothing: a plugin the user installed should not silently
-// disappear because the file that records it is gone.
-func DisabledFromLock(path string) []string {
+// DisabledFromLock returns the plugin names the lock at path marks disabled. A missing lock
+// disables nothing: nothing has been installed yet, which is not a failure. A lock that will
+// not parse is a failure, and it is returned as one: the file is the only record of which
+// plugins the user turned off, so reading it as "none of them" would start child processes
+// the user disabled.
+func DisabledFromLock(path string) ([]string, error) {
 	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("pluginstore: %s: %w", path, err)
 	}
 	var l lock
 	if err := toml.Unmarshal(b, &l); err != nil {
-		return nil
+		return nil, fmt.Errorf("pluginstore: %s: %w", path, err)
 	}
 	var out []string
 	for name, e := range l.Plugins {
@@ -42,5 +50,6 @@ func DisabledFromLock(path string) []string {
 			out = append(out, name)
 		}
 	}
-	return out
+	sort.Strings(out)
+	return out, nil
 }

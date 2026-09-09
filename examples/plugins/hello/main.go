@@ -116,6 +116,14 @@ func (p *plugin) call(method string, params any) error {
 			return err
 		}
 		if m.Method != "" || string(m.ID) != strconv.Itoa(id) {
+			// A request arriving mid-call is discarded, which is safe here only because this
+			// plugin calls the server from one place: registration, before it has told the
+			// server it is ready, when nothing is being asked of it. A plugin that calls the
+			// server from inside a handler (opening a child session while answering
+			// tool.invoke, say) must not do this: the server is waiting for the answer to the
+			// request being dropped, this loop is waiting for an answer the server will not
+			// send until it gets that one, and both sides wait forever. Serve requests on
+			// their own goroutine, or queue what arrives mid-call and handle it after.
 			continue
 		}
 		if m.Error != nil {

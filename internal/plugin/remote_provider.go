@@ -2,11 +2,13 @@ package plugin
 
 import (
 	"context"
+	"errors"
 
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
+	"github.com/guygrigsby/rudy/internal/session"
 )
 
 // remoteProvider is a wire: custom provider: the plugin does the streaming and the server
@@ -25,7 +27,7 @@ func (p *remoteProvider) Name() string { return p.name }
 func (p *remoteProvider) ListModels(ctx context.Context) ([]provider.Model, error) {
 	var out protocol.ProviderListModelsResult
 	if err := p.sp.peer.Client().Call(ctx, protocol.MethodProviderListModels, struct{}{}, &out); err != nil {
-		return nil, err
+		return nil, providerErr(err)
 	}
 	return out.Models, nil
 }
@@ -67,7 +69,7 @@ func (p *remoteProvider) Complete(ctx context.Context, req provider.Request, emi
 			}
 		case c := <-done:
 			if c.err != nil {
-				return c.err
+				return providerErr(c.err)
 			}
 			return p.finish(sub, c.res, emit)
 		case <-ctx.Done():
@@ -107,6 +109,20 @@ func (p *remoteProvider) finish(sub *deltaSub, res protocol.ProviderCompleteResu
 		StopReason:    res.StopReason,
 		StopReasonRaw: res.StopReasonRaw,
 	})
+}
+
+// providerErr gives a plugin's failure the class the turn records. Without it every failure
+// from a wire: custom provider would land as an internal fault, which is what a rudy bug
+// looks like, rather than the provider error it is. A cancelled turn stays a cancellation.
+func providerErr(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	var pe *provider.Error
+	if errors.As(err, &pe) {
+		return err
+	}
+	return &provider.Error{Class: session.ErrProvider, Message: err.Error(), Attempts: 1}
 }
 
 func drainParts(parts <-chan provider.Part, emit func(provider.Part) error) error {

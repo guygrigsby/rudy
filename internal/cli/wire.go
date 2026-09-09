@@ -139,7 +139,8 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		}
 	}()
 	if discover {
-		set = append(set, spawnedPlugins(paths, plugins, srv, o.Version, notice)...)
+		set = append(set, spawnedPlugins(paths, plugins, srv, o.Version,
+			time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice)...)
 	}
 	services := srv.PluginServices()
 	// Withdrawing a provider has to reach the provider registry's own copy, not just the
@@ -209,7 +210,7 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 // the first registration of a name wins. The roots are the data root (where rudy plugin
 // install puts them), the config root (where a user drops one by hand) and the workspace's
 // own .rudy, which is how a repository ships a plugin with itself.
-func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, notice func(string)) []plugin.Plugin {
+func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, commandTimeout time.Duration, notice func(string)) []plugin.Plugin {
 	// No working directory is no project scope, never a reason to fail the build.
 	cwd, _ := os.Getwd()
 	roots := []string{paths.Data, paths.Config}
@@ -227,20 +228,26 @@ func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Se
 	out := make([]plugin.Plugin, 0, len(manifests))
 	for _, m := range manifests {
 		out = append(out, plugin.NewSpawned(m, plugin.SpawnServices{
-			ServePlugin: srv.ServePlugin,
-			Version:     version,
-			Workspaces:  workspaces,
-			Fail:        plugins.Fail,
+			ServePlugin:    srv.ServePlugin,
+			Version:        version,
+			Workspaces:     workspaces,
+			Fail:           plugins.Fail,
+			CommandTimeout: commandTimeout,
 		}))
 	}
 	return out
 }
 
 // discoverPlugins is Discover minus what the lock file disables. A disabled plugin is not
-// started at all, so it gets no status row: it was never asked to load.
+// started at all, so it gets no status row: it was never asked to load. A lock that will not
+// parse spawns nothing at all: it is the only record of what the user turned off, and running
+// a plugin the user disabled is worse than running none until the file is fixed.
 func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []error) {
+	disabled, err := pluginstore.DisabledFromLock(lockPath)
+	if err != nil {
+		return nil, []error{fmt.Errorf("%s: %v; spawning no plugins until it is fixed", pluginstore.LockFile, err)}
+	}
 	manifests, errs := plugin.Discover(roots)
-	disabled := pluginstore.DisabledFromLock(lockPath)
 	return slices.DeleteFunc(manifests, func(m plugin.Manifest) bool {
 		return slices.Contains(disabled, m.Name)
 	}), errs

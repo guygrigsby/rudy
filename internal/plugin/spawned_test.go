@@ -23,10 +23,12 @@ type fakeChild struct {
 
 	peer *protocol.Peer
 
-	version  int  // what to answer plugin.init with
-	register bool // send registrations before answering plugin.init
-	provider bool // register a wire: custom provider too
-	slowTool bool // never answer tool.invoke, so the caller's context is what ends it
+	version      int  // what to answer plugin.init with
+	register     bool // send registrations before answering plugin.init
+	provider     bool // register a wire: custom provider too
+	slowTool     bool // never answer tool.invoke, so the caller's context is what ends it
+	slowCommand  bool // never answer command.invoke
+	failComplete bool // answer provider.complete with an error
 
 	mu      sync.Mutex
 	init    protocol.PluginInitParams
@@ -128,6 +130,9 @@ func (c *fakeChild) handle(ctx context.Context, req protocol.Request) (any, *pro
 	case protocol.MethodCommandInvoke:
 		var p protocol.CommandInvokeParams
 		_ = json.Unmarshal(req.Params, &p)
+		if c.slowCommand {
+			return nil, nil, true
+		}
 		if p.Args == "prompt" {
 			return protocol.CommandInvokeResult{Prompt: "say hi"}, nil, false
 		}
@@ -135,6 +140,9 @@ func (c *fakeChild) handle(ctx context.Context, req protocol.Request) (any, *pro
 	case protocol.MethodProviderComplete:
 		var p protocol.ProviderCompleteParams
 		_ = json.Unmarshal(req.Params, &p)
+		if c.failComplete {
+			return nil, protocol.NewError(protocol.CodePluginError, "the model said no", nil), false
+		}
 		for _, text := range []string{"one", "two"} {
 			note, err := protocol.NewNotification(protocol.NotifyProviderDelta, protocol.ProviderDelta{
 				RequestID: p.RequestID,
@@ -287,9 +295,10 @@ func loadSpawned(t *testing.T, cfg map[string]any, tune func(*fakeChild)) *spawn
 			ServePlugin: func(ctx context.Context, conn protocol.Conn, r Registrar) error {
 				return serveRegistrar(ctx, conn, r)
 			},
-			Version:    "test-version",
-			Workspaces: []string{"/ws"},
-			Fail:       reg.Fail,
+			Version:        "test-version",
+			Workspaces:     []string{"/ws"},
+			Fail:           reg.Fail,
+			CommandTimeout: 300 * time.Millisecond,
 		},
 		start,
 	)
@@ -588,4 +597,67 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatal("condition never held")
+}
+
+func TestSpawnedCommandTimesOutRatherThanParkingTheCaller(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) { c.slowCommand = true })
+	cmd, ok := h.reg.Command("hello")
+	if !ok {
+		t.Fatal("no hello command")
+	}
+	start := time.Now()
+	_, err := cmd.Run(context.Background(), CommandCall{})
+	if err == nil {
+		t.Fatal("a command the child never answered came back with no error")
+	}
+	if !strings.Contains(err.Error(), "no answer within") {
+		t.Fatalf("err = %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("the caller waited %s", took)
+	}
+	notes := strings.Join(h.notes(), "\n")
+	if !strings.Contains(notes, "hello") || !strings.Contains(notes, "no answer within") {
+		t.Fatalf("notices = %v", h.notes())
+	}
+}
+
+func TestSpawnedConnectionLossFailsThePlugin(t *testing.T) {
+	h := loadSpawned(t, nil, nil)
+	if _, ok := h.reg.Tool("hello_upper"); !ok {
+		t.Fatal("no hello_upper tool before the connection went")
+	}
+	_, _ = h.tail.Write([]byte("still running\n"))
+	// The child stops talking without exiting: its end of the connection closes and its
+	// process, as far as this side knows, is still there.
+	_ = h.child.peer.Close()
+	waitFor(t, func() bool {
+		st := h.reg.Statuses()
+		return len(st) == 1 && st[0].State == StateFailed
+	})
+	st := h.reg.Statuses()[0]
+	if !strings.Contains(st.Reason, "connection lost") || !strings.Contains(st.Reason, "still running") {
+		t.Fatalf("reason = %q", st.Reason)
+	}
+	if _, ok := h.reg.Tool("hello_upper"); ok {
+		t.Fatal("the unreachable plugin's tool is still registered")
+	}
+}
+
+func TestSpawnedProviderFailureCarriesTheProviderClass(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) { c.provider = true; c.failComplete = true })
+	ps := h.reg.Providers()
+	if len(ps) != 1 {
+		t.Fatalf("providers = %+v", ps)
+	}
+	err := ps[0].Complete(context.Background(), provider.Request{
+		Model: session.ModelRef{Provider: "hello", Model: "m1"},
+	}, func(provider.Part) error { return nil })
+	var pe *provider.Error
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %v (%T), want a *provider.Error", err, err)
+	}
+	if pe.Class != session.ErrProvider || pe.Attempts != 1 || !strings.Contains(pe.Message, "the model said no") {
+		t.Fatalf("provider error = %+v", pe)
+	}
 }

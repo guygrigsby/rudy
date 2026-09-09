@@ -12,6 +12,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -61,7 +62,9 @@ func ReadManifest(dir string) (Manifest, error) {
 }
 
 // Discover reads <root>/plugins/<name>/plugin.toml under each root in order; the first
-// manifest for a name wins, so a project plugin shadows a user one of the same name. A
+// manifest for a name wins, so the caller decides what shadows what by the order it passes
+// (wire passes the data root first, so an installed plugin wins over a copy dropped in the
+// config root or in a workspace). A
 // directory with no manifest is not a plugin and is skipped silently; a manifest whose name
 // differs from its directory is skipped with an error in the returned list, since the
 // directory is the identity the lock file and the install path use.
@@ -117,6 +120,11 @@ type SpawnServices struct {
 	Version     string
 	Workspaces  []string
 	Fail        func(name, reason string)
+	// CommandTimeout bounds one command.invoke. A slash command runs on the calling
+	// connection's serve loop, so a child that never answers would park that connection for
+	// good; the budget is the same hook_timeout_ms a hook handler gets. Zero means
+	// DefaultHookTimeout.
+	CommandTimeout time.Duration
 }
 
 // Registrar is what the server calls when a spawned plugin sends plugin.register_* or
@@ -203,6 +211,12 @@ const (
 	// stopGrace is how long Close waits for a child to notice its stdin closed before it is
 	// killed.
 	stopGrace = time.Second
+	// exitGrace is how long a lost connection waits for the process to be reaped before it
+	// decides the connection is what went: a child's stdout closes as it exits, and its exit
+	// status is the better reason of the two.
+	exitGrace = time.Second
+	// termGrace is how long a terminated child gets between SIGTERM and the kill.
+	termGrace = 5 * time.Second
 	// tailBytes is how much of a child's stderr is kept for the failure notice.
 	tailBytes = 4096
 	// deltaBuffer is how far a streaming provider may run ahead of the turn consuming it.
@@ -293,8 +307,11 @@ func (s *Spawned) Init(ctx context.Context, h Host) error {
 	s.tl = tl
 	s.peer = protocol.NewPeer(conn)
 	// The plugin's own connection to the server, serving exactly the requests a linked
-	// plugin's Host.Connect client may make plus the registrations.
-	go func() { _ = s.services.ServePlugin(ctx, s.peer.Incoming(), s) }()
+	// plugin's Host.Connect client may make plus the registrations. Its return is how this
+	// hears that the connection has ended, which is a way for a plugin to be gone that has
+	// nothing to do with its process still being alive.
+	lost := make(chan error, 1)
+	go func() { lost <- s.services.ServePlugin(ctx, s.peer.Incoming(), s) }()
 
 	ictx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
@@ -313,7 +330,7 @@ func (s *Spawned) Init(ctx context.Context, h Host) error {
 		return s.abandon(wait, fmt.Errorf("protocol version %d, want %d", res.ProtocolVersion, protocol.ProtocolVersion))
 	}
 	s.ready.Store(true)
-	go s.watch(wait)
+	go s.watch(wait, lost)
 	return nil
 }
 
@@ -332,23 +349,46 @@ func (s *Spawned) abandon(wait func() error, err error) error {
 	return err
 }
 
-// watch reaps the child. An exit after the plugin was committed withdraws everything it
-// registered and says so once: the session goes on without it.
-func (s *Spawned) watch(wait func() error) {
-	err := wait()
-	close(s.exited)
+// watch ends the plugin when either half of it ends: the process exits, or the connection to
+// it is lost while it is still running (a child that closed its stdout, a transport that
+// overflowed). Either way, once the plugin was committed, everything it registered is
+// withdrawn and the reason is said once: the session goes on without it.
+func (s *Spawned) watch(wait func() error, lost <-chan error) {
+	exit := make(chan error, 1)
+	go func() {
+		err := wait()
+		exit <- err
+		close(s.exited)
+	}()
+	var reason string
+	select {
+	case err := <-exit:
+		reason = "exited: " + exitReason(err)
+	case err := <-lost:
+		if s.closing.Load() || errors.Is(err, context.Canceled) {
+			// Our own shutdown, not the plugin's: the server cancelled the serve loop.
+			return
+		}
+		select {
+		case perr := <-exit:
+			reason = "exited: " + exitReason(perr)
+		case <-time.After(exitGrace):
+			// The connection is gone and the process is not. A child nobody can talk to is
+			// not going to stop on its own.
+			s.terminate()
+			reason = "connection lost: " + lostReason(err)
+		}
+	}
 	if s.closing.Load() {
 		return
 	}
+	// The registry commits this plugin's stage when Init returns; withdrawing before that
+	// would leave behind exactly what it was meant to remove.
 	<-s.commit
 	if s.closing.Load() {
 		return
 	}
-	why := "process ended"
-	if err != nil {
-		why = err.Error()
-	}
-	reason := fmt.Sprintf("exited: %s; stderr: %s", why, s.tl.String())
+	reason = fmt.Sprintf("%s; stderr: %s", reason, s.tl.String())
 	if s.services.Fail != nil {
 		s.services.Fail(s.m.Name, reason)
 	}
@@ -356,6 +396,39 @@ func (s *Spawned) watch(wait func() error) {
 		s.host.Notice(reason)
 	}
 	_ = s.peer.Close()
+}
+
+func exitReason(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "process ended"
+}
+
+func lostReason(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "end of input"
+}
+
+// terminate asks a child that has stopped talking to us to stop, and insists if it will not.
+func (s *Spawned) terminate() {
+	s.procMu.Lock()
+	p := s.proc
+	s.procMu.Unlock()
+	if p == nil {
+		return
+	}
+	if err := p.Signal(syscall.SIGTERM); err != nil {
+		_ = p.Kill()
+		return
+	}
+	select {
+	case <-s.exited:
+	case <-time.After(termGrace):
+		_ = p.Kill()
+	}
 }
 
 // Close ends the child: its stdin is closed first, which is how a well-behaved plugin is
@@ -646,12 +719,23 @@ func (s *Spawned) fireHook(point HookPoint) func(ctx context.Context, call HookC
 // nothing at all.
 func (s *Spawned) runCommand(name string) func(ctx context.Context, call CommandCall) (Action, error) {
 	return func(ctx context.Context, call CommandCall) (Action, error) {
+		// A slash command runs on the calling connection's serve loop, so this budget is
+		// what keeps a child that never answers from parking that connection for good.
+		ctx, cancel := context.WithTimeout(ctx, s.commandTimeout())
+		defer cancel()
 		var out protocol.CommandInvokeResult
 		err := s.peer.Client().Call(ctx, protocol.MethodCommandInvoke, protocol.CommandInvokeParams{
 			SessionID: call.SessionID.String(),
 			Name:      name,
 			Args:      call.Args,
 		}, &out)
+		if errors.Is(err, context.DeadlineExceeded) {
+			timedOut := fmt.Errorf("/%s: no answer within %s", name, s.commandTimeout())
+			if s.host != nil {
+				s.host.Notice(timedOut.Error())
+			}
+			return nil, timedOut
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -663,6 +747,13 @@ func (s *Spawned) runCommand(name string) func(ctx context.Context, call Command
 		}
 		return NoAction{}, nil
 	}
+}
+
+func (s *Spawned) commandTimeout() time.Duration {
+	if s.services.CommandTimeout > 0 {
+		return s.services.CommandTimeout
+	}
+	return DefaultHookTimeout
 }
 
 func (s *Spawned) subscribe(requestID string) *deltaSub {

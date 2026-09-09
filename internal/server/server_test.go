@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1693,6 +1697,102 @@ func TestPluginClassIsGatedPerTheCallerTable(t *testing.T) {
 	if err := pc.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: own.SessionID}, &struct{}{}); err != nil {
 		t.Fatalf("plugin close of its own session: %v", err)
 	}
+}
+
+// TestEveryProtocolMethodIsDecidedForPlugins reads the method constants out of
+// internal/protocol and asserts each one is either named here as something a plugin may call
+// or refused on a plugin connection. A method added later and forgotten fails this test
+// rather than quietly becoming something every plugin can do.
+func TestEveryProtocolMethodIsDecidedForPlugins(t *testing.T) {
+	allowed := map[string]bool{
+		protocol.MethodClientHello:            true,
+		protocol.MethodSessionOpen:            true,
+		protocol.MethodSessionSubmit:          true,
+		protocol.MethodSessionInterrupt:       true,
+		protocol.MethodSessionClose:           true,
+		protocol.MethodSessionSetModel:        true,
+		protocol.MethodSessionSetMode:         true,
+		protocol.MethodSessionSetThinking:     true,
+		protocol.MethodSessionSetTitle:        true,
+		protocol.MethodSessionCompact:         true,
+		protocol.MethodCommandRun:             true,
+		protocol.MethodRegistryList:           true,
+		protocol.MethodPluginAppendNote:       true,
+		protocol.MethodPluginRegisterTool:     true,
+		protocol.MethodPluginRegisterCommand:  true,
+		protocol.MethodPluginRegisterHook:     true,
+		protocol.MethodPluginRegisterWidget:   true,
+		protocol.MethodPluginRegisterProvider: true,
+		protocol.MethodPluginSetStatus:        true,
+	}
+	methods := protocolMethods(t)
+	if len(methods) < len(allowed) {
+		t.Fatalf("found only %d method constants: %v", len(methods), methods)
+	}
+	hp := &hostPlugin{}
+	newHarnessWith(t, &scriptProvider{}, hp)
+	pc := dialPlugin(t, hp)
+	ctx := context.Background()
+	for _, m := range methods {
+		if allowed[m] {
+			continue
+		}
+		err := pc.Call(ctx, m, nil, &struct{}{})
+		if got := code(t, err); got != protocol.CodeUnauthorized {
+			t.Errorf("plugin %s: code %d (%v), want unauthorized or a place in the allowlist", m, got, err)
+		}
+	}
+}
+
+// protocolMethods is every Method* constant declared in internal/protocol, read from the
+// source: nothing at runtime can enumerate a package's constants.
+func protocolMethods(t *testing.T) []string {
+	t.Helper()
+	dir := filepath.Join("..", "protocol")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read internal/protocol: %v", err)
+	}
+	fset := token.NewFileSet()
+	var out []string
+	for _, ent := range ents {
+		name := ent.Name()
+		if ent.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, ident := range vs.Names {
+					if !strings.HasPrefix(ident.Name, "Method") || i >= len(vs.Values) {
+						continue
+					}
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.STRING {
+						continue
+					}
+					value, err := strconv.Unquote(lit.Value)
+					if err != nil {
+						t.Fatalf("%s: %v", ident.Name, err)
+					}
+					out = append(out, value)
+				}
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // TestBroadcastsSkipPluginConnections pins the fan-out rule: a plugin's own connection gets
