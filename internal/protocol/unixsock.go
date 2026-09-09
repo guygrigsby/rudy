@@ -39,8 +39,10 @@ const (
 	socketDirMode = 0o700
 	// socketMode is set after bind: the bind itself takes the umask off 0777.
 	socketMode = 0o600
-	// lockMode is the mode the lock file is created with. Nothing reads its contents; the
-	// lock is the file's open description, not anything written in it.
+	// lockMode is set on the lock file at every open, not just the one that creates it.
+	// Nothing reads its contents; the lock is the file's open description, not anything
+	// written in it, and the file outlives the server, so a mode a stale umask left behind
+	// would outlive it too.
 	lockMode = 0o600
 )
 
@@ -110,9 +112,17 @@ func lockPath(path string) string { return path + ".lock" }
 // makes taking a stale socket over safe: two servers starting at once both find the same
 // dead socket, and only the one holding the lock gets as far as removing it.
 func takeLock(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, lockMode)
+	// O_RDONLY is all a flock asks for, so the widest set of existing modes can still be
+	// opened, and the mode is set afterwards rather than left to the umask: this file is
+	// never removed, so a umask of 0200 on the run that created it would otherwise leave a
+	// 0400 file that every later server fails to open, for good.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, lockMode)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: socket lock %s: %w", path, err)
+	}
+	if err := os.Chmod(path, lockMode); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("protocol: socket lock mode %s: %w", path, err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()

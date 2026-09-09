@@ -138,6 +138,48 @@ func TestListenCreatesAPrivateDirAndSocket(t *testing.T) {
 	}
 }
 
+func TestListenFixesTheLockFileMode(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		// The lock file outlives the server, so a mode set once under a hostile umask would
+		// lock every later server out of its own socket for good.
+		{"a umask that narrows the create", func(t *testing.T, path string) {
+			old := syscall.Umask(0o277)
+			t.Cleanup(func() { syscall.Umask(old) })
+		}},
+		{"a lock file left narrow by an older run", func(t *testing.T, path string) {
+			if err := os.WriteFile(path+".lock", nil, 0o400); err != nil {
+				t.Fatalf("write lock: %v", err)
+			}
+		}},
+		{"a lock file left wide by an older run", func(t *testing.T, path string) {
+			if err := os.WriteFile(path+".lock", nil, 0o666); err != nil {
+				t.Fatalf("write lock: %v", err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(sockDir(t), "s.sock")
+			tc.setup(t, path)
+			l, err := ListenUnix(path)
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer func() { _ = l.Close() }()
+			li, err := os.Lstat(path + ".lock")
+			if err != nil {
+				t.Fatalf("stat lock: %v", err)
+			}
+			if got := li.Mode().Perm(); got != 0o600 {
+				t.Fatalf("lock mode = %o, want 600", got)
+			}
+		})
+	}
+}
+
 func TestListenRefusesASymlinkedDir(t *testing.T) {
 	base := sockDir(t)
 	real := filepath.Join(base, "real")
