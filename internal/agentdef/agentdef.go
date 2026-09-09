@@ -13,6 +13,7 @@ import (
 
 	yaml "go.yaml.in/yaml/v3"
 
+	"github.com/guygrigsby/rudy/internal/frontmatter"
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
@@ -27,9 +28,9 @@ type Definition struct {
 	MaxTurns    int
 }
 
-// frontmatter is the YAML header. Tools is a pointer so an absent key (every tool) is
+// header is the YAML frontmatter. Tools is a pointer so an absent key (every tool) is
 // distinguishable from an explicit empty list (no tool).
-type frontmatter struct {
+type header struct {
 	Name        string    `yaml:"name"`
 	Description string    `yaml:"description"`
 	Tools       *[]string `yaml:"tools"`
@@ -91,12 +92,12 @@ func Resolve(defs map[string]Definition, name string) (Definition, bool) {
 // parse splits the frontmatter from the body and validates the header. stem is the file name
 // without its extension, which is the definition's name unless the header repeats it.
 func parse(stem string, data []byte) (Definition, error) {
-	head, body, err := split(data)
-	if err != nil {
-		return Definition{}, err
+	head, body, ok := frontmatter.Split(string(data))
+	if !ok {
+		return Definition{}, errors.New("frontmatter: file must start with --- and close with ---")
 	}
-	var fm frontmatter
-	if err := yaml.Unmarshal(head, &fm); err != nil {
+	var fm header
+	if err := yaml.Unmarshal([]byte(head), &fm); err != nil {
 		return Definition{}, fmt.Errorf("frontmatter: %w", err)
 	}
 	if fm.Name != "" && fm.Name != stem {
@@ -115,7 +116,7 @@ func parse(stem string, data []byte) (Definition, error) {
 	d := Definition{
 		Name:        stem,
 		Description: fm.Description,
-		Prompt:      strings.TrimSpace(string(body)),
+		Prompt:      strings.TrimSpace(body),
 		Model:       fm.Model,
 		Thinking:    thinking,
 		MaxTurns:    fm.MaxTurns,
@@ -127,23 +128,4 @@ func parse(stem string, data []byte) (Definition, error) {
 		d.Tools = tools
 	}
 	return d, nil
-}
-
-// split separates the YAML frontmatter from the body. The file must start with "---\n"; the
-// header ends at the next "\n---\n" (or a trailing "\n---"). Kept here rather than shared for
-// now; the skills loader grows its own reader of the same shape.
-func split(data []byte) (head, body []byte, err error) {
-	const fence = "---\n"
-	s := string(data)
-	if !strings.HasPrefix(s, fence) {
-		return nil, nil, errors.New("file does not start with a --- frontmatter fence")
-	}
-	rest := s[len(fence):]
-	if i := strings.Index(rest, "\n"+fence); i >= 0 {
-		return []byte(rest[:i]), []byte(rest[i+len("\n")+len(fence):]), nil
-	}
-	if strings.HasSuffix(rest, "\n---") {
-		return []byte(strings.TrimSuffix(rest, "\n---")), nil, nil
-	}
-	return nil, nil, errors.New("frontmatter has no closing --- fence")
 }
