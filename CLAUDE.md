@@ -50,6 +50,10 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
 `build` (default), `test`, `lint`, `check`, `fmt-check`, `vendor-types`,
 `install`, `redeploy`. CI calls these and nothing else.
 
+`make test` runs the whole suite and then the server package again under
+`RUDY_TEST_TRANSPORT=socket`, so every server test runs over both transports:
+the in-memory pipe and the unix socket `rudy serve` listens on.
+
 ## Building against memory-go
 
 `go.mod` replaces `github.com/aeryx-ai/memory/memory-go` with

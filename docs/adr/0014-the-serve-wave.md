@@ -1,6 +1,6 @@
 # 14. The serve wave: a unix socket on the same server, clients that attach or embed, questions to every asker
 
-- Status: Accepted
+- Status: Accepted, implemented 2026-09-09
 - Date: 2026-09-09
 - Deciders: Guy Grigsby
 

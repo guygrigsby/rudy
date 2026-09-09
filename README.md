@@ -5,8 +5,8 @@ workspace with tools, sessions, permissions and plugins, fronted by a
 terminal client the owner controls down to the glyph, and runnable headless
 or as a server without changing the loop.
 
-This build is the kernel, the terminal client and the headless printer.
-Server mode is the next plan.
+This build is the kernel, the terminal client, the headless printer and the
+server.
 
 ## Build
 
@@ -89,6 +89,76 @@ asks before an unsafe tool and denies it if nothing can answer, `permissive`
 allows by default, `off` allows everything. In strict mode with no client
 able to answer, every unsafe tool call is denied and the denial is recorded;
 pass `--mode permissive` or `--mode off` for unattended runs.
+
+## Run a server
+
+    rudy serve                            # until interrupted
+
+`rudy serve` runs the server this binary already embeds, on a unix socket
+instead of an in-process pipe: `$XDG_RUNTIME_DIR/rudy/rudy.sock`, or
+`$TMPDIR/rudy-<uid>/rudy.sock` where nothing sets `XDG_RUNTIME_DIR`, macOS
+included. It logs to stderr, and on SIGINT or SIGTERM it stops
+accepting, cancels every running turn so each records `turn_interrupted`,
+closes its sessions and removes the socket.
+
+`rudy`, `rudy -p`, `rudy sessions resume` and `rudy sessions fork` probe that
+socket with a 50ms connect and attach to whatever answers; nothing answering
+means they serve themselves, as they did before. `--socket <path>` attaches to
+that server or fails, and on `rudy serve` it is the path to listen on;
+`--embed` skips the probe and serves in this process. The socket directory is
+`0700` and the socket `0600`, and a connection whose peer uid is not the
+server's is closed before a byte is read.
+
+Attached, a session lives in the daemon rather than in the terminal. A turn
+keeps running after the client that started it exits, and `rudy --resume <id>`
+picks up the transcript with the answer in it. Two terminals on one session
+both see a permission question; the first answer decides and takes the prompt
+down in the other. A session some other process is holding answers
+`unavailable` and names the socket to attach through.
+
+Nothing installs a service, and rudy never starts one for you. Both of these
+are examples to adapt and install yourself.
+
+`~/Library/LaunchAgents/dev.grigsby.rudy.plist`, loaded with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.grigsby.rudy.plist`:
+
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>Label</key><string>dev.grigsby.rudy</string>
+      <key>ProgramArguments</key>
+      <array>
+        <string>/Users/you/go/bin/rudy</string>
+        <string>serve</string>
+      </array>
+      <key>RunAtLoad</key><true/>
+      <key>KeepAlive</key><true/>
+      <key>StandardErrorPath</key><string>/Users/you/Library/Logs/rudy.log</string>
+    </dict>
+    </plist>
+
+launchd gives a user agent the same per-user `TMPDIR` a login shell gets and
+sets no `XDG_RUNTIME_DIR`, so the daemon and your terminal resolve the same
+socket without either naming it.
+
+`~/.config/systemd/user/rudy.service`, enabled with
+`systemctl --user enable --now rudy` and `loginctl enable-linger $USER` so it
+survives logout:
+
+    [Unit]
+    Description=rudy
+
+    [Service]
+    ExecStart=%h/go/bin/rudy serve
+    Restart=on-failure
+
+    [Install]
+    WantedBy=default.target
+
+systemd sets `XDG_RUNTIME_DIR` to `/run/user/<uid>` for the unit and for your
+login session alike, so those agree on the socket too.
 
 ## Inspect
 

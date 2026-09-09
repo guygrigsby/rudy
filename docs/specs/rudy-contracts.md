@@ -1,6 +1,6 @@
 # rudy contracts
 
-Pass 4, 2026-09-09: the socket transport, attach and the asker rules (ADR 0014). Pass 3, 2026-09-08. Pass 3 implemented 2026-09-09; the rows below were walked against the code and corrected where they differed. Pass 2 aligned the protocol section with the kernel implementation; pass 3 adds the plugins wave (ADR 0012): child sessions for subagents, `session.compact` and the ninth hook point `before_compaction`, the clinepass dialect key, the memory summary model, skill migration sources, and the `mcp.toml` and `plugins.lock.toml` records. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
+Pass 4, 2026-09-09: the socket transport, attach and the asker rules (ADR 0014). Pass 4 implemented 2026-09-09; its rows were walked against the code and one was corrected: `server.socket` was listed as a config key and is not one, since ADR 0014 makes the socket `Paths.Socket()` with `--socket` overriding it. Pass 3, 2026-09-08. Pass 3 implemented 2026-09-09; the rows below were walked against the code and corrected where they differed. Pass 2 aligned the protocol section with the kernel implementation; pass 3 adds the plugins wave (ADR 0012): child sessions for subagents, `session.compact` and the ninth hook point `before_compaction`, the clinepass dialect key, the memory summary model, skill migration sources, and the `mcp.toml` and `plugins.lock.toml` records. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
 
 ## Error taxonomy
 
@@ -457,6 +457,9 @@ Every key, its type, default and meaning. A missing key takes the default. Unkno
 ignored; refusing them at load with the key path named is pass 3: not yet implemented (bead
 rudy-k0.27).
 
+The socket is not among them: it is `Paths.Socket()`, overridden by `--socket` and by
+nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the unknown ones.
+
 | key | type | default | meaning |
 |---|---|---|---|
 | `default.provider` | string | required when `providers` is non-empty | the provider of the one model in config; everything else comes from the registry |
@@ -470,7 +473,6 @@ rudy-k0.27).
 | `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it; must be positive, since zero is a window no two presses fall inside and the double-Esc cancel would be unreachable |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
-| `server.socket` | path | `$XDG_RUNTIME_DIR/rudy/rudy.sock` | |
 | `log.level` | `debug`, `info`, `warn`, `error` | `info` | |
 | `log.file` | path | `$XDG_CACHE_HOME/rudy/rudy.log` | |
 | `ui.render` | `inline`, `altscreen` | `inline` | |
