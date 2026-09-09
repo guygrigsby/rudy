@@ -69,6 +69,12 @@ func (cn *conn) notify(method string, params any) {
 	cn.send(req)
 }
 
+// isAsker reports whether this connection is one a permission question may be put to: its
+// hello declared asker, and it is a client rather than a plugin. handleHello refuses a
+// plugin's claim at the door and every routing walk asks this again, so the two can never
+// disagree about who counts (see liveSession.askers for why a plugin never does).
+func (cn *conn) isAsker() bool { return cn.asker && cn.plugin == "" }
+
 // subscribed reports whether this connection holds sid. Self-locking (takes cn.mu, which
 // is never nested inside any of the server's locks).
 func (cn *conn) subscribed(sid ulid.ULID) bool {

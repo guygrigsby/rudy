@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -16,8 +16,10 @@ import (
 )
 
 // errNoAsker is returned by liveAsker.Ask when the session has no subscriber whose hello
-// declared asker.
-var errNoAsker = errors.New("server: no asker attached")
+// declared asker, and when the last one detaches while a question stands. It wraps
+// turn.ErrNoAsker, which is what makes the runner record the fixed no_asker reason for both
+// rather than an asker failure.
+var errNoAsker = fmt.Errorf("server: %w", turn.ErrNoAsker)
 
 // liveSession is one open session: the real, single-owner *session.Session plus everything
 // the server tracks about it while it is live.
@@ -146,15 +148,15 @@ func (ls *liveSession) mirroredState() (turn.State, string) {
 // being released and the runner's own first StateChanged callback could see ls.runner != nil
 // but an unrelated, stale mirrored state, pass the active-turn check, and append to the
 // session concurrently with the runner. The runner's first real StateChanged overwrites both
-// fields moments later; turnID here matters only for a steer resume (where it is already known
-// and unchanged) - pass "" for a fresh turn, whose id is not known until its first append (see
-// firstAppendSignal).
+// fields moments later; turnID is the id when the caller already knows it (a steer resume,
+// which keeps the turn id it read from this same mirror) and empty for a fresh turn, whose id
+// is not known until its first append (see firstAppendSignal). Empty clears the mirror rather
+// than leaving the last turn's id behind: an attach landing in this window would otherwise be
+// handed a turn.state naming a turn that has already finished (see subscribeLocked).
 func (ls *liveSession) markStarting(turnID string) {
 	ls.obsMu.Lock()
 	ls.state = turn.Streaming
-	if turnID != "" {
-		ls.turnID = turnID
-	}
+	ls.turnID = turnID
 	ls.obsMu.Unlock()
 }
 
@@ -212,7 +214,7 @@ func (ls *liveSession) askers() []*conn {
 func (ls *liveSession) askersObsLocked() []*conn {
 	var out []*conn
 	for _, c := range ls.conns {
-		if c.asker && c.plugin == "" {
+		if c.isAsker() {
 			out = append(out, c)
 		}
 	}
@@ -344,10 +346,13 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 		entries: append([]session.Entry(nil), ls.entries...),
 		info:    deriveInfo(sid, ls.entries),
 	}
-	if isActive(ls.state) {
+	// No turn id yet means the turn is between markStarting and the runner's first append,
+	// so there is nothing truthful to name: the newcomer gets that first StateChanged as a
+	// live notification a moment later instead.
+	if isActive(ls.state) && ls.turnID != "" {
 		at.state = &protocol.TurnStateChanged{SessionID: sid.String(), TurnID: ls.turnID, State: string(ls.state)}
 	}
-	if cn.asker && cn.plugin == "" {
+	if cn.isAsker() {
 		for _, q := range ls.standing {
 			at.standing = append(at.standing, q.req)
 		}
@@ -591,6 +596,11 @@ func (a *liveAsker) Ask(ctx context.Context, q turn.Question) (turn.Answer, erro
 	}
 	select {
 	case ans := <-ch:
+		// Drop it here too, not only in the handler that sent the answer: that handler can
+		// run between the pending channel being published above and stand publishing the
+		// question, in which case it deleted a standing entry that did not exist yet, and
+		// the question would stand, already decided, for the rest of the turn.
+		a.ls.forget(q.ToolUseID)
 		return ans, nil
 	case <-abandon:
 		// The last asker detached while this stood. Same return as never having had one,

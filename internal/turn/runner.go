@@ -57,6 +57,12 @@ type Asker interface {
 	Ask(ctx context.Context, q Question) (Answer, error)
 }
 
+// ErrNoAsker is what an Asker returns, directly or wrapped, when nobody is left to answer:
+// none was attached when the question was put, or the last one detached while it stood. It is
+// not a failure of the Asker, so the runner records the same no_asker denial the Gate writes
+// when nothing was attached at all, down to the reason, rather than an asker error.
+var ErrNoAsker = errors.New("turn: no asker attached")
+
 // Observer sees every entry, every stream part and every state change.
 type Observer interface {
 	EntryAppended(e session.Entry)
@@ -491,6 +497,11 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 			return true, ctx.Err()
 		}
 		switch {
+		case errors.Is(askErr, ErrNoAsker):
+			// Nobody to ask reads the same in the log wherever it was decided: this is the
+			// string gate.Evaluate writes for the same verdict, and the domain model fixes
+			// it for no_asker.
+			dec.Decision, dec.DecidedBy, dec.Reason = session.Deny, session.ByNoAsker, "no asker attached"
 		case askErr != nil:
 			dec.Decision, dec.DecidedBy, dec.Reason = session.Deny, session.ByNoAsker, "asker failed: "+askErr.Error()
 		default:

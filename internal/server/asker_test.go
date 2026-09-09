@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -297,6 +296,18 @@ func TestAnAskerAttachingMidQuestionHearsIt(t *testing.T) {
 		t.Fatalf("resumed %s, want %s", attached.SessionID, info.SessionID)
 	}
 
+	// A headless client attaching to the same standing question is told the state and
+	// nothing else: a question goes only to a connection that can answer it.
+	headless := rawDialAs(t, h.srv, false)
+	_, raws = headless.call(protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID})
+	quiet := []string{
+		protocol.NotifyEntryAppended, protocol.NotifyEntryAppended, protocol.NotifyEntryAppended,
+		protocol.NotifyTurnState,
+	}
+	if got := rawMethods(sessionNotes(raws)); !slices.Equal(got, quiet) {
+		t.Fatalf("headless attach order = %v, want %v", got, quiet)
+	}
+
 	if err := answerWith(cl, info.SessionID, pr.ToolUseID, session.Deny); err != nil {
 		t.Fatalf("answer: %v", err)
 	}
@@ -334,8 +345,8 @@ func TestTheLastAskerLeavingDeniesTheQuestion(t *testing.T) {
 	if pd.Decision != session.Deny || pd.DecidedBy != session.ByNoAsker {
 		t.Fatalf("decision = %+v, want a no_asker deny", pd)
 	}
-	if !strings.Contains(pd.Reason, "no asker attached") {
-		t.Fatalf("reason = %q, want it to name the missing asker", pd.Reason)
+	if pd.Reason != "no asker attached" {
+		t.Fatalf("reason = %q, want the fixed no_asker string", pd.Reason)
 	}
 	if tr := es[4].Payload.(session.ToolResult); tr.Outcome != session.OutcomeError {
 		t.Fatalf("tool result = %+v, want an error", tr)

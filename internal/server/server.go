@@ -459,9 +459,11 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// A plugin connection is never an asker, whatever it claims: the plugin that opens a
 	// child session is the one waiting on that child's tool call, so routing that child's
 	// permission question back to it would park the question behind its own answer. The
-	// human's connection is the only one that can answer, and askers skips plugin
-	// connections for the same reason.
-	cn.asker = p.Asker && cn.plugin == ""
+	// human's connection is the only one that can answer. Take the claim, then let the one
+	// predicate decide whether it holds, so the door and every routing walk say the same
+	// thing about who is an asker.
+	cn.asker = p.Asker
+	cn.asker = cn.isAsker()
 	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version}, nil
 }
 
@@ -1492,8 +1494,10 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 			// same as the fresh-turn path below: it is what makes "ls.runner != nil and
 			// isActive(mirror)" hold atomically the instant mu is released, rather than
 			// relying on the reader also knowing Steering was never touched in between.
-			// turnID is already correct (a steer resume keeps the same turn id), so leave it.
-			ls.markStarting("")
+			// A steer resume keeps the turn id it already has, read back from the mirror
+			// rather than from the runner, which nothing holding mu may call.
+			_, tid := ls.mirroredState()
+			ls.markStarting(tid)
 			ls.mu.Unlock()
 			if e := s.spawnTurn(ls, r, msg); e != nil {
 				return "", e

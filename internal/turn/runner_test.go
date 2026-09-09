@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -292,6 +293,53 @@ func TestRunToolDenied(t *testing.T) {
 	tr := rec.entries[3].Payload.(session.ToolResult)
 	if tr.Outcome != session.OutcomeError || tr.Content[0].Text != "denied: not now" {
 		t.Fatalf("tool result %+v", tr)
+	}
+}
+
+// TestAnAskerReportingNobodyLeftRecordsTheFixedReason: an Asker that says nobody is left to
+// answer is not an asker that failed. The decision has to read exactly like the one the Gate
+// writes when nothing was attached in the first place, reason included, because the log is
+// where "why was this denied" is answered and the domain model fixes that string for no_asker.
+// Any other error from an Asker still says what went wrong.
+func TestAnAskerReportingNobodyLeftRecordsTheFixedReason(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		askErr error
+		reason string
+	}{
+		{"the last asker detached", ErrNoAsker, "no asker attached"},
+		{"wrapped by its caller", fmt.Errorf("server: %w", ErrNoAsker), "no asker attached"},
+		{"any other ask failure", errors.New("boom"), "asker failed: boom"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openTestSession(t, session.ModeStrict)
+			invoked := false
+			unsafe := echoTool(tool.Unsafe, "bash")
+			unsafe.Invoke = func(context.Context, tool.Call) (tool.Result, error) { invoked = true; return tool.Result{}, nil }
+			p := &scripted{scripts: [][]provider.Part{
+				append(toolCall("tu1", "bash", `{"command":"ls"}`), stop(session.StopToolUse, "tool_calls")),
+				{text("understood"), stop(session.StopEndTurn, "stop")},
+			}}
+			asker := askerFunc(func(context.Context, Question) (Answer, error) {
+				return Answer{}, tc.askErr
+			})
+			rec := &recorder{}
+			r := newRunner(t, s, p, toolSet{"bash": unsafe}, asker, rec)
+			if err := r.Run(context.Background(), userMsg(session.SourceTyped, "list")); err != nil {
+				t.Fatal(err)
+			}
+			if invoked {
+				t.Fatal("a denied tool must not run")
+			}
+			pd := rec.entries[2].Payload.(session.PermissionDecision)
+			if pd.Decision != session.Deny || pd.DecidedBy != session.ByNoAsker || pd.Reason != tc.reason {
+				t.Fatalf("decision = %+v, want a no_asker deny reading %q", pd, tc.reason)
+			}
+			tr := rec.entries[3].Payload.(session.ToolResult)
+			if tr.Outcome != session.OutcomeError || tr.Content[0].Text != "denied: "+tc.reason {
+				t.Fatalf("tool result = %+v", tr)
+			}
+		})
 	}
 }
 

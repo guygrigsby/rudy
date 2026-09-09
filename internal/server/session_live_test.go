@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -136,5 +138,131 @@ func TestAskersNeverIncludeAPluginConnection(t *testing.T) {
 	lone.conns = []*conn{pluginConn}
 	if got := lone.askers(); len(got) != 0 {
 		t.Errorf("lone plugin session askers = %+v, want none", got)
+	}
+}
+
+// newTestLive opens a real session on disk and wraps it, the setup every liveSession unit test
+// below needs before it can call anything that reads sess.ID().
+func newTestLive(t *testing.T) *liveSession {
+	t.Helper()
+	dir := t.TempDir()
+	store, err := session.OpenStore(filepath.Join(dir, "sessions"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := session.Open(store, session.SessionOpened{
+		SchemaVersion: 1,
+		RudyVersion:   "test",
+		Workspace:     session.Workspace{Root: dir},
+		Model:         session.ModelRef{Provider: "fake", Model: "m1"},
+		Thinking:      session.ThinkingOff,
+		Mode:          session.ModeStrict,
+		Agent:         "default",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sess.Close() })
+	return newLive(sess, provider.Model{Ref: session.ModelRef{Provider: "fake", Model: "m1"}})
+}
+
+// askerConn is a client connection that declared asker, with no transport under it: notify
+// only enqueues, so nothing here needs a pump.
+func askerConn(id int) *conn {
+	cn := newConn(id, nil)
+	cn.asker = true
+	return cn
+}
+
+// TestAnAnswerRacingTheQuestionLeavesNothingStanding: session.answer can land between Ask
+// publishing the pending channel under mu and publishing the question under obsMu. The
+// tool_use id is in the assistant_message every subscriber already holds, so a client can
+// answer before it has been asked. The handler then deletes a standing entry that is not there
+// yet, and Ask publishes it a moment later, leaving a decided question standing for the rest
+// of the turn: every asker attaching afterwards is shown a question whose decision has already
+// replayed, and answering it is a conflict. Ask has to drop it when it takes the answer, the
+// same as on the two branches beside it.
+//
+// The state that interleaving leaves behind is set up directly rather than raced for: the
+// answer is delivered through the pending channel without standing being deleted, which is
+// exactly what the handler's early half leaves.
+func TestAnAnswerRacingTheQuestionLeavesNothingStanding(t *testing.T) {
+	ls := newTestLive(t)
+	ls.conns = []*conn{askerConn(1)}
+	r := turn.NewRunner(turn.Config{
+		Session:  ls.sess,
+		Provider: nil, // never called: only TurnID is asked of this runner
+		Model:    ls.model,
+		Tools:    plugin.NewRegistry(nil, func(string) {}),
+		Gate:     gate.New(nil),
+		Observer: &fanout{ls: ls, sid: ls.sess.ID().String()},
+		System:   "test",
+	})
+	a := &liveAsker{ls: ls, sid: ls.sess.ID().String(), runner: r}
+
+	type outcome struct {
+		ans turn.Answer
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		ans, err := a.Ask(context.Background(), turn.Question{ToolUseID: "tu1", Tool: "bash"})
+		done <- outcome{ans, err}
+	}()
+
+	// Once the question is standing, stand has run and the pending channel is published.
+	for {
+		ls.obsMu.Lock()
+		published := len(ls.standing) == 1
+		ls.obsMu.Unlock()
+		if published {
+			break
+		}
+		runtime.Gosched()
+	}
+	ls.mu.Lock()
+	ch, ok := ls.pending["tu1"]
+	delete(ls.pending, "tu1")
+	ls.mu.Unlock()
+	if !ok {
+		t.Fatal("the question was published with no pending channel behind it")
+	}
+	// The handler's other half ran while standing was still empty, so nothing is deleted
+	// here. Only the answer arrives.
+	ch <- turn.Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "yes"}
+	got := <-done
+	if got.err != nil || got.ans.Decision != session.Allow {
+		t.Fatalf("ask = %+v, %v, want the allow it was sent", got.ans, got.err)
+	}
+
+	// An asker attaching now is owed nothing: the question has been decided.
+	if at := ls.subscribeLocked(askerConn(2)); len(at.standing) != 0 {
+		t.Fatalf("a decided question is still standing: %+v", at.standing)
+	}
+}
+
+// TestAttachBeforeTheFirstStateChangeHearsNoStaleTurn: startTurn marks a session active before
+// the runner has appended anything, so between that and the runner's first StateChanged there
+// is a live turn whose id nobody knows yet (it is the id of the user_message the runner has
+// still to append). A client attaching in that window must not be handed the previous turn's
+// id on a turn.state: that names a turn which has already finished. It hears nothing, and the
+// runner's first state change reaches it as a live notification a moment later. A steer resume,
+// which does know its id, still sends it.
+func TestAttachBeforeTheFirstStateChangeHearsNoStaleTurn(t *testing.T) {
+	ls := newTestLive(t)
+	// A turn ran and rested, leaving its id in the mirror.
+	ls.obsMu.Lock()
+	ls.state, ls.turnID = turn.Completed, "the turn before"
+	ls.obsMu.Unlock()
+
+	ls.markStarting("") // startTurn's fresh turn: active, id not known yet
+	if at := ls.subscribeLocked(askerConn(1)); at.state != nil {
+		t.Fatalf("attach heard turn.state %+v before the turn had an id", *at.state)
+	}
+
+	ls.markStarting("turn-1") // startTurn's steer resume: the id is already known
+	at := ls.subscribeLocked(askerConn(2))
+	if at.state == nil || at.state.TurnID != "turn-1" || at.state.State != string(turn.Streaming) {
+		t.Fatalf("attach state = %+v, want streaming on turn-1", at.state)
 	}
 }
