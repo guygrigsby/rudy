@@ -173,9 +173,10 @@ func (f *fakePlugin) Init(ctx context.Context, h plugin.Host) error {
 }
 
 type harness struct {
-	srv *server.Server
-	ws  string
-	fp  *fakePlugin
+	srv   *server.Server
+	ws    string
+	fp    *fakePlugin
+	store *session.Store
 }
 
 func newHarness(t *testing.T, prov *scriptProvider) *harness {
@@ -189,8 +190,8 @@ func newHarness(t *testing.T, prov *scriptProvider) *harness {
 func newHarnessWith(t *testing.T, prov *scriptProvider, extra ...plugin.Plugin) *harness {
 	t.Helper()
 	fp := &fakePlugin{prov: prov}
-	srv, _ := newServerWith(t, testConfig(), append([]plugin.Plugin{fp}, extra...)...)
-	return &harness{srv: srv, ws: t.TempDir(), fp: fp}
+	srv, store := newServerWith(t, testConfig(), append([]plugin.Plugin{fp}, extra...)...)
+	return &harness{srv: srv, ws: t.TempDir(), fp: fp, store: store}
 }
 
 // testConfig is what every server test starts from: the fake provider's one model, strict
@@ -1760,6 +1761,8 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 		parts = call("tu_agent", "agent", `{"agent":"explorer","prompt":"look"}`)
 	case root && n == 2:
 		parts = call("tu_agent2", "agent", `{"agent":"helper","prompt":"help"}`)
+	case root && n == 3:
+		parts = call("tu_probe", "probe", `{}`)
 	case root:
 		parts = answer("root done")
 	case n == 1:
@@ -1775,16 +1778,26 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 	return nil
 }
 
-// echoPlugin is the agentProvider plus one unsafe tool the explorer definition allows and one
-// the definition leaves out, so the child's filtered tool set is observable.
+// echoPlugin is the agentProvider plus one unsafe tool the explorer definition allows, one it
+// leaves out (so the child's filtered tool set is observable) and a safe "probe" that opens
+// child sessions from inside its own tool call, which is the only moment a plugin holds a
+// pending tool_use of its own.
 type echoPlugin struct {
 	prov *agentProvider
 	ran  int32
+
+	host      plugin.Host // this plugin's own host, for the probe's connections
+	otherHost plugin.Host // another plugin's, to try the same parent from the wrong caller
+	otherWS   string      // a directory that is not the parent's workspace
+
+	mu                                     sync.Mutex
+	errCwd, errFirst, errSecond, errStolen error
 }
 
 func (e *echoPlugin) Name() string { return "echo" }
 
 func (e *echoPlugin) Init(_ context.Context, h plugin.Host) error {
+	e.host = h
 	if err := h.RegisterProvider(e.prov); err != nil {
 		return err
 	}
@@ -1798,12 +1811,45 @@ func (e *echoPlugin) Init(_ context.Context, h plugin.Host) error {
 	if err != nil {
 		return err
 	}
-	return h.RegisterTool(tool.Tool{
+	err = h.RegisterTool(tool.Tool{
 		Name: "bash", Description: "not in the explorer definition", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Unsafe,
 		Invoke: func(context.Context, tool.Call) (tool.Result, error) {
 			return tool.Result{Content: []session.Block{session.TextBlock("bashed")}}, nil
 		},
 	})
+	if err != nil {
+		return err
+	}
+	return h.RegisterTool(tool.Tool{
+		Name: "probe", Description: "opens child sessions for its own tool_use", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe,
+		Invoke: e.probe,
+	})
+}
+
+// probe runs while its own tool_use is pending in the session that called it, which is what
+// every parent check is about. It records what the server answered; the test asserts on it
+// once the turn is over.
+func (e *echoPlugin) probe(ctx context.Context, call tool.Call) (tool.Result, error) {
+	open := func(h plugin.Host, cwd string) error {
+		client, err := h.Connect(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = client.Close() }()
+		var info protocol.SessionInfo
+		return client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
+			Cwd:    cwd,
+			Parent: &protocol.ParentRef{SessionID: call.SessionID.String(), ToolUseID: call.ID},
+		}, &info)
+	}
+	cwdErr := open(e.host, e.otherWS)
+	stolenErr := open(e.otherHost, call.Workspace.Root)
+	firstErr := open(e.host, call.Workspace.Root)
+	secondErr := open(e.host, call.Workspace.Root)
+	e.mu.Lock()
+	e.errCwd, e.errStolen, e.errFirst, e.errSecond = cwdErr, stolenErr, firstErr, secondErr
+	e.mu.Unlock()
+	return tool.Result{Content: []session.Block{session.TextBlock("probed")}}, nil
 }
 
 // capturingPlugin keeps its Host so a test can Connect as the plugin caller class itself.
@@ -1814,6 +1860,28 @@ func (c *capturingPlugin) Name() string { return "capture" }
 func (c *capturingPlugin) Init(_ context.Context, h plugin.Host) error {
 	c.host = h
 	return nil
+}
+
+// openChild is one session.open naming a parent, made over a plugin's own connection, which
+// is the only caller class allowed to name one.
+func openChild(t *testing.T, h plugin.Host, parentSID, toolUseID, cwd string) error {
+	t.Helper()
+	ctx := context.Background()
+	client, err := h.Connect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	var info protocol.SessionInfo
+	return client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
+		Cwd: cwd, Parent: &protocol.ParentRef{SessionID: parentSID, ToolUseID: toolUseID},
+	}, &info)
+}
+
+// hasCode reports whether err is a protocol error with this code.
+func hasCode(err error, code int) bool {
+	var pe *protocol.Error
+	return errorsAs(err, &pe) && pe.Code == code
 }
 
 // completedOn stops a drain when the turn on sid reports itself completed.
@@ -1852,11 +1920,12 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 		t.Fatal(err)
 	}
 	prov := &agentProvider{}
-	ep := &echoPlugin{prov: prov}
+	ep := &echoPlugin{prov: prov, otherWS: t.TempDir()}
 	cp := &capturingPlugin{}
 	cfg := testConfig()
 	cfg.ConfigDir = t.TempDir()
 	srv, store := newServerWith(t, cfg, ep, cp, subagents.New(cfg.ConfigDir))
+	ep.otherHost = cp.host
 
 	ctx := context.Background()
 	cl := dialAs(t, srv, true)
@@ -1875,6 +1944,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	// child's own session id.
 	var childSIDs []string
 	var childToolUse string
+	var depthErr error
 	ns := drain(t, cl, func(n protocol.Notification) bool {
 		switch n.Method {
 		case protocol.NotifyPermissionRequested:
@@ -1885,6 +1955,11 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 			}
 			childSIDs = append(childSIDs, pr.SessionID)
 			childToolUse = pr.ToolUseID
+			// The echo tool is pending in a child right now, and echo is this plugin's
+			// own tool, so only depth stands between it and a grandchild.
+			if len(childSIDs) == 1 {
+				depthErr = openChild(t, ep.host, pr.SessionID, pr.ToolUseID, ws)
+			}
 			go func() {
 				_ = cl.Call(ctx, protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
 					SessionID: pr.SessionID, ToolUseID: pr.ToolUseID,
@@ -1944,13 +2019,34 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 		t.Errorf("child system = %q", creqs[0].System)
 	}
 
+	// What the server answered the four parent checks. The happy path above is the fifth:
+	// the agent tool's own child, opened by the plugin that owns the agent tool.
+	ep.mu.Lock()
+	errCwd, errStolen, errFirst, errSecond := ep.errCwd, ep.errStolen, ep.errFirst, ep.errSecond
+	ep.mu.Unlock()
+	if !hasCode(errStolen, protocol.CodeUnauthorized) {
+		t.Errorf("another plugin opened a child on a tool_use it does not own: %v", errStolen)
+	}
+	if !hasCode(depthErr, protocol.CodeRefusedByInvariant) {
+		t.Errorf("a child session opened a grandchild: %v", depthErr)
+	}
+	if !hasCode(errCwd, protocol.CodeInvalidArgument) {
+		t.Errorf("a child opened outside the parent's workspace: %v", errCwd)
+	}
+	if errFirst != nil {
+		t.Errorf("a plugin could not open a child for its own pending tool_use: %v", errFirst)
+	}
+	if !hasCode(errSecond, protocol.CodeConflict) {
+		t.Errorf("one tool_use opened two children: %v", errSecond)
+	}
+
 	// The helper child named no tools, so it was offered every registered tool and never
 	// the agent tool: a child cannot open a grandchild.
 	hreqs := prov.requestsFor(helperSID)
 	if len(hreqs) != 2 {
 		t.Fatalf("helper made %d requests", len(hreqs))
 	}
-	if names := toolNames(hreqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "bash"}) {
+	if names := toolNames(hreqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
 		t.Errorf("helper tools = %v", names)
 	}
 
@@ -1985,7 +2081,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if len(hreqs) != 3 {
 		t.Fatalf("helper made %d requests after the resume", len(hreqs))
 	}
-	if names := toolNames(hreqs[2].Tools); !reflect.DeepEqual(names, []string{"echo", "bash"}) {
+	if names := toolNames(hreqs[2].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
 		t.Errorf("resumed child tools = %v", names)
 	}
 	if !strings.HasPrefix(hreqs[2].System, "You help.") {
@@ -2030,4 +2126,126 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if !errorsAs(err, &pe) || pe.Code != protocol.CodeInvalidArgument {
 		t.Errorf("open with a parent from a client = %v, want invalid_argument", err)
 	}
+}
+
+// namedToolPlugin registers one safe tool under its own name, for a test that needs the
+// registry to hold more than the fake plugin's one tool.
+type namedToolPlugin struct{ name string }
+
+func (p namedToolPlugin) Name() string { return p.name }
+
+func (p namedToolPlugin) Init(_ context.Context, h plugin.Host) error {
+	return h.RegisterTool(tool.Tool{
+		Name: p.name, Description: p.name, Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe,
+		Invoke: func(context.Context, tool.Call) (tool.Result, error) {
+			return tool.Result{Content: []session.Block{session.TextBlock("ok")}}, nil
+		},
+	})
+}
+
+// TestForkKeepsTheAgentDefinition: a fork inherits its parent's entries, so it inherits the
+// agent those entries name. Without re-applying the definition a fork of a restricted session
+// would come back with every tool, the default prompt and no step limit.
+func TestForkKeepsTheAgentDefinition(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	// A second registered tool the definition leaves out, so "the fork kept the definition"
+	// and "the fork got the whole registry" are different answers.
+	h := newHarnessWith(t, prov, namedToolPlugin{"extra"})
+	if err := os.MkdirAll(filepath.Join(h.ws, ".rudy", "agents"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	def := "---\ndescription: Read-only exploration\ntools: [danger]\n---\nYou explore and report.\n"
+	if err := os.WriteFile(filepath.Join(h.ws, ".rudy", "agents", "explorer.md"), []byte(def), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	cl := h.dial(t, false)
+	var info protocol.SessionInfo
+	if err := cl.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: h.ws, Agent: "explorer"}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	opened := entries(t, drain(t, cl, func(n protocol.Notification) bool {
+		return n.Method == protocol.NotifyEntryAppended
+	}))
+	if len(opened) != 1 || opened[0].Kind != session.KindSessionOpened {
+		t.Fatalf("replayed %v", kinds(opened))
+	}
+	var forkInfo protocol.SessionInfo
+	if err := cl.Call(ctx, protocol.MethodSessionFork, protocol.SessionForkParams{
+		SessionID: info.SessionID, AtEntryID: opened[0].ID.String(),
+	}, &forkInfo); err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: forkInfo.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit to the fork: %v", err)
+	}
+	drain(t, cl, completedOn(forkInfo.SessionID))
+	req := prov.lastRequest()
+	if names := toolNames(req.Tools); !reflect.DeepEqual(names, []string{"danger"}) {
+		t.Errorf("fork tools = %v, want the definition's", names)
+	}
+	if !strings.HasPrefix(req.System, "You explore and report.") {
+		t.Errorf("fork system = %q", req.System)
+	}
+}
+
+// TestOrphanedSessionClosesWhenItsTurnEnds: the last connection can leave while a turn is
+// running, and detach cannot close the session then because the turn still owns it. Nothing
+// else comes back for it, so the turn closes it on its way out. The agent tool's interrupted
+// child is exactly this, and so is a client that disconnects mid-turn.
+func TestOrphanedSessionClosesWhenItsTurnEnds(t *testing.T) {
+	prov := &scriptProvider{block: make(chan struct{}), textOnly: true}
+	h := newHarness(t, prov)
+	ctx := context.Background()
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	sid := mustULID(t, info.SessionID)
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	// The provider is inside Complete once its first delta has arrived, so the turn is
+	// genuinely running when the only connection lets the session go.
+	drain(t, cl, func(n protocol.Notification) bool { return n.Method == protocol.NotifyStreamDelta })
+	if err := cl.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{}); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Still held: the turn owns the session, so detach left it open and locked.
+	if s, err := session.Load(h.store, sid); !errors.Is(err, session.ErrLocked) {
+		if err == nil {
+			_ = s.Close()
+		}
+		t.Fatalf("session should still be held while its turn runs, got %v", err)
+	}
+	close(prov.block)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s, err := session.Load(h.store, sid)
+		if err == nil {
+			_ = s.Close()
+			return
+		}
+		if !errors.Is(err, session.ErrLocked) {
+			t.Fatalf("load: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the session was never closed after its turn ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// mustULID parses an id a server response just produced.
+func mustULID(t *testing.T, s string) ulid.ULID {
+	t.Helper()
+	id, err := ulid.Parse(s)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return id
 }

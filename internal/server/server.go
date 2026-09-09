@@ -711,6 +711,13 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, err.Error())
 	}
+	// The parent is resolved first: it is what says whether this caller may open a child at
+	// all, and a refusal there should not depend on anything the request asked for. It also
+	// decides what an unset model, mode or thinking level inherits.
+	parent, perror := s.parentOf(cn, p.Parent, ws)
+	if perror != nil {
+		return nil, perror
+	}
 	agentName := p.Agent
 	if agentName == "" {
 		agentName = s.d.Config.Agent
@@ -718,13 +725,6 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	def, ok := s.resolveAgent(cn, ws, agentName)
 	if !ok {
 		return nil, perr(protocol.CodeNotFound, "unknown agent "+agentName)
-	}
-
-	// The parent, when there is one, decides what an unset model, mode or thinking level
-	// inherits, so it is resolved before any of them.
-	parent, perror := s.parentOf(cn, p.Parent)
-	if perror != nil {
-		return nil, perror
 	}
 	// What a child inherits from its parent: the parent's current values, not the ones it
 	// opened with. A root session inherits nothing, so these stay empty for it.
@@ -806,6 +806,23 @@ func (s *Server) applyAgent(ls *liveSession, def agentdef.Definition) {
 	ls.maxSteps = def.MaxTurns
 }
 
+// applyAgentFromLog stamps the agent definition a session already carries in its log onto a
+// liveSession that is not yet shared: the cold-load and fork paths, where the name comes from
+// the log rather than the request. The definition is a file and not part of the log, so it is
+// re-read here; one that has since been deleted falls back to the default rather than
+// refusing to bring the session back, since its entries are still perfectly readable and a
+// lost file is not the user's fault.
+func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
+	name := ls.sess.Agent()
+	ws := deriveInfo(ls.sess.ID(), ls.entries).Workspace
+	def, ok := s.resolveAgent(cn, ws, name)
+	if !ok {
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "agent " + name + " is no longer defined; continuing under the default agent"})
+		def, _ = s.resolveAgent(cn, ws, "")
+	}
+	s.applyAgent(ls, def)
+}
+
 // openedAsChild reads child-ness off the log rather than off the live parent, which a
 // resumed session no longer has: a child resumed long after the session that spawned it is
 // gone is still a child, and still has no business opening one of its own.
@@ -817,10 +834,13 @@ func openedAsChild(entries []session.Entry) bool {
 	return ok && o.ParentSessionID != ""
 }
 
-// parentOf resolves the parent a child session hangs off. Only a plugin may name one, and
-// only a tool_use that is still pending in a live session: that pending id is the capability,
-// since the only way to hold one is to be the plugin currently running that very tool call.
-func (s *Server) parentOf(cn *conn, ref *protocol.ParentRef) (*liveSession, *protocol.Error) {
+// parentOf resolves the parent a child session hangs off, and is the whole of the authority
+// to open one. A plugin may name a parent only through a tool call it is itself running: the
+// named tool_use must be pending in a live session and must be a tool this very plugin
+// registered, which is the binding between a child and the tool whose answer it is. On top of
+// that the parent must not itself be a child (depth is one), the tool_use may open a child
+// only once, and the child runs in the parent's workspace and nowhere else.
+func (s *Server) parentOf(cn *conn, ref *protocol.ParentRef, ws session.Workspace) (*liveSession, *protocol.Error) {
 	if ref == nil {
 		return nil, nil
 	}
@@ -831,12 +851,31 @@ func (s *Server) parentOf(cn *conn, ref *protocol.ParentRef) (*liveSession, *pro
 	if e != nil {
 		return nil, e
 	}
-	for _, b := range session.PendingToolUsesIn(parent.snapshotEntries()) {
+	entries := parent.snapshotEntries()
+	toolName, pending := "", false
+	for _, b := range session.PendingToolUsesIn(entries) {
 		if b.ID == ref.ToolUseID {
-			return parent, nil
+			toolName, pending = b.Name, true
+			break
 		}
 	}
-	return nil, perr(protocol.CodeNotFound, "no pending tool_use "+ref.ToolUseID+" in "+ref.SessionID)
+	if !pending {
+		return nil, perr(protocol.CodeNotFound, "no pending tool_use "+ref.ToolUseID+" in "+ref.SessionID)
+	}
+	if owner, ok := s.d.Plugins.ToolOwner(toolName); !ok || owner != cn.plugin {
+		return nil, perr(protocol.CodeUnauthorized, "tool_use "+ref.ToolUseID+" is not a tool of plugin "+cn.plugin)
+	}
+	if openedAsChild(entries) {
+		return nil, perr(protocol.CodeRefusedByInvariant, "depth is one: a child session cannot open another")
+	}
+	if root := deriveInfo(parent.sess.ID(), entries).Workspace.Root; ws.Root != root {
+		return nil, perr(protocol.CodeInvalidArgument, "child cwd must be the parent's workspace")
+	}
+	// Claimed last, so a refusal above never spends the one child this tool_use may open.
+	if !parent.claimChild(ref.ToolUseID) {
+		return nil, perr(protocol.CodeConflict, "tool_use "+ref.ToolUseID+" already opened a child session")
+	}
+	return parent, nil
 }
 
 // resume attaches cn to sid, loading it from disk first when it is not already live. loadCold
@@ -900,7 +939,13 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 	if rerr != nil {
 		m = provider.Model{Ref: child.Model()}
 	}
-	return s.installAndAttach(cn, newLive(child, m)), nil
+	// A fork inherits its parent's entries by reference, so its log answers "which agent"
+	// and "is this a child" exactly as the session it came from does. Without this a fork of
+	// a restricted subagent session would come back with every tool, the default prompt and
+	// no step limit.
+	ls := newLive(child, m)
+	s.applyAgentFromLog(cn, ls)
+	return s.installAndAttach(cn, ls), nil
 }
 
 // loadCold returns the live session for sid, loading it from disk first if it is not already
@@ -964,17 +1009,7 @@ func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.E
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "model not in registry: " + sess.Model().String()})
 	}
 	ls := newLive(sess, m)
-	// A resumed session runs under the same agent definition it was opened with, re-read
-	// from disk: the definition is a file, not part of the log. One that has since been
-	// deleted falls back to the default rather than refusing the resume, since the session's
-	// entries are still perfectly readable and a lost file is not the user's fault.
-	ws := deriveInfo(sess.ID(), ls.entries).Workspace
-	def, ok := s.resolveAgent(cn, ws, sess.Agent())
-	if !ok {
-		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "agent " + sess.Agent() + " is no longer defined; resuming under the default agent"})
-		def, _ = s.resolveAgent(cn, ws, "")
-	}
-	s.applyAgent(ls, def)
+	s.applyAgentFromLog(cn, ls)
 	// Every path that brings a session back from disk goes through here, so this is where a
 	// resumed session gets its session_opened, once, whether the caller was resume or fork.
 	// Before the install, not after: loadCold checks s.live before s.loading, so a session
@@ -1107,28 +1142,39 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 		}
 	}
 	ls.conns = kept
+	ls.obsMu.Unlock()
+
+	s.closeIfUnusedLocked(ls)
+}
+
+// closeIfUnusedLocked closes and removes ls when no connection holds it any more and no turn
+// still owns it, and releases Server.mu whatever it decides. The caller holds Server.mu across
+// its own change to ls.conns (detach) or across nothing at all (runTurn, whose session's last
+// connection may have detached mid-turn), because holding it across the whole decide-then-
+// remove is what keeps this from racing attachIfLive into subscribing to a session that is
+// concurrently being closed (see detach).
+//
+// The delete is what has to happen before releasing mu: it is what stops a concurrent
+// attachIfLive from finding this session again. The actual Close, once that is done, no longer
+// needs mu - nothing can reach ls through s.live to race it, and the claim (ls.closed, set
+// under ls.mu by claimCloseIfIdle) is what stops any other path (Shutdown's closeIfOpen) from
+// also closing it, or from firing session_closed a second time for the same session. But
+// sess.Close still has to run (releasing the store's flock) before a cold load for this same id
+// can safely call session.Load again, so register it in s.closing in this same critical
+// section, before releasing mu: a concurrent loadCold checks s.closing right alongside s.live
+// and s.loading (see loadCold) and waits instead of racing the flock.
+func (s *Server) closeIfUnusedLocked(ls *liveSession) {
+	ls.obsMu.Lock()
 	empty := len(ls.conns) == 0
 	ls.obsMu.Unlock()
 	if !empty {
 		s.mu.Unlock()
 		return
 	}
-
 	if !ls.claimCloseIfIdle() {
 		s.mu.Unlock()
 		return
 	}
-
-	// The delete is what has to happen before releasing mu: it is what stops a concurrent
-	// attachIfLive from finding this session again. The actual Close, once that is done, no
-	// longer needs mu - nothing can reach ls through s.live to race it, and the claim above
-	// (ls.closed, set under ls.mu by claimCloseIfIdle) is what stops any other path
-	// (Shutdown's closeIfOpen) from also closing it, or from firing session_closed a second
-	// time for the same session. But sess.Close still has to run (releasing the store's flock) before a cold
-	// load for this same id can safely call session.Load again, so register it in s.closing in
-	// this same critical section, before releasing mu: a concurrent loadCold checks s.closing
-	// right alongside s.live and s.loading (see loadCold) and waits instead of racing the
-	// flock.
 	id := ls.sess.ID()
 	closingCh := make(chan struct{})
 	if s.closing == nil {
@@ -1217,9 +1263,13 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		tools = ls.tools
 	}
 	// An agent definition's body replaces the base prompt; the workspace's AGENTS.md
-	// sections still follow it, which is what SystemPromptWith is for.
-	base := turn.SystemPrompt(view.Workspace, s.d.Version)
-	if ls.system != "" {
+	// sections still follow it, which is what SystemPromptWith is for. Only the prompt in
+	// force is built: each of these reads the workspace's AGENTS.md and the global one from
+	// disk, and an agent session would otherwise pay for both every turn.
+	var base string
+	if ls.system == "" {
+		base = turn.SystemPrompt(view.Workspace, s.d.Version)
+	} else {
 		base = turn.SystemPromptWith(ls.system, view.Workspace)
 	}
 	r := turn.NewRunner(turn.Config{
@@ -1302,4 +1352,10 @@ func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessag
 		ls.runner = nil
 	}
 	ls.mu.Unlock()
+	// A session whose last connection detached while this turn was running is nobody's now:
+	// detach could not close it then (a turn still owned it), and nothing else will come
+	// back for it. That is the plugin whose agent tool was interrupted and closed its child
+	// while the child was still streaming, and equally a client that disconnected mid-turn.
+	s.mu.Lock()
+	s.closeIfUnusedLocked(ls)
 }

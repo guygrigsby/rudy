@@ -77,6 +77,12 @@ type liveSession struct {
 	maxSteps int          // the definition's max_turns; zero means unlimited
 	parent   *liveSession // the session whose tool call opened this one; nil for a root
 
+	// children is the tool_use ids of this session that have already opened a child, so a
+	// second open for the same call is refused rather than silently spawning a second
+	// subagent nobody will read. Guarded by mu, unlike the four fields above: it is written
+	// while the session is live, from whichever connection is opening the child.
+	children map[string]bool
+
 	obsMu   sync.Mutex
 	entries []session.Entry
 	conns   []*conn
@@ -94,6 +100,7 @@ func newLive(sess *session.Session, m provider.Model) *liveSession {
 		entries:   append([]session.Entry(nil), sess.Entries()...),
 		pending:   map[string]chan turn.Answer{},
 		overrides: map[string][]session.Block{},
+		children:  map[string]bool{},
 	}
 }
 
@@ -125,6 +132,19 @@ func (ls *liveSession) markStarting(turnID string) {
 		ls.turnID = turnID
 	}
 	ls.obsMu.Unlock()
+}
+
+// claimChild records that toolUseID is opening a child session and reports whether this
+// caller is the first to do so: at most one child per tool call. Self-locking (takes mu, which
+// nests outside obsMu; nothing else is taken here).
+func (ls *liveSession) claimChild(toolUseID string) bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.children[toolUseID] {
+		return false
+	}
+	ls.children[toolUseID] = true
+	return true
 }
 
 // hookContextSuffixLocked is what the session_opened hooks added to this session's system

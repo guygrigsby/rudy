@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 
@@ -84,9 +85,12 @@ func (p *agentPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, 
 	if err != nil {
 		return fsroot.Fail("agent: open: %v", err), nil
 	}
-	// The child belongs to this one tool call: closing it here releases its log and its
-	// place in the server's live set whatever happened to the turn. context.Background
-	// deliberately, since the call context may be exactly what ended the turn.
+	// The child belongs to this one tool call, so this connection gives it up here whatever
+	// happened to the turn. context.Background deliberately, since the call context may be
+	// exactly what ended the turn. This is a detach, not a guarantee of closure: a child
+	// still streaming when it lands stays live until its turn ends, and the server closes it
+	// then (see the orphan close in runTurn), which is why the cancel path below waits for
+	// the interrupt to take rather than walking away.
 	defer func() {
 		_ = client.Call(context.Background(), protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, nil)
 	}()
@@ -97,72 +101,127 @@ func (p *agentPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, 
 	}, &sub); err != nil {
 		return fsroot.Fail("agent: submit: %v", err), nil
 	}
-	text, failure, err := waitTurn(ctx, client, info.SessionID, sub.TurnID)
+	out, err := waitTurn(ctx, client, info.SessionID, sub.TurnID)
 	switch {
 	case err != nil:
 		return fsroot.Fail("agent: %v", err), nil
-	case failure != "":
-		return fsroot.Fail("agent %s failed: %s", a.Agent, failure), nil
+	case out.state == stateFailed || out.failure != "":
+		return fsroot.Fail("agent %s failed: %s", a.Agent, out.failure), nil
+	case out.state == stateIdle:
+		// Idle is an interrupted subagent, not an answer: report what it managed to say as
+		// a failure so the parent model does not read a half turn as a finished one.
+		msg := "agent " + a.Agent + " interrupted"
+		if out.text != "" {
+			msg += "\n" + out.text
+		}
+		return fsroot.Fail("%s", msg), nil
 	}
-	return fsroot.Text(fmt.Sprintf("[agent %s, session %s]\n%s", a.Agent, info.SessionID, text)), nil
+	return fsroot.Text(fmt.Sprintf("[agent %s, session %s]\n%s", a.Agent, info.SessionID, out.text)), nil
 }
 
-// waitTurn follows the child session's notifications until its turn comes to rest, and
-// returns the text of its last assistant message. It reads the same two notifications a
-// client does (entry.appended and turn.state) and ignores entries older than the turn, which
-// is how the replay of everything that came before is skipped: a turn id is the ULID of the
-// user_message that started it, so every entry of that turn sorts at or above it.
-func waitTurn(ctx context.Context, client *protocol.Client, sessionID, turnID string) (text, failure string, err error) {
+// The turn states a child session comes to rest in, as they arrive on turn.state.
+const (
+	stateCompleted = "completed"
+	stateFailed    = "failed"
+	stateIdle      = "idle"
+)
+
+// interruptGrace bounds how long a cancelled tool call waits for the child it interrupted to
+// come to rest. Long enough for a provider stream to unwind, short enough that a parent turn
+// being torn down is not held up by a subagent that will not stop.
+const interruptGrace = 5 * time.Second
+
+// turnOutcome is what one child turn came to: the state it rested in, the text of its last
+// assistant message and, when it failed, the failure the runner recorded.
+type turnOutcome struct {
+	state   string
+	text    string
+	failure string
+}
+
+// waitTurn follows the child session's notifications until its turn comes to rest. It reads
+// the same two notifications a client does (entry.appended and turn.state) and ignores entries
+// older than the turn, which is how the replay of everything that came before is skipped: a
+// turn id is the ULID of the user_message that started it, so every entry of that turn sorts
+// at or above it.
+//
+// A cancelled ctx interrupts the child and then keeps reading, on a fresh deadline, until its
+// turn actually rests: the interrupt is asynchronous, and walking away from a child that is
+// still streaming leaves a session running for a tool call nobody is waiting on any more.
+func waitTurn(ctx context.Context, client *protocol.Client, sessionID, turnID string) (turnOutcome, error) {
 	turnULID, perr := ulid.Parse(turnID)
 	if perr != nil {
-		return "", "", fmt.Errorf("turn id %q: %w", turnID, perr)
+		return turnOutcome{}, fmt.Errorf("turn id %q: %w", turnID, perr)
 	}
+	var out turnOutcome
+	var cause error // the parent's cancellation, once it has happened
 	for {
 		select {
 		case <-ctx.Done():
-			// The parent turn was interrupted or timed out. Cancel the child rather than
-			// leaving it streaming into a session nobody is reading any more.
-			cancelCtx := context.WithoutCancel(ctx)
-			_ = client.Call(cancelCtx, protocol.MethodSessionInterrupt, protocol.SessionInterruptParams{
+			if cause != nil {
+				// The grace ran out: the child did not come to rest in time, and the
+				// server closes it when its turn ends (see the orphan close in runTurn).
+				return out, cause
+			}
+			cause = ctx.Err()
+			grace, done := context.WithTimeout(context.WithoutCancel(ctx), interruptGrace)
+			defer done()
+			ctx = grace
+			_ = client.Call(ctx, protocol.MethodSessionInterrupt, protocol.SessionInterruptParams{
 				SessionID: sessionID, How: session.InterruptCancel,
 			}, nil)
-			return "", "", ctx.Err()
 		case n, ok := <-client.Notifications():
 			if !ok {
-				return "", "", errors.New("the server closed the subagent's connection")
+				return out, errors.New("the server closed the subagent's connection")
 			}
-			switch n.Method {
-			case protocol.NotifyEntryAppended:
-				var ea protocol.EntryAppended
-				if err := json.Unmarshal(n.Params, &ea); err != nil {
-					return "", "", fmt.Errorf("entry.appended: %w", err)
-				}
-				if ea.SessionID != sessionID || ea.Entry.ID.Compare(turnULID) < 0 {
-					continue
-				}
-				switch pl := ea.Entry.Payload.(type) {
-				case session.AssistantMessage:
-					if t := textOf(pl.Content); t != "" {
-						text = t
-					}
-				case session.TurnFailed:
-					failure = pl.Message
-				}
-			case protocol.NotifyTurnState:
-				var ts protocol.TurnStateChanged
-				if err := json.Unmarshal(n.Params, &ts); err != nil {
-					return "", "", fmt.Errorf("turn.state: %w", err)
-				}
-				if ts.SessionID != sessionID || ts.TurnID != turnID {
-					continue
-				}
-				switch ts.State {
-				case "completed", "failed", "idle":
-					return text, failure, nil
-				}
+			rest, err := out.observe(n, sessionID, turnID, turnULID)
+			switch {
+			case err != nil:
+				return out, err
+			case rest && cause != nil:
+				return out, cause
+			case rest:
+				return out, nil
 			}
 		}
 	}
+}
+
+// observe folds one notification into the outcome and reports whether the turn has come to
+// rest. Notifications for another session or another turn are ignored.
+func (out *turnOutcome) observe(n protocol.Notification, sessionID, turnID string, turnULID ulid.ULID) (rest bool, err error) {
+	switch n.Method {
+	case protocol.NotifyEntryAppended:
+		var ea protocol.EntryAppended
+		if err := json.Unmarshal(n.Params, &ea); err != nil {
+			return false, fmt.Errorf("entry.appended: %w", err)
+		}
+		if ea.SessionID != sessionID || ea.Entry.ID.Compare(turnULID) < 0 {
+			return false, nil
+		}
+		switch pl := ea.Entry.Payload.(type) {
+		case session.AssistantMessage:
+			if t := textOf(pl.Content); t != "" {
+				out.text = t
+			}
+		case session.TurnFailed:
+			out.failure = pl.Message
+		}
+	case protocol.NotifyTurnState:
+		var ts protocol.TurnStateChanged
+		if err := json.Unmarshal(n.Params, &ts); err != nil {
+			return false, fmt.Errorf("turn.state: %w", err)
+		}
+		if ts.SessionID != sessionID || ts.TurnID != turnID {
+			return false, nil
+		}
+		switch ts.State {
+		case stateCompleted, stateFailed, stateIdle:
+			out.state = ts.State
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func textOf(blocks []session.Block) string {

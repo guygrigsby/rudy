@@ -352,6 +352,16 @@ func (r *Registry) Tool(name string) (tool.Tool, bool) {
 	return o.value, ok
 }
 
+// ToolOwner is the plugin that registered name. The server asks it to bind a child session to
+// the plugin whose tool call is opening it: a plugin may only name a pending tool_use of its
+// own tool as a parent.
+func (r *Registry) ToolOwner(name string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	o, ok := r.tools[name]
+	return o.owner, ok
+}
+
 // ToolView is a filtered view of a registry's tools: what one session may call. A session
 // opened under an agent definition sees the definition's list; a child session never sees the
 // agent tool, which is what keeps subagent depth at one. It reads the registry live, so a
