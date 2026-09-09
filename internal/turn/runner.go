@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/gate"
+	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -68,17 +70,37 @@ type Tools interface {
 	Tools() []tool.Tool
 }
 
+// HookFirer runs one hook point's handlers and returns their results in order.
+// plugin.HookRunner is the implementation; the interface is what keeps the turn loop free of
+// the registry it fires against.
+type HookFirer interface {
+	Fire(ctx context.Context, call plugin.HookCall) []any
+}
+
+// Compactor summarizes part of a session and records the summary.
+type Compactor interface {
+	// Compact summarizes the request context up to but excluding entries at or after
+	// before (zero means everything in the request context) and appends a compaction. It
+	// returns the zero Entry and nil when fewer than two entries would be covered.
+	Compact(ctx context.Context, s *session.Session, before ulid.ULID, instructions string) (session.Entry, error)
+}
+
 // Config wires one Runner.
 type Config struct {
-	Session   *session.Session
-	Provider  provider.Provider
-	Model     provider.Model
-	Tools     Tools
-	Gate      *gate.Gate
-	Asker     Asker // nil allowed
-	Observer  Observer
-	System    string // full system prompt
-	MaxTokens int
+	Session     *session.Session
+	Provider    provider.Provider
+	Model       provider.Model
+	Tools       Tools
+	Gate        *gate.Gate
+	Asker       Asker // nil allowed
+	Observer    Observer
+	System      string // full system prompt
+	MaxTokens   int
+	Hooks       HookFirer     // nil means no hooks
+	Compactor   Compactor     // nil means never compact
+	CompactAt   float64       // fraction of Model.ContextWindow; 0 means never
+	ToolTimeout time.Duration // 0 means none
+	MaxSteps    int           // provider requests per turn; 0 means unlimited
 }
 
 type noopObserver struct{}
@@ -90,6 +112,14 @@ func (noopObserver) StateChanged(string, State)  {}
 // Runner drives one turn at a time over a session.
 type Runner struct {
 	cfg Config
+
+	// The current turn's working state. Run, loop, stream and runTool execute in sequence
+	// on the one goroutine inside Run and are the only readers or writers, so unlike the
+	// fields below these need no lock: nothing outside a turn (Interrupt, State, TurnID)
+	// touches them.
+	system    string                     // cfg.System plus this turn's before_turn additions
+	overrides map[string][]session.Block // after_tool replacements the model sees, by tool_use id
+	turnUsage session.Usage              // sum of this turn's assistant message usages
 
 	mu        sync.Mutex
 	state     State
@@ -201,8 +231,50 @@ func (r *Runner) Run(ctx context.Context, msg session.UserMessage) error {
 		r.mu.Lock()
 		r.turn = e.ID
 		r.mu.Unlock()
+		r.startTurnState(ctx, e)
 	}
 	return r.loop(ctx)
+}
+
+// startTurnState resets what belongs to one turn and asks the before_turn hook for its
+// system prompt additions. Only a fresh turn calls it: a steer resume continues the same
+// turn, under the same id, with the additions and overrides it already has.
+func (r *Runner) startTurnState(ctx context.Context, e session.Entry) {
+	r.system = r.cfg.System
+	r.overrides = nil
+	r.turnUsage = session.Usage{}
+	sid, tid := r.ids()
+	for _, res := range r.fire(ctx, plugin.HookBeforeTurn, &plugin.BeforeTurnPayload{SessionID: sid, TurnID: tid, Message: e}) {
+		bt, ok := res.(*plugin.BeforeTurnResult)
+		if !ok {
+			continue
+		}
+		for _, add := range bt.SystemPromptAdditions {
+			if add == "" {
+				continue
+			}
+			if r.system != "" {
+				r.system += "\n\n"
+			}
+			r.system += add
+		}
+	}
+}
+
+// ids are the session and turn ids every hook call and payload from this runner carries.
+func (r *Runner) ids() (sessionID, turnID string) {
+	return r.cfg.Session.ID().String(), r.TurnID()
+}
+
+// fire runs one hook point's handlers, or nothing at all when no hook runner is wired. The
+// HookRunner already bounds, isolates and reports each handler, so there is nothing to
+// handle here: a hook that failed is simply absent from the results.
+func (r *Runner) fire(ctx context.Context, point plugin.HookPoint, payload any) []any {
+	if r.cfg.Hooks == nil {
+		return nil
+	}
+	sid, tid := r.ids()
+	return r.cfg.Hooks.Fire(ctx, plugin.HookCall{Point: point, SessionID: sid, TurnID: tid, Payload: payload})
 }
 
 func (r *Runner) loop(ctx context.Context) error {
@@ -216,7 +288,7 @@ func (r *Runner) loop(ctx context.Context) error {
 			if _, aerr := r.append(am); aerr != nil {
 				return r.fail(session.ErrInternal, aerr)
 			}
-			return r.finishInterrupt(how)
+			return r.finishInterrupt(ctx, how)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -226,7 +298,7 @@ func (r *Runner) loop(ctx context.Context) error {
 				if _, aerr := r.append(am); aerr != nil {
 					return r.fail(session.ErrInternal, aerr)
 				}
-				_ = r.finishInterrupt(session.InterruptCancel)
+				_ = r.finishInterrupt(ctx, session.InterruptCancel)
 				return ctx.Err()
 			}
 			var pe *provider.Error
@@ -236,9 +308,13 @@ func (r *Runner) loop(ctx context.Context) error {
 			return r.fail(session.ErrTransport, err)
 		}
 		malformed := sanitizeToolInputs(am.Content)
-		if _, err := r.append(am); err != nil {
+		ae, err := r.append(am)
+		if err != nil {
 			return r.fail(session.ErrInternal, err)
 		}
+		r.turnUsage = r.turnUsage.Add(am.Usage)
+		sid, tid := r.ids()
+		r.fire(ctx, plugin.HookAfterResponse, &plugin.AfterResponsePayload{SessionID: sid, TurnID: tid, Message: ae})
 
 		var toolUses []session.Block
 		for _, b := range am.Content {
@@ -247,7 +323,7 @@ func (r *Runner) loop(ctx context.Context) error {
 			}
 		}
 		if len(toolUses) == 0 {
-			return r.rest(Completed)
+			return r.rest(ctx, Completed)
 		}
 		for _, tu := range toolUses {
 			if raw, bad := malformed[tu.ID]; bad {
@@ -275,8 +351,26 @@ func (r *Runner) stream(ctx context.Context) (session.AssistantMessage, error) {
 	defer cancel()
 
 	acc := newAccumulator()
-	req := Assemble(r.cfg.Session, r.cfg.Tools.Tools(), r.cfg.System, r.cfg.MaxTokens)
-	turnID := r.TurnID()
+	req := Assemble(r.cfg.Session, r.cfg.Tools.Tools(), r.system, r.cfg.MaxTokens, r.overrides)
+	sid, turnID := r.ids()
+	for _, res := range r.fire(ctx, plugin.HookBeforeRequest, &plugin.BeforeRequestPayload{
+		SessionID: sid,
+		TurnID:    turnID,
+		Provider:  r.cfg.Provider.Name(),
+		Model:     req.Model,
+		Headers:   maps.Clone(req.Headers),
+	}) {
+		br, ok := res.(*plugin.BeforeRequestResult)
+		if !ok || len(br.Headers) == 0 {
+			continue
+		}
+		if req.Headers == nil {
+			req.Headers = map[string]string{}
+		}
+		// Later handlers win over earlier ones, the same way the results are merged
+		// everywhere else: they run in the order the registry decided.
+		maps.Copy(req.Headers, br.Headers)
+	}
 	err := r.cfg.Provider.Complete(stepCtx, req, func(p provider.Part) error {
 		r.cfg.Observer.Delta(turnID, p)
 		acc.add(p)
@@ -307,41 +401,62 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		return false, nil
 	}
 
-	verdict := r.cfg.Gate.Evaluate(gate.Input{
-		Tool:         tu.Name,
-		Safety:       t.Safety,
-		Mode:         s.Mode(),
-		Args:         tu.Input,
-		Allowances:   s.Allowances(),
-		AskerPresent: r.cfg.Asker != nil,
-	})
-	dec := session.PermissionDecision{
-		ToolUseID: tu.ID,
-		Tool:      tu.Name,
-		Mode:      s.Mode(),
-		Matcher:   verdict.Matcher,
-		Decision:  verdict.Decision,
-		DecidedBy: verdict.DecidedBy,
-		Scope:     session.ScopeOnce,
-		Reason:    verdict.Reason,
+	input, hookDec := r.askHooks(ctx, tu, t.Safety)
+	var dec session.PermissionDecision
+	ask := false
+	if hookDec != nil {
+		// A hook decided, so the gate never weighs in: what it would have said about the
+		// mode, the allowances or an asker no longer applies. The matcher is still the
+		// gate's, computed over the input that will actually run, because that is the key
+		// an allowance would be matched on.
+		dec = session.PermissionDecision{
+			ToolUseID: tu.ID,
+			Tool:      tu.Name,
+			Mode:      s.Mode(),
+			Matcher:   r.cfg.Gate.MatcherFor(tu.Name, input),
+			Decision:  hookDec.decision,
+			DecidedBy: session.ByHook,
+			Scope:     session.ScopeOnce,
+			Reason:    hookDec.reason,
+		}
+	} else {
+		verdict := r.cfg.Gate.Evaluate(gate.Input{
+			Tool:         tu.Name,
+			Safety:       t.Safety,
+			Mode:         s.Mode(),
+			Args:         input,
+			Allowances:   s.Allowances(),
+			AskerPresent: r.cfg.Asker != nil,
+		})
+		dec = session.PermissionDecision{
+			ToolUseID: tu.ID,
+			Tool:      tu.Name,
+			Mode:      s.Mode(),
+			Matcher:   verdict.Matcher,
+			Decision:  verdict.Decision,
+			DecidedBy: verdict.DecidedBy,
+			Scope:     session.ScopeOnce,
+			Reason:    verdict.Reason,
+		}
+		ask = verdict.Ask
 	}
-	if verdict.Ask {
+	if ask {
 		r.setState(AwaitingPermission)
 		askCtx, cancel := context.WithCancel(ctx)
 		r.setCancel(cancel)
-		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: tu.Input, Matcher: verdict.Matcher})
+		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: input, Matcher: dec.Matcher})
 		cancel()
 		if how := r.takeInterrupt(); how != "" {
 			if err := r.refuse(interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {
 				return true, r.fail(session.ErrInternal, err)
 			}
-			return true, r.finishInterrupt(how)
+			return true, r.finishInterrupt(ctx, how)
 		}
 		if ctx.Err() != nil {
 			if err := r.refuse(interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {
 				return true, r.fail(session.ErrInternal, err)
 			}
-			_ = r.finishInterrupt(session.InterruptCancel)
+			_ = r.finishInterrupt(ctx, session.InterruptCancel)
 			return true, ctx.Err()
 		}
 		switch {
@@ -378,15 +493,21 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		return true, r.fail(session.ErrPlugin, fmt.Errorf("tool %s has no Invoke", tu.Name))
 	}
 	toolCtx, cancel := context.WithCancel(ctx)
+	if r.cfg.ToolTimeout > 0 {
+		toolCtx, cancel = context.WithTimeout(ctx, r.cfg.ToolTimeout)
+	}
 	r.setCancel(cancel)
 	start := time.Now()
 	res, panicked, invokeErr := invokeTool(t, toolCtx, tool.Call{
 		ID:        tu.ID,
 		Name:      tu.Name,
-		Input:     tu.Input,
+		Input:     input,
 		Workspace: s.Workspace(),
 		SessionID: s.ID(),
 	})
+	// Read the deadline before cancelling: after cancel every context reads as done, and
+	// only the deadline distinguishes a tool that ran out of time from one the turn killed.
+	timedOut := errors.Is(toolCtx.Err(), context.DeadlineExceeded)
 	cancel()
 	dur := time.Since(start).Milliseconds()
 	if panicked != nil {
@@ -401,7 +522,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		if _, err := r.append(session.ToolResult{ToolUseID: tu.ID, Outcome: session.OutcomeKilled, Content: content, DurationMS: dur}); err != nil {
 			return true, r.fail(session.ErrInternal, err)
 		}
-		return true, r.finishInterrupt(how)
+		return true, r.finishInterrupt(ctx, how)
 	}
 	if ctx.Err() != nil {
 		if len(content) == 0 {
@@ -410,11 +531,16 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		if _, err := r.append(session.ToolResult{ToolUseID: tu.ID, Outcome: session.OutcomeKilled, Content: content, DurationMS: dur}); err != nil {
 			return true, r.fail(session.ErrInternal, err)
 		}
-		_ = r.finishInterrupt(session.InterruptCancel)
+		_ = r.finishInterrupt(ctx, session.InterruptCancel)
 		return true, ctx.Err()
 	}
 	outcome := session.OutcomeOK
 	switch {
+	case timedOut:
+		// Whatever the tool produced before its deadline is kept: it is often the half of
+		// the output that explains why the rest never came.
+		outcome = session.OutcomeError
+		content = []session.Block{session.TextBlock(fmt.Sprintf("%s\n[timed out after %s]", textOf(content), r.cfg.ToolTimeout))}
 	case invokeErr != nil:
 		outcome = session.OutcomeError
 		content = []session.Block{session.TextBlock(invokeErr.Error())}
@@ -424,10 +550,82 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 	if len(content) == 0 {
 		content = []session.Block{session.TextBlock("")}
 	}
-	if _, err := r.append(session.ToolResult{ToolUseID: tu.ID, Outcome: outcome, Content: content, DurationMS: dur}); err != nil {
+	e, err := r.append(session.ToolResult{ToolUseID: tu.ID, Outcome: outcome, Content: content, DurationMS: dur})
+	if err != nil {
 		return true, r.fail(session.ErrInternal, err)
 	}
+	sid, tid := r.ids()
+	for _, hres := range r.fire(ctx, plugin.HookAfterTool, &plugin.AfterToolPayload{SessionID: sid, TurnID: tid, ToolUseID: tu.ID, Result: e}) {
+		at, ok := hres.(*plugin.AfterToolResult)
+		if !ok || len(at.Content) == 0 {
+			continue
+		}
+		// The first replacement wins, and only the request carries it: the entry above is
+		// what the tool really returned and stays that way.
+		if r.overrides == nil {
+			r.overrides = map[string][]session.Block{}
+		}
+		r.overrides[tu.ID] = at.Content
+		break
+	}
 	return false, nil
+}
+
+// hookVerdict is a before_tool handler's allow or deny, already normalized: Reason is never
+// empty, which the log refuses.
+type hookVerdict struct {
+	decision session.Decision
+	reason   string
+}
+
+// askHooks runs before_tool and returns the input the call should use and the hook's
+// decision, or nil when no handler decided. Handlers are walked in order: a modify replaces
+// the input with the bytes it returned, verbatim, and the first allow or deny ends the walk,
+// so a later handler can neither soften nor override a decision already made. A modify whose
+// bytes are not JSON is a pass, since the log and the provider both refuse a tool input that
+// is not an object.
+func (r *Runner) askHooks(ctx context.Context, tu session.Block, safety tool.Safety) (json.RawMessage, *hookVerdict) {
+	input := tu.Input
+	sid, tid := r.ids()
+	for _, res := range r.fire(ctx, plugin.HookBeforeTool, &plugin.BeforeToolPayload{
+		SessionID: sid,
+		TurnID:    tid,
+		ToolUseID: tu.ID,
+		Tool:      tu.Name,
+		Input:     tu.Input,
+		Safety:    safety,
+	}) {
+		bt, ok := res.(*plugin.BeforeToolResult)
+		if !ok {
+			continue
+		}
+		reason := bt.Reason
+		if reason == "" {
+			reason = "hook"
+		}
+		switch bt.Decision {
+		case plugin.DecisionModify:
+			if json.Valid(bt.Input) {
+				input = bt.Input
+			}
+		case plugin.DecisionAllow:
+			return input, &hookVerdict{decision: session.Allow, reason: reason}
+		case plugin.DecisionDeny:
+			return input, &hookVerdict{decision: session.Deny, reason: reason}
+		}
+	}
+	return input, nil
+}
+
+// textOf is the text a tool result carries, which a timeout keeps alongside its own note.
+func textOf(blocks []session.Block) string {
+	var b strings.Builder
+	for _, bl := range blocks {
+		if bl.Type == session.BlockText {
+			b.WriteString(bl.Text)
+		}
+	}
+	return b.String()
 }
 
 // refuse records a tool_use that will not run: the deny the log requires ahead of any
@@ -470,9 +668,9 @@ func interruptedDeny(dec session.PermissionDecision) session.PermissionDecision 
 	return dec
 }
 
-func (r *Runner) finishInterrupt(how session.Interrupt) error {
+func (r *Runner) finishInterrupt(ctx context.Context, how session.Interrupt) error {
 	if how == session.InterruptSteer {
-		return r.rest(Steering)
+		return r.rest(ctx, Steering)
 	}
 	r.mu.Lock()
 	turn := r.turn
@@ -480,7 +678,7 @@ func (r *Runner) finishInterrupt(how session.Interrupt) error {
 	if _, err := r.append(session.TurnInterrupted{TurnID: turn, How: how}); err != nil {
 		return r.fail(session.ErrInternal, err)
 	}
-	return r.rest(Idle)
+	return r.rest(ctx, Idle)
 }
 
 // rest makes everything the turn appended durable, then enters the resting state that ends
@@ -489,9 +687,13 @@ func (r *Runner) finishInterrupt(how session.Interrupt) error {
 // already seen. Every call site here is an otherwise successful turn, so a sync failure is
 // the turn's failure and is recorded as a turn_failed; the failing paths sync in fail
 // instead, where the error can only be logged.
-func (r *Runner) rest(s State) error {
+func (r *Runner) rest(ctx context.Context, s State) error {
 	if err := r.cfg.Session.Sync(); err != nil {
 		return r.fail(session.ErrInternal, fmt.Errorf("sync session log: %w", err))
+	}
+	if s == Completed {
+		sid, tid := r.ids()
+		r.fire(ctx, plugin.HookTurnCompleted, &plugin.TurnCompletedPayload{SessionID: sid, TurnID: tid, Usage: r.turnUsage})
 	}
 	r.setState(s)
 	return nil

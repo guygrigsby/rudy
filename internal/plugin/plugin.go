@@ -44,7 +44,8 @@ type Host interface {
 	RegisterTool(t tool.Tool) error
 	RegisterCommand(c Command) error
 	RegisterProvider(p provider.Provider) error
-	Config() map[string]any // the plugin's [plugins.<name>] table, never nil
+	RegisterHook(h HookHandler) error // invalid point or nil Handle refused
+	Config() map[string]any           // the plugin's [plugins.<name>] table, never nil
 	Notice(text string)
 }
 

@@ -27,6 +27,7 @@ type Registry struct {
 	cmdOrder  []string
 	providers map[string]owned[provider.Provider]
 	provOrder []string
+	hooks     []OwnedHook // load order; Hooks sorts a point's handlers by priority
 	statuses  []Status
 }
 
@@ -107,6 +108,9 @@ func (r *Registry) commit(h *host) {
 		r.providers[n] = owned[provider.Provider]{owner: h.name, value: h.providers[n]}
 		r.provOrder = append(r.provOrder, n)
 	}
+	for _, hh := range h.hooks {
+		r.hooks = append(r.hooks, OwnedHook{Owner: h.name, HookHandler: hh})
+	}
 }
 
 func (r *Registry) Tools() []tool.Tool {
@@ -173,6 +177,7 @@ type host struct {
 	cmdOrder  []string
 	providers map[string]provider.Provider
 	provOrder []string
+	hooks     []HookHandler
 }
 
 func newHost(r *Registry, name string) *host {

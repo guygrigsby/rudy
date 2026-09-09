@@ -43,7 +43,10 @@ func New(o Options) *Client {
 
 func (c *Client) Name() string { return c.opts.Name }
 
-func (c *Client) newRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
+// newRequest builds one HTTP request. headers, which a before_request hook produced, is
+// applied last so a hook can override a configured header but never the ones the transport
+// itself depends on being right.
+func (c *Client) newRequest(ctx context.Context, method, path string, body []byte, headers map[string]string) (*http.Request, error) {
 	var r io.Reader
 	if body != nil {
 		r = bytes.NewReader(body)
@@ -62,6 +65,9 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 	for k, v := range c.opts.Headers {
 		req.Header.Set(k, v)
 	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	return req, nil
 }
 
@@ -74,7 +80,7 @@ func (c *Client) Complete(ctx context.Context, req provider.Request, emit func(p
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	hreq, err := c.newRequest(ctx, http.MethodPost, "/chat/completions", body)
+	hreq, err := c.newRequest(ctx, http.MethodPost, "/chat/completions", body, req.Headers)
 	if err != nil {
 		return err
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,9 +24,19 @@ import (
 // scriptProvider answers odd calls with a tool_use for "danger" and even calls with "done".
 // When block is non-nil it streams one delta and then waits for ctx or block.
 type scriptProvider struct {
-	mu    sync.Mutex
-	calls int
-	block chan struct{}
+	mu      sync.Mutex
+	calls   int
+	block   chan struct{}
+	systems []string // the system prompt of every request, in order
+}
+
+func (p *scriptProvider) lastSystem() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.systems) == 0 {
+		return ""
+	}
+	return p.systems[len(p.systems)-1]
 }
 
 func (p *scriptProvider) Name() string { return "fake" }
@@ -43,6 +54,7 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 	p.mu.Lock()
 	p.calls++
 	n := p.calls
+	p.systems = append(p.systems, req.System)
 	p.mu.Unlock()
 	if p.block != nil {
 		if err := emit(provider.Part{Type: provider.PartTextDelta, Text: "thinking"}); err != nil {
@@ -122,6 +134,14 @@ type harness struct {
 
 func newHarness(t *testing.T, prov *scriptProvider) *harness {
 	t.Helper()
+	return newHarnessWith(t, prov)
+}
+
+// newHarnessWith is newHarness plus extra plugins, for a test that needs hooks registered.
+// The hook runner is always wired: with no handler registered it is what every other test
+// exercises, a fire that finds nothing and returns.
+func newHarnessWith(t *testing.T, prov *scriptProvider, extra ...plugin.Plugin) *harness {
+	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
 	store, err := session.OpenStore(filepath.Join(dir, "sessions"))
@@ -130,7 +150,7 @@ func newHarness(t *testing.T, prov *scriptProvider) *harness {
 	}
 	fp := &fakePlugin{prov: prov}
 	plugins := plugin.NewRegistry(nil, func(string) {})
-	plugins.Load(ctx, fp)
+	plugins.Load(ctx, append([]plugin.Plugin{fp}, extra...)...)
 	reg := provider.NewRegistry(filepath.Join(dir, "registry.json"), plugins.Providers()...)
 	if err := reg.Refresh(ctx); err != nil {
 		t.Fatal(err)
@@ -148,6 +168,7 @@ func newHarness(t *testing.T, prov *scriptProvider) *harness {
 		Registry: reg,
 		Plugins:  plugins,
 		Gate:     gate.New(nil),
+		Hooks:    plugin.NewHookRunner(plugins, 5*time.Second, func(string) {}),
 	})
 	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	return &harness{srv: srv, ws: t.TempDir(), fp: fp}
@@ -1030,5 +1051,92 @@ func TestSubmitRejectsAnInvalidMessage(t *testing.T) {
 	}
 	if pe.Code != protocol.CodeInvalidArgument {
 		t.Fatalf("submit code = %d, want CodeInvalidArgument", pe.Code)
+	}
+}
+
+// hookRecorder registers the two session hooks and counts what reaches them. Its
+// session_opened context is what the turn's system prompt must carry.
+type hookRecorder struct {
+	mu     sync.Mutex
+	opened []plugin.SessionOpenedPayload
+	closed []string
+}
+
+func (h *hookRecorder) Name() string { return "hookrec" }
+
+func (h *hookRecorder) Init(ctx context.Context, host plugin.Host) error {
+	err := host.RegisterHook(plugin.HookHandler{Point: plugin.HookSessionOpened, Handle: func(ctx context.Context, c plugin.HookCall) (any, error) {
+		p, ok := c.Payload.(*plugin.SessionOpenedPayload)
+		if !ok {
+			return nil, fmt.Errorf("session_opened payload %T", c.Payload)
+		}
+		h.mu.Lock()
+		h.opened = append(h.opened, *p)
+		h.mu.Unlock()
+		return &plugin.SessionOpenedResult{Context: "HOOK CONTEXT"}, nil
+	}})
+	if err != nil {
+		return err
+	}
+	return host.RegisterHook(plugin.HookHandler{Point: plugin.HookSessionClosed, Handle: func(ctx context.Context, c plugin.HookCall) (any, error) {
+		h.mu.Lock()
+		h.closed = append(h.closed, c.SessionID)
+		h.mu.Unlock()
+		return nil, nil
+	}})
+}
+
+func (h *hookRecorder) counts() ([]plugin.SessionOpenedPayload, []string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]plugin.SessionOpenedPayload(nil), h.opened...), append([]string(nil), h.closed...)
+}
+
+// TestSessionHooksFireOnceAndReachTheSystemPrompt covers the two hooks the server itself
+// fires: session_opened once when the session goes live, with its context reaching the
+// turn's system prompt, and session_closed once when the last client detaches.
+func TestSessionHooksFireOnceAndReachTheSystemPrompt(t *testing.T) {
+	hr := &hookRecorder{}
+	prov := &scriptProvider{}
+	h := newHarnessWith(t, prov, hr)
+	cl := h.dial(t, false) // no asker: the tool is denied and the turn still runs two requests
+	info := h.open(t, cl)
+	ctx := context.Background()
+
+	opened, closed := hr.counts()
+	if len(opened) != 1 || opened[0].SessionID != info.SessionID || opened[0].Resumed || opened[0].Workspace.Root != h.ws {
+		t.Fatalf("session_opened %+v", opened)
+	}
+	if len(closed) != 0 {
+		t.Fatalf("session_closed before any close: %v", closed)
+	}
+
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatal(err)
+	}
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyTurnState {
+			return false
+		}
+		var ts protocol.TurnStateChanged
+		_ = json.Unmarshal(n.Params, &ts)
+		return ts.State == "completed"
+	})
+	if got := prov.lastSystem(); !strings.HasSuffix(got, "HOOK CONTEXT") {
+		t.Errorf("system prompt %q does not end with the session_opened context", got)
+	}
+
+	if err := cl.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+	opened, closed = hr.counts()
+	if len(opened) != 1 {
+		t.Errorf("session_opened fired %d times", len(opened))
+	}
+	if len(closed) != 1 || closed[0] != info.SessionID {
+		t.Errorf("session_closed %v", closed)
 	}
 }

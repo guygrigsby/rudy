@@ -9,7 +9,11 @@ import (
 // Assemble builds the provider request from the session's request context. A leading
 // compaction entry becomes a user message carrying its summary. Entry kinds that are not
 // conversation content are skipped.
-func Assemble(s *session.Session, tools []tool.Tool, system string, maxTokens int) provider.Request {
+//
+// overrides, keyed by tool_use id, replaces what the model sees of a tool result without
+// touching the log: an after_tool hook may rewrite a result for the model only, so the two
+// deliberately disagree and the request, not the entry, is where the substitution happens.
+func Assemble(s *session.Session, tools []tool.Tool, system string, maxTokens int, overrides map[string][]session.Block) provider.Request {
 	req := provider.Request{
 		Model:     s.Model(),
 		System:    system,
@@ -32,7 +36,11 @@ func Assemble(s *session.Session, tools []tool.Tool, system string, maxTokens in
 		case session.AssistantMessage:
 			req.Messages = append(req.Messages, provider.Message{Role: provider.RoleAssistant, Content: p.Content})
 		case session.ToolResult:
-			req.Messages = append(req.Messages, provider.Message{Role: provider.RoleToolResult, Content: p.Content, ToolUseID: p.ToolUseID})
+			content := p.Content
+			if over, ok := overrides[p.ToolUseID]; ok {
+				content = over
+			}
+			req.Messages = append(req.Messages, provider.Message{Role: provider.RoleToolResult, Content: content, ToolUseID: p.ToolUseID})
 		}
 	}
 	return req

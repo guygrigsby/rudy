@@ -44,7 +44,7 @@ func TestAssembleMapsEntriesToMessages(t *testing.T) {
 	mustAppend(t, s, session.ModeChange{Mode: session.ModeOff})
 
 	tools := []tool.Tool{{Name: "read", Description: "read a file", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe}}
-	req := Assemble(s, tools, "SYSTEM", 4096)
+	req := Assemble(s, tools, "SYSTEM", 4096, nil)
 
 	if req.System != "SYSTEM" || req.MaxTokens != 4096 || req.Model != s.Model() || req.Thinking != session.ThinkingHigh || req.SessionID != s.ID() {
 		t.Fatalf("header fields %+v", req)
@@ -76,7 +76,7 @@ func TestAssembleStartsFromCompaction(t *testing.T) {
 	mustAppend(t, s, session.Compaction{Summary: "we discussed old things", FirstEntryID: first.ID, LastEntryID: last.ID, Model: s.Model()})
 	mustAppend(t, s, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("new")}})
 
-	req := Assemble(s, nil, "S", 100)
+	req := Assemble(s, nil, "S", 100, nil)
 	if len(req.Messages) != 2 {
 		t.Fatalf("want summary then new message, got %+v", req.Messages)
 	}

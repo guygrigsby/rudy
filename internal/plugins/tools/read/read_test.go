@@ -21,6 +21,7 @@ type captureHost struct{ tools []tool.Tool }
 func (h *captureHost) RegisterTool(t tool.Tool) error           { h.tools = append(h.tools, t); return nil }
 func (h *captureHost) RegisterCommand(plugin.Command) error     { return nil }
 func (h *captureHost) RegisterProvider(provider.Provider) error { return nil }
+func (h *captureHost) RegisterHook(plugin.HookHandler) error    { return nil }
 func (h *captureHost) Config() map[string]any                   { return nil }
 func (h *captureHost) Notice(string)                            {}
 

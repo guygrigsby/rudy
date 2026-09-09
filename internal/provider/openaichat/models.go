@@ -37,7 +37,7 @@ type wireModel struct {
 }
 
 func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
-	hreq, err := c.newRequest(ctx, http.MethodGet, "/models", nil)
+	hreq, err := c.newRequest(ctx, http.MethodGet, "/models", nil, nil)
 	if err != nil {
 		return nil, err
 	}

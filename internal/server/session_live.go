@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/oklog/ulid/v2"
@@ -53,12 +54,13 @@ var errNoAsker = errors.New("server: no asker attached")
 // than something eliminated by holding a lock across both changes; it exists because closing
 // it would mean re-introducing exactly the AB-BA risk mu's own doc above rules out.
 type liveSession struct {
-	mu      sync.Mutex
-	sess    *session.Session
-	model   provider.Model
-	runner  *turn.Runner
-	pending map[string]chan turn.Answer
-	closed  bool // sess has been closed and removed from Server.live; never touch sess again
+	mu          sync.Mutex
+	sess        *session.Session
+	model       provider.Model
+	runner      *turn.Runner
+	pending     map[string]chan turn.Answer
+	closed      bool     // sess has been closed and removed from Server.live; never touch sess again
+	hookContext []string // what session_opened handlers added to this session's system prompt
 
 	obsMu   sync.Mutex
 	entries []session.Entry
@@ -107,6 +109,18 @@ func (ls *liveSession) markStarting(turnID string) {
 		ls.turnID = turnID
 	}
 	ls.obsMu.Unlock()
+}
+
+// hookContextSuffixLocked is what the session_opened hooks added to this session's system
+// prompt, ready to append to it: one blank line, then the contexts a blank line apart, or
+// nothing at all when no handler returned any. Caller holds mu, which is what guards
+// hookContext; startTurn reads it while building the runner config in that same critical
+// section.
+func (ls *liveSession) hookContextSuffixLocked() string {
+	if len(ls.hookContext) == 0 {
+		return ""
+	}
+	return "\n\n" + strings.Join(ls.hookContext, "\n\n")
 }
 
 // firstAsker is the connection a turn's permission questions route to: the first subscriber

@@ -133,6 +133,7 @@ func Build(ctx context.Context, o BuildOptions) (*Built, error) {
 		Registry: registry,
 		Plugins:  plugins,
 		Gate:     g,
+		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
 	})
 	return &Built{
 		Version:  o.Version,

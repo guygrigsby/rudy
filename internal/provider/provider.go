@@ -43,7 +43,8 @@ type Request struct {
 	Tools     []ToolDef
 	Thinking  session.ThinkingLevel
 	MaxTokens int
-	SessionID ulid.ULID // for the X-Rudy-Session header
+	SessionID ulid.ULID         // for the X-Rudy-Session header
+	Headers   map[string]string // extra request headers a before_request hook added, verbatim
 }
 
 // PartType tags a streamed Part.

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 
@@ -30,6 +31,7 @@ type Deps struct {
 	Registry *provider.Registry
 	Plugins  *plugin.Registry
 	Gate     *gate.Gate
+	Hooks    *plugin.HookRunner // nil means no hooks fire
 }
 
 // EntryIDResult answers session.set_model, set_mode, set_thinking and set_title.
@@ -174,6 +176,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	var errs []error
 	for _, ls := range lives {
+		s.fireSessionClosed(ctx, ls)
 		if err := ls.closeIfOpen(); err != nil {
 			errs = append(errs, err)
 		}
@@ -563,7 +566,10 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	if err != nil {
 		return nil, protocol.ErrorFrom(err)
 	}
-	return s.installAndAttach(cn, newLive(sess, m)), nil
+	ls := newLive(sess, m)
+	info := s.installAndAttach(cn, ls)
+	s.fireSessionOpened(s.ctx, ls, false)
+	return info, nil
 }
 
 // resume attaches cn to sid, loading it from disk first when it is not already live. loadCold
@@ -694,7 +700,65 @@ func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.E
 	s.mu.Lock()
 	s.live[sid] = ls
 	s.mu.Unlock()
+	// Every path that brings a session back from disk goes through here, so this is where a
+	// resumed session gets its session_opened, once, whether the caller was resume or fork.
+	s.fireSessionOpened(s.ctx, ls, true)
 	return ls, nil
+}
+
+// hookFirer is s.d.Hooks as the interface the turn loop takes, or nil when no runner is
+// wired. The explicit nil matters: a nil *plugin.HookRunner assigned straight into the
+// interface field would be non-nil to the runner's own "are there hooks" check and panic on
+// the first fire.
+func (s *Server) hookFirer() turn.HookFirer {
+	if s.d.Hooks == nil {
+		return nil
+	}
+	return s.d.Hooks
+}
+
+// fireSessionOpened runs the session_opened hook for a session that has just gone live and
+// keeps every context it returns for that session's system prompt. It holds no lock while
+// firing: each handler gets hook_timeout_ms, and holding ls.mu across that would block every
+// other request for this session for as long as the slowest handler takes. The payload comes
+// from the entries mirror, not from ls.sess, for the reason every other reader here does the
+// same: the session is single-owner and a turn that has already started owns it.
+func (s *Server) fireSessionOpened(ctx context.Context, ls *liveSession, resumed bool) {
+	if s.d.Hooks == nil {
+		return
+	}
+	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
+	p := &plugin.SessionOpenedPayload{
+		SessionID: view.SessionID,
+		Workspace: view.Workspace,
+		Model:     view.Model,
+		Mode:      view.Mode,
+		Thinking:  view.Thinking,
+		Resumed:   resumed,
+	}
+	var add []string
+	for _, res := range s.d.Hooks.Fire(ctx, plugin.HookCall{Point: plugin.HookSessionOpened, SessionID: p.SessionID, Payload: p}) {
+		if so, ok := res.(*plugin.SessionOpenedResult); ok && so.Context != "" {
+			add = append(add, so.Context)
+		}
+	}
+	if len(add) == 0 {
+		return
+	}
+	ls.mu.Lock()
+	ls.hookContext = append(ls.hookContext, add...)
+	ls.mu.Unlock()
+}
+
+// fireSessionClosed runs the session_closed hook for a session about to be closed. Callers
+// hold no lock: like fireSessionOpened this waits on handlers, and the session is already
+// out of s.live by the time it runs.
+func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
+	if s.d.Hooks == nil {
+		return
+	}
+	sid := ls.sess.ID().String()
+	s.d.Hooks.Fire(ctx, plugin.HookCall{Point: plugin.HookSessionClosed, SessionID: sid, Payload: &plugin.SessionClosedPayload{SessionID: sid}})
 }
 
 // installAndAttach installs a freshly created (never-before-shared) liveSession into s.live and
@@ -795,6 +859,7 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	delete(s.live, id)
 	s.mu.Unlock()
 
+	s.fireSessionClosed(s.ctx, ls)
 	_ = ls.sess.Close()
 
 	s.mu.Lock()
@@ -867,15 +932,18 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
 	first := &firstAppendSignal{Observer: &fanout{ls: ls, sid: sid}, started: make(chan session.Entry, 1), failed: make(chan struct{})}
 	r := turn.NewRunner(turn.Config{
-		Session:   ls.sess,
-		Provider:  prov,
-		Model:     ls.model,
-		Tools:     s.d.Plugins,
-		Gate:      s.d.Gate,
-		Asker:     asker,
-		Observer:  first,
-		System:    turn.SystemPrompt(view.Workspace, s.d.Version),
-		MaxTokens: s.d.Config.MaxTokens,
+		Session:  ls.sess,
+		Provider: prov,
+		Model:    ls.model,
+		Tools:    s.d.Plugins,
+		Gate:     s.d.Gate,
+		Asker:    asker,
+		Observer: first,
+		// hookContext is guarded by ls.mu, which this still holds.
+		System:      turn.SystemPrompt(view.Workspace, s.d.Version) + ls.hookContextSuffixLocked(),
+		MaxTokens:   s.d.Config.MaxTokens,
+		Hooks:       s.hookFirer(),
+		ToolTimeout: time.Duration(s.d.Config.ToolTimeoutMS) * time.Millisecond,
 	})
 	la.runner = r
 	ls.runner = r

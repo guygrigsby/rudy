@@ -25,8 +25,9 @@ func (h *captureHost) RegisterProvider(p provider.Provider) error {
 	h.providers = append(h.providers, p)
 	return nil
 }
-func (h *captureHost) Config() map[string]any { return nil }
-func (h *captureHost) Notice(s string)        { h.notices = append(h.notices, s) }
+func (h *captureHost) RegisterHook(plugin.HookHandler) error { return nil }
+func (h *captureHost) Config() map[string]any                { return nil }
+func (h *captureHost) Notice(s string)                       { h.notices = append(h.notices, s) }
 
 func TestRegistersOnePerOpenAIChatEntryAndSkipsBadSecrets(t *testing.T) {
 	providers := map[string]config.ProviderConfig{

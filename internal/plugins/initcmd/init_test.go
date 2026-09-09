@@ -17,6 +17,7 @@ type captureHost struct{ cmds []plugin.Command }
 func (h *captureHost) RegisterTool(tool.Tool) error             { return nil }
 func (h *captureHost) RegisterCommand(c plugin.Command) error   { h.cmds = append(h.cmds, c); return nil }
 func (h *captureHost) RegisterProvider(provider.Provider) error { return nil }
+func (h *captureHost) RegisterHook(plugin.HookHandler) error    { return nil }
 func (h *captureHost) Config() map[string]any                   { return nil }
 func (h *captureHost) Notice(string)                            {}
 

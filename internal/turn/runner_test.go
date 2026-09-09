@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/guygrigsby/rudy/internal/gate"
+	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -884,16 +886,6 @@ func kindsOf(entries []session.Entry) []session.Kind {
 	return out
 }
 
-func textOf(blocks []session.Block) string {
-	var b strings.Builder
-	for _, bl := range blocks {
-		if bl.Type == session.BlockText {
-			b.WriteString(bl.Text)
-		}
-	}
-	return b.String()
-}
-
 // TestMalformedToolInputIsAnErrorResult covers a model that streams tool-call JSON the log
 // will not accept. The block cannot be appended as sent (Append refuses a tool_use whose
 // input is not valid JSON), and dropping the block would leave the model's own message
@@ -939,5 +931,233 @@ func TestMalformedToolInputIsAnErrorResult(t *testing.T) {
 	}
 	if len(p.requests) != 2 {
 		t.Fatalf("the model must get a second turn to retry, got %d requests", len(p.requests))
+	}
+}
+
+// recordingHooks is a HookFirer that records every call and answers each point from a fixed
+// table, standing in for a plugin registry's handlers.
+type recordingHooks struct {
+	calls   []plugin.HookCall
+	results map[plugin.HookPoint][]any
+}
+
+func (h *recordingHooks) Fire(ctx context.Context, c plugin.HookCall) []any {
+	h.calls = append(h.calls, c)
+	return h.results[c.Point]
+}
+
+func (h *recordingHooks) points() []plugin.HookPoint {
+	out := make([]plugin.HookPoint, 0, len(h.calls))
+	for _, c := range h.calls {
+		out = append(out, c.Point)
+	}
+	return out
+}
+
+// fixtureTools is the tool set the hook tests use: echo returns its input and sleep waits
+// for its duration or the context, whichever comes first. Both are unsafe, so every call
+// goes past the gate or a hook decision.
+type fixtureTools struct {
+	mu    sync.Mutex
+	calls int
+	sleep time.Duration
+}
+
+func (ft *fixtureTools) ran() int {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	return ft.calls
+}
+
+func (ft *fixtureTools) Tool(name string) (tool.Tool, bool) {
+	t := tool.Tool{Name: name, Description: name, Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Unsafe}
+	switch name {
+	case "echo":
+		t.Invoke = func(_ context.Context, c tool.Call) (tool.Result, error) {
+			ft.mu.Lock()
+			ft.calls++
+			ft.mu.Unlock()
+			return tool.Result{Content: []session.Block{session.TextBlock("echo:" + string(c.Input))}}, nil
+		}
+	case "sleep":
+		t.Invoke = func(ctx context.Context, _ tool.Call) (tool.Result, error) {
+			ft.mu.Lock()
+			ft.calls++
+			d := ft.sleep
+			ft.mu.Unlock()
+			timer := time.NewTimer(d)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			return tool.Result{Content: []session.Block{session.TextBlock("slept")}}, nil
+		}
+	default:
+		return tool.Tool{}, false
+	}
+	return t, true
+}
+
+func (ft *fixtureTools) Tools() []tool.Tool {
+	echo, _ := ft.Tool("echo")
+	sl, _ := ft.Tool("sleep")
+	return []tool.Tool{echo, sl}
+}
+
+// newTurnFixture opens a session and returns it with a provider scripted to answer each
+// request with one of scripts, and the tool set above. The mode is off so the gate allows
+// every unsafe call on its own: what these tests measure is what the hooks and the tool
+// timeout do instead, and a hook decision that never fired would show up as a decision
+// attributed to the mode rather than to the hook.
+func newTurnFixture(t *testing.T, scripts ...[]provider.Part) (*session.Session, *scripted, *fixtureTools) {
+	t.Helper()
+	return openTestSession(t, session.ModeOff), &scripted{scripts: scripts}, &fixtureTools{}
+}
+
+func callThenDone(id, name, input string) [][]provider.Part {
+	return [][]provider.Part{
+		append(toolCall(id, name, input), usage(10, 2), stop(session.StopToolUse, "tool_calls")),
+		{text("done"), usage(3, 1), stop(session.StopEndTurn, "stop")},
+	}
+}
+
+func TestRunnerFiresHooksInOrder(t *testing.T) {
+	// One turn: the model calls the unsafe tool "echo" once, then answers with text.
+	script := callThenDone("tu1", "echo", `{"x":1}`)
+	s, prov, tools := newTurnFixture(t, script...)
+	hooks := &recordingHooks{results: map[plugin.HookPoint][]any{
+		plugin.HookBeforeTurn:    {&plugin.BeforeTurnResult{SystemPromptAdditions: []string{"ADD"}}},
+		plugin.HookBeforeRequest: {&plugin.BeforeRequestResult{Headers: map[string]string{"X-Test": "1"}}},
+		plugin.HookBeforeTool:    {&plugin.BeforeToolResult{Decision: "allow", Reason: "hook says yes"}},
+		plugin.HookAfterTool:     {&plugin.AfterToolResult{Content: []session.Block{session.TextBlock("REPLACED")}}},
+	}}
+	r := NewRunner(Config{Session: s, Provider: prov, Model: provider.Model{Ref: s.Model()}, Tools: tools, Gate: gate.New(nil), System: "BASE", MaxTokens: 10, Hooks: hooks})
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	want := []plugin.HookPoint{plugin.HookBeforeTurn, plugin.HookBeforeRequest, plugin.HookAfterResponse, plugin.HookBeforeTool, plugin.HookAfterTool, plugin.HookBeforeRequest, plugin.HookAfterResponse, plugin.HookTurnCompleted}
+	if got := hooks.points(); !reflect.DeepEqual(got, want) {
+		t.Errorf("points %v\nwant   %v", got, want)
+	}
+	last := hooks.calls[len(hooks.calls)-1]
+	tc, ok := last.Payload.(*plugin.TurnCompletedPayload)
+	if !ok || tc.Usage.Input != 13 || tc.Usage.Output != 3 || tc.TurnID != r.TurnID() {
+		t.Errorf("turn_completed payload %+v", last.Payload)
+	}
+	if !strings.Contains(prov.requests[0].System, "BASE") || !strings.HasSuffix(prov.requests[0].System, "ADD") {
+		t.Errorf("system prompt %q", prov.requests[0].System)
+	}
+	if prov.requests[0].Headers["X-Test"] != "1" {
+		t.Errorf("headers %v", prov.requests[0].Headers)
+	}
+	// The hook decided; no asker was needed and the decision says so.
+	var dec session.PermissionDecision
+	for _, e := range s.Entries() {
+		if d, ok := e.Payload.(session.PermissionDecision); ok {
+			dec = d
+		}
+	}
+	if dec.Decision != session.Allow || dec.DecidedBy != session.ByHook || dec.Reason != "hook says yes" {
+		t.Errorf("decision %+v", dec)
+	}
+	if tools.ran() != 1 {
+		t.Errorf("tool ran %d times", tools.ran())
+	}
+	// The second request saw the replacement, the log kept the real result.
+	msgs := prov.requests[1].Messages
+	lastMsg := msgs[len(msgs)-1]
+	if lastMsg.Role != provider.RoleToolResult || lastMsg.Content[0].Text != "REPLACED" {
+		t.Errorf("request saw %+v", lastMsg)
+	}
+	for _, e := range s.Entries() {
+		if tr, ok := e.Payload.(session.ToolResult); ok && tr.Content[0].Text == "REPLACED" {
+			t.Error("log stored the override")
+		}
+	}
+}
+
+func TestRunnerHookDenyAndModify(t *testing.T) {
+	script := callThenDone("tu1", "echo", `{"x":1}`)
+	s, prov, tools := newTurnFixture(t, script...)
+	hooks := &recordingHooks{results: map[plugin.HookPoint][]any{
+		plugin.HookBeforeTool: {&plugin.BeforeToolResult{Decision: "modify", Input: json.RawMessage(`{"x":2}`)}, &plugin.BeforeToolResult{Decision: "deny", Reason: "no"}},
+	}}
+	r := NewRunner(Config{Session: s, Provider: prov, Model: provider.Model{Ref: s.Model()}, Tools: tools, Gate: gate.New(nil), MaxTokens: 10, Hooks: hooks})
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range s.Entries() {
+		switch p := e.Payload.(type) {
+		case session.PermissionDecision:
+			if p.Decision != session.Deny || p.DecidedBy != session.ByHook || p.Reason != "no" {
+				t.Errorf("decision %+v", p)
+			}
+		case session.ToolResult:
+			if p.Outcome != session.OutcomeError || !strings.Contains(p.Content[0].Text, "denied: no") {
+				t.Errorf("result %+v", p)
+			}
+		}
+	}
+	if tools.ran() != 0 {
+		t.Error("tool ran despite deny")
+	}
+	if got := string(hooks.calls[3].Payload.(*plugin.BeforeToolPayload).Input); got != `{"x":1}` {
+		t.Errorf("before_tool saw input %s", got)
+	}
+}
+
+func TestRunnerHookModifyReachesTheTool(t *testing.T) {
+	script := callThenDone("tu1", "echo", `{"x":1}`)
+	s, prov, tools := newTurnFixture(t, script...)
+	hooks := &recordingHooks{results: map[plugin.HookPoint][]any{
+		plugin.HookBeforeTool: {
+			&plugin.BeforeToolResult{Decision: "modify", Input: json.RawMessage(`not json`)},
+			&plugin.BeforeToolResult{Decision: "modify", Input: json.RawMessage(`{"x": 2}`)},
+			&plugin.BeforeToolResult{Decision: "allow"},
+		},
+	}}
+	r := NewRunner(Config{Session: s, Provider: prov, Model: provider.Model{Ref: s.Model()}, Tools: tools, Gate: gate.New(nil), MaxTokens: 10, Hooks: hooks})
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	var res session.ToolResult
+	var dec session.PermissionDecision
+	for _, e := range s.Entries() {
+		switch p := e.Payload.(type) {
+		case session.ToolResult:
+			res = p
+		case session.PermissionDecision:
+			dec = p
+		}
+	}
+	// The invalid modify passed, the valid one replaced the input byte for byte.
+	if res.Content[0].Text != `echo:{"x": 2}` {
+		t.Errorf("tool saw %q", res.Content[0].Text)
+	}
+	if dec.Decision != session.Allow || dec.DecidedBy != session.ByHook || dec.Reason != "hook" {
+		t.Errorf("decision %+v", dec)
+	}
+}
+
+func TestRunnerToolTimeout(t *testing.T) {
+	script := callThenDone("tu1", "sleep", `{}`)
+	s, prov, tools := newTurnFixture(t, script...)
+	tools.sleep = 200 * time.Millisecond
+	r := NewRunner(Config{Session: s, Provider: prov, Model: provider.Model{Ref: s.Model()}, Tools: tools, Gate: gate.New(nil), MaxTokens: 10, ToolTimeout: 20 * time.Millisecond})
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "hi")); err != nil {
+		t.Fatal(err)
+	}
+	seen := false
+	for _, e := range s.Entries() {
+		if tr, ok := e.Payload.(session.ToolResult); ok {
+			seen = true
+			if tr.Outcome != session.OutcomeError || !strings.Contains(tr.Content[0].Text, "timed out after 20ms") {
+				t.Errorf("result %+v", tr)
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("no tool result")
 	}
 }
