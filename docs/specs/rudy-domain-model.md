@@ -24,7 +24,13 @@ flowchart TB
         HookHandler
         AgentDefinition
     end
-    CLIENT[["Client (TUI, headless printer)<br/>conformist"]] -.-> Session
+    subgraph CL["Client"]
+        TranscriptRow
+        Editor
+        Theme
+        KeyBinding
+    end
+    CL -.-> Session
     MEM[["memory-go<br/>(external module)"]] -.-> Plugin
     Turn --> Provider
     Turn --> Tool
@@ -959,6 +965,128 @@ Value object. One row of `plugins.lock.toml`.
 | `commit` | string | Checked-out commit; empty when the source is a path outside a repository |
 | `installedAt` | instant | |
 | `enabled` | bool | A disabled plugin is discovered and not spawned |
+
+## TranscriptRow
+
+Entity, owned by the Client context. One thing on screen, derived from entries and notifications; keyed by the entry id it came from, or by tool_use id for a tool row.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `key` | string | The entry id, or the `tool_use` id for a tool row |
+| `kind` | `RowKind` | user, assistant, tool, prompt, marker |
+| `turnID` | string | The turn the row belongs to; rows commit to scrollback together |
+| `live` | bool | Streaming or pending: rendered as plain text, replaced on commit |
+| `expanded` | bool | Tool rows only; the config default, toggled by the user |
+| `entry` | `Entry` or empty | The committed entry; empty while live |
+| `decision` | `PermissionDecision` or empty | Tool rows: absorbed by tool_use id |
+| `result` | `ToolResult` or empty | Tool rows: absorbed by tool_use id |
+
+### Behaviors
+
+- `Absorb(entry)` folds a `permission_decision` or `tool_result` into the tool row with the same tool_use id.
+- `Render(theme, config, width) []string` produces the row's lines; a tool row renders one line plus `tool_preview_lines` of preview unless expanded.
+
+### Invariants
+
+- A row's key is unique in the transcript; replay and reattach never duplicate.
+- A prompt row exists only between `permission.requested` and the answer, in the place its tool row takes afterwards.
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `Entry` | derived-from | 1 to 1 (tool rows 1 to 3) |
+| `Turn` | references (by turn id) | n to 1 |
+
+## RowKind
+
+Enumeration.
+
+| Value | Means |
+|---|---|
+| `user` | A `user_message` |
+| `assistant` | One text block of an `assistant_message` (thinking when shown) |
+| `tool` | A `tool_use` with its decision and result |
+| `prompt` | A pending permission question |
+| `marker` | `note`, `compaction`, `turn_interrupted`, `turn_failed` |
+
+## Slot
+
+Enumeration. A region of the client screen with an owner, ordered top to bottom by `ui.layout.slots`.
+
+| Value | Owner | Means |
+|---|---|---|
+| `header` | config or a plugin widget | Optional, once at the top |
+| `transcript` | client | The rows |
+| `above_editor` | plugin widgets | Between the transcript and the input |
+| `input` | client | The editor and the prompt row |
+| `below_editor` | plugin widgets | Between the input and the status |
+| `status` | client, items from config and plugins | The status line |
+
+## Theme
+
+Value object. Named color roles, every one with a default.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | The built-in `default` or a file under `themes/` |
+| `roles` | map[role]color | `accent`, `text`, `muted`, `user`, `assistant`, `tool`, `success`, `error`, `warning`, `diff_add`, `diff_del`, `code`; a value is a hex color, another role's name, or for `code` a `chroma:<style>` |
+
+### Invariants
+
+- Every role resolves to a color after at most one role indirection; a cycle or an unknown role is a load error.
+- No role paints a background.
+
+## KeyBinding
+
+Value object. One action id bound to zero or more key strings in pi's `modifier+key` grammar.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `action` | string | A pi action id from the closed set ADR 0013 lists |
+| `keys` | []string | Empty unbinds |
+
+### Invariants
+
+- An action id outside the closed set is a config error naming the id.
+- A key string that does not parse is a config error naming the action.
+
+## Editor
+
+Entity, one per client. The input textarea with its modal state.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `mode` | `EditorMode` | disabled, insert, normal, visual |
+| `text` | string | The buffer |
+| `queue` | []string | Follow-ups queued while a turn runs, oldest first |
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> insert: ui.vim true
+    [*] --> disabled: ui.vim false
+    insert --> normal: Esc
+    normal --> insert: i a o I A O c
+    normal --> visual: v V
+    visual --> normal: Esc, an operator
+```
+
+## TurnControl
+
+Value object on the client. What Esc does depends on it.
+
+| State | Esc once | Esc twice within `double_press_ms` |
+|---|---|---|
+| idle | closes a picker or a selection | nothing more |
+| streaming or running a tool | `session.interrupt steer` | `session.interrupt cancel`, queue back to the editor |
+| steering, editor non-empty | submit continues the turn (Enter), Esc does nothing | cancel |
+| steering, editor empty | `session.interrupt cancel` | |
 
 ## Origin
 

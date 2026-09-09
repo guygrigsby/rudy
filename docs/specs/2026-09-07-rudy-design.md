@@ -276,6 +276,12 @@ double-press window, or once while steering with an empty editor, cancels the
 turn, drops queued follow-ups back into the editor and idles. Idle Esc only
 closes a picker or a selection. ADR 0006.
 
+Inline rendering commits a turn's rows to native scrollback when the turn
+rests; a row still in the live region expands, a committed one does not.
+`ui.render = "altscreen"` keeps every row expandable. Assistant text streams
+as plain text and renders through glamour once its entry arrives. Queued
+follow-ups are held by the client and submitted when the turn rests. ADR 0013.
+
 ## CLI
 
 Cobra with Viper. Noun then verb: `rudy skills migrate`, never

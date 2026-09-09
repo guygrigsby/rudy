@@ -30,6 +30,8 @@
 | Request, Notification | What a client sends the server, what the server sends a client; JSON-RPC words | Protocol |
 | Slot | A region of the client screen with an owner: transcript, input, status, header, widget | Client |
 | Theme | Named color roles with defaults | Client |
+| Row | One thing on the client screen derived from an entry: user, assistant, tool, prompt, marker | Client |
+| Queue | Follow-up messages the client holds while a turn runs; the server never sees them until submitted | Client |
 
 ## Contexts
 
