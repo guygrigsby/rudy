@@ -6,9 +6,11 @@ LDFLAGS := -X github.com/guygrigsby/rudy/internal/cli.version=$(VERSION)
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/rudy ./cmd/rudy
 
+# The race detector needs cgo on Linux, so the tests build with it even though the binary
+# does not: `build` stays CGO_ENABLED=0 and ships a static rudy.
 test:
-	CGO_ENABLED=0 go test -race ./...
-	CGO_ENABLED=0 RUDY_TEST_TRANSPORT=socket go test -race -count=1 ./internal/server/
+	CGO_ENABLED=1 go test -race ./...
+	CGO_ENABLED=1 RUDY_TEST_TRANSPORT=socket go test -race -count=1 ./internal/server/
 
 lint:
 	golangci-lint run ./...
