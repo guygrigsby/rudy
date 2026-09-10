@@ -149,6 +149,13 @@ func ThemeDefaults() map[string]string {
 	return out
 }
 
+// PromptConfig is the [prompt] table: the system prompt an operator writes instead of the
+// built-in one. File is a path; empty means system.md under the config directory when that
+// exists, and the built-in template when it does not.
+type PromptConfig struct {
+	File string `mapstructure:"file"`
+}
+
 // MemoryConfig is the [memory] table.
 type MemoryConfig struct {
 	Dir          string         `mapstructure:"dir"`
@@ -176,6 +183,7 @@ type Config struct {
 		Dir       string  `mapstructure:"dir"`
 		CompactAt float64 `mapstructure:"compact_at"`
 	} `mapstructure:"sessions"`
+	Prompt    PromptConfig              `mapstructure:"prompt"`
 	Providers map[string]ProviderConfig `mapstructure:"providers"`
 	// Plugins and PluginsDisabled are filled by hand from the raw [plugins] table after
 	// Unmarshal, since "disabled" is a sibling key of the per-plugin tables under the same
@@ -226,6 +234,7 @@ func Defaults() map[string]any {
 		"memory.summary_model":             "",
 		"mcp.connect_timeout_ms":           10000,
 		"max_tokens":                       8192,
+		"prompt.file":                      "",
 		"ui.render":                        "altscreen",
 		"ui.header.show":                   true,
 		"ui.header.animate":                true,

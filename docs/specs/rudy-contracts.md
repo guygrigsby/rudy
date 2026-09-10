@@ -225,6 +225,7 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | `$XDG_CACHE_HOME/rudy/rudy.log` | kernel | slog JSON lines |
 | `$XDG_CONFIG_HOME/rudy/config.toml` | user | config; rudy never writes it |
 | `$XDG_CONFIG_HOME/rudy/themes/<name>.toml` | user | theme roles |
+| `$XDG_CONFIG_HOME/rudy/system.md` | user | the system prompt template, when `prompt.file` names none |
 | `$XDG_CONFIG_HOME/rudy/plugins/<name>/plugin.toml` | user | spawned plugin manifest |
 | `$XDG_CONFIG_HOME/rudy/agents/<name>.md` | user | agent definition |
 | `<workspace>/.rudy/config.toml` | project | overrides merged over the user config; same keys |
@@ -474,6 +475,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `permissions.mode` | PermissionMode | `strict` | |
 | `permissions.dangerous` | [string] | see open list | matchers that always ask unless the mode is off, ahead of any session allowance; each is `tool` or `tool:prefix`. Pass 1 entries are plain shell command prefixes for bash; the `tool:prefix` form is deferred |
 | `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it; must be positive, since zero is a window no two presses fall inside and the double-Esc cancel would be unreachable |
+| `prompt.file` | path | `` | a system prompt template of the operator's own; empty reads `system.md` under the config directory when it exists, and the built-in template when it does not. `${base}`, `${tools}`, `${agents}`, `${version}`, `${workspace}`, `${project}`, `${model}`, `${date}`, `${os}` are the values a template may name, `$${` writes a literal `${`, and a name outside the set is a warning notice and the built-in prompt (ADR 0024) |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
 | `log.level` | `debug`, `info`, `warn`, `error` | `info` | |

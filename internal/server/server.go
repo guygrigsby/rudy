@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,10 @@ type Deps struct {
 	Gate     *gate.Gate
 	Hooks    *plugin.HookRunner // nil means no hooks fire
 	Socket   string             // the socket a locked session's unavailable error names
+	// Prompt is the system prompt template every session renders. Empty is the built-in
+	// one; a file the operator wrote replaces it (ADR 0024). It is read once, when the
+	// server is built, so a turn never waits on a disk read for it.
+	Prompt string
 }
 
 // EntryIDResult answers session.set_model, set_mode, set_thinking, set_title and
@@ -817,6 +822,48 @@ func (s *Server) handleAppendNote(cn *conn, raw json.RawMessage) (any, *protocol
 		return nil, protocol.ErrorFrom(aerr)
 	}
 	return EntryIDResult{EntryID: e.ID.String()}, nil
+}
+
+// renderPrompt is the system prompt for one turn: the operator's template when there is
+// one, the built-in otherwise, with the session's own values in it. An agent definition's
+// body takes the place of the built-in opening paragraph and nothing else.
+//
+// A template that fails to render is reported as a notice and the built-in is used: a bad
+// prompt file must not take a session down, and a session that silently lost its prompt
+// would be worse than one that says so.
+func (s *Server) renderPrompt(ls *liveSession, ws session.Workspace, tools []tool.Tool) string {
+	base := ls.system
+	if base == "" {
+		base = turn.BaseParagraph(ws, s.d.Version)
+	}
+	if s.d.Prompt == "" {
+		if ls.system == "" {
+			return turn.SystemPrompt(ws, s.d.Version, tools...)
+		}
+		return turn.SystemPromptWith(ls.system, ws, tools...)
+	}
+	out, err := turn.Build(s.d.Prompt, turn.Vars{
+		Base:      strings.TrimRight(base, "\n"),
+		Tools:     turn.ToolList(tools),
+		Agents:    turn.AgentsSections(ws),
+		Version:   s.d.Version,
+		Workspace: ws.Root,
+		Project:   ws.ProjectID,
+		Model:     ls.model.Ref.String(),
+		Date:      time.Now().Format("2006-01-02"),
+		OS:        runtime.GOOS,
+	})
+	if err != nil {
+		// Said to whoever is attached to this session, since it is their prompt file and
+		// their session that is running without it.
+		ls.obsMu.Lock()
+		ls.broadcastObsLocked(protocol.NotifyNotice, protocol.NoticeParams{
+			Level: "warn", Text: err.Error() + "; using the built-in prompt",
+		})
+		ls.obsMu.Unlock()
+		return turn.SystemPromptWith(base, ws, tools...)
+	}
+	return out
 }
 
 // shellTool is the tool `!` runs through. The operator's shell command is the same tool the
@@ -1675,13 +1722,8 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	// force is built: each of these reads the workspace's AGENTS.md and the global one from
 	// disk, and an agent session would otherwise pay for both every turn.
 	// The tool list is the view's own, so an agent definition's narrower set is what its
-	// prompt describes.
-	var base string
-	if ls.system == "" {
-		base = turn.SystemPrompt(view.Workspace, s.d.Version, tools.Tools()...)
-	} else {
-		base = turn.SystemPromptWith(ls.system, view.Workspace, tools.Tools()...)
-	}
+	// prompt describes, and the template is whatever the operator's prompt file said.
+	base := s.renderPrompt(ls, view.Workspace, tools.Tools())
 	r := turn.NewRunner(turn.Config{
 		Session:     ls.sess,
 		Provider:    prov,

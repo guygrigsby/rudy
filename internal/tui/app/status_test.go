@@ -164,7 +164,7 @@ func TestWorkspaceItem(t *testing.T) {
 // schedules no timer at all.
 func TestTurnItemSpinsWhileTheTurnRuns(t *testing.T) {
 	h := newHarness(t, map[string]any{"ui.status.items": []string{"turn"}})
-	// The default preset's frames, whichever preset that is (ADR 0024).
+	// The default preset's frames, whichever preset ui.spinner.name names.
 	frames := tuispinner.Default().Frames
 	glyph := frames[0]
 	if got := ansi.Strip(h.m.statusLine()); got != "" {

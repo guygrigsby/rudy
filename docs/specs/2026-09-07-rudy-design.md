@@ -176,12 +176,19 @@ to migrate skills from `.claude/skills` and pi's skill directories, and
 covers agent definitions yet. `AGENTS.md` is read from the workspace and from
 `~/.agents/AGENTS.md`.
 
-The system prompt is the base paragraph, then a `## Tools` list of the tools that
-turn actually offers, one line each from the tool's own description, then the two
-`AGENTS.md` sections, then whatever a `session_opened` hook returned as context,
-which is where the skills list comes from. An agent definition's body replaces the
-base paragraph and nothing else, so a subagent keeps the workspace's instructions
-and gets its own narrower tool list.
+The system prompt is a template. The built-in one is `${base}`, `${tools}` and
+`${agents}`: the opening paragraph, a `## Tools` list of the tools that turn
+actually offers, and the two `AGENTS.md` sections. Whatever a `session_opened`
+hook returned as context follows it, which is where the skills list comes from.
+An agent definition's body replaces `${base}` and nothing else, so a subagent
+keeps the workspace's instructions and gets its own narrower tool list.
+
+`system.md` under the config directory, or `prompt.file`, replaces the template,
+so the order and what is in it are the operator's. The values are `${base}`,
+`${tools}`, `${agents}`, `${version}`, `${workspace}`, `${project}`, `${model}`,
+`${date}` and `${os}`; a name outside that set is a notice and the built-in
+prompt. `rudy prompt show` prints what a session here would send, `rudy prompt
+example` the template to start from. ADR 0024.
 
 ## Memory
 

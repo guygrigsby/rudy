@@ -49,6 +49,9 @@ type Built struct {
 	Registry *provider.Registry
 	Plugins  *plugin.Registry
 	Server   *server.Server
+	// Prompt is the system prompt template this build read, empty for the built-in one.
+	// `rudy prompt show` renders it without opening a session.
+	Prompt string
 }
 
 // BuildOptions tunes wiring. Zero values mean the real environment.
@@ -66,6 +69,28 @@ type BuildOptions struct {
 // defaultRefreshTimeout bounds the startup registry refresh when BuildOptions.RefreshTimeout
 // is unset, so a stalled provider cannot hold a command silent forever.
 const defaultRefreshTimeout = 20 * time.Second
+
+// promptTemplate is the system prompt template a session renders: the file prompt.file
+// names, else system.md under the config directory, else "" for the built-in one.
+//
+// A named file that cannot be read is an error the caller turns into a notice: the operator
+// asked for that file by name and should hear that it is missing. A system.md that is not
+// there is not an error, since nobody named it.
+func promptTemplate(paths config.Paths, cfg *config.Config) (string, error) {
+	named := config.ExpandHome(cfg.Prompt.File, paths.Home)
+	path := named
+	if path == "" {
+		path = filepath.Join(paths.Config, "system.md")
+	}
+	body, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		return string(body), nil
+	case named != "":
+		return "", fmt.Errorf("prompt: %s: %w; using the built-in prompt", named, err)
+	}
+	return "", nil
+}
 
 // shutdownBudget bounds the unwind of a half-built server, which has no running turn and no
 // client, so it only has to close the sessions it never opened.
@@ -134,6 +159,12 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	// afterwards: a plugin's Host reaches the server through the protocol (Connect, Note,
 	// the status broadcasts), so the server has to exist by the time any Init runs.
 	g := gate.New(cfg.Permissions.Dangerous)
+	// The prompt file is read once, here: a turn never waits on a disk read for it, and a
+	// file that cannot be read is a notice rather than a failed boot (ADR 0024).
+	prompt, err := promptTemplate(paths, cfg)
+	if err != nil {
+		notice(err.Error())
+	}
 	srv := server.New(server.Deps{
 		Version:  o.Version,
 		Config:   cfg,
@@ -143,8 +174,9 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		Gate:     g,
 		Hooks:    plugin.NewHookRunner(plugins, time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice),
 		Socket:   socket,
+		Prompt:   prompt,
 	})
-	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv}
+	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv, Prompt: prompt}
 	defer func() {
 		if err != nil {
 			shutCtx, cancel := context.WithTimeout(context.Background(), shutdownBudget)

@@ -28,6 +28,14 @@ model = ""
 # e.g. "medium"
 thinking = "high"
 
+# The system prompt. Empty reads system.md under this directory when it exists,
+# and the built-in template when it does not. `rudy prompt example` prints the
+# built-in one to start from, `rudy prompt show` prints what a session would send.
+[prompt]
+# A prompt template of your own.
+# e.g. "~/.config/rudy/system.md"
+file = ""
+
 # When rudy asks before running an unsafe tool.
 [permissions]
 # strict asks, permissive allows but still asks for the dangerous set, off allows everything.

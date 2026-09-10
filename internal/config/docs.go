@@ -67,6 +67,17 @@ var Sections = []Section{
 		},
 	},
 	{
+		Table: "prompt",
+		Comment: []string{
+			"The system prompt. Empty reads system.md under this directory when it exists,",
+			"and the built-in template when it does not. `rudy prompt example` prints the",
+			"built-in one to start from, `rudy prompt show` prints what a session would send.",
+		},
+		Keys: []Doc{
+			{Key: "prompt.file", Comment: "A prompt template of your own.", Example: `"~/.config/rudy/system.md"`},
+		},
+	},
+	{
 		Table: "permissions",
 		Comment: []string{
 			"When rudy asks before running an unsafe tool.",

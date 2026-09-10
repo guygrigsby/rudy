@@ -98,6 +98,19 @@ Every render choice is a config field under `[ui]` with a default, listed in
 the terminal's own scrollback, where a turn's rows are committed when it rests
 and a committed row no longer expands.
 
+## The system prompt
+
+    rudy prompt show                      # what a session here would send
+    rudy prompt example > ~/.config/rudy/system.md
+    rudy prompt path                      # the file it is read from
+
+`system.md` under the config directory replaces the built-in prompt, and
+`[prompt] file` names one somewhere else. A template may use `${base}`,
+`${tools}`, `${agents}`, `${version}`, `${workspace}`, `${project}`, `${model}`,
+`${date}` and `${os}`, and `$${` writes a literal `${`. A name outside that set
+is a notice and the built-in prompt, so a typo never leaves a session with a hole
+in its instructions.
+
 ## Run headless
 
     rudy -p "Reply with exactly: ok"
