@@ -37,9 +37,17 @@ const statusGap = "  "
 // status line in the same left gutter every transcript row sits in. An item with nothing
 // to say draws nothing and takes no separator with it, so a session with no cost yet does
 // not leave a gap where the cost will be.
-func (m *Model) statusLine() string {
-	parts := make([]string, 0, len(m.cfg.UI.Status.Items))
-	for _, id := range m.cfg.UI.Status.Items {
+func (m *Model) statusLine() string { return m.statusLineOf(m.cfg.UI.Status.Items) }
+
+// aboveEditorLine is the status line drawn over the composer, ui.status.above_editor: the
+// turn cell by default, which is what a person watches while a turn runs and the last thing
+// they should have to look down for.
+func (m *Model) aboveEditorLine() string { return m.statusLineOf(m.cfg.UI.Status.AboveEditor) }
+
+// statusLineOf draws one list of status items.
+func (m *Model) statusLineOf(items []string) string {
+	parts := make([]string, 0, len(items))
+	for _, id := range items {
 		if s := m.statusItem(id); s != "" {
 			parts = append(parts, s)
 		}

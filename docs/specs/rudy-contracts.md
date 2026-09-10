@@ -486,14 +486,15 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.header.facts` | [string] | `["model", "thinking", "workspace"]` | the session's facts the header carries, in the order they draw; legal entries are `model`, `thinking`, `mode`, `workspace` |
 | `ui.render` | `inline`, `altscreen` | `altscreen` | `altscreen` owns the screen and keeps every row expandable; `inline` draws in the terminal's own scrollback and commits a rested turn's rows out of the live region, where they can no longer be expanded (ADR 0015) |
 | `ui.vim` | bool | true | |
-| `ui.layout.slots` | [string] | `["transcript", "status", "input"]` | order top to bottom; `header` may be added. The status line is above the composer by default, where the eye already is while typing; `["transcript", "input", "status"]` puts it back underneath |
+| `ui.layout.slots` | [string] | `["transcript", "input", "status"]` | order top to bottom; `header` may be added |
 | `ui.transcript.tool_collapsed` | bool | true | |
 | `ui.transcript.tool_preview_lines` | int | 2 | |
 | `ui.transcript.thinking` | `hidden`, `shown` | `hidden` | |
 | `ui.transcript.user_prefix` | string | `›` | |
 | `ui.transcript.block_gap` | int | 1 | blank lines between assistant blocks; zero or positive |
 | `ui.diff.style` | `text`, `background` | `text` | |
-| `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"]` | built-in keys (`vim_mode`, `model`, `permission_mode`, `context`, `cost`, `workspace`, `turn`, `cat`) plus `plugin:key` for plugin items; `context` is still a legal item and is no longer a default, since the composer's lower rule carries it (ADR 0017); `turn` is a spinner and one word (`thinking`, `streaming`, `tool`, `steering`, `waiting`) while a turn runs and nothing at rest |
+| `ui.status.above_editor` | [string] | `["turn"]` | the status line drawn over the composer, same vocabulary as `ui.status.items`: what is worth seeing while typing rather than after. An item in both lists is drawn in both |
+| `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "cost", "workspace", "cat"]` | built-in keys (`vim_mode`, `model`, `permission_mode`, `context`, `cost`, `workspace`, `turn`, `cat`) plus `plugin:key` for plugin items; `context` is still a legal item and is no longer a default, since the composer's lower rule carries it (ADR 0017); `turn` is a spinner and one word (`thinking`, `streaming`, `tool`, `steering`, `waiting`) while a turn runs and nothing at rest |
 | `ui.input.rules` | bool | true | a rule above the composer and one below it; the upper one carries the session's name once it has one (ADR 0019) and the lower one the context percentage, labelled, which is the only place it is drawn (ADR 0017) |
 | `ui.header.show` | bool | true | the startup header: the greeting, the mark, the session facts, the tips and what is new. Drawn once at the top of the transcript and scrolled away by it (ADR 0016) |
 | `ui.header.animate` | bool | true | the mark materializes once on startup, then settles. Altscreen only: inline draws the settled header, since an inline frame that grows and shrinks strands its rows |

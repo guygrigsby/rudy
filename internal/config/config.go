@@ -43,7 +43,12 @@ type DiffConfig struct {
 
 // StatusConfig is the [ui.status] table.
 type StatusConfig struct {
+	// Items is the status line under the composer.
 	Items []string `mapstructure:"items"`
+	// AboveEditor is the line drawn over the composer, for the items worth seeing while
+	// typing rather than after: the turn cell and whatever else belongs with it. Same
+	// vocabulary as Items; an item named in both is drawn in both.
+	AboveEditor []string `mapstructure:"above_editor"`
 }
 
 // NoticesConfig is the [ui.notices] table. Max is how many notice lines the client draws,
@@ -252,14 +257,15 @@ func Defaults() map[string]any {
 		"ui.spinner.interval_ms":           0,
 		"ui.cats":                          true,
 		"ui.vim":                           true,
-		"ui.layout.slots":                  []string{"transcript", "status", "input"},
+		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,
 		"ui.transcript.tool_preview_lines": 2,
 		"ui.transcript.thinking":           "hidden",
 		"ui.transcript.user_prefix":        "›",
 		"ui.transcript.block_gap":          1,
 		"ui.diff.style":                    "text",
-		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"},
+		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "cat"},
+		"ui.status.above_editor":           []string{"turn"},
 		"ui.notices.max":                   3,
 		"ui.notices.ttl_ms":                8000,
 		"plugins.disabled":                 []string{},
@@ -605,13 +611,23 @@ func (c *Config) validateUI() []error {
 			errs = append(errs, fmt.Errorf("config: ui.layout.slots is missing %q", req))
 		}
 	}
-	for _, item := range c.UI.Status.Items {
+	errs = append(errs, validStatusItems("ui.status.items", c.UI.Status.Items)...)
+	errs = append(errs, validStatusItems("ui.status.above_editor", c.UI.Status.AboveEditor)...)
+	return errs
+}
+
+// validStatusItems checks one status list: every entry is a built-in item or a plugin's
+// "<plugin>:<key>". Both lists take the same vocabulary, so an item can be drawn over the
+// composer, under it, or in both places.
+func validStatusItems(key string, items []string) []error {
+	var errs []error
+	for _, item := range items {
 		if builtinStatusItems[item] {
 			continue
 		}
-		plugin, key, ok := strings.Cut(item, ":")
-		if !ok || plugin == "" || key == "" {
-			errs = append(errs, fmt.Errorf("config: ui.status.items %q is not a built-in item or plugin:key", item))
+		plugin, k, ok := strings.Cut(item, ":")
+		if !ok || plugin == "" || k == "" {
+			errs = append(errs, fmt.Errorf("config: %s %q is not a built-in item or plugin:key", key, item))
 		}
 	}
 	return errs

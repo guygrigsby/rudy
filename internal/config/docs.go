@@ -136,7 +136,7 @@ var Sections = []Section{
 		Table:   "ui.layout",
 		Comment: []string{"The slots drawn top to bottom. transcript, input and status are required once each."},
 		Keys: []Doc{
-			{Key: "ui.layout.slots", Comment: "header is optional and is where a plugin's header widget draws; put status after input to read it under the composer instead.", Example: `["header", "transcript", "input", "status"]`},
+			{Key: "ui.layout.slots", Comment: "header is optional and is where a plugin's header widget draws.", Example: `["header", "transcript", "input", "status"]`},
 		},
 	},
 	{
@@ -193,6 +193,7 @@ var Sections = []Section{
 		Table:   "ui.status",
 		Comment: []string{"The status line under the composer."},
 		Keys: []Doc{
+			{Key: "ui.status.above_editor", Comment: "The line over the composer: what is worth seeing while you type rather than after.", Example: `["turn", "context"]`},
 			{Key: "ui.status.items", Comment: "Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is \"<plugin>:<key>\".", Example: `["vim_mode", "model", "context", "cost", "workspace", "turn"]`},
 		},
 	},

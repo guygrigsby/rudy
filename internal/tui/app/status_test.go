@@ -16,6 +16,40 @@ import (
 	tuispinner "github.com/guygrigsby/rudy/internal/tui/spinner"
 )
 
+// TestTheTurnCellIsDrawnOverTheComposer: what a person watches while a turn runs is the
+// one status item they should not have to look down for.
+func TestTheTurnCellIsDrawnOverTheComposer(t *testing.T) {
+	h := newHarness(t, nil)
+	if got := ansi.Strip(h.m.aboveEditorLine()); got != "" {
+		t.Errorf("a turn at rest draws no cell over the composer: %q", got)
+	}
+	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{
+		SessionID: h.m.session.SessionID, TurnID: session.NewID().String(), State: stateStreaming,
+	})
+	// "thinking" until an answer streams, which is what the turn cell says between the
+	// request going out and the first text delta.
+	above := ansi.Strip(h.m.aboveEditorLine())
+	if !strings.Contains(above, "thinking") {
+		t.Fatalf("a running turn says so over the composer: %q", above)
+	}
+	if strings.Contains(ansi.Strip(h.m.statusLine()), "thinking") {
+		t.Errorf("and not under it as well: %q", ansi.Strip(h.m.statusLine()))
+	}
+	lines := h.lines()
+	var turn, editor int
+	for i, l := range lines {
+		switch {
+		case strings.Contains(ansi.Strip(l), "thinking"):
+			turn = i
+		case strings.Contains(ansi.Strip(l), "┃"):
+			editor = i
+		}
+	}
+	if turn == 0 || editor == 0 || turn > editor {
+		t.Errorf("the turn cell is above the composer, turn %d editor %d:\n%s", turn, editor, ansi.Strip(h.view()))
+	}
+}
+
 func TestStatusLineIsTheDesignScreen(t *testing.T) {
 	h := newHarness(t, nil)
 	h.appended(session.AssistantMessage{
@@ -30,20 +64,8 @@ func TestStatusLineIsTheDesignScreen(t *testing.T) {
 	if got != want {
 		t.Fatalf("status %q want %q", got, want)
 	}
-	// Above the composer, which is where ui.layout.slots puts it by default: the eye is
-	// already there while you type.
-	lines := h.lines()
-	var status, editor int
-	for i, l := range lines {
-		switch {
-		case strings.Contains(ansi.Strip(l), "INSERT"):
-			status = i
-		case strings.Contains(ansi.Strip(l), "┃"):
-			editor = i
-		}
-	}
-	if status == 0 || editor == 0 || status > editor {
-		t.Errorf("the status line sits above the composer, status %d editor %d:\n%s", status, editor, ansi.Strip(h.view()))
+	if !strings.HasSuffix(strings.TrimRight(h.view(), "\n"), h.m.statusLine()) {
+		t.Error("the status line is the last thing drawn")
 	}
 }
 

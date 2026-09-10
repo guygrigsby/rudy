@@ -1348,6 +1348,7 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 			above, below := m.composerRules()
 			blocks = append(blocks,
 				above,
+				m.statusAboveLines(),
 				m.widgetLines(protocol.SlotAboveEditor),
 				m.menuLines(),
 				editor,
@@ -1385,6 +1386,15 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 		out = append(out, b...)
 	}
 	return out, rowAt
+}
+
+// statusAboveLines is ui.status.above_editor as a block, or nothing when it has nothing to
+// say: a turn at rest draws no turn cell, and a line with no cells in it takes no row.
+func (m *Model) statusAboveLines() []string {
+	if s := m.aboveEditorLine(); s != "" {
+		return []string{s}
+	}
+	return nil
 }
 
 // transcriptBlock is the transcript slot: the rows, then the notices under them. Inline

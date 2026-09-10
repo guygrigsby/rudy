@@ -90,9 +90,9 @@ cats = true
 
 # The slots drawn top to bottom. transcript, input and status are required once each.
 [ui.layout]
-# header is optional and is where a plugin's header widget draws; put status after input to read it under the composer instead.
+# header is optional and is where a plugin's header widget draws.
 # e.g. ["header", "transcript", "input", "status"]
-slots = ["transcript", "status", "input"]
+slots = ["transcript", "input", "status"]
 
 # The header drawn once at the top of the transcript, which the conversation scrolls away.
 [ui.header]
@@ -158,9 +158,12 @@ style = "text"
 
 # The status line under the composer.
 [ui.status]
+# The line over the composer: what is worth seeing while you type rather than after.
+# e.g. ["turn", "context"]
+above_editor = ["turn"]
 # Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is "<plugin>:<key>".
 # e.g. ["vim_mode", "model", "context", "cost", "workspace", "turn"]
-items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"]
+items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "cat"]
 
 # Notices are chrome under the transcript and never reach a session log.
 [ui.notices]

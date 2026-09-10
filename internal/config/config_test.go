@@ -296,7 +296,7 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	if c.UI.Render != "altscreen" || !c.UI.Vim || c.Permissions.DoublePressMS != 500 {
 		t.Errorf("ui %+v", c.UI)
 	}
-	if !reflect.DeepEqual(c.UI.Layout.Slots, []string{"transcript", "status", "input"}) {
+	if !reflect.DeepEqual(c.UI.Layout.Slots, []string{"transcript", "input", "status"}) {
 		t.Errorf("slots %v", c.UI.Layout.Slots)
 	}
 	tr := c.UI.Transcript
@@ -307,9 +307,14 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 		t.Errorf("diff %+v", c.UI.Diff)
 	}
 	// No "context": the percentage is drawn on the composer's lower rule, once (ADR 0017).
-	want := []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"}
+	// No "turn": the turn cell is drawn over the composer, where the eye is while a turn
+	// runs, and ui.status.above_editor is what puts it there.
+	want := []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "cat"}
 	if !reflect.DeepEqual(c.UI.Status.Items, want) {
 		t.Errorf("status %v", c.UI.Status.Items)
+	}
+	if !reflect.DeepEqual(c.UI.Status.AboveEditor, []string{"turn"}) {
+		t.Errorf("above the editor %v", c.UI.Status.AboveEditor)
 	}
 	if !c.UI.Cats {
 		t.Error("a cat by default")

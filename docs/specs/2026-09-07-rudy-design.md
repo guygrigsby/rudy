@@ -230,8 +230,8 @@ lines of output, edits show the first hunk as red and green text, read, grep and
 glob show a one-line count. Thinking hidden. Every row and the status line sit
 one column in, the gutter the screen above draws. Icons come from `[ui.icons]`: the branch
 in the workspace cell, the model, the context, one per tool on a tool row and
-one per notice level. Status above the input, vim
-mode first and `turn` last: a spinner from `[ui.spinner]` and one word for what the turn is doing
+one per notice level. Status under the input, vim
+mode first and `turn` last: a spinner from `[ui.spinner]` and one word for what the turn is doing, drawn over the composer by `ui.status.above_editor` rather than under it
 (`thinking` until an answer streams, then `streaming`, `tool`, `steering`,
 `waiting`), drawing nothing at rest. Enter or a click expands a row. A permission
 question renders inline where the tool row would be. Assistant markdown renders
@@ -247,7 +247,7 @@ vim = true
 double_press_ms = 500
 
 [ui.layout]
-slots = ["transcript", "status", "input"]
+slots = ["transcript", "input", "status"]
 
 [ui.input]
 rules = true
@@ -275,7 +275,8 @@ block_gap = 1
 style = "text"
 
 [ui.status]
-items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"]
+above_editor = ["turn"]
+items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "cat"]
 
 [ui.spinner]
 name = "arc"
