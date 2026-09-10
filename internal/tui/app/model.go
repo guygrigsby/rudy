@@ -182,6 +182,10 @@ type Model struct {
 	// menu is the slash menu's own state, which is only ever a selection and a dismissal:
 	// what it lists comes from the draft.
 	menu menuState
+	// pendingCommand is the draft the command.run in flight was typed as, held only until
+	// its answer lands. A command runs while a turn does (ADR 0026), and the few the
+	// server refuses for needing a resting session put it back rather than lose it.
+	pendingCommand string
 	// scope is the models app.model.cycleForward and cycleBackward step through, in
 	// registry order. Empty means the whole registry, which is what a client opens on
 	// (ADR 0020).
@@ -602,6 +606,8 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		// (ADR 0015 decision 3), so its row is the one nobody can reach.
 		m.commands = append(slices.Clone(res.Commands), clientCommands...)
 	case protocol.MethodCommandRun:
+		// It ran: there is nothing to put back.
+		m.pendingCommand = ""
 		var res protocol.CommandRunResult
 		if !m.result(r, &res) {
 			return nil
@@ -647,6 +653,14 @@ func (m *Model) callFailed(r CallResultMsg) tea.Cmd {
 		cmd = m.abortSwitch()
 	}
 	if r.Method == protocol.MethodCommandRun {
+		draft := m.pendingCommand
+		m.pendingCommand = ""
+		// A command refused because a turn is running is a race with the model, not a
+		// mistake: the draft goes back where Enter reaches it again. Only into an editor
+		// that is empty, since anything typed since is the person's own and outranks it.
+		if draft != "" && m.ed.Empty() && conflict(r.Err) {
+			m.ed.SetText(draft)
+		}
 		// A command's failure is the server's own words, which is what the user typed
 		// come back at them ("unknown command /x"). The method and the JSON-RPC code in
 		// front of it would say nothing they can act on.
@@ -655,6 +669,13 @@ func (m *Model) callFailed(r CallResultMsg) tea.Cmd {
 	}
 	m.note(levelError, r.Method+": "+r.Err.Error())
 	return cmd
+}
+
+// conflict reports whether an error is the server refusing something because a turn is
+// running, which is the one refusal a client can do anything about.
+func conflict(err error) bool {
+	var pe *protocol.Error
+	return errors.As(err, &pe) && pe.Code == protocol.CodeConflict
 }
 
 // serverMessage is the message a server error carries, or the whole error for one that

@@ -148,18 +148,25 @@ func (m *Model) sendQueued() tea.Cmd {
 // when the turn rested.
 func (m *Model) sendTyped(text string) tea.Cmd {
 	if name, args, ok := commandIn(text); ok {
-		if localCommand(name) {
-			// The client's own, never the server's: what they do is the client's business
-			// and no session hears about them (ADR 0015 decision 3, ADR 0020).
-			return m.runLocal(name, args)
-		}
-		return m.callNamed(protocol.MethodCommandRun, name, protocol.CommandRunParams{
-			SessionID: m.session.SessionID,
-			Name:      name,
-			Args:      args,
-		})
+		return m.runCommand(name, args, text)
 	}
 	return m.submitText(text, session.SourceTyped)
+}
+
+// runCommand runs one command and remembers the draft it was typed as, so a refusal can
+// put it back where a person can press Enter on it again. The client's own never reach the
+// wire: what they do is the client's business and no session hears about them (ADR 0015
+// decision 3, ADR 0020).
+func (m *Model) runCommand(name, args, draft string) tea.Cmd {
+	if localCommand(name) {
+		return m.runLocal(name, args)
+	}
+	m.pendingCommand = draft
+	return m.callNamed(protocol.MethodCommandRun, name, protocol.CommandRunParams{
+		SessionID: m.session.SessionID,
+		Name:      name,
+		Args:      args,
+	})
 }
 
 // lateRows commits a row that arrived after its turn had already gone to scrollback: a
@@ -321,15 +328,29 @@ func (m *Model) submit() tea.Cmd {
 	if m.ed.Empty() {
 		return nil
 	}
+	text := m.ed.Text()
+	name, args, isCommand := commandIn(text)
+	// The client's own commands answer with no server at all: /exit is the one thing a
+	// client whose server has gone away still has to be able to do.
+	if isCommand && localCommand(name) {
+		m.ed.Clear()
+		return m.runLocal(name, args)
+	}
 	if m.disconnected {
 		m.note(levelError, "not connected: nothing was sent, the draft is still here")
 		return nil
+	}
+	// A command is not a message and does not wait behind the turn: somebody who types one
+	// while the model is thinking means now (ADR 0026). The server refuses the few that
+	// need a resting session in its own words, and the draft comes back to the editor.
+	if isCommand {
+		m.ed.Clear()
+		return m.runCommand(name, args, text)
 	}
 	if m.turn.running() {
 		m.ed.Enqueue()
 		return nil
 	}
-	text := m.ed.Text()
 	// A shell command is not a message and never steers a turn: it runs, it is recorded,
 	// and the model reads it next time something is sent (ADR 0023).
 	if command, ok := shellIn(text); ok {

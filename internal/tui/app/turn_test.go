@@ -530,3 +530,40 @@ func TestATurnRestingDuringAReplayDoesNotPrint(t *testing.T) {
 		t.Errorf("a turn resting outside a replay commits, printed %q", printed)
 	}
 }
+
+// TestACommandRunsWhileTheModelThinks is rudy-lr0: a command is not a message, and a
+// person who types one while the model is thinking means now. It never joins the queue a
+// follow-up message goes in.
+func TestACommandRunsWhileTheModelThinks(t *testing.T) {
+	h := newAppHarness(t, scripted{slowText("one", 300*time.Millisecond), text("two")})
+	h.typeText("first")
+	h.press("enter")
+	h.waitTurn(stateStreaming)
+	h.typeText("/notice while the model thinks")
+	h.press("enter")
+	if q := h.editor().Queue(); len(q) != 0 {
+		t.Fatalf("a command does not wait for the turn: queued %q", q)
+	}
+	h.waitFor("the command's notice", func(v string) bool {
+		return strings.Contains(v, "noticed: while the model thinks")
+	})
+	if h.m.turn.state != stateStreaming {
+		t.Errorf("the turn it ran under is still running: %q", h.m.turn.state)
+	}
+}
+
+// TestACommandTheTurnRefusesComesBack: the few commands that need a resting session are
+// the server's to refuse, in its own words, and what was typed is put back rather than
+// lost to a race with the model.
+func TestACommandTheTurnRefusesComesBack(t *testing.T) {
+	h := newAppHarness(t, scripted{slowText("one", 300*time.Millisecond), text("two")})
+	h.typeText("first")
+	h.press("enter")
+	h.waitTurn(stateStreaming)
+	h.typeText("/ask what a turn is")
+	h.press("enter")
+	h.waitFor("the refusal", func(v string) bool { return strings.Contains(v, "a turn is active") })
+	if got := h.editor().Text(); got != "/ask what a turn is" {
+		t.Errorf("the draft comes back to the editor, holds %q", got)
+	}
+}
