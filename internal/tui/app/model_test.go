@@ -741,7 +741,7 @@ func TestMouseClickTogglesTheToolRowUnderIt(t *testing.T) {
 			lines := h.lines()
 			row := -1
 			for i, l := range lines {
-				if strings.Contains(ansi.Strip(l), "▸ bash") {
+				if strings.Contains(ansi.Strip(l), "bash  ls") {
 					row = i
 				}
 			}

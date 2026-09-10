@@ -115,6 +115,14 @@ type UIConfig struct {
 	Theme      map[string]string `mapstructure:"theme"`
 	// Icons holds ui.icons.set plus per-name overrides, merged the same way Theme is.
 	Icons map[string]string `mapstructure:"icons"`
+	// Mouse is what the client asks the terminal to report: "off" leaves the mouse to the
+	// terminal, so a drag selects text to copy as it does anywhere else; "click" reports
+	// clicks and the wheel, which is what expands a tool row and scrolls the transcript;
+	// "all" reports movement too, which nothing here uses yet.
+	//
+	// With reporting on, a terminal's own selection is usually still one modifier away:
+	// Option on macOS terminals, Shift on most others.
+	Mouse string `mapstructure:"mouse"`
 	// Cats draws a random cat face in the status line's cat cell, one for the life of the
 	// client. False leaves the cell empty wherever ui.status.items placed it.
 	Cats bool `mapstructure:"cats"`
@@ -256,6 +264,7 @@ func Defaults() map[string]any {
 		"ui.spinner.frames":                []string{},
 		"ui.spinner.interval_ms":           0,
 		"ui.cats":                          true,
+		"ui.mouse":                         "click",
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,
@@ -533,6 +542,9 @@ func (c *Config) validate() error {
 
 // validRenders, validThinking and validDiffStyles gate the matching ui.* enums.
 var validRenders = map[string]bool{"inline": true, "altscreen": true}
+
+// validMouse are ui.mouse's three values.
+var validMouse = map[string]bool{"off": true, "click": true, "all": true}
 var validThinking = map[string]bool{"hidden": true, "shown": true}
 var validDiffStyles = map[string]bool{"text": true, "background": true}
 
@@ -556,6 +568,9 @@ var builtinStatusItems = map[string]bool{
 
 func (c *Config) validateUI() []error {
 	var errs []error
+	if !validMouse[c.UI.Mouse] {
+		errs = append(errs, fmt.Errorf("config: ui.mouse %q is not off, click or all", c.UI.Mouse))
+	}
 	if !validRenders[c.UI.Render] {
 		errs = append(errs, fmt.Errorf("config: ui.render %q is not inline or altscreen", c.UI.Render))
 	}

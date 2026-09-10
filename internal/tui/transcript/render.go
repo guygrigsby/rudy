@@ -17,6 +17,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 )
 
@@ -121,7 +122,9 @@ func (t *Transcript) tool(r *Row) []string {
 		input = r.Decision.Input
 	}
 	name := r.ToolUse.Name
-	out := []string{t.summaryLine(name, input)}
+	// The row opens with a marker saying which way it is: a click or ctrl+o toggles it, and
+	// without the marker nothing on screen says the click did anything (ADR 0025).
+	out := []string{t.summaryLine(name, input, t.disclosure(r))}
 	if r.Decision != nil && r.Decision.Decision == session.Deny {
 		return append(out, t.line(theme.RoleError, previewIndent, "denied: "+r.Decision.Reason, false))
 	}
@@ -272,7 +275,7 @@ func (t *Transcript) prompt(r *Row) []string {
 		return nil
 	}
 	return []string{
-		t.summaryLine(p.Tool, p.Input),
+		t.summaryLine(p.Tool, p.Input, ""),
 		t.line(theme.RoleWarning, previewIndent, promptChoices, false),
 	}
 }
@@ -321,10 +324,28 @@ var summaryField = map[string]string{
 	"glob":  "pattern",
 }
 
-// summaryLine opens a tool row and a permission question alike: the glyph, the tool and
-// what the call does.
-func (t *Transcript) summaryLine(name string, input json.RawMessage) string {
-	return t.line(theme.RoleTool, 0, t.toolIcon(name)+" "+name+"  "+summary(name, input), false)
+// summaryLine opens a tool row and a permission question alike: the marker, the glyph, the
+// tool and what the call does. A permission question passes no marker: there is nothing to
+// expand until the call has run.
+func (t *Transcript) summaryLine(name string, input json.RawMessage, marker string) string {
+	return t.line(theme.RoleTool, 0, marker+t.toolIcon(name)+" "+name+"  "+summary(name, input), false)
+}
+
+// disclosure is the marker a tool row opens with: pointing right while its result is
+// folded, down while it is open, and nothing at all when the row has nothing to fold,
+// which is a call that has not finished or was denied.
+func (t *Transcript) disclosure(r *Row) string {
+	if r.Result == nil || (r.Decision != nil && r.Decision.Decision == session.Deny) {
+		return ""
+	}
+	name := icons.Collapsed
+	if r.Expanded || !t.opts.ToolCollapsed {
+		name = icons.Expanded
+	}
+	if g := t.opts.Icons.Get(name); g != "" {
+		return g + " "
+	}
+	return ""
 }
 
 // summary is a tool call in one line: the field that says what it does for the built-in

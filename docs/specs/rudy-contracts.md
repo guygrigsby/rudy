@@ -484,6 +484,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.header.greeting` | bool | true | the time of day and a name in the header |
 | `ui.header.mark` | bool | true | the cat in the header |
 | `ui.header.facts` | [string] | `["model", "thinking", "workspace"]` | the session's facts the header carries, in the order they draw; legal entries are `model`, `thinking`, `mode`, `workspace` |
+| `ui.mouse` | `off`, `click`, `all` | `click` | what the client asks the terminal to report. `off` leaves the mouse alone, so a drag selects text as it does anywhere else; `click` reports clicks and the wheel, which is what expands a tool row and scrolls the transcript; `all` reports movement too. With reporting on, a terminal's own selection is a modifier away: Option on macOS, Shift on most others (ADR 0025) |
 | `ui.render` | `inline`, `altscreen` | `altscreen` | `altscreen` owns the screen and keeps every row expandable; `inline` draws in the terminal's own scrollback and commits a rested turn's rows out of the live region, where they can no longer be expanded (ADR 0015) |
 | `ui.vim` | bool | true | |
 | `ui.layout.slots` | [string] | `["transcript", "input", "status"]` | order top to bottom; `header` may be added |
@@ -493,7 +494,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.transcript.user_prefix` | string | `›` | |
 | `ui.transcript.block_gap` | int | 1 | blank lines between assistant blocks; zero or positive |
 | `ui.diff.style` | `text`, `background` | `text` | |
-| `ui.status.above_editor` | [string] | `["turn"]` | the status line drawn over the composer, same vocabulary as `ui.status.items`: what is worth seeing while typing rather than after. An item in both lists is drawn in both |
+| `ui.status.above_editor` | [string] | `["turn"]` | the status line drawn over the composer, same vocabulary as `ui.status.items`: what is worth seeing while typing rather than after. An item is drawn once, in the first list that names it, so a file that carried `turn` under the composer before this key existed does not draw it twice |
 | `ui.status.items` | [string] | `["vim_mode", "model", "permission_mode", "cost", "workspace", "cat"]` | built-in keys (`vim_mode`, `model`, `permission_mode`, `context`, `cost`, `workspace`, `turn`, `cat`) plus `plugin:key` for plugin items; `context` is still a legal item and is no longer a default, since the composer's lower rule carries it (ADR 0017); `turn` is a spinner and one word (`thinking`, `streaming`, `tool`, `steering`, `waiting`) while a turn runs and nothing at rest |
 | `ui.input.rules` | bool | true | a rule above the composer and one below it; the upper one carries the session's name once it has one (ADR 0019) and the lower one the context percentage, labelled, which is the only place it is drawn (ADR 0017) |
 | `ui.header.show` | bool | true | the startup header: the greeting, the mark, the session facts, the tips and what is new. Drawn once at the top of the transcript and scrolled away by it (ADR 0016) |
@@ -509,7 +510,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.notices.max` | int | 3 | notice lines the client draws under the transcript, newest first; `0` draws none |
 | `ui.cats` | bool | true | a random cat face from `internal/cats` in the status line's `cat` cell, one for the life of the client; false leaves the cell empty wherever `ui.status.items` placed it |
 | `ui.icons.set` | `nerd`, `unicode`, `ascii` | `nerd` | the glyph set: `nerd` is Nerd Font codepoints (Powerline, Font Awesome 4) and needs a patched font, `unicode` needs none, `ascii` is what the client drew before icons (ADR 0018) |
-| `ui.icons.<name>` | string | per set | overrides one glyph; the empty string draws none and leaves no gap. Names: `branch`, `model`, `context`, `tool`, `bash`, `edit`, `read`, `write`, `grep`, `glob`, `fetch`, `agent`, `info`, `warn`, `error`; an unknown set or name is a load error naming it |
+| `ui.icons.<name>` | string | per set | overrides one glyph; the empty string draws none and leaves no gap. Names: `branch`, `model`, `context`, `collapsed`, `expanded`, `tool`, `bash`, `edit`, `read`, `write`, `grep`, `glob`, `fetch`, `agent`, `info`, `warn`, `error`; an unknown set or name is a load error naming it |
 | `ui.theme.name` | string | `default` | a file under `themes/` or the built-in |
 | `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes. `shell` paints the composer while a draft is a shell command and the row it becomes, and defaults to `warning` |
 | `keys.<action id>` | string or [string] | pi defaults | one of the ids ADR 0013 decision 5 lists; a value replaces the default for that action; `[]` unbinds; an unknown id or an unparseable key is a load error naming it |

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -37,7 +38,21 @@ const statusGap = "  "
 // status line in the same left gutter every transcript row sits in. An item with nothing
 // to say draws nothing and takes no separator with it, so a session with no cost yet does
 // not leave a gap where the cost will be.
-func (m *Model) statusLine() string { return m.statusLineOf(m.cfg.UI.Status.Items) }
+// statusLine is the line under the composer: ui.status.items, less whatever the line above
+// the composer already draws. An item is drawn once, in the first list that names it, so a
+// config that carried `turn` before ui.status.above_editor existed does not say it twice
+// (ADR 0025). Naming it in both is how a person asks for both.
+func (m *Model) statusLine() string {
+	above := m.cfg.UI.Status.AboveEditor
+	items := make([]string, 0, len(m.cfg.UI.Status.Items))
+	for _, id := range m.cfg.UI.Status.Items {
+		if slices.Contains(above, id) {
+			continue
+		}
+		items = append(items, id)
+	}
+	return m.statusLineOf(items)
+}
 
 // aboveEditorLine is the status line drawn over the composer, ui.status.above_editor: the
 // turn cell by default, which is what a person watches while a turn runs and the last thing

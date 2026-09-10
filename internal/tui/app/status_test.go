@@ -197,7 +197,12 @@ func TestWorkspaceItem(t *testing.T) {
 // turn at rest leaves the cell empty and the tick loop stopped, so an idle client
 // schedules no timer at all.
 func TestTurnItemSpinsWhileTheTurnRuns(t *testing.T) {
-	h := newHarness(t, map[string]any{"ui.status.items": []string{"turn"}})
+	// The turn cell is drawn over the composer by default; this test is about the cell
+	// itself, so it is put back in the status line and taken off the line above.
+	h := newHarness(t, map[string]any{
+		"ui.status.items":        []string{"turn"},
+		"ui.status.above_editor": []string{},
+	})
 	// The default preset's frames, whichever preset ui.spinner.name names.
 	frames := tuispinner.Default().Frames
 	glyph := frames[0]
@@ -255,7 +260,12 @@ func TestTurnItemSpinsWhileTheTurnRuns(t *testing.T) {
 }
 
 func TestADisconnectRestsTheTurnCell(t *testing.T) {
-	h := newHarness(t, map[string]any{"ui.status.items": []string{"turn"}})
+	// The turn cell is drawn over the composer by default; this test is about the cell
+	// itself, so it is put back in the status line and taken off the line above.
+	h := newHarness(t, map[string]any{
+		"ui.status.items":        []string{"turn"},
+		"ui.status.above_editor": []string{},
+	})
 	sid, turn := h.m.session.SessionID, session.NewID().String()
 	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: sid, TurnID: turn, State: stateStreaming})
 	if !h.m.spinning {
@@ -272,5 +282,28 @@ func TestADisconnectRestsTheTurnCell(t *testing.T) {
 	}
 	if cmd := h.m.spinTicked(spinner.TickMsg{ID: h.m.spin.ID()}); cmd != nil {
 		t.Error("a tick that arrives after the disconnect asks for no further tick")
+	}
+}
+
+// TestAnItemNamedAboveIsNotDrawnBelow: a config written before ui.status.above_editor
+// existed still lists turn in ui.status.items, and drawing it in both places is what the
+// screen looked like when this was found.
+func TestAnItemNamedAboveIsNotDrawnBelow(t *testing.T) {
+	h := newHarness(t, map[string]any{
+		"ui.status.above_editor": []string{"turn"},
+		"ui.status.items":        []string{"vim_mode", "turn", "model"},
+	})
+	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{
+		SessionID: h.m.session.SessionID, TurnID: session.NewID().String(), State: stateStreaming,
+	})
+	if got := ansi.Strip(h.m.statusLine()); strings.Contains(got, "thinking") {
+		t.Errorf("the turn cell is drawn above, so not below as well: %q", got)
+	}
+	if got := ansi.Strip(h.m.aboveEditorLine()); !strings.Contains(got, "thinking") {
+		t.Errorf("and it is drawn above: %q", got)
+	}
+	// The rest of the line is untouched.
+	if got := ansi.Strip(h.m.statusLine()); !strings.Contains(got, "INSERT") || !strings.Contains(got, "fake:m1") {
+		t.Errorf("everything else stays: %q", got)
 	}
 }

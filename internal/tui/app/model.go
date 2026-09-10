@@ -45,6 +45,9 @@ const (
 	thinkingHidden  = "hidden"
 	diffBackground  = "background"
 
+	mouseOff = "off"
+	mouseAll = "all"
+
 	slotHeader     = "header"
 	slotTranscript = "transcript"
 	slotInput      = "input"
@@ -1307,8 +1310,21 @@ func (m *Model) View() tea.View {
 	lines, _ := m.compose()
 	v := tea.NewView(strings.Join(lines, "\n"))
 	v.AltScreen = !m.inline()
-	v.MouseMode = tea.MouseModeCellMotion
+	v.MouseMode = m.mouseMode()
 	return v
+}
+
+// mouseMode is ui.mouse: what the client asks the terminal to report. Reporting is what
+// takes a drag away from the terminal's own selection, so it is a config field with three
+// values rather than something the client decides for everybody (ADR 0025).
+func (m *Model) mouseMode() tea.MouseMode {
+	switch m.cfg.UI.Mouse {
+	case mouseOff:
+		return tea.MouseModeNone
+	case mouseAll:
+		return tea.MouseModeAllMotion
+	}
+	return tea.MouseModeCellMotion
 }
 
 // compose lays the configured slots out in order and returns the lines with the

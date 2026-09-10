@@ -21,26 +21,29 @@ import (
 type Name string
 
 const (
-	Branch  Name = "branch"
-	Model   Name = "model"
-	Context Name = "context"
-	Tool    Name = "tool"
-	Bash    Name = "bash"
-	Edit    Name = "edit"
-	Read    Name = "read"
-	Write   Name = "write"
-	Grep    Name = "grep"
-	Glob    Name = "glob"
-	Fetch   Name = "fetch"
-	Agent   Name = "agent"
-	Info    Name = "info"
-	Warn    Name = "warn"
-	Error   Name = "error"
+	Branch    Name = "branch"
+	Model     Name = "model"
+	Context   Name = "context"
+	Tool      Name = "tool"
+	Collapsed Name = "collapsed"
+	Expanded  Name = "expanded"
+	Bash      Name = "bash"
+	Edit      Name = "edit"
+	Read      Name = "read"
+	Write     Name = "write"
+	Grep      Name = "grep"
+	Glob      Name = "glob"
+	Fetch     Name = "fetch"
+	Agent     Name = "agent"
+	Info      Name = "info"
+	Warn      Name = "warn"
+	Error     Name = "error"
 )
 
 // Names is every icon, in the order the contracts table lists them.
 var Names = []Name{
 	Branch, Model, Context,
+	Collapsed, Expanded,
 	Tool, Bash, Edit, Read, Write, Grep, Glob, Fetch, Agent,
 	Info, Warn, Error,
 }
@@ -56,60 +59,68 @@ const (
 // what a Nerd Font patches into the private use area. A terminal whose font is not patched
 // draws a box for each, which is what ui.icons.set = "unicode" is for.
 var nerd = Set{
-	Branch:  "", // powerline branch
-	Model:   "", // fa cube
-	Context: "", // fa tachometer
-	Tool:    "", // fa cog
-	Bash:    "", // fa terminal
-	Edit:    "", // fa pencil
-	Read:    "", // fa file-text-o
-	Write:   "", // fa floppy-o
-	Grep:    "", // fa search
-	Glob:    "", // fa folder-o
-	Fetch:   "", // fa globe
-	Agent:   "", // fa users
-	Info:    "", // fa info-circle
-	Warn:    "", // fa exclamation-triangle
-	Error:   "", // fa times-circle
+	Branch:    "", // powerline branch
+	Model:     "", // fa cube
+	Context:   "", // fa tachometer
+	Collapsed: "", // fa angle-right
+	Expanded:  "", // fa angle-down
+	Tool:      "", // fa cog
+	Bash:      "", // fa terminal
+	Edit:      "", // fa pencil
+	Read:      "", // fa file-text-o
+	Write:     "", // fa floppy-o
+	Grep:      "", // fa search
+	Glob:      "", // fa folder-o
+	Fetch:     "", // fa globe
+	Agent:     "", // fa users
+	Info:      "", // fa info-circle
+	Warn:      "", // fa exclamation-triangle
+	Error:     "", // fa times-circle
 }
 
 // unicode needs no patched font: every glyph is an ordinary codepoint an everyday font
 // has. It is the set to name when the nerd one draws boxes.
 var unicode = Set{
-	Branch:  "⎇",
-	Model:   "◆",
-	Context: "◔",
-	Tool:    "▸",
-	Bash:    "▸",
-	Edit:    "✎",
-	Read:    "▤",
-	Write:   "▣",
-	Grep:    "⌕",
-	Glob:    "▢",
-	Fetch:   "⌂",
-	Agent:   "◇",
-	Info:    "•",
-	Warn:    "!",
-	Error:   "✗",
+	Branch:    "⎇",
+	Model:     "◆",
+	Context:   "◔",
+	Collapsed: "▸",
+	Expanded:  "▾",
+	// Not a chevron: the disclosure marker above is one, and a row that opened with two
+	// of them said nothing twice.
+	Tool:  "•",
+	Bash:  "$",
+	Edit:  "✎",
+	Read:  "▤",
+	Write: "▣",
+	Grep:  "⌕",
+	Glob:  "▢",
+	Fetch: "⌂",
+	Agent: "◇",
+	Info:  "•",
+	Warn:  "!",
+	Error: "✗",
 }
 
 // ascii is the last resort, and is what the client drew before it had icons at all.
 var ascii = Set{
-	Branch:  "on",
-	Model:   "",
-	Context: "",
-	Tool:    ">",
-	Bash:    "$",
-	Edit:    "~",
-	Read:    "<",
-	Write:   ">",
-	Grep:    "/",
-	Glob:    "*",
-	Fetch:   "@",
-	Agent:   "&",
-	Info:    "i",
-	Warn:    "!",
-	Error:   "x",
+	Branch:    "on",
+	Model:     "",
+	Context:   "",
+	Collapsed: ">",
+	Expanded:  "v",
+	Tool:      "-",
+	Bash:      "$",
+	Edit:      "~",
+	Read:      "<",
+	Write:     ">",
+	Grep:      "/",
+	Glob:      "*",
+	Fetch:     "@",
+	Agent:     "&",
+	Info:      "i",
+	Warn:      "!",
+	Error:     "x",
 }
 
 // Set is the glyph for each name. A name mapped to the empty string draws nothing and

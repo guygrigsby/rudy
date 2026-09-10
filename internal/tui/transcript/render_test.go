@@ -13,6 +13,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 )
 
@@ -272,5 +273,40 @@ func TestAnAnswerCarriesNoEscapes(t *testing.T) {
 				t.Errorf("the row lost the text it was safe to draw: %q", plain)
 			}
 		})
+	}
+}
+
+// TestAToolRowSaysWhichWayItIs is what makes a click legible: the row opens with a marker
+// pointing right while its result is folded and down while it is open, so expanding is
+// visible rather than inferred from the lines below (ADR 0025).
+func TestAToolRowSaysWhichWayItIs(t *testing.T) {
+	tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2, Icons: icons.Default()}, theme.Default())
+	tr.Apply(entry(t, session.AssistantMessage{
+		Model: ref, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+		Content: []session.Block{session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"go test"}`))},
+	}))
+	rows := tr.Rows()
+	if len(rows) != 1 {
+		t.Fatalf("rows %+v", rows)
+	}
+	// Nothing to fold yet: the call has not answered.
+	if got := ansi.Strip(tr.Render(rows[0])[0]); strings.HasPrefix(strings.TrimSpace(got), icons.Default().Get(icons.Collapsed)) {
+		t.Errorf("a running call has nothing to expand: %q", got)
+	}
+	tr.Apply(entry(t, session.ToolResult{
+		ToolUseID: "t1", Outcome: session.OutcomeOK, DurationMS: 1,
+		Content: []session.Block{session.TextBlock("ok\n")},
+	}))
+	collapsed := ansi.Strip(tr.Render(rows[0])[0])
+	if !strings.Contains(collapsed, icons.Default().Get(icons.Collapsed)) {
+		t.Errorf("a folded row points right: %q", collapsed)
+	}
+	tr.Toggle(rows[0].Key)
+	expanded := ansi.Strip(tr.Render(rows[0])[0])
+	if !strings.Contains(expanded, icons.Default().Get(icons.Expanded)) {
+		t.Errorf("an open row points down: %q", expanded)
+	}
+	if collapsed == expanded {
+		t.Error("and the two look different")
 	}
 }

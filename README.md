@@ -92,6 +92,10 @@ Icons are Nerd Font glyphs by default: the branch in the workspace cell, the
 model, the context and one per tool. A terminal without a patched font wants
 `ui.icons.set = "unicode"`, and `ui.icons.<name> = ""` turns any single one off.
 The status line wears a cat face for the run, which `ui.cats = false` takes away.
+Mouse reporting is on, so a click expands a row and the wheel scrolls; that is
+also what stops a drag from selecting text, so hold Option on macOS or Shift
+elsewhere to select anyway, or set `ui.mouse = "off"` to leave the mouse to the
+terminal entirely.
 
 Every render choice is a config field under `[ui]` with a default, listed in
 `docs/specs/rudy-contracts.md`; `ui.render = "inline"` swaps the full screen for
