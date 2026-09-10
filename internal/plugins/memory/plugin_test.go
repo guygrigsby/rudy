@@ -863,12 +863,16 @@ func TestRememberJobRunsOffTheToolCall(t *testing.T) {
 	if got != "remembered "+rel {
 		t.Fatalf("result %q", got)
 	}
+	// Every git call in the job sleeps 250ms, so a tool that waited for the job could not
+	// have answered this fast. That is the whole contract: the turn is not held open on
+	// network egress.
 	if elapsed > 200*time.Millisecond {
 		t.Fatalf("the tool waited %s on the write job", elapsed)
 	}
-	if strings.Contains(h.projectIndex(), "use-pnpm") {
-		t.Fatal("the index was regenerated before the tool answered")
-	}
+	// What is deliberately not asserted here: that the index has not been regenerated yet.
+	// The job's first step is a pure Go index write with nothing to block it, so whether it
+	// has happened microseconds after the tool answered is a race with the scheduler, not a
+	// contract. It failed that way on a loaded CI runner.
 	h.settle()
 	if !strings.Contains(h.projectIndex(), "use-pnpm") {
 		t.Errorf("the job never ran:\n%s", h.projectIndex())
