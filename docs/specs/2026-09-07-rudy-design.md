@@ -257,10 +257,12 @@ block_gap = 1
 style = "text"
 
 [ui.status]
-items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn"]
+items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"]
 
 [ui.notices]
 max = 3
+
+cats = true
 
 [ui.icons]
 set = "nerd"
@@ -308,7 +310,9 @@ Assistant text streams as plain text and renders through glamour once its entry
 arrives. Queued follow-ups are held by the client and submitted when the turn
 rests. ADR 0013, ADR 0015.
 
-The client opens on a header: a framed two column box with a greeting, a cat, the session's model and workspace on the left, and a tip or two beside
+The client opens on a header: a framed two column box with a greeting, a cat
+from `internal/cats`, the session's model and workspace on the left, and a tip
+or two beside
 what the build carries as news, read from the `CHANGELOG.md` it was compiled
 with. The cat materializes once, column by column, and any key skips it. The composer
 sits between two rules, and the lower one carries the context percentage. The box
