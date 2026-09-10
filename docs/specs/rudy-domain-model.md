@@ -586,7 +586,7 @@ Entity, identity by provider plus id. One model offered by one provider.
 | `provider` | string | The owning provider name |
 | `id` | string | The model id from `/v1/models` |
 | `displayName` | string | Human label from `/v1/models` display_name |
-| `upstream` | string | Who actually serves the model when the provider is a proxy, from `metadata.provider`. Empty when the endpoint names nobody |
+| `upstream` | string | Who actually serves the model when the provider is a proxy, from `metadata.provider`. Comma separated when the endpoint serves the id from more than one. Empty when it names nobody |
 | `contextWindow` | int | Max context tokens from context_window_tokens |
 | `maxOutput` | int | Max output tokens from max_output_tokens |
 | `inputPrice` | Decimal | Cost per input token |
@@ -597,8 +597,8 @@ Entity, identity by provider plus id. One model offered by one provider.
 ### Invariants
 
 - The pair (`provider`, `id`) is unique within a snapshot. A proxy that serves one id from
-  two upstreams therefore appears twice, and `ModelRef` addresses whichever the endpoint
-  picks: `upstream` tells a person which rows those are, it does not select one (rudy-aol).
+  two upstreams lists the pair each time, and the registry folds those into one entry
+  naming both: the ref cannot address one of them, so they are one model (rudy-aol).
 - `contextWindow` greater than zero. A model reporting no window is refused into the snapshot.
 
 ### Relationships

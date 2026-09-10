@@ -51,6 +51,7 @@ const (
 const (
 	keyEnter = "\r"
 	keyCtrlD = "\x04"
+	keyCtrlP = "\x10"
 )
 
 // altScreenEnter is the sequence a client sends to take the whole terminal, which is what
@@ -130,6 +131,24 @@ func TestRealTUIOverPTY(t *testing.T) {
 	if !log.wrote(altScreenEnter) {
 		t.Fatalf("the client opens full screen; it never entered the alternate buffer. the terminal read:\n%s", tail(log.text()))
 	}
+
+	// ctrl+p steps the session's model to the next one in the registry, which the status
+	// line carries. The header names the model the session opened on and stays on screen,
+	// so the status line is read on its own. A registry that listed one id twice stepped
+	// from the first copy to the second, set the model it was already on, and never moved
+	// (rudy-aol). Neither this nor /model asks a provider anything, so both run before the
+	// turn does.
+	press(t, pty, keyCtrlP)
+	waitFor(t, log, "the status line to show another model", drawWait, func(s string) bool {
+		st := statusLine(s)
+		return strings.Contains(st, "INSERT") && strings.Contains(st, ":") && !strings.Contains(st, ref)
+	})
+	// And back to the one the config names, so the turn below runs on the operator's own.
+	typeIn(t, pty, log, "/model "+ref)
+	press(t, pty, keyEnter)
+	waitFor(t, log, "the model set back to "+ref, drawWait, func(s string) bool {
+		return strings.Contains(statusLine(s), ref)
+	})
 
 	const prompt = "Reply with exactly: ok"
 	typeIn(t, pty, log, prompt)
@@ -379,6 +398,19 @@ func hasLine(want string) func(string) bool {
 		}
 		return false
 	}
+}
+
+// statusLine is the bottom row the client draws, which is the one that carries the
+// session's model: the startup header names the model too and stays on screen, so a test
+// about what the model is now has to read the status line rather than the terminal.
+func statusLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 // tail is the end of the terminal, for a failure message: the screen and the last of what

@@ -1419,3 +1419,15 @@ func TestSuspendSuspendsTheProgram(t *testing.T) {
 		t.Fatal("app.suspend must suspend the program")
 	}
 }
+
+// TestCyclingASingleModelSaysSo: ctrl+p that lands where it started is a key press that
+// does nothing, which is what a scope of one is. The client says so rather than leaving
+// somebody pressing it (rudy-aol found this by way of a duplicated ref).
+func TestCyclingASingleModelSaysSo(t *testing.T) {
+	h := newAppHarness(t, scripted{text("done")})
+	h.m.scope = []session.ModelRef{h.m.session.Model}
+	h.exec(h.m.cycleModel(1))
+	if !strings.Contains(h.view(), "only this model") {
+		t.Errorf("a cycle of one says so:\n%s", h.view())
+	}
+}

@@ -144,7 +144,7 @@ func (r *Registry) LoadSnapshot() error {
 	return nil
 }
 
-// Models returns every model sorted by provider then id.
+// Models returns every model sorted by provider then id, one entry per ref.
 func (r *Registry) Models() []Model {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -158,7 +158,45 @@ func (r *Registry) Models() []Model {
 		}
 		return out[i].Ref.Model < out[j].Ref.Model
 	})
+	return collapse(out)
+}
+
+// upstreamSep joins the upstreams of a model served by more than one.
+const upstreamSep = ", "
+
+// collapse folds the entries that share a ref, which the sort has already put side by
+// side. An endpoint that fronts several serves some ids from more than one of them and
+// lists the pair each time, but (provider, id) is what everything downstream addresses a
+// model by, so two entries the ref cannot tell apart are one model (rudy-aol). The first
+// wins every field but the upstream: the survivor names each one it came from, since a
+// person filtering by either has to find it.
+func collapse(sorted []Model) []Model {
+	out := make([]Model, 0, len(sorted))
+	for _, m := range sorted {
+		if n := len(out); n > 0 && out[n-1].Ref == m.Ref {
+			out[n-1].Upstream = withUpstream(out[n-1].Upstream, m.Upstream)
+			continue
+		}
+		out = append(out, m)
+	}
 	return out
+}
+
+// withUpstream adds one name to what a merged model carries, in the order they arrived and
+// each said once.
+func withUpstream(have, add string) string {
+	switch {
+	case add == "":
+		return have
+	case have == "":
+		return add
+	}
+	for _, s := range strings.Split(have, upstreamSep) {
+		if s == add {
+			return have
+		}
+	}
+	return have + upstreamSep + add
 }
 
 // Resolve finds a model by "provider:id" or by a bare id that is unique across providers.

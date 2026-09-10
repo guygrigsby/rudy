@@ -29,7 +29,7 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `Span` | `{text: string, role: string}`; `role` is a theme role name |
 | `Usage` | `{input: int, output: int, cache_read: int, cache_write: int}` |
 | `Entry` | `{id: ulid, at: rfc3339nano, kind: EntryKind, ...payload}`; payloads in the record layer |
-| `Model` | `{provider, id, display_name, upstream, context_window: int, max_output: int, pricing}`; `upstream` is who actually serves the model when the endpoint is a proxy, in the endpoint's own words, and is absent when the endpoint says nothing; `context_window` and `max_output` zero mean unknown; `pricing` is `{input, output, cache_read, cache_write}` as decimal strings in USD per token and is absent when no source supplied it |
+| `Model` | `{provider, id, display_name, upstream, context_window: int, max_output: int, pricing}`; `upstream` is who actually serves the model when the endpoint is a proxy, in the endpoint's own words, comma separated when it serves the id from more than one, absent when it says nothing; `context_window` and `max_output` zero mean unknown; `pricing` is `{input, output, cache_read, cache_write}` as decimal strings in USD per token and is absent when no source supplied it |
 | `SessionSummary` | `{id, opened_at, workspace, model, forked, parent_session_id, last_entry_at, title, entry_count}`; `parent_session_id` empty means root, `forked` is true when the session began as a fork; `last_entry_at`, `title` and `entry_count` are pass 3: not yet reported, the store does not compute them and `session.list` omits them |
 | `PermissionMode` | `strict`, `permissive`, `off` |
 | `ThinkingLevel` | `off`, `low`, `medium`, `high` |

@@ -908,6 +908,12 @@ func (m *Model) cycleModel(d int) tea.Cmd {
 	if i := slices.Index(refs, m.session.Model); i >= 0 {
 		next = ((i+d)%n + n) % n
 	}
+	if refs[next] == m.session.Model {
+		// A cycle of one, which is what a scope of one is. Setting the model already set
+		// would be a key press that does nothing and says nothing.
+		m.note(levelInfo, "the cycle has only this model in it")
+		return nil
+	}
 	return m.setSessionModel(refs[next])
 }
 

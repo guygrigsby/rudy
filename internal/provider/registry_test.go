@@ -108,3 +108,47 @@ func TestRegistryResolve(t *testing.T) {
 		t.Errorf("provider lookup")
 	}
 }
+
+// TestOneRefIsOneModel is the snapshot invariant (rudy-aol): an endpoint that fronts
+// several serves some ids from more than one of them and lists each pair, but the pair
+// (provider, id) is what everything downstream addresses a model by. Two entries the ref
+// cannot tell apart are one model, and the surviving one names every upstream it came
+// from, so filtering by either finds it.
+//
+// The stuck cycle is what this was: sorting puts the two side by side, so ctrl+p stepped
+// from the first to the second, set the model it was already on, and never moved.
+func TestOneRefIsOneModel(t *testing.T) {
+	dup := func(id, up string) provider.Model {
+		m := model("aperture", id)
+		m.Upstream = up
+		return m
+	}
+	a := &fakeProvider{name: "aperture", models: []provider.Model{
+		dup("moonshotai/kimi-k3", "OpenRouter"),
+		dup("anthropic/claude-opus-5", "OpenRouter"),
+		dup("moonshotai/kimi-k3", "Aperture"),
+		dup("moonshotai/kimi-k3", "OpenRouter"),
+	}}
+	r := provider.NewRegistry(filepath.Join(t.TempDir(), "registry.json"), a)
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	models := r.Models()
+	if len(models) != 2 {
+		t.Fatalf("one entry per ref, got %d: %+v", len(models), models)
+	}
+	seen := map[session.ModelRef]bool{}
+	for _, m := range models {
+		if seen[m.Ref] {
+			t.Errorf("%s listed twice", m.Ref)
+		}
+		seen[m.Ref] = true
+	}
+	kimi := models[1]
+	if kimi.Ref.Model != "moonshotai/kimi-k3" {
+		t.Fatalf("sorted by id: %+v", models)
+	}
+	if kimi.Upstream != "OpenRouter, Aperture" {
+		t.Errorf("the survivor names both upstreams once each, got %q", kimi.Upstream)
+	}
+}
