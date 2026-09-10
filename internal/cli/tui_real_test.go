@@ -66,6 +66,10 @@ const settledMarkRow = `/ o o \ \ \`
 // it needs no provider and it is what ends the process.
 const slashCommand = "/exit"
 
+// sentinel is the word the long answer ends with, on a line of its own: the model is
+// asked for it so the run can tell a turn that is still streaming from one that is over.
+const sentinel = "FINISHED"
+
 // screenTail is how much of the terminal a failed wait prints.
 const screenTail = 4000
 
@@ -134,6 +138,26 @@ func TestRealTUIOverPTY(t *testing.T) {
 	// the prompt that asked for it: the prompt carries the same two letters at the end of
 	// a longer line.
 	waitFor(t, log, "the answer row to read ok", turnWait, hasLine("ok"))
+
+	// A command runs while the model does (ADR 0026): the answer is long enough to still
+	// be streaming when /permissions is typed, and its notice landing before the sentinel
+	// is the command having run rather than having waited for the turn. The sentinel goes
+	// after a blank line because the transcript renders markdown, where a lone newline is
+	// a soft break and a count would come back as one wrapped paragraph.
+	typeIn(t, pty, log, "Count from 1 to 100. Then, after a blank line, write only: "+sentinel)
+	press(t, pty, keyEnter)
+	waitFor(t, log, "the count to start", turnWait, func(s string) bool {
+		return strings.Contains(s, "1 2 3")
+	})
+	typeIn(t, pty, log, "/permissions")
+	press(t, pty, keyEnter)
+	waitFor(t, log, "the /permissions notice mid-turn", drawWait, func(s string) bool {
+		return strings.Contains(s, "ask before an unsafe tool")
+	})
+	if hasLine(sentinel)(log.text()) {
+		t.Errorf("the answer was already finished, so nothing was proven about a command mid-turn")
+	}
+	waitFor(t, log, "the count to finish", turnWait, hasLine(sentinel))
 
 	typeIn(t, pty, log, "/compact")
 	press(t, pty, keyEnter)
