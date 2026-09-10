@@ -52,6 +52,7 @@ const (
 	keyEnter = "\r"
 	keyCtrlD = "\x04"
 	keyCtrlP = "\x10"
+	keySpace = " "
 )
 
 // altScreenEnter is the sequence a client sends to take the whole terminal, which is what
@@ -149,6 +150,26 @@ func TestRealTUIOverPTY(t *testing.T) {
 	waitFor(t, log, "the model set back to "+ref, drawWait, func(s string) bool {
 		return strings.Contains(statusLine(s), ref)
 	})
+
+	// The scope survives the client (ADR 0027): choose one model through the picker and
+	// read back the file the next client opens on. Nothing here asks a provider anything.
+	typeIn(t, pty, log, "/scoped-models")
+	press(t, pty, keyEnter)
+	waitFor(t, log, "the scope picker", drawWait, func(s string) bool {
+		return strings.Contains(s, "space toggles, enter confirms")
+	})
+	press(t, pty, keySpace)
+	press(t, pty, keyEnter)
+	waitFor(t, log, "the client to say what it cycles now", drawWait, func(s string) bool {
+		return strings.Contains(s, "cycling one model")
+	})
+	scope, err := os.ReadFile(filepath.Join(root, "data", "rudy", "scope.toml"))
+	if err != nil {
+		t.Fatalf("the choice is written where the next client reads it: %v", err)
+	}
+	if !strings.Contains(string(scope), ":") {
+		t.Errorf("scope.toml names the model chosen: %q", scope)
+	}
 
 	const prompt = "Reply with exactly: ok"
 	typeIn(t, pty, log, prompt)
