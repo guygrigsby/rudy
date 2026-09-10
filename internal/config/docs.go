@@ -129,7 +129,7 @@ var Sections = []Section{
 		Keys: []Doc{
 			{Key: "ui.render", Comment: "altscreen owns the terminal; inline draws in its scrollback and cannot re-expand a committed row.", Example: `"inline"`},
 			{Key: "ui.vim", Comment: "Modal editing in the composer."},
-			{Key: "ui.mouse", Comment: "off leaves the mouse to the terminal so a drag selects text; click reports clicks and the wheel, which expands a tool row and scrolls; all reports movement too. With reporting on, hold Option (macOS) or Shift to select anyway.", Example: `"off"`},
+			{Key: "ui.mouse", Comment: "off, the default, leaves the mouse to the terminal so a drag selects text to copy; click reports clicks and the wheel, which expands a tool row and scrolls; all reports movement too. With reporting on, selecting takes a modifier: Shift in Ghostty, WezTerm and most others, Option in Terminal.app and iTerm2.", Example: `"click"`},
 			{Key: "ui.cats", Comment: "A cat face in the status line, one for the life of the client."},
 		},
 	},

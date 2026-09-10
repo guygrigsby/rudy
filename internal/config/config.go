@@ -120,8 +120,11 @@ type UIConfig struct {
 	// clicks and the wheel, which is what expands a tool row and scrolls the transcript;
 	// "all" reports movement too, which nothing here uses yet.
 	//
-	// With reporting on, a terminal's own selection is usually still one modifier away:
-	// Option on macOS terminals, Shift on most others.
+	// Off is the default: copying an error out of the transcript is a daily thing, and a
+	// client that takes the mouse to expand a row nobody clicks has taken the more useful
+	// half. With reporting on, a terminal's own selection is one modifier away, and which
+	// one is the terminal's business: Shift in xterm, Ghostty, WezTerm and most others,
+	// Option in Terminal.app and iTerm2.
 	Mouse string `mapstructure:"mouse"`
 	// Cats draws a random cat face in the status line's cat cell, one for the life of the
 	// client. False leaves the cell empty wherever ui.status.items placed it.
@@ -268,7 +271,7 @@ func Defaults() map[string]any {
 		"ui.spinner.frames":                []string{},
 		"ui.spinner.interval_ms":           0,
 		"ui.cats":                          true,
-		"ui.mouse":                         "click",
+		"ui.mouse":                         "off",
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,

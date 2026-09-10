@@ -29,7 +29,7 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `Span` | `{text: string, role: string}`; `role` is a theme role name |
 | `Usage` | `{input: int, output: int, cache_read: int, cache_write: int}` |
 | `Entry` | `{id: ulid, at: rfc3339nano, kind: EntryKind, ...payload}`; payloads in the record layer |
-| `Model` | `{provider, id, display_name, upstream, context_window: int, max_output: int, pricing}`; `upstream` is who actually serves the model when the endpoint is a proxy, in the endpoint's own words, comma separated when it serves the id from more than one, absent when it says nothing; `context_window` and `max_output` zero mean unknown; `pricing` is `{input, output, cache_read, cache_write}` as decimal strings in USD per token and is absent when no source supplied it |
+| `Model` | `{provider, id, display_name, upstream, context_window: int, max_output: int, pricing}`; `upstream` is who actually serves the model when the endpoint is a proxy: the route it takes, named as the endpoint names that route, comma separated when it serves the id over more than one and absent when it names none; `context_window` and `max_output` zero mean unknown; `pricing` is `{input, output, cache_read, cache_write}` as decimal strings in USD per token and is absent when no source supplied it |
 | `SessionSummary` | `{id, opened_at, workspace, model, forked, parent_session_id, last_entry_at, title, entry_count}`; `parent_session_id` empty means root, `forked` is true when the session began as a fork; `last_entry_at`, `title` and `entry_count` are pass 3: not yet reported, the store does not compute them and `session.list` omits them |
 | `PermissionMode` | `strict`, `permissive`, `off` |
 | `ThinkingLevel` | `off`, `low`, `medium`, `high` |
@@ -486,7 +486,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.header.greeting` | bool | true | the time of day and a name in the header |
 | `ui.header.mark` | bool | true | the cat in the header |
 | `ui.header.facts` | [string] | `["model", "thinking", "workspace"]` | the session's facts the header carries, in the order they draw; legal entries are `model`, `thinking`, `mode`, `workspace` |
-| `ui.mouse` | `off`, `click`, `all` | `click` | what the client asks the terminal to report. `off` leaves the mouse alone, so a drag selects text as it does anywhere else; `click` reports clicks and the wheel, which is what expands a tool row and scrolls the transcript; `all` reports movement too. With reporting on, a terminal's own selection is a modifier away: Option on macOS, Shift on most others (ADR 0006) |
+| `ui.mouse` | `off`, `click`, `all` | `off` | what the client asks the terminal to report. `off` leaves the mouse alone, so a drag selects text as it does anywhere else; `click` reports clicks and the wheel, which is what expands a tool row and scrolls the transcript; `all` reports movement too. With reporting on, a terminal's own selection is a modifier away: Shift in Ghostty, WezTerm and most others, Option in Terminal.app and iTerm2 (ADR 0006) |
 | `ui.render` | `inline`, `altscreen` | `altscreen` | `altscreen` owns the screen and keeps every row expandable; `inline` draws in the terminal's own scrollback and commits a rested turn's rows out of the live region, where they can no longer be expanded (ADR 0015) |
 | `ui.vim` | bool | true | |
 | `ui.layout.slots` | [string] | `["transcript", "input", "status"]` | order top to bottom; `header` may be added |

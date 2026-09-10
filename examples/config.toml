@@ -85,9 +85,9 @@ connect_timeout_ms = 10000
 render = "altscreen"
 # Modal editing in the composer.
 vim = true
-# off leaves the mouse to the terminal so a drag selects text; click reports clicks and the wheel, which expands a tool row and scrolls; all reports movement too. With reporting on, hold Option (macOS) or Shift to select anyway.
-# e.g. "off"
-mouse = "click"
+# off, the default, leaves the mouse to the terminal so a drag selects text to copy; click reports clicks and the wheel, which expands a tool row and scrolls; all reports movement too. With reporting on, selecting takes a modifier: Shift in Ghostty, WezTerm and most others, Option in Terminal.app and iTerm2.
+# e.g. "click"
+mouse = "off"
 # A cat face in the status line, one for the life of the client.
 cats = true
 

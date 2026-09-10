@@ -98,13 +98,20 @@ func TestListModelsErrorStatus(t *testing.T) {
 
 // TestUpstreamNamesWhoActuallyServesTheModel: an aperture fronts OpenRouter, ClinePass and
 // OpenAI, and every id looks like the proxy's own until the metadata is read.
+//
+// The route is `upstream`, not `id`: this endpoint puts the model's vendor in the id and
+// leaves the name empty for the three deepseek models, which take the same "default" route
+// the ClinePass ones do. Reading the id called them DeepSeek, and a person picking one to
+// stay off their ClinePass quota spent it instead.
 func TestUpstreamNamesWhoActuallyServesTheModel(t *testing.T) {
 	const body = `{"data":[
 	 {"id":"anthropic/claude-fable-5","display_name":"Claude Fable 5","context_window_tokens":1000000,
-	  "metadata":{"provider":{"id":"openrouter","name":"OpenRouter"}}},
+	  "metadata":{"provider":{"id":"openrouter","name":"OpenRouter","upstream":"openrouter"}}},
 	 {"id":"cline-pass/kimi-k3","display_name":"Kimi K3","context_window_tokens":1048576,
-	  "metadata":{"provider":{"id":"Cline","name":"ClinePass"}}},
-	 {"id":"deepseek-chat","metadata":{"provider":{"id":"DeepSeek","name":""}}},
+	  "metadata":{"provider":{"id":"Cline","name":"ClinePass","upstream":"default"}}},
+	 {"id":"deepseek-chat","metadata":{"provider":{"id":"DeepSeek","name":"","upstream":"default"}}},
+	 {"id":"spooled","metadata":{"provider":{"id":"aperture","name":"Aperture","upstream":"spool"}}},
+	 {"id":"unrouted","metadata":{"provider":{"id":"Groq","name":""}}},
 	 {"id":"gpt-6","owned_by":"openai"}
 	]}`
 	c, _ := serve(t, 200, "application/json", []byte(body))
@@ -115,8 +122,12 @@ func TestUpstreamNamesWhoActuallyServesTheModel(t *testing.T) {
 	want := map[string]string{
 		"anthropic/claude-fable-5": "OpenRouter",
 		"cline-pass/kimi-k3":       "ClinePass",
-		// A provider with an id and no name is named by its id.
-		"deepseek-chat": "DeepSeek",
+		// The same route as the ClinePass models, so the same answer: what serves it is
+		// not what made it.
+		"deepseek-chat": "ClinePass",
+		"spooled":       "Aperture",
+		// A route nothing on it names is named by what the endpoint did say about it.
+		"unrouted": "Groq",
 		// A plain OpenAI server says nothing, and nothing is what the model carries.
 		"gpt-6": "",
 	}

@@ -123,3 +123,12 @@ func TestTheReadmeNamesTheConfigCommands(t *testing.T) {
 		}
 	}
 }
+
+// TestTheMouseIsTheTerminalsUntilAsked: with reporting on, a drag stops selecting text in
+// most terminals, and copying an error out of the transcript is the more daily thing. A
+// client takes the mouse only when the config says to.
+func TestTheMouseIsTheTerminalsUntilAsked(t *testing.T) {
+	if got := config.Defaults()["ui.mouse"]; got != "off" {
+		t.Errorf("ui.mouse defaults to off, got %v", got)
+	}
+}

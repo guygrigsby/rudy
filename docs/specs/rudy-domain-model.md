@@ -586,7 +586,7 @@ Entity, identity by provider plus id. One model offered by one provider.
 | `provider` | string | The owning provider name |
 | `id` | string | The model id from `/v1/models` |
 | `displayName` | string | Human label from `/v1/models` display_name |
-| `upstream` | string | Who actually serves the model when the provider is a proxy, from `metadata.provider`. Comma separated when the endpoint serves the id from more than one. Empty when it names nobody |
+| `upstream` | string | Who actually serves the model when the provider is a proxy: the route from `metadata.provider.upstream`, named the way the endpoint names that route elsewhere in the same listing. Not `provider.id`, which is as often the model's vendor as the route. Comma separated when the endpoint serves the id over more than one route. Empty when it names none |
 | `contextWindow` | int | Max context tokens from context_window_tokens |
 | `maxOutput` | int | Max output tokens from max_output_tokens |
 | `inputPrice` | Decimal | Cost per input token |
