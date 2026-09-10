@@ -107,6 +107,13 @@ type Options struct {
 	// Clock is what the client reads the time from while it runs, for the notices that
 	// expire. Nil means time.Now; a test hands over one it can move.
 	Clock func() time.Time
+	// Scope is the models ctrl+p cycles through, as the last client to be told left them
+	// (ADR 0027). Empty is the whole registry, which is what a client that has never been
+	// told opens on.
+	Scope []session.ModelRef
+	// SaveScope records a new choice where the next client reads it. Nil is a client with
+	// nowhere to write one, which is what a test is: the choice still holds for this run.
+	SaveScope func([]session.ModelRef) error
 	// Workspace overrides the workspace status item. Empty means read it from git in
 	// Cwd, which is what a run does; a test sets it so drawing a status line never
 	// depends on the directory the test happens to run in.
@@ -187,9 +194,11 @@ type Model struct {
 	// server refuses for needing a resting session put it back rather than lose it.
 	pendingCommand string
 	// scope is the models app.model.cycleForward and cycleBackward step through, in
-	// registry order. Empty means the whole registry, which is what a client opens on
-	// (ADR 0020).
-	scope []session.ModelRef
+	// registry order. Empty means the whole registry (ADR 0020). It is read from and
+	// written back to the client's own state, so a set chosen once stays chosen
+	// (ADR 0027).
+	scope     []session.ModelRef
+	saveScope func([]session.ModelRef) error
 	// switching is the session switch waiting for its answer, nil when none is. It holds
 	// the session being left and the notifications that arrived while it was in flight,
 	// which for a resume, an open and a fork are the new session's replay: the server
@@ -257,6 +266,8 @@ func New(o Options) *Model {
 		// The client's own are there from the first keystroke; command.list's answer is
 		// prepended to them when it lands.
 		commands:  clientCommands,
+		scope:     o.Scope,
+		saveScope: o.SaveScope,
 		workspace: o.Workspace,
 		wsFixed:   o.Workspace != "",
 		width:     defaultWidth,
@@ -950,6 +961,13 @@ func (m *Model) setScope(chosen map[string]bool) {
 		}
 	}
 	m.scope = scope
+	if m.saveScope != nil {
+		if err := m.saveScope(scope); err != nil {
+			// The cycle is set for this client either way: what failed is remembering it
+			// for the next one, which is worth a line and not worth refusing the choice.
+			m.note(levelWarn, err.Error())
+		}
+	}
 	switch len(scope) {
 	case 0:
 		m.note(levelInfo, "cycling every model in the registry")

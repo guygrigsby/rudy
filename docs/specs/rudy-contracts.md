@@ -226,6 +226,7 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | `$XDG_CONFIG_HOME/rudy/config.toml` | user | config; rudy never writes it |
 | `$XDG_CONFIG_HOME/rudy/themes/<name>.toml` | user | theme roles |
 | `$XDG_DATA_HOME/rudy/trust.toml` | user | the workspaces whose own plugins the operator agreed to run, and what they agreed to (ADR 0025) |
+| `$XDG_DATA_HOME/rudy/scope.toml` | user | the models `ctrl+p` and `ctrl+n` cycle through, as `/scoped-models` last left them; absent or empty is the whole registry (ADR 0027) |
 | `$XDG_CONFIG_HOME/rudy/system.md` | user | the system prompt template, when `prompt.file` names none |
 | `$XDG_CONFIG_HOME/rudy/plugins/<name>/plugin.toml` | user | spawned plugin manifest |
 | `$XDG_CONFIG_HOME/rudy/agents/<name>.md` | user | agent definition |

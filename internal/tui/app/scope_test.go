@@ -165,3 +165,32 @@ func TestTheScopePickerMarksTheSet(t *testing.T) {
 		t.Errorf("and one that is not is not:\n%s", view)
 	}
 }
+
+// TestTheScopeOutlivesTheClient: a set chosen through the picker is written where the next
+// client reads it, and a client that opens with one cycles it without being told again
+// (ADR 0027).
+func TestTheScopeOutlivesTheClient(t *testing.T) {
+	var saved [][]session.ModelRef
+	h := newHarnessWith(t, nil, func(o *Options) {
+		o.Models = threeModels()
+		o.SaveScope = func(refs []session.ModelRef) error {
+			saved = append(saved, refs)
+			return nil
+		}
+	})
+	h.m.keys = sessionKeys(t)
+	h.m.setScope(map[string]bool{"fake:m2": true, "fake:m3": true})
+	if len(saved) != 1 || len(saved[0]) != 2 {
+		t.Fatalf("choosing a scope records it: %v", saved)
+	}
+
+	next := newHarnessWith(t, nil, func(o *Options) {
+		o.Models = threeModels()
+		o.Scope = saved[0]
+	})
+	next.m.keys = sessionKeys(t)
+	runAll(t, next.press("ctrl+p"))
+	if got := sent(t, next); len(got) != 1 || got[0] != "fake:m2" {
+		t.Errorf("the remembered scope is what ctrl+p walks, sent %v", got)
+	}
+}

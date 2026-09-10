@@ -15,6 +15,7 @@ import (
 	rudy "github.com/guygrigsby/rudy"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
+	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/app"
 	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
@@ -213,6 +214,13 @@ func launchApp(ctx context.Context, r clientRun) error {
 		// not the session: the server already resolved the model the session opened on.
 		_, _ = fmt.Fprintln(r.stderr, "rudy: registry.list:", err)
 	}
+	// The models ctrl+p walks, as the last client to be told left them. A file that will
+	// not parse costs the cycle its shortlist and nothing else, so it is printed and the
+	// client opens on the whole registry (ADR 0027).
+	scope, err := readScope(r.dial.Paths.Data)
+	if err != nil {
+		_, _ = fmt.Fprintln(r.stderr, err)
+	}
 	return app.Run(ctx, app.Options{
 		Config: r.dial.Config,
 		// The binary's own release notes, for the startup header's news (ADR 0016).
@@ -227,5 +235,7 @@ func launchApp(ctx context.Context, r clientRun) error {
 		Version:   r.dial.Version,
 		Cwd:       r.cwd,
 		Prompt:    r.prompt,
+		Scope:     scope,
+		SaveScope: func(refs []session.ModelRef) error { return writeScope(r.dial.Paths.Data, refs) },
 	})
 }
