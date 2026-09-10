@@ -312,13 +312,14 @@ rests. ADR 0013, ADR 0015.
 
 The client opens on a header: a framed two column box with a greeting, a cat
 from `internal/cats`, the session's model and workspace on the left, and a tip
-or two beside
-what the build carries as news, read from the `CHANGELOG.md` it was compiled
-with. The cat materializes once, column by column, and any key skips it. The composer
-sits between two rules, and the lower one carries the context percentage. The box
-is the top of the transcript rather than a slot, so the conversation scrolls it
-away; inline prints it into the terminal's own scrollback instead. Every part is
-a `[ui.header]` field. ADR 0016.
+or two beside what the build carries as news, read from the `CHANGELOG.md` it
+was compiled with. The cat materializes once, column by column, and any key
+skips it. The composer sits between two rules: the upper one carries the
+session's name and the lower one the context percentage. The box is the top of
+the transcript rather than a slot, so the conversation scrolls it away; inline
+prints it into the terminal's own scrollback instead. Every part is a
+`[ui.header]` field, and the status line wears a face from the same package
+under `ui.cats`. ADR 0016, ADR 0017, ADR 0019.
 
 A draft that opens with `/` and carries no space yet lists the matching commands
 above the editor, name and description, filtered as it is typed. The editor keeps
