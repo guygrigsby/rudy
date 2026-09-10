@@ -252,7 +252,7 @@ func Defaults() map[string]any {
 		"ui.spinner.interval_ms":           0,
 		"ui.cats":                          true,
 		"ui.vim":                           true,
-		"ui.layout.slots":                  []string{"transcript", "input", "status"},
+		"ui.layout.slots":                  []string{"transcript", "status", "input"},
 		"ui.transcript.tool_collapsed":     true,
 		"ui.transcript.tool_preview_lines": 2,
 		"ui.transcript.thinking":           "hidden",

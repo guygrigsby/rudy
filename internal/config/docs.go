@@ -136,7 +136,7 @@ var Sections = []Section{
 		Table:   "ui.layout",
 		Comment: []string{"The slots drawn top to bottom. transcript, input and status are required once each."},
 		Keys: []Doc{
-			{Key: "ui.layout.slots", Comment: "header is optional and is where a plugin's header widget draws.", Example: `["header", "transcript", "input", "status"]`},
+			{Key: "ui.layout.slots", Comment: "header is optional and is where a plugin's header widget draws; put status after input to read it under the composer instead.", Example: `["header", "transcript", "input", "status"]`},
 		},
 	},
 	{

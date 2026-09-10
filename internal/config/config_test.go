@@ -296,7 +296,7 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	if c.UI.Render != "altscreen" || !c.UI.Vim || c.Permissions.DoublePressMS != 500 {
 		t.Errorf("ui %+v", c.UI)
 	}
-	if !reflect.DeepEqual(c.UI.Layout.Slots, []string{"transcript", "input", "status"}) {
+	if !reflect.DeepEqual(c.UI.Layout.Slots, []string{"transcript", "status", "input"}) {
 		t.Errorf("slots %v", c.UI.Layout.Slots)
 	}
 	tr := c.UI.Transcript

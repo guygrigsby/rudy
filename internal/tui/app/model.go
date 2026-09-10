@@ -1320,7 +1320,7 @@ func (m *Model) View() tea.View {
 func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 	blocks := make([][]string, 0, len(m.cfg.UI.Layout.Slots)+2)
 	at := -1
-	for _, slot := range m.cfg.UI.Layout.Slots {
+	for i, slot := range m.cfg.UI.Layout.Slots {
 		switch slot {
 		case slotHeader:
 			blocks = append(blocks, m.widgetLines(protocol.SlotHeader))
@@ -1329,14 +1329,14 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 			// left, so its own block cannot be built until they are.
 			at = len(blocks)
 			blocks = append(blocks, nil)
-		case slotInput:
-			// The design leaves one blank line between the transcript and the composer,
-			// so the input area reads as its own block and not as the next transcript
-			// row. Only when something is above it: input as the first slot opens the
-			// frame, and a frame does not open on a blank line.
-			if len(blocks) > 0 {
+			// One blank line under the rows, so whatever config put below them reads as
+			// its own region rather than as the next transcript row. Only when something
+			// is below: a transcript that is the last slot ends the frame, and a frame
+			// does not end on a blank line.
+			if i < len(m.cfg.UI.Layout.Slots)-1 {
 				blocks = append(blocks, []string{""})
 			}
+		case slotInput:
 			// A picker stands where the editor is, not over it: it is what the keyboard
 			// is pointed at, and the draft it hides is still there when it closes.
 			editor := strings.Split(m.ed.View(), "\n")

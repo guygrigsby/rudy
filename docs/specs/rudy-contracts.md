@@ -486,7 +486,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.header.facts` | [string] | `["model", "thinking", "workspace"]` | the session's facts the header carries, in the order they draw; legal entries are `model`, `thinking`, `mode`, `workspace` |
 | `ui.render` | `inline`, `altscreen` | `altscreen` | `altscreen` owns the screen and keeps every row expandable; `inline` draws in the terminal's own scrollback and commits a rested turn's rows out of the live region, where they can no longer be expanded (ADR 0015) |
 | `ui.vim` | bool | true | |
-| `ui.layout.slots` | [string] | `["transcript", "input", "status"]` | order top to bottom; `header` may be added |
+| `ui.layout.slots` | [string] | `["transcript", "status", "input"]` | order top to bottom; `header` may be added. The status line is above the composer by default, where the eye already is while typing; `["transcript", "input", "status"]` puts it back underneath |
 | `ui.transcript.tool_collapsed` | bool | true | |
 | `ui.transcript.tool_preview_lines` | int | 2 | |
 | `ui.transcript.thinking` | `hidden`, `shown` | `hidden` | |

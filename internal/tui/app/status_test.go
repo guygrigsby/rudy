@@ -30,8 +30,20 @@ func TestStatusLineIsTheDesignScreen(t *testing.T) {
 	if got != want {
 		t.Fatalf("status %q want %q", got, want)
 	}
-	if !strings.HasSuffix(strings.TrimRight(h.view(), "\n"), h.m.statusLine()) {
-		t.Error("the status line is the last thing drawn")
+	// Above the composer, which is where ui.layout.slots puts it by default: the eye is
+	// already there while you type.
+	lines := h.lines()
+	var status, editor int
+	for i, l := range lines {
+		switch {
+		case strings.Contains(ansi.Strip(l), "INSERT"):
+			status = i
+		case strings.Contains(ansi.Strip(l), "┃"):
+			editor = i
+		}
+	}
+	if status == 0 || editor == 0 || status > editor {
+		t.Errorf("the status line sits above the composer, status %d editor %d:\n%s", status, editor, ansi.Strip(h.view()))
 	}
 }
 

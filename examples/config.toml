@@ -90,9 +90,9 @@ cats = true
 
 # The slots drawn top to bottom. transcript, input and status are required once each.
 [ui.layout]
-# header is optional and is where a plugin's header widget draws.
+# header is optional and is where a plugin's header widget draws; put status after input to read it under the composer instead.
 # e.g. ["header", "transcript", "input", "status"]
-slots = ["transcript", "input", "status"]
+slots = ["transcript", "status", "input"]
 
 # The header drawn once at the top of the transcript, which the conversation scrolls away.
 [ui.header]
