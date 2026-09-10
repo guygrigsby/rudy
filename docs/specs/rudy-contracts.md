@@ -222,7 +222,7 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/blobs/<sha256>` | Session | image bytes referenced by `blob` |
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/lock` | Session | `flock` held by the process serving the session; a second process gets `unavailable` and is told the socket path |
 | `$XDG_CACHE_HOME/rudy/registry.json` | Registry | the last discovered snapshot; a snapshot is a cache |
-| `$XDG_CACHE_HOME/rudy/rudy.log` | kernel | slog JSON lines |
+| `$XDG_CACHE_HOME/rudy/rudy.log` | kernel | slog JSON lines; UNSHIPPED (rudy-oat), nothing writes it yet |
 | `$XDG_CONFIG_HOME/rudy/config.toml` | user | config; rudy never writes it |
 | `$XDG_CONFIG_HOME/rudy/themes/<name>.toml` | user | theme roles |
 | `$XDG_DATA_HOME/rudy/trust.toml` | user | the workspaces whose own plugins the operator agreed to run, and what they agreed to (ADR 0025) |
@@ -480,8 +480,8 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `prompt.file` | path | `` | a system prompt template of the operator's own; empty reads `system.md` under the config directory when it exists, and the built-in template when it does not. `${base}`, `${tools}`, `${agents}`, `${version}`, `${workspace}`, `${project}`, `${model}`, `${date}`, `${os}` are the values a template may name, `$${` writes a literal `${`, and a name outside the set is a warning notice and the built-in prompt (ADR 0024) |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
-| `log.level` | `debug`, `info`, `warn`, `error` | `info` | |
-| `log.file` | path | `$XDG_CACHE_HOME/rudy/rudy.log` | |
+| `log.level` | `debug`, `info`, `warn`, `error` | `info` | UNSHIPPED (rudy-oat): nothing logs yet, so neither key exists |
+| `log.file` | path | `$XDG_CACHE_HOME/rudy/rudy.log` | UNSHIPPED (rudy-oat): the file in the record layer table above is written by nobody until this is |
 | `ui.header.frame` | bool | true | false draws the header's lines with no box around them |
 | `ui.header.greeting` | bool | true | the time of day and a name in the header |
 | `ui.header.mark` | bool | true | the cat in the header |
@@ -528,7 +528,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `memory.dir` | path | `~/.agents/memory` | passed to the memory SDK |
 | `memory.enabled` | bool | true | |
 | `memory.summary_model` | string | `` | model spec for fold summaries; empty means the session's model |
-| `memory.fold` | table | `{}` | `observe_after_tokens`, `reflect_after_tokens`, `observations_max_tokens`, `observations_target_tokens`, `observer_max_tokens`; a missing key takes the SDK default |
+| `memory.fold.<key>` | int | the SDK's own | `observe_after_tokens`, `reflect_after_tokens`, `observations_max_tokens`, `observations_target_tokens`, `observer_max_tokens`; a missing key takes the SDK default |
 | `skills.migrate_from` | [path] | `["~/.claude/skills", "~/.pi/agent/skills"]` | roots `rudy skills migrate` copies from, one directory per skill |
 | `mcp.connect_timeout_ms` | int | 10000 | per server at boot |
 

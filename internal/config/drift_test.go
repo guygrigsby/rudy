@@ -92,25 +92,66 @@ func TestEveryDefaultIsInTheContracts(t *testing.T) {
 	}
 }
 
-// TestEveryContractedUIKeyExists is the other direction, for the ui table where drift is
-// likeliest: a documented ui.* key that no longer exists is a promise the code broke.
+// unshipped marks a config.toml row as documented but not built yet. A row that carries it
+// must not be in Defaults(), and one that does not carry it must be: that is what keeps a
+// table nobody has implemented from reading like a promise the code keeps.
+const unshipped = "UNSHIPPED"
+
+// TestEveryContractedKeyExists is the other direction, over the whole config.toml table:
+// a documented key the code does not carry is a promise nothing keeps. It was ui.* only,
+// which is how log.level and log.file sat in the table for a wave with no logger behind
+// them and nothing to write the rudy.log the file table also promises (rudy-3fb).
+//
 // Rows naming a pattern rather than a key (ui.theme.<role>) are the table's own shorthand
-// and are skipped.
-func TestEveryContractedUIKeyExists(t *testing.T) {
+// and are skipped; rows marked UNSHIPPED are checked the other way round.
+func TestEveryContractedKeyExists(t *testing.T) {
 	defaults := config.Defaults()
-	for _, line := range strings.Split(repoFile(t, "docs/specs/rudy-contracts.md"), "\n") {
+	var seen int
+	for _, line := range configSection(t) {
 		m := contractKey.FindStringSubmatch(line)
 		if m == nil {
 			continue
 		}
 		key := m[1]
-		if !strings.HasPrefix(key, "ui.") || strings.Contains(key, "<") {
+		if strings.Contains(key, "<") {
 			continue
 		}
-		if _, ok := defaults[key]; !ok {
-			t.Errorf("docs/specs/rudy-contracts.md documents %q, which Defaults() does not carry; add the default or drop the row", key)
+		seen++
+		_, ok := defaults[key]
+		switch {
+		case strings.Contains(line, unshipped) && ok:
+			t.Errorf("docs/specs/rudy-contracts.md marks %q %s, but Defaults() carries it; drop the marker", key, unshipped)
+		case !strings.Contains(line, unshipped) && !ok:
+			t.Errorf("docs/specs/rudy-contracts.md documents %q, which Defaults() does not carry; add the default, mark the row %s with the issue that will, or drop the row", key, unshipped)
 		}
 	}
+	if seen < len(defaults) {
+		t.Errorf("read %d config rows for %d defaults; the table shape moved and this guard stopped reading it", seen, len(defaults))
+	}
+}
+
+// configSection is the lines of the contracts' config.toml table and nothing else: every
+// other table in that file is keyed by the same backtick shape, so a key is only a config
+// key by where it sits. A heading that has moved is a failure rather than an empty read.
+func configSection(t *testing.T) []string {
+	t.Helper()
+	const heading = "### config.toml"
+	var out []string
+	var in bool
+	for _, line := range strings.Split(repoFile(t, "docs/specs/rudy-contracts.md"), "\n") {
+		switch {
+		case strings.HasPrefix(line, heading):
+			in = true
+		case in && strings.HasPrefix(line, "#"):
+			return out
+		case in:
+			out = append(out, line)
+		}
+	}
+	if !in {
+		t.Fatalf("docs/specs/rudy-contracts.md has no %q heading; this guard reads the table under it", heading)
+	}
+	return out
 }
 
 // TestTheReadmeNamesTheConfigCommands is the doc-commands guard: the README tells a reader
