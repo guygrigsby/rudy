@@ -35,6 +35,7 @@ func newPluginCommand() *cobra.Command {
 		newPluginEnableCommand(),
 		newPluginDisableCommand(),
 		newPluginUpdateCommand(),
+		newPluginsTrustCmd(),
 	)
 	return cmd
 }

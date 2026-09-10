@@ -34,7 +34,11 @@ type Manifest struct {
 	Args            []string          `toml:"args"`
 	Env             map[string]string `toml:"env"`
 	Description     string            `toml:"description"`
-	Dir             string            `toml:"-"` // the directory holding plugin.toml
+	// Build is a command run once in the checkout after staging and before the manifest is
+	// accepted, so a plugin can be cloned and built rather than shipped as a binary. It
+	// runs arbitrary code, which is what installing from a source means (ADR 0025).
+	Build string `toml:"build"`
+	Dir   string `toml:"-"` // the directory holding plugin.toml
 }
 
 // ManifestFile is the name every plugin directory carries.

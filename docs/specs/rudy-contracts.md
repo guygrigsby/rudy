@@ -225,11 +225,12 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | `$XDG_CACHE_HOME/rudy/rudy.log` | kernel | slog JSON lines |
 | `$XDG_CONFIG_HOME/rudy/config.toml` | user | config; rudy never writes it |
 | `$XDG_CONFIG_HOME/rudy/themes/<name>.toml` | user | theme roles |
+| `$XDG_DATA_HOME/rudy/trust.toml` | user | the workspaces whose own plugins the operator agreed to run, and what they agreed to (ADR 0025) |
 | `$XDG_CONFIG_HOME/rudy/system.md` | user | the system prompt template, when `prompt.file` names none |
 | `$XDG_CONFIG_HOME/rudy/plugins/<name>/plugin.toml` | user | spawned plugin manifest |
 | `$XDG_CONFIG_HOME/rudy/agents/<name>.md` | user | agent definition |
 | `<workspace>/.rudy/config.toml` | project | overrides merged over the user config; same keys |
-| `<workspace>/.rudy/plugins/<name>/plugin.toml` | project | spawned plugin manifest |
+| `<workspace>/.rudy/plugins/<name>/plugin.toml` | project | spawned plugin manifest; loaded only after the operator has trusted this workspace as it stands, and never by a client that cannot ask (ADR 0025) |
 | `<workspace>/.rudy/agents/<name>.md` | project | agent definition |
 | `~/.agents/skills/<name>/SKILL.md` | standard | skill |
 | `<workspace>/.agents/skills/<name>/SKILL.md` | standard | skill |
@@ -542,6 +543,7 @@ Roles, every one required in a theme file or the built-in default applies: `acce
 | `version` | string | required | |
 | `protocol_version` | int | required | must equal the server's |
 | `command` | string | required | executable |
+| `build` | string | `` | a command run once in the checkout after staging and before the manifest is accepted, so a plugin can be cloned and built. It runs arbitrary code, which is what installing from a source means |
 | `args` | [string] | `[]` | |
 | `env` | table | `{}` | added to the child environment |
 | `description` | string | `` | shown in `/plugins` |

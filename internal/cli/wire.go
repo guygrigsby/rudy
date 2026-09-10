@@ -56,14 +56,17 @@ type Built struct {
 
 // BuildOptions tunes wiring. Zero values mean the real environment.
 type BuildOptions struct {
-	Version        string
-	Overrides      map[string]any      // config keys that win over file and env, dotted ("default.model")
-	Plugins        []plugin.Plugin     // nil means BuiltinPlugins
-	Env            func(string) string // nil means os.Getenv
-	Home           string              // "" means os.UserHomeDir
-	Stderr         io.Writer           // nil means os.Stderr
-	Socket         string              // "" means paths.Socket(); the socket a locked session tells a client to attach through
-	RefreshTimeout time.Duration       // <= 0 means 20 seconds; bounds the startup registry refresh
+	Version   string
+	Overrides map[string]any      // config keys that win over file and env, dotted ("default.model")
+	Plugins   []plugin.Plugin     // nil means BuiltinPlugins
+	Env       func(string) string // nil means os.Getenv
+	Home      string              // "" means os.UserHomeDir
+	Stderr    io.Writer           // nil means os.Stderr
+	// Trust is how this caller asks whether the workspace's own plugins may run. Nil is a
+	// caller that cannot ask, and no answer means no (ADR 0025).
+	Trust          TrustAsker
+	Socket         string        // "" means paths.Socket(); the socket a locked session tells a client to attach through
+	RefreshTimeout time.Duration // <= 0 means 20 seconds; bounds the startup registry refresh
 }
 
 // defaultRefreshTimeout bounds the startup registry refresh when BuildOptions.RefreshTimeout
@@ -186,7 +189,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	}()
 	if discover {
 		set = append(set, spawnedPlugins(paths, plugins, srv, o.Version,
-			time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice)...)
+			time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice, o.Trust)...)
 	}
 	services := srv.PluginServices()
 	// Withdrawing a provider has to reach the provider registry's own copy, not just the
@@ -256,16 +259,23 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 // the first registration of a name wins. The roots are the data root (where rudy plugin
 // install puts them), the config root (where a user drops one by hand) and the workspace's
 // own .rudy, which is how a repository ships a plugin with itself.
-func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, commandTimeout time.Duration, notice func(string)) []plugin.Plugin {
+func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, commandTimeout time.Duration, notice func(string), trust TrustAsker) []plugin.Plugin {
 	// No working directory is no project scope, never a reason to fail the build.
 	cwd, _ := os.Getwd()
 	roots := []string{paths.Data, paths.Config}
-	if cwd != "" {
-		roots = append(roots, filepath.Join(cwd, ".rudy"))
-	}
 	manifests, errs := discoverPlugins(roots, filepath.Join(paths.Data, pluginstore.LockFile))
 	for _, err := range errs {
 		notice(err.Error())
+	}
+	// The workspace's own plugins are separate, and load only if somebody agreed to this
+	// workspace: a repository is read before it is run, and opening one is not agreeing to
+	// execute what it declares (ADR 0025).
+	if cwd != "" {
+		own, ownErrs := discoverPlugins([]string{filepath.Join(cwd, ".rudy")}, filepath.Join(paths.Data, pluginstore.LockFile))
+		for _, err := range ownErrs {
+			notice(err.Error())
+		}
+		manifests = append(manifests, trustedOnly(paths, cwd, own, trust, notice)...)
 	}
 	var workspaces []string
 	if cwd != "" {
@@ -282,6 +292,46 @@ func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Se
 		}))
 	}
 	return out
+}
+
+// TrustAsker is how a caller asks the operator whether this workspace's own plugins may
+// run. It answers true only when a person said so. Nil is a caller that cannot ask, which is
+// every headless one: no answer means no, the rule the Gate keeps for an unsafe tool.
+type TrustAsker func(root string, manifests []plugin.Manifest) (bool, error)
+
+// trustedOnly is the workspace's own manifests when the operator has trusted this workspace
+// as it stands, and nothing when they have not. A caller that cannot ask says why once,
+// naming what it did not run, so a plugin that is missing is never a mystery.
+func trustedOnly(paths config.Paths, cwd string, own []plugin.Manifest, trust TrustAsker, notice func(string)) []plugin.Manifest {
+	if len(own) == 0 {
+		return nil
+	}
+	store := pluginstore.New(paths.Data)
+	trusted, err := store.IsTrusted(cwd, own)
+	if err != nil {
+		notice(err.Error())
+		return nil
+	}
+	if trusted {
+		return own
+	}
+	if trust == nil {
+		notice(fmt.Sprintf("this workspace ships %d plugin(s) and is not trusted; run rudy plugins trust to allow them", len(own)))
+		return nil
+	}
+	ok, err := trust(cwd, own)
+	if err != nil {
+		notice(err.Error())
+		return nil
+	}
+	if !ok {
+		notice("this workspace's plugins were not trusted; none of them were started")
+		return nil
+	}
+	if err := store.Trust(cwd, own, time.Now()); err != nil {
+		notice(err.Error())
+	}
+	return own
 }
 
 // discoverPlugins is Discover minus what the lock file disables. A disabled plugin is not

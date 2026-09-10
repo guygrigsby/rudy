@@ -116,6 +116,17 @@ and a committed row no longer expands.
 is a notice and the built-in prompt, so a typo never leaves a session with a hole
 in its instructions.
 
+## Plugins from a repository
+
+A repository can ship its own plugins under `.rudy/plugins/<name>/plugin.toml`.
+They run as you, so rudy asks once per workspace before starting any of them,
+and remembers what you agreed to: a manifest that later changes what it executes
+asks again. A client that cannot ask, `--print` or a pipe, runs none of them and
+says so.
+
+    rudy plugins trust            # yes, run this workspace's plugins
+    rudy plugins trust --forget   # take it back
+
 ## Run headless
 
     rudy -p "Reply with exactly: ok"

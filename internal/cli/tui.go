@@ -115,7 +115,9 @@ func runTUI(ctx context.Context, build buildFunc, dopts dialOptions, resolve res
 	// Ctrl-C is a key (app.clear), not a signal.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
-	d, code, err := dial(ctx, build, BuildOptions{Stderr: stderr}, dopts, "rudy-tui", true)
+	// The client has a terminal and has not taken it yet, so it is the one caller that can
+	// ask whether this workspace's own plugins may run (ADR 0025).
+	d, code, err := dial(ctx, build, BuildOptions{Stderr: stderr, Trust: askTrust(os.Stdin, stderr)}, dopts, "rudy-tui", true)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return code
