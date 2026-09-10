@@ -1573,11 +1573,13 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	// sections still follow it, which is what SystemPromptWith is for. Only the prompt in
 	// force is built: each of these reads the workspace's AGENTS.md and the global one from
 	// disk, and an agent session would otherwise pay for both every turn.
+	// The tool list is the view's own, so an agent definition's narrower set is what its
+	// prompt describes.
 	var base string
 	if ls.system == "" {
-		base = turn.SystemPrompt(view.Workspace, s.d.Version)
+		base = turn.SystemPrompt(view.Workspace, s.d.Version, tools.Tools()...)
 	} else {
-		base = turn.SystemPromptWith(ls.system, view.Workspace)
+		base = turn.SystemPromptWith(ls.system, view.Workspace, tools.Tools()...)
 	}
 	r := turn.NewRunner(turn.Config{
 		Session:     ls.sess,

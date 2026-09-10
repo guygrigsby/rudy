@@ -176,6 +176,13 @@ to migrate skills from `.claude/skills` and pi's skill directories, and
 covers agent definitions yet. `AGENTS.md` is read from the workspace and from
 `~/.agents/AGENTS.md`.
 
+The system prompt is the base paragraph, then a `## Tools` list of the tools that
+turn actually offers, one line each from the tool's own description, then the two
+`AGENTS.md` sections, then whatever a `session_opened` hook returned as context,
+which is where the skills list comes from. An agent definition's body replaces the
+base paragraph and nothing else, so a subagent keeps the workspace's instructions
+and gets its own narrower tool list.
+
 ## Memory
 
 A Go SDK for the OKF bundle, `memory-go`, living with the memory project so

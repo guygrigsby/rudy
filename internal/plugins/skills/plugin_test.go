@@ -121,3 +121,29 @@ func TestErrorsFromLoadNoticedOncePerDistinctMessage(t *testing.T) {
 		t.Fatalf("notices %v", h.Notices)
 	}
 }
+
+// TestTheSkillsBlockSaysHowToResolveARelativePath: a skill that references references/api.md
+// means the file beside its own SKILL.md. Without the rule the model resolves it against the
+// workspace and reads the wrong file, or none.
+func TestTheSkillsBlockSaysHowToResolveARelativePath(t *testing.T) {
+	dir := t.TempDir()
+	writeSkill(t, dir, "deploy", "name: deploy\ndescription: Ship it")
+	reg := plugin.NewRegistry(nil, nil)
+	reg.Load(context.Background(), New([]string{dir}))
+	results := plugin.NewHookRunner(reg, 0, nil).Fire(context.Background(), plugin.HookCall{
+		Point:   plugin.HookSessionOpened,
+		Payload: &plugin.SessionOpenedPayload{Workspace: session.Workspace{Root: t.TempDir()}},
+	})
+	if len(results) != 1 {
+		t.Fatalf("results %v", results)
+	}
+	res, ok := results[0].(*plugin.SessionOpenedResult)
+	if !ok {
+		t.Fatalf("result type %T", results[0])
+	}
+	for _, want := range []string{"resolves against that skill's own directory", "absolute path in tool calls"} {
+		if !strings.Contains(res.Context, want) {
+			t.Errorf("the block says %q:\n%s", want, res.Context)
+		}
+	}
+}

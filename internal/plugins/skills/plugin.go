@@ -100,7 +100,11 @@ func render(list []skills.Skill) string {
 	}
 	var b strings.Builder
 	b.WriteString("## Skills\n\n")
-	b.WriteString("Skills are instructions for specific tasks. When one matches the task, read its SKILL.md with the read tool before acting.\n\n")
+	b.WriteString("Skills are instructions for specific tasks. When one matches the task, read its SKILL.md with the read tool before acting.\n")
+	// The rule a skill's own author relies on: a skill that says `references/api.md` means
+	// the file beside its SKILL.md, not one under the workspace the session happens to be
+	// in. Without this the model reads the wrong path, or nothing.
+	b.WriteString("A relative path inside a skill resolves against that skill's own directory, the one holding its SKILL.md; use the absolute path in tool calls.\n\n")
 	for _, s := range list {
 		fmt.Fprintf(&b, "- %s: %s (read %s before using it)\n", s.Name, s.Description, filepath.Join(s.Dir, "SKILL.md"))
 	}
