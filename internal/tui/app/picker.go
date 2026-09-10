@@ -183,13 +183,16 @@ func (p *picker) head() string {
 }
 
 // modelRows are the registry's models as the picker draws them: the canonical
-// "provider:id" a log entry and the status line both name, then what choosing it costs,
-// the context window and the price of a million tokens in and out.
+// "provider:id" a log entry and the status line both name, then who actually serves it when
+// the endpoint is a proxy, then what choosing it costs, the context window and the price of
+// a million tokens in and out.
 func modelRows(models []provider.Model) []pickRow {
 	out := make([]pickRow, 0, len(models))
 	for _, mo := range models {
 		id := mo.Ref.String()
-		out = append(out, pickRow{id: id, text: join(id, tokenCount(mo.ContextWindow), perMillion(mo.Pricing))})
+		// The upstream after the id: an endpoint that fronts several says which is which,
+		// and the filter reads the row, so typing "openrouter" narrows to those.
+		out = append(out, pickRow{id: id, text: join(id, mo.Upstream, tokenCount(mo.ContextWindow), perMillion(mo.Pricing))})
 	}
 	return out
 }

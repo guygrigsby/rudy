@@ -55,13 +55,23 @@ func newModelsListCommand(build buildFunc) *cobra.Command {
 // renderModels prints one row per model. Prices are per million tokens.
 func renderModels(w io.Writer, models []provider.Model) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "PROVIDER\tMODEL\tCONTEXT\tIN/1M\tOUT/1M\tNAME")
+	// UPSTREAM before the price: an endpoint that fronts several serves the same id from
+	// more than one of them, and without this column the rows read as duplicates.
+	_, _ = fmt.Fprintln(tw, "PROVIDER\tMODEL\tUPSTREAM\tCONTEXT\tIN/1M\tOUT/1M\tNAME")
 	for _, m := range models {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			m.Ref.Provider, m.Ref.Model, intOrDash(m.ContextWindow),
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			m.Ref.Provider, m.Ref.Model, dashIfEmpty(m.Upstream), intOrDash(m.ContextWindow),
 			per1M(m.Pricing.Input), per1M(m.Pricing.Output), m.DisplayName)
 	}
 	return tw.Flush()
+}
+
+// dashIfEmpty is a column an endpoint said nothing about.
+func dashIfEmpty(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 // per1M turns a per-token decimal string into dollars per million tokens, or "-" when unknown.

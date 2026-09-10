@@ -13,6 +13,7 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
+	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
@@ -852,5 +853,32 @@ func TestASwitchWaitsForTheHeadOfTheLog(t *testing.T) {
 	}
 	if h.m.usage != (session.Usage{Input: 10, Output: 2}) {
 		t.Errorf("and is priced once: %+v", h.m.usage)
+	}
+}
+
+// TestTheModelPickerSaysWhoServesEachModel: an endpoint that fronts several upstreams gives
+// every model an id that looks like its own, so the picker names the upstream and the filter
+// reads it.
+func TestTheModelPickerSaysWhoServesEachModel(t *testing.T) {
+	models := []provider.Model{
+		{Ref: session.ModelRef{Provider: "aperture", Model: "anthropic/claude-fable-5"}, Upstream: "OpenRouter", ContextWindow: 1000000},
+		{Ref: session.ModelRef{Provider: "aperture", Model: "cline-pass/kimi-k3"}, Upstream: "ClinePass", ContextWindow: 1048576},
+		{Ref: session.ModelRef{Provider: "mlx", Model: "local-thing"}},
+	}
+	rows := modelRows(models)
+	if len(rows) != 3 {
+		t.Fatalf("rows %+v", rows)
+	}
+	if !strings.Contains(rows[0].text, "OpenRouter") || !strings.Contains(rows[1].text, "ClinePass") {
+		t.Errorf("each row names its upstream: %+v", rows)
+	}
+	// An endpoint that says nothing leaves no gap where the upstream would have been.
+	if strings.Contains(rows[2].text, "  ") {
+		t.Errorf("a model with no upstream draws no empty column: %q", rows[2].text)
+	}
+	// The filter reads the row, so the upstream is how a person finds those models.
+	p := &picker{kind: pickerModel, rows: rows, filter: "openrouter"}
+	if got := p.visible(); len(got) != 1 || got[0].id != "aperture:anthropic/claude-fable-5" {
+		t.Errorf("filtering by upstream finds them: %+v", got)
 	}
 }

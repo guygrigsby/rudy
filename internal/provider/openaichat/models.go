@@ -34,6 +34,15 @@ type wireModel struct {
 	Architecture        struct {
 		InputModalities []string `json:"input_modalities"`
 	} `json:"architecture"`
+	// Metadata is aperture's own: a proxy names the upstream that actually serves each
+	// model here, which is the only thing that tells one apart from the next when every
+	// id looks like the proxy's.
+	Metadata struct {
+		Provider struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"provider"`
+	} `json:"metadata"`
 }
 
 func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
@@ -88,7 +97,17 @@ func (c *Client) toModel(m wireModel) provider.Model {
 			Reasoning: reasoningHeuristic(m),
 			Vision:    slices.Contains(m.Architecture.InputModalities, "image"),
 		},
+		Upstream: upstream(m),
 	}
+}
+
+// upstream is who the endpoint says actually serves this model: its name when it has one,
+// its id otherwise, and nothing at all when the endpoint says nothing.
+func upstream(m wireModel) string {
+	if n := strings.TrimSpace(m.Metadata.Provider.Name); n != "" {
+		return n
+	}
+	return strings.TrimSpace(m.Metadata.Provider.ID)
 }
 
 // priceString keeps a price verbatim whether the provider sent it as a JSON

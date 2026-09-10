@@ -52,4 +52,9 @@ type Model struct {
 	MaxOutput     int64            `json:"max_output"`     // 0 unknown
 	Pricing       Pricing          `json:"pricing"`
 	Capabilities  Capabilities     `json:"capabilities"`
+	// Upstream is who actually serves this model when the endpoint is a proxy, in the
+	// endpoint's own words: an aperture that fronts OpenRouter, ClinePass and OpenAI says
+	// so per model, and without it every model reads as the proxy's own. Empty when the
+	// endpoint says nothing, which is every plain OpenAI server.
+	Upstream string `json:"upstream,omitempty"`
 }

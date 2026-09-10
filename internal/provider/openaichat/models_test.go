@@ -95,3 +95,43 @@ func TestListModelsErrorStatus(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+// TestUpstreamNamesWhoActuallyServesTheModel: an aperture fronts OpenRouter, ClinePass and
+// OpenAI, and every id looks like the proxy's own until the metadata is read.
+func TestUpstreamNamesWhoActuallyServesTheModel(t *testing.T) {
+	const body = `{"data":[
+	 {"id":"anthropic/claude-fable-5","display_name":"Claude Fable 5","context_window_tokens":1000000,
+	  "metadata":{"provider":{"id":"openrouter","name":"OpenRouter"}}},
+	 {"id":"cline-pass/kimi-k3","display_name":"Kimi K3","context_window_tokens":1048576,
+	  "metadata":{"provider":{"id":"Cline","name":"ClinePass"}}},
+	 {"id":"deepseek-chat","metadata":{"provider":{"id":"DeepSeek","name":""}}},
+	 {"id":"gpt-6","owned_by":"openai"}
+	]}`
+	c, _ := serve(t, 200, "application/json", []byte(body))
+	models, err := c.ListModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"anthropic/claude-fable-5": "OpenRouter",
+		"cline-pass/kimi-k3":       "ClinePass",
+		// A provider with an id and no name is named by its id.
+		"deepseek-chat": "DeepSeek",
+		// A plain OpenAI server says nothing, and nothing is what the model carries.
+		"gpt-6": "",
+	}
+	for _, m := range models {
+		w, ok := want[m.Ref.Model]
+		if !ok {
+			t.Errorf("unexpected model %q", m.Ref.Model)
+			continue
+		}
+		if m.Upstream != w {
+			t.Errorf("%s upstream = %q, want %q", m.Ref.Model, m.Upstream, w)
+		}
+		delete(want, m.Ref.Model)
+	}
+	if len(want) != 0 {
+		t.Errorf("models never listed: %v", want)
+	}
+}
