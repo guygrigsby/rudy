@@ -513,7 +513,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.icons.set` | `nerd`, `unicode`, `ascii` | `nerd` | the glyph set: `nerd` is Nerd Font codepoints (Powerline, Font Awesome 4) and needs a patched font, `unicode` needs none, `ascii` is what the client drew before icons (ADR 0018) |
 | `ui.icons.<name>` | string | per set | overrides one glyph; the empty string draws none and leaves no gap. Names: `branch`, `model`, `context`, `collapsed`, `expanded`, `tool`, `bash`, `edit`, `read`, `write`, `grep`, `glob`, `fetch`, `agent`, `info`, `warn`, `error`; an unknown set or name is a load error naming it |
 | `ui.theme.name` | string | `default` | a file under `themes/` or the built-in |
-| `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes. `shell` paints the composer while a draft is a shell command and the row it becomes, and defaults to `warning` |
+| `ui.theme.<role>` | color or role name | per theme | overrides; roles listed under themes. `shell` paints the composer while a draft is a shell command and the row it becomes, and defaults to `warning`. `status` paints the status line's cells and `spinner` the spinner in its turn cell: the one thing on that line that moves is the only news on it, so it is not painted as the line around it |
 | `keys.<action id>` | string or [string] | pi defaults | one of the ids ADR 0013 decision 5 lists; a value replaces the default for that action; `[]` unbinds; an unknown id or an unparseable key is a load error naming it |
 | `providers.<name>.wire` | `anthropic_messages`, `openai_chat`, `custom` | required | `custom` is a provider a plugin serves over `provider.complete`; the two codec wires are the linked provider plugins |
 | `providers.<name>.base_url` | string | required | |
@@ -533,7 +533,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 
 ### themes/<name>.toml
 
-Roles, every one required in a theme file or the built-in default applies: `accent`, `text`, `muted`, `user`, `assistant`, `tool`, `success`, `error`, `warning`, `diff_add`, `diff_del`, `shell`, `code`. A value is a hex color, a role name, or for `code` a `chroma:<style>` name. No role paints a background.
+Roles, every one required in a theme file or the built-in default applies: `accent`, `text`, `muted`, `user`, `assistant`, `tool`, `success`, `error`, `warning`, `diff_add`, `diff_del`, `shell`, `status`, `spinner`, `code`. A value is a hex color, a role name, or for `code` a `chroma:<style>` name. No role paints a background.
 
 ### plugins/<name>/plugin.toml
 

@@ -68,3 +68,20 @@ func TestStyleForUnknownRoleIsText(t *testing.T) {
 		t.Error("no backgrounds")
 	}
 }
+
+// TestTheStatusLineAndTheSpinnerArePaintedApart: the status line was muted end to end, so
+// the one cell on it that moves read as chrome. They are their own roles now, and neither
+// is muted's.
+func TestTheStatusLineAndTheSpinnerArePaintedApart(t *testing.T) {
+	th := Default()
+	status, spin, muted := th.Colors[RoleStatus], th.Colors[RoleSpinner], th.Colors[RoleMuted]
+	if status == nil || spin == nil {
+		t.Fatalf("both resolve: status %v spinner %v", status, spin)
+	}
+	if status == spin {
+		t.Error("the spinner is not the line it sits on")
+	}
+	if status == muted || spin == muted {
+		t.Error("neither is muted any more")
+	}
+}

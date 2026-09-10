@@ -1,6 +1,6 @@
-// Package theme resolves the twelve config.toml theme roles
-// (docs/specs/rudy-contracts.md, "themes/<name>.toml") into lipgloss styles. Eleven
-// roles are colors; the twelfth, code, names a chroma style for syntax highlighting
+// Package theme resolves the fifteen config.toml theme roles
+// (docs/specs/rudy-contracts.md, "themes/<name>.toml") into lipgloss styles. Fourteen
+// roles are colors; the fifteenth, code, names a chroma style for syntax highlighting
 // rather than a paintable color, and so lives in Theme.Chroma instead of Theme.Colors.
 // No role ever paints a background: Style and StyleFor only ever set foreground.
 package theme
@@ -21,10 +21,10 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 )
 
-// Role names one of the twelve paintable theme roles.
+// Role names one of the fourteen paintable theme roles.
 type Role string
 
-// The twelve color roles. "code", the theme file's thirteenth key, resolves to
+// The fourteen color roles. "code", the theme file's fifteenth key, resolves to
 // Theme.Chroma instead and so has no Role constant.
 const (
 	RoleAccent    Role = "accent"
@@ -42,12 +42,18 @@ const (
 	// command becomes. It is its own role rather than warning's so a person can tell a
 	// shell from a warning at a glance (ADR 0023).
 	RoleShell Role = "shell"
+	// RoleStatus paints the status line's cells, and RoleSpinner the spinner in the turn
+	// cell. Both were muted, which made the one thing on that line that is moving read as
+	// chrome: what a turn is doing is the line's news, and the rest of it is not.
+	RoleStatus  Role = "status"
+	RoleSpinner Role = "spinner"
 )
 
-// Roles lists the twelve color roles, in the order Theme.Colors resolves them.
+// Roles lists the fourteen color roles, in the order Theme.Colors resolves them.
 var Roles = []Role{
 	RoleAccent, RoleText, RoleMuted, RoleUser, RoleAssistant, RoleTool,
 	RoleSuccess, RoleError, RoleWarning, RoleDiffAdd, RoleDiffDel, RoleShell,
+	RoleStatus, RoleSpinner,
 }
 
 // codeKey is the theme file's thirteenth legal key; it names a chroma style, not a color.
@@ -56,7 +62,7 @@ const codeKey = "code"
 // chromaPrefix is code's required value prefix: "chroma:<style>".
 const chromaPrefix = "chroma:"
 
-// legalKeys are the twelve keys a theme file (or an overrides map) may set: the eleven
+// legalKeys are the fifteen keys a theme file (or an overrides map) may set: the fourteen
 // color roles plus code.
 var legalKeys = func() map[string]bool {
 	m := map[string]bool{codeKey: true}
@@ -66,7 +72,7 @@ var legalKeys = func() map[string]bool {
 	return m
 }()
 
-// Theme is a fully resolved set of roles: Colors for the eleven paintable roles,
+// Theme is a fully resolved set of roles: Colors for the fourteen paintable roles,
 // Chroma for the code role's style name (without the "chroma:" prefix).
 type Theme struct {
 	Name   string

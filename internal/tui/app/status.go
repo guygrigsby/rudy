@@ -83,22 +83,24 @@ func (m *Model) statusItem(id string) string {
 	case itemModel:
 		// The canonical form, "provider:model": two providers can carry the same model
 		// id, and the picker and every log entry name one this way.
-		return m.styled(theme.RoleMuted, m.ic.Label(icons.Model, m.session.Model.String()))
+		return m.styled(theme.RoleStatus, m.ic.Label(icons.Model, m.session.Model.String()))
 	case itemPermissionMode:
-		return m.styled(theme.RoleMuted, string(m.session.Mode))
+		return m.styled(theme.RoleStatus, string(m.session.Mode))
 	case itemContext:
-		return m.styled(theme.RoleMuted, m.ic.Label(icons.Context, contextPercent(m.model.ContextWindow, m.lastPrompt)))
+		return m.styled(theme.RoleStatus, m.ic.Label(icons.Context, contextPercent(m.model.ContextWindow, m.lastPrompt)))
 	case itemCost:
 		// No icon: the currency symbol the amount opens with is the icon.
-		return m.styled(theme.RoleMuted, cost(m.model.Pricing, m.usage))
+		return m.styled(theme.RoleStatus, cost(m.model.Pricing, m.usage))
 	case itemWorkspace:
-		return m.styled(theme.RoleMuted, m.workspaceCell())
+		return m.styled(theme.RoleStatus, m.workspaceCell())
 	case itemTurn:
-		return m.styled(theme.RoleMuted, m.turnCell())
+		// Its own cell rather than a styled string: the spinner inside it is the one thing
+		// on this line that moves, and it is painted apart from the word it spins beside.
+		return m.turnCell()
 	case itemCat:
 		// Empty when ui.cats is off, which draws no cell and takes no separator with it,
 		// the way vim off leaves no mode cell.
-		return m.styled(theme.RoleMuted, m.cat)
+		return m.styled(theme.RoleStatus, m.cat)
 	}
 	// A plugin's item. One no plugin has set renders nothing rather than a placeholder:
 	// the config placed a cell, the plugin decides whether there is anything in it.
@@ -140,7 +142,7 @@ func (m *Model) turnCell() string {
 	if word == "" {
 		return ""
 	}
-	return m.spin.View() + " " + word
+	return m.th.Style(theme.RoleSpinner).Render(m.spin.View()) + " " + m.styled(theme.RoleStatus, word)
 }
 
 // vimMode is the editor's mode as the status line spells it, upper case. Vim disabled has

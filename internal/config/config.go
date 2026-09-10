@@ -129,7 +129,7 @@ type UIConfig struct {
 }
 
 // themeDefaults are the design's ui.theme role values
-// (docs/specs/2026-09-07-rudy-design.md, [ui.theme]): the eleven color roles plus code.
+// (docs/specs/2026-09-07-rudy-design.md, [ui.theme]): the fourteen color roles plus code.
 // ThemeDefaults is the one exported copy of this data; internal/tui/theme.Default and
 // Load's built-in "default" theme resolve from it too, so it lives here once rather
 // than once per package. Kept out of Defaults() (and so out of viper's SetDefault)
@@ -150,7 +150,11 @@ var themeDefaults = map[string]string{
 	"diff_add":  "success",
 	"diff_del":  "error",
 	"shell":     "warning",
-	"code":      "chroma:tokyonight-night",
+	// The status line is pink where it used to be muted, and the spinner is the hot one:
+	// the only cell on that line that moves is the only one that is news.
+	"status":  "#b48ead",
+	"spinner": "#ff69b4",
+	"code":    "chroma:tokyonight-night",
 }
 
 // ThemeDefaults is the design's ui.theme role values, a fresh copy each call.

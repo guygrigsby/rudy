@@ -14,6 +14,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	tuispinner "github.com/guygrigsby/rudy/internal/tui/spinner"
+	"github.com/guygrigsby/rudy/internal/tui/theme"
 )
 
 // TestTheTurnCellIsDrawnOverTheComposer: what a person watches while a turn runs is the
@@ -310,5 +311,32 @@ func TestAnItemNamedAboveIsNotDrawnBelow(t *testing.T) {
 	// The rest of the line is untouched.
 	if got := ansi.Strip(h.m.statusLine()); !strings.Contains(got, "INSERT") || !strings.Contains(got, "fake:m1") {
 		t.Errorf("everything else stays: %q", got)
+	}
+}
+
+// TestTheSpinnerIsPaintedApartFromTheLineItSitsOn: the turn cell is the only thing on the
+// status line that moves, and it used to be painted as the chrome around it. The spinner
+// carries the spinner role, the word beside it the status role, and neither is the other.
+// Named rather than left to a golden, so regenerating one cannot quietly take it back.
+func TestTheSpinnerIsPaintedApartFromTheLineItSitsOn(t *testing.T) {
+	h := newHarness(t, nil)
+	h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{
+		SessionID: h.m.session.SessionID, TurnID: session.NewID().String(), State: stateStreaming,
+	})
+	cell := h.m.turnCell()
+	if ansi.Strip(cell) == "" {
+		t.Fatal("a running turn has a cell")
+	}
+	spin := h.m.th.Style(theme.RoleSpinner).Render("x")
+	status := h.m.th.Style(theme.RoleStatus).Render("x")
+	open := func(styled string) string { return strings.TrimSuffix(styled, "x"+ansi.ResetStyle) }
+	if !strings.HasPrefix(cell, open(spin)) {
+		t.Errorf("the spinner is in the spinner role: %q", cell)
+	}
+	if !strings.Contains(cell, open(status)+"thinking") {
+		t.Errorf("the word beside it is the status line's: %q", cell)
+	}
+	if open(spin) == open(status) {
+		t.Error("and the two roles are not the same paint")
 	}
 }
