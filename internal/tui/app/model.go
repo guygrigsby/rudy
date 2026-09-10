@@ -1361,10 +1361,12 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 			}
 			// The composer's own rules bracket it, outside the plugin widgets so a
 			// widget still sits against the editor it belongs to (ADR 0017).
+			// The status line, then the composer line, then the composer: the status is
+			// about the turn and belongs over the whole input region, not inside it.
 			above, below := m.composerRules()
 			blocks = append(blocks,
-				above,
 				m.statusAboveLines(),
+				above,
 				m.widgetLines(protocol.SlotAboveEditor),
 				m.menuLines(),
 				editor,
@@ -1404,8 +1406,9 @@ func (m *Model) compose() ([]string, map[int]*transcript.Row) {
 	return out, rowAt
 }
 
-// statusAboveLines is ui.status.above_editor as a block, or nothing when it has nothing to
-// say: a turn at rest draws no turn cell, and a line with no cells in it takes no row.
+// statusAboveLines is the status line over the composer, ui.status.above_editor, or nothing
+// when it has nothing to say: a turn at rest draws no turn cell, and a line with no cells in
+// it takes no row. It sits above the composer line, which is the rule under it.
 func (m *Model) statusAboveLines() []string {
 	if s := m.aboveEditorLine(); s != "" {
 		return []string{s}

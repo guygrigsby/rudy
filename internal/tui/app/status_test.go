@@ -35,18 +35,23 @@ func TestTheTurnCellIsDrawnOverTheComposer(t *testing.T) {
 	if strings.Contains(ansi.Strip(h.m.statusLine()), "thinking") {
 		t.Errorf("and not under it as well: %q", ansi.Strip(h.m.statusLine()))
 	}
+	// The status line sits above the composer line, which is the rule over the composer:
+	// status, rule, composer, rule.
 	lines := h.lines()
-	var turn, editor int
+	turn, rule, editor := -1, -1, -1
 	for i, l := range lines {
+		text := ansi.Strip(l)
 		switch {
-		case strings.Contains(ansi.Strip(l), "thinking"):
+		case strings.Contains(text, "thinking"):
 			turn = i
-		case strings.Contains(ansi.Strip(l), "┃"):
+		case strings.Contains(text, "─") && rule < 0:
+			rule = i
+		case strings.Contains(text, "┃"):
 			editor = i
 		}
 	}
-	if turn == 0 || editor == 0 || turn > editor {
-		t.Errorf("the turn cell is above the composer, turn %d editor %d:\n%s", turn, editor, ansi.Strip(h.view()))
+	if turn < 0 || rule < 0 || editor < 0 || turn >= rule || rule >= editor {
+		t.Errorf("status %d, composer line %d, composer %d:\n%s", turn, rule, editor, ansi.Strip(h.view()))
 	}
 }
 

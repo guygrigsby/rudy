@@ -346,7 +346,9 @@ from `internal/cats`, the session's model and workspace on the left, and a tip
 or two beside what the build carries as news, read from the `CHANGELOG.md` it
 was compiled with. The cat materializes once, column by column, and any key
 skips it. The composer sits between two rules: the upper one carries the
-session's name and the lower one the context percentage. The box is the top of
+session's name and the lower one the context percentage. The status line drawn
+by `ui.status.above_editor` sits above the upper composer line, so the order is
+status line, composer line, composer, composer line. The box is the top of
 the transcript rather than a slot, so the conversation scrolls it away; inline
 prints it into the terminal's own scrollback instead. Every part is a
 `[ui.header]` field, and the status line wears a face from the same package

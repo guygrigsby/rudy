@@ -160,7 +160,7 @@ var Sections = []Section{
 		Table:   "ui.input",
 		Comment: []string{"The composer."},
 		Keys: []Doc{
-			{Key: "ui.input.rules", Comment: "A rule above the composer carrying the session's name, and one below carrying the context percentage."},
+			{Key: "ui.input.rules", Comment: "The composer lines: one above carrying the session's name, one below carrying the context percentage."},
 		},
 	},
 	{
@@ -194,7 +194,7 @@ var Sections = []Section{
 		Table:   "ui.status",
 		Comment: []string{"The status line under the composer."},
 		Keys: []Doc{
-			{Key: "ui.status.above_editor", Comment: "The line over the composer: what is worth seeing while you type rather than after.", Example: `["turn", "context"]`},
+			{Key: "ui.status.above_editor", Comment: "The status line, above the composer line: what is worth seeing while you type rather than after.", Example: `["turn", "context"]`},
 			{Key: "ui.status.items", Comment: "Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is \"<plugin>:<key>\".", Example: `["vim_mode", "model", "context", "cost", "workspace", "turn"]`},
 		},
 	},
