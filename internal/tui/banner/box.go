@@ -107,9 +107,11 @@ func leftWidth(width int) int {
 // layout is the box itself: a title in the top border, two columns of cells, and every
 // frame character in one role so the box reads as one object. Cells shorter than the box
 // are padded with blanks; a column with no cells at all draws as empty space.
-func layout(title string, left, right []cell, width int, th theme.Theme, frame theme.Role) []string {
-	if width < framedWidth {
-		return plain(left, th)
+func layout(title string, left, right []cell, width int, framed bool, th theme.Theme, frame theme.Role) []string {
+	if !framed || width < framedWidth {
+		// No box: the cells themselves, in the order they were given, which is what a
+		// terminal too narrow for a border gets and what ui.header.frame = false asks for.
+		return plain(append(append([]cell{}, left...), right...), th)
 	}
 	inner := width - 2 - 2*pad // the two borders and the padding inside them
 	oneColumn := width < twoColumnWidth || len(right) == 0

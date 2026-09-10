@@ -241,7 +241,11 @@ rules = true
 [ui.header]
 show = true
 animate = true
+frame = true
+greeting = true
+mark = true
 name = ""
+facts = ["model", "thinking", "workspace"]
 tips = 2
 updates = 3
 max_width = 120

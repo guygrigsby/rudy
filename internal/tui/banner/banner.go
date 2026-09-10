@@ -27,6 +27,14 @@ type Options struct {
 	// Width is the terminal's, and MaxWidth the widest box worth drawing in it.
 	Width    int
 	MaxWidth int
+	// Frame draws the box; without it the same lines are drawn bare.
+	Frame bool
+	// Greeting and Mark are the two halves above the facts.
+	Greeting bool
+	Mark     bool
+	// Facts are the session's own, in the order they draw: model, thinking, mode,
+	// workspace. Nothing draws none.
+	Facts []string
 	// Tips and Updates are how many of each to draw; zero draws none.
 	Tips    int
 	Updates int
@@ -46,7 +54,7 @@ func Render(o Options, th theme.Theme) []string {
 	if width <= 0 {
 		return nil
 	}
-	return layout(title(o.Version), left(o, leftWidth(width)), right(o), width, th, theme.RoleAccent)
+	return layout(title(o.Version), left(o, leftWidth(width)), right(o), width, o.Frame, th, theme.RoleAccent)
 }
 
 // title is what the top border carries: the harness and the build, the way the box in the
@@ -61,23 +69,49 @@ func title(version string) string {
 // left is the greeting, the mark and the session's facts, each centered in its column.
 // The facts are the two a person checks before typing: what is answering, and where.
 func left(o Options, w int) []cell {
-	out := []cell{
-		{text: Greeting(o.Now, o.Name), role: theme.RoleText, center: true},
-		line(),
+	var out []cell
+	if o.Greeting {
+		out = append(out, cell{text: Greeting(o.Now, o.Name), role: theme.RoleText, center: true})
 	}
-	for _, row := range Mark(o.Step) {
-		out = append(out, cell{text: row, role: theme.RoleAccent, center: true})
+	if o.Mark {
+		if len(out) > 0 {
+			out = append(out, line())
+		}
+		for _, row := range Mark(o.Step) {
+			out = append(out, cell{text: row, role: theme.RoleAccent, center: true})
+		}
 	}
-	out = append(out, line())
-	// The mode is not here: the status line carries it, pinned, for the whole session,
-	// and this box is read once.
-	if facts := join(" · ", o.Model, o.Thinking); facts != "" {
-		out = append(out, cell{text: facts, role: theme.RoleText, center: true})
+	facts := o.facts(w)
+	if len(out) > 0 && len(facts) > 0 {
+		out = append(out, line())
 	}
-	if o.Cwd != "" {
-		// Shortened to the column it lands in, so a long path loses its leading directories
-		// rather than being shortened once and then truncated again on the right.
-		out = append(out, cell{text: ShortPath(o.Cwd, o.Home, w), role: theme.RoleMuted, center: true})
+	return append(out, facts...)
+}
+
+// facts are the session's own, one cell per line: everything but the workspace on one
+// line, since they are short and read as a sentence, and the workspace on its own, since
+// it is a path. An unknown fact is dropped; config refused it long before here.
+func (o Options) facts(w int) []cell {
+	var inline []string
+	var out []cell
+	for _, f := range o.Facts {
+		switch f {
+		case "model":
+			inline = append(inline, o.Model)
+		case "thinking":
+			inline = append(inline, o.Thinking)
+		case "mode":
+			inline = append(inline, o.Mode)
+		case "workspace":
+			if o.Cwd != "" {
+				// Shortened to the column it lands in, so a long path loses its leading
+				// directories rather than being shortened once and truncated again.
+				out = append(out, cell{text: ShortPath(o.Cwd, o.Home, w), role: theme.RoleMuted, center: true})
+			}
+		}
+	}
+	if line := join(" · ", inline...); line != "" {
+		out = append([]cell{{text: line, role: theme.RoleText, center: true}}, out...)
 	}
 	return out
 }

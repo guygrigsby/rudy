@@ -44,7 +44,17 @@ needs one: aperture authenticates by tailnet and mlx is local.
 
 Paths follow XDG: `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME`
 each default to `~/.config`, `~/.local/share` and `~/.cache`, plus `/rudy`.
-`config.toml` is read, never written.
+`config.toml` is yours to edit. The harness only ever adds to it:
+
+    rudy config path                      # the file rudy reads
+    rudy config example                   # every key, its default and what it is for
+    rudy config sync                      # add the keys your file is missing
+    rudy config sync --dry-run            # say what it would add and write nothing
+
+`make install` runs `rudy config sync`, so a key added by a new release reaches your
+file with the comment that says what it is for. A value you have already set is never
+changed, your comments and ordering are kept, and `examples/config.toml` in this
+repository is the same file `rudy config example` prints.
 
 ## Run the client
 

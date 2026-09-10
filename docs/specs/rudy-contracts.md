@@ -469,6 +469,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `agent` | string | `default` | agent definition for new sessions |
 | `hook_timeout_ms` | int | 5000 | per handler |
 | `tool_timeout_ms` | int | 600000 | per tool invocation |
+| `max_tokens` | int | 8192 | output tokens one request may produce |
 | `permissions.mode` | PermissionMode | `strict` | |
 | `permissions.dangerous` | [string] | see open list | matchers that always ask unless the mode is off, ahead of any session allowance; each is `tool` or `tool:prefix`. Pass 1 entries are plain shell command prefixes for bash; the `tool:prefix` form is deferred |
 | `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it; must be positive, since zero is a window no two presses fall inside and the double-Esc cancel would be unreachable |
@@ -476,6 +477,10 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
 | `log.level` | `debug`, `info`, `warn`, `error` | `info` | |
 | `log.file` | path | `$XDG_CACHE_HOME/rudy/rudy.log` | |
+| `ui.header.frame` | bool | true | false draws the header's lines with no box around them |
+| `ui.header.greeting` | bool | true | the time of day and a name in the header |
+| `ui.header.mark` | bool | true | the cat in the header |
+| `ui.header.facts` | [string] | `["model", "thinking", "workspace"]` | the session's facts the header carries, in the order they draw; legal entries are `model`, `thinking`, `mode`, `workspace` |
 | `ui.render` | `inline`, `altscreen` | `altscreen` | `altscreen` owns the screen and keeps every row expandable; `inline` draws in the terminal's own scrollback and commits a rested turn's rows out of the live region, where they can no longer be expanded (ADR 0015) |
 | `ui.vim` | bool | true | |
 | `ui.layout.slots` | [string] | `["transcript", "input", "status"]` | order top to bottom; `header` may be added |

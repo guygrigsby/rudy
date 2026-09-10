@@ -51,7 +51,9 @@ func newHeaderHarness(t *testing.T, over map[string]any) *harness {
 func TestTheHeaderOpensTheTranscript(t *testing.T) {
 	h := newHeaderHarness(t, nil)
 	view := ansi.Strip(h.view())
-	for _, want := range []string{"rudy 0.1.0", "afternoon, Guy", "fake:m1", "Opens full screen"} {
+	// The cat by name: a golden would catch it going missing too, but a golden is
+	// regenerated with a flag and this is not (rudy lost its cat once that way).
+	for _, want := range []string{"rudy 0.1.0", "afternoon, Guy", `/ o o \`, "fake:m1", "Opens full screen"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("the header says %q:\n%s", want, view)
 		}
@@ -59,6 +61,29 @@ func TestTheHeaderOpensTheTranscript(t *testing.T) {
 	lines := h.lines()
 	if !strings.HasPrefix(strings.TrimSpace(ansi.Strip(lines[0])), "╭") {
 		t.Errorf("the header is the first thing drawn:\n%s", view)
+	}
+}
+
+// TestTheHeaderPartsAreConfig walks the fields the client hands the box, so a config that
+// turns one off reaches the screen (ADR 0021).
+func TestTheHeaderPartsAreConfig(t *testing.T) {
+	for _, c := range []struct {
+		key  string
+		gone string
+	}{
+		{"ui.header.greeting", "afternoon, Guy"},
+		{"ui.header.mark", `/ o o \`},
+		{"ui.header.frame", "╭"},
+	} {
+		h := newHeaderHarness(t, map[string]any{c.key: false})
+		if got := ansi.Strip(h.view()); strings.Contains(got, c.gone) {
+			t.Errorf("%s = false must take %q off the screen:\n%s", c.key, c.gone, got)
+		}
+	}
+	h := newHeaderHarness(t, map[string]any{"ui.header.facts": []string{"mode"}})
+	view := ansi.Strip(h.view())
+	if !strings.Contains(view, "strict") || strings.Contains(view, "fake:m1 ·") {
+		t.Errorf("the facts are the ones config named:\n%s", view)
 	}
 }
 

@@ -1,0 +1,195 @@
+# rudy configuration.
+#
+# Every key below is written with the value rudy uses when it is absent, so a file
+# with all of them changes nothing. Delete what you do not care about, or leave it:
+# `rudy config sync` adds keys that are missing and never touches a value you set.
+#
+# The full table, with the legal values for each key, is docs/specs/rudy-contracts.md.
+
+# The agent definition a session runs under.
+agent = "default"
+# Output tokens a single request may produce.
+max_tokens = 8192
+# How long one hook handler may take before it is abandoned.
+hook_timeout_ms = 5000
+# How long one tool invocation may take.
+# e.g. 60000
+tool_timeout_ms = 600000
+
+# The provider and model a new session opens on.
+[default]
+# A name from [providers.<name>] below.
+# e.g. "aperture"
+provider = ""
+# A model that provider serves, as its own id.
+# e.g. "cline-pass/kimi-k3"
+model = ""
+# off, low, medium or high.
+# e.g. "medium"
+thinking = "high"
+
+# When rudy asks before running an unsafe tool.
+[permissions]
+# strict asks, permissive allows but still asks for the dangerous set, off allows everything.
+# e.g. "permissive"
+mode = "strict"
+# The window two Escapes have to fall inside to cancel a turn.
+double_press_ms = 500
+# Command prefixes that ask every time unless the mode is off.
+dangerous = ["rm -rf", "rm -r", "git push --force", "git push -f", "git reset --hard", "git clean", "sudo", "chmod -R", "chown -R", "mkfs", "dd"]
+
+# Where session logs live and when they are compacted.
+[sessions]
+# Empty means $XDG_DATA_HOME/rudy/sessions.
+# e.g. "~/work/rudy-sessions"
+dir = ""
+# Fraction of the context window that triggers a compaction.
+# e.g. 0.9
+compact_at = 0.8
+
+# Where SKILL.md files are discovered. Relative paths resolve against the workspace.
+[skills]
+# Roots to read skills from.
+dirs = ["~/.agents/skills", ".agents/skills"]
+# Roots `rudy skills migrate` offers to copy from.
+migrate_from = ["~/.claude/skills", "~/.pi/agent/skills"]
+
+# The OKF memory bundle the memory plugin reads and folds.
+[memory]
+# The bundle's directory.
+dir = "~/.agents/memory"
+# False loads the plugin and leaves it idle.
+enabled = true
+# Model the fold summarises with; empty uses the session's.
+# e.g. "aperture:cline-pass/kimi-k3"
+summary_model = ""
+
+# MCP servers are configured in mcp.toml, which `rudy mcp add` writes.
+[mcp]
+# How long a server has to answer its handshake.
+connect_timeout_ms = 10000
+
+# Every render choice is a field with a default, and the defaults below are the
+# screen the design draws. Nothing renders that this table did not place.
+[ui]
+# altscreen owns the terminal; inline draws in its scrollback and cannot re-expand a committed row.
+# e.g. "inline"
+render = "altscreen"
+# Modal editing in the composer.
+vim = true
+# A cat face in the status line, one for the life of the client.
+cats = true
+
+# The slots drawn top to bottom. transcript, input and status are required once each.
+[ui.layout]
+# header is optional and is where a plugin's header widget draws.
+# e.g. ["header", "transcript", "input", "status"]
+slots = ["transcript", "input", "status"]
+
+# The header drawn once at the top of the transcript, which the conversation scrolls away.
+[ui.header]
+# False opens on an empty transcript.
+show = true
+# The cat materialises once on startup. Altscreen only; any key skips it.
+animate = true
+# False draws the same lines with no box around them.
+frame = true
+# The time of day and a name.
+greeting = true
+# The cat.
+mark = true
+# The greeting's name; empty reads git user.name, then the OS user.
+# e.g. "Guy"
+name = ""
+# The session's own facts, in the order they draw: model, thinking, mode, workspace.
+# e.g. ["model", "mode", "workspace"]
+facts = ["model", "thinking", "workspace"]
+# Tips in the right column, rotated by the day. 0 draws none.
+tips = 2
+# Release notes from the CHANGELOG the binary was built with. 0 draws none.
+updates = 3
+# The widest the box draws; a wider terminal leaves the rest of the line alone.
+max_width = 120
+
+# The composer.
+[ui.input]
+# A rule above the composer carrying the session's name, and one below carrying the context percentage.
+rules = true
+
+# Rows: what a tool call folds to, and what an assistant message looks like.
+[ui.transcript]
+# False opens every tool row.
+tool_collapsed = true
+# Lines of a tool's result shown under a collapsed row.
+tool_preview_lines = 2
+# hidden or shown. ctrl+t toggles it for one run.
+# e.g. "shown"
+thinking = "hidden"
+# The glyph a user message opens with.
+user_prefix = "›"
+# Blank lines between assistant blocks.
+block_gap = 1
+
+# How an edit's hunk is drawn.
+[ui.diff]
+# text is red and green text; background paints the line, the one painted background in the client.
+# e.g. "background"
+style = "text"
+
+# The status line under the composer.
+[ui.status]
+# Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is "<plugin>:<key>".
+# e.g. ["vim_mode", "model", "context", "cost", "workspace", "turn"]
+items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"]
+
+# Notices are chrome under the transcript and never reach a session log.
+[ui.notices]
+# Lines drawn, newest last. 0 draws none.
+max = 3
+
+# The glyph set. nerd needs a patched font, unicode needs none, ascii is plain text.
+# Any single icon can be replaced, and "" turns one off.
+[ui.icons]
+# nerd, unicode or ascii.
+# e.g. "unicode"
+set = "nerd"
+# branch = ""          # names: branch, model, context, tool, bash, edit, read,
+# model  = ""          # write, grep, glob, fetch, agent, info, warn, error
+
+# Colour roles. A value is a hex colour or another role's name; code takes a
+# chroma style. Themes live in themes/<name>.toml under this directory.
+[ui.theme]
+# A file under themes/ or the built-in.
+# e.g. "tokyonight"
+name = "default"
+# accent = "#7aa2f7"
+# text   = "#c0caf5"
+# muted  = "#565f89"
+# code   = "chroma:tokyonight-night"
+
+# One table per endpoint. wire is anthropic_messages, openai_chat or custom;
+# auth is env:NAME or cache:KEY, and is left out when the endpoint needs none.
+# The models themselves are discovered from the endpoint, never listed here.
+# [providers.aperture]
+# wire = "openai_chat"
+# base_url = "https://ai.example.ts.net/v1"
+# dialect = "clinepass"
+
+# [providers.anthropic]
+# wire = "anthropic_messages"
+# base_url = "https://api.anthropic.com"
+# auth = "env:ANTHROPIC_API_KEY"
+
+# pi's action ids bound to pi's keys. A value replaces the default for that action
+# and [] unbinds it. An id outside the closed set is an error naming it.
+[keys]
+# "app.model.select" = "ctrl+l"
+# "app.tools.expand" = ["ctrl+o", "ctrl+e"]
+
+# Plugins are linked in or spawned from a manifest; this table only turns them off and hands each its own settings.
+[plugins]
+# Names not to load.
+# e.g. ["memory"]
+disabled = []
+# [plugins.memory]
+# # every key here is handed to the plugin verbatim

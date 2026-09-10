@@ -40,6 +40,12 @@ func XDG(env func(string) string, home string) Paths {
 	}
 }
 
+// ConfigFile is the one file rudy reads its configuration from, and the only one it ever
+// adds a key to (Sync). It lives here so Load, the CLI and the tests all name it once.
+func (p Paths) ConfigFile() string {
+	return filepath.Join(p.Config, "config.toml")
+}
+
 // Socket is the path to rudy's unix socket, under the runtime directory.
 func (p Paths) Socket() string {
 	return filepath.Join(p.Runtime, "rudy.sock")

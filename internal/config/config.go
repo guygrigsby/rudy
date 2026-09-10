@@ -63,12 +63,22 @@ type InputConfig struct {
 // top of the transcript and lets the conversation scroll away (ADR 0016). Name empty
 // resolves git's user.name and then the OS user.
 type HeaderConfig struct {
-	Show     bool   `mapstructure:"show"`
-	Animate  bool   `mapstructure:"animate"`
+	Show    bool `mapstructure:"show"`
+	Animate bool `mapstructure:"animate"`
+	// Frame draws the box around the header. False leaves its lines with no border, which
+	// is what a terminal too narrow for one gets anyway.
+	Frame bool `mapstructure:"frame"`
+	// Greeting and Mark are the two halves of the left column above the facts: the time of
+	// day with a name, and the cat.
+	Greeting bool   `mapstructure:"greeting"`
+	Mark     bool   `mapstructure:"mark"`
 	Name     string `mapstructure:"name"`
-	Tips     int    `mapstructure:"tips"`
-	Updates  int    `mapstructure:"updates"`
-	MaxWidth int    `mapstructure:"max_width"`
+	// Facts are the session's own, in the order they draw: model, thinking, mode,
+	// workspace. An empty list draws none.
+	Facts    []string `mapstructure:"facts"`
+	Tips     int      `mapstructure:"tips"`
+	Updates  int      `mapstructure:"updates"`
+	MaxWidth int      `mapstructure:"max_width"`
 }
 
 // UIConfig is the [ui] table. Theme holds ui.theme.name plus role overrides, merged
@@ -205,6 +215,10 @@ func Defaults() map[string]any {
 		"ui.render":                        "altscreen",
 		"ui.header.show":                   true,
 		"ui.header.animate":                true,
+		"ui.header.frame":                  true,
+		"ui.header.greeting":               true,
+		"ui.header.mark":                   true,
+		"ui.header.facts":                  []string{"model", "thinking", "workspace"},
 		"ui.header.name":                   "",
 		"ui.header.tips":                   2,
 		"ui.header.updates":                3,
@@ -221,6 +235,11 @@ func Defaults() map[string]any {
 		"ui.diff.style":                    "text",
 		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"},
 		"ui.notices.max":                   3,
+		"plugins.disabled":                 []string{},
+		// The two tables merged by hand below still take their defaults from here, so a
+		// default lives in one place whatever shape its table has.
+		"ui.icons.set":  "nerd",
+		"ui.theme.name": "default",
 	}
 }
 
@@ -235,7 +254,7 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 	v.SetEnvPrefix("RUDY")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
-	file := filepath.Join(paths.Config, "config.toml")
+	file := paths.ConfigFile()
 	body, statErr := os.ReadFile(file)
 	fileExists := statErr == nil
 	if fileExists {
@@ -273,7 +292,7 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 	// ui.theme is a table of strings (name plus role overrides); merge the file's and
 	// overrides' values over the built-in defaults by hand, see themeDefaults.
 	c.UI.Theme = ThemeDefaults()
-	c.UI.Theme["name"] = "default"
+	c.UI.Theme["name"] = Defaults()["ui.theme.name"].(string)
 	for k, val := range v.GetStringMapString("ui.theme") {
 		c.UI.Theme[k] = val
 	}
@@ -284,7 +303,7 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 	}
 	// ui.icons is the same shape: the set's name plus per-icon overrides, merged over the
 	// default set by hand for the same reason ui.theme is.
-	c.UI.Icons = map[string]string{"set": "nerd"}
+	c.UI.Icons = map[string]string{"set": Defaults()["ui.icons.set"].(string)}
 	for k, val := range v.GetStringMapString("ui.icons") {
 		c.UI.Icons[k] = val
 	}
@@ -489,6 +508,12 @@ var validDiffStyles = map[string]bool{"text": true, "background": true}
 var legalSlots = map[string]bool{"header": true, "transcript": true, "input": true, "status": true}
 var requiredSlots = []string{"transcript", "input", "status"}
 
+// legalHeaderFacts are ui.header.facts' entries: the session's own facts the box may
+// carry, each one the status line spells the same way.
+var legalHeaderFacts = map[string]bool{
+	"model": true, "thinking": true, "mode": true, "workspace": true,
+}
+
 // builtinStatusItems are ui.status.items' seven built-in keys; anything else must be a
 // non-empty "<plugin>:<key>" pair.
 var builtinStatusItems = map[string]bool{
@@ -515,6 +540,11 @@ func (c *Config) validateUI() []error {
 	}
 	if c.UI.Notices.Max < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.notices.max %d must be zero or positive", c.UI.Notices.Max))
+	}
+	for _, f := range c.UI.Header.Facts {
+		if !legalHeaderFacts[f] {
+			errs = append(errs, fmt.Errorf("config: ui.header.facts %q is not model, thinking, mode or workspace", f))
+		}
 	}
 	if c.UI.Header.Tips < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.header.tips %d must be zero or positive", c.UI.Header.Tips))

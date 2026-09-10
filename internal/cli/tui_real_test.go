@@ -117,8 +117,8 @@ func TestRealTUIOverPTY(t *testing.T) {
 	waitFor(t, log, "the settled cat and the release notes", drawWait, func(s string) bool {
 		return strings.Contains(s, settledMarkRow) && strings.Contains(s, "What's new in")
 	})
-	if s := log.text(); strings.ContainsAny(s[len(s)-4000:], "▓▒") {
-		t.Errorf("the reveal left nothing in flight; the terminal read:\n%s", tail(s))
+	if s := tail(log.text()); strings.ContainsAny(s, "▓▒") {
+		t.Errorf("the reveal left nothing in flight; the terminal read:\n%s", s)
 	}
 
 	// Full screen: the client took the alternate buffer, which is what every other

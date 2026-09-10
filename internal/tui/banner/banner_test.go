@@ -36,7 +36,8 @@ func testOptions() Options {
 		Model: "aperture:kimi-k3", Thinking: "high", Mode: "strict",
 		Cwd: "/home/guy/projects/rudy", Home: "/home/guy",
 		Width: 100, MaxWidth: 120, Tips: 2, Updates: 3, Changelog: testChangelog,
-		Step: Settled,
+		Step: Settled, Frame: true, Greeting: true, Mark: true,
+		Facts: []string{"model", "thinking", "workspace"},
 	}
 }
 
@@ -259,5 +260,66 @@ func TestALongPathIsShortenedOnceToItsColumn(t *testing.T) {
 	}
 	if !strings.Contains(body, "001") {
 		t.Errorf("the directory's own name survives:\n%s", body)
+	}
+}
+
+// TestEveryPartOfTheHeaderIsOptional is the tenet: UX is config, so each part of the box
+// answers to a field and the box still reads with any of them gone (ADR 0021).
+func TestEveryPartOfTheHeaderIsOptional(t *testing.T) {
+	full := strings.Join(render(t, testOptions()), "\n")
+	for _, c := range []struct {
+		name string
+		off  func(*Options)
+		gone string
+	}{
+		{"greeting", func(o *Options) { o.Greeting = false }, "afternoon, Guy"},
+		{"mark", func(o *Options) { o.Mark = false }, `/\_/\`},
+		{"tips", func(o *Options) { o.Tips = 0 }, "Tips for getting started"},
+		{"updates", func(o *Options) { o.Updates = 0 }, "What's new"},
+		{"facts", func(o *Options) { o.Facts = nil }, "aperture:kimi-k3"},
+	} {
+		o := testOptions()
+		c.off(&o)
+		body := strings.Join(render(t, o), "\n")
+		if strings.Contains(body, c.gone) {
+			t.Errorf("%s off must take %q with it:\n%s", c.name, c.gone, body)
+		}
+		if !strings.Contains(full, c.gone) {
+			t.Errorf("%s on must draw %q, so the test proves something", c.name, c.gone)
+		}
+		if len(body) == 0 {
+			t.Errorf("%s off leaves a header, not nothing", c.name)
+		}
+	}
+}
+
+// TestTheFactsAreOrderedByConfig: ui.header.facts names them in the order they draw, and
+// an entry left out is a fact left out.
+func TestTheFactsAreOrderedByConfig(t *testing.T) {
+	o := testOptions()
+	o.Facts = []string{"mode", "model"}
+	o.Mode = "strict"
+	body := strings.Join(render(t, o), "\n")
+	if !strings.Contains(body, "strict · aperture:kimi-k3") {
+		t.Errorf("the facts draw in the order config named them:\n%s", body)
+	}
+	if strings.Contains(body, "high") {
+		t.Errorf("and a fact nobody asked for is not drawn:\n%s", body)
+	}
+}
+
+// TestTheFrameCanBeTurnedOff leaves the same lines with no box, which is what a terminal
+// too narrow for one already gets.
+func TestTheFrameCanBeTurnedOff(t *testing.T) {
+	o := testOptions()
+	o.Frame = false
+	body := strings.Join(render(t, o), "\n")
+	if strings.ContainsAny(body, "╭╰│") {
+		t.Errorf("no frame was asked for:\n%s", body)
+	}
+	for _, want := range []string{"afternoon, Guy", "aperture:kimi-k3", "What's new in 0.1.0"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("and everything the box carried is still said, missing %q:\n%s", want, body)
+		}
 	}
 }

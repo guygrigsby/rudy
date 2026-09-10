@@ -28,9 +28,17 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
   appended and fsynced. No asker means deny.
 - Tool inputs and thinking signatures are raw bytes end to end. Never
   re-marshal them.
-- `config.toml` is read, never written by the harness. Commands that persist
-  state (`mcp add`, `plugin install`) write their own dedicated files. XDG
-  paths, `XDG_CONFIG_HOME` honored first, default `~/.config/rudy`.
+- `config.toml` is the operator's. The harness reads it and adds to it: `rudy
+  config sync`, which `make install` runs, writes keys that are absent with the
+  comment that says what each is for, and changes no value, comment or ordering
+  that is already there (ADR 0021). Nothing else writes it; commands that
+  persist state (`mcp add`, `plugin install`) write their own dedicated files.
+  XDG paths, `XDG_CONFIG_HOME` honored first, default `~/.config/rudy`.
+- Every config key is described once, in `internal/config/docs.go`, and the
+  shipped `examples/config.toml` is generated from it (`make config-example`).
+  A new key means a default, a catalogue entry, a contracts row and a
+  regenerated example; the guards in `internal/config` fail until all four
+  agree.
 - CLI is noun then verb (`rudy skills migrate`). Long flags take two dashes.
 - No model lists in config beyond a default. The registry comes from
   `/v1/models`.
