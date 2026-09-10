@@ -3113,3 +3113,57 @@ func TestShellNeedsABashToolInTheSessionsView(t *testing.T) {
 		t.Errorf("no bash tool is not_found, got %v", err)
 	}
 }
+
+// TestPermissionsCommandSetsTheMode is /permissions through command.run: the SetMode action
+// appends a mode_change the way session.set_mode does, and the gate reads it from the log
+// either way (ADR 0025).
+func TestPermissionsCommandSetsTheMode(t *testing.T) {
+	h := newHarnessWith(t, &scriptProvider{}, commands.New())
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	if info.Mode != session.ModeStrict {
+		t.Fatalf("the session opens strict, got %q", info.Mode)
+	}
+
+	var cr protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "permissions", Args: "permissive",
+	}, &cr); err != nil {
+		t.Fatalf("/permissions permissive: %v", err)
+	}
+	if cr.Notice != "permissions: permissive" {
+		t.Errorf("notice %q", cr.Notice)
+	}
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.Entry.Kind == session.KindModeChange
+	})
+	es := entries(t, ns)
+	mc, ok := es[len(es)-1].Payload.(session.ModeChange)
+	if !ok || mc.Mode != session.ModePermissive {
+		t.Fatalf("mode_change = %+v", es[len(es)-1].Payload)
+	}
+
+	// With no argument it reports the mode now in force, which is the one it just set.
+	var shown protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "permissions",
+	}, &shown); err != nil {
+		t.Fatalf("/permissions: %v", err)
+	}
+	if !strings.HasPrefix(shown.Notice, "permissions: permissive") {
+		t.Errorf("a command reads the session's own facts: %q", shown.Notice)
+	}
+	// An unknown mode is the command's own refusal, reported as a plugin error.
+	err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "permissions", Args: "yolo",
+	}, &protocol.CommandRunResult{})
+	if code(t, err) != protocol.CodePluginError {
+		t.Errorf("an unknown mode is refused: %v", err)
+	}
+}

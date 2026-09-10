@@ -70,6 +70,11 @@ type Compact struct{ Instructions string }
 // a provider:id spec or a bare id unique across providers.
 type SetModel struct{ Model string }
 
+// SetMode has the server set this session's permission mode, the body of session.set_mode:
+// strict asks before an unsafe tool, permissive allows one unless it is in the dangerous
+// set, off allows everything.
+type SetMode struct{ Mode session.Mode }
+
 // SetTitle has the server name this session, the body of session.set_title. A title is
 // what a person calls the session; an empty one is refused, as the method refuses it.
 type SetTitle struct{ Title string }
@@ -84,6 +89,7 @@ func (SubmitPrompt) isAction() {}
 func (Notice) isAction()       {}
 func (Compact) isAction()      {}
 func (SetModel) isAction()     {}
+func (SetMode) isAction()      {}
 func (SetTitle) isAction()     {}
 func (Fork) isAction()         {}
 func (NoAction) isAction()     {}
@@ -92,6 +98,11 @@ type CommandCall struct {
 	SessionID ulid.ULID
 	Workspace session.Workspace
 	Args      string
+	// The session's own facts as the log has them, so a command can report what it is
+	// about to change: /permissions with no argument says which mode is in force.
+	Mode     session.Mode
+	Model    session.ModelRef
+	Thinking session.ThinkingLevel
 }
 
 type Command struct {

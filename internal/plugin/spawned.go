@@ -756,6 +756,9 @@ func (s *Spawned) runCommand(name string) func(ctx context.Context, call Command
 			SessionID: call.SessionID.String(),
 			Name:      name,
 			Args:      call.Args,
+			Mode:      call.Mode,
+			Model:     call.Model.String(),
+			Thinking:  call.Thinking,
 		}, &out)
 		if errors.Is(err, context.DeadlineExceeded) {
 			timedOut := fmt.Errorf("/%s: no answer within %s", name, s.commandTimeout())

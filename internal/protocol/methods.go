@@ -431,6 +431,11 @@ type CommandInvokeParams struct {
 	SessionID string `json:"session_id"`
 	Name      string `json:"name"`
 	Args      string `json:"args"`
+	// The session's own facts, so a spawned command can report what it is about to change
+	// rather than asking for them back over the wire.
+	Mode     session.Mode          `json:"mode"`
+	Model    string                `json:"model"`
+	Thinking session.ThinkingLevel `json:"thinking"`
 }
 
 // CommandInvokeResult is what the command asks the server to do. A non-empty Prompt is

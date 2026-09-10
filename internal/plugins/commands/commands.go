@@ -1,5 +1,5 @@
-// Package commands is the kernel's own slash commands: /model, /help, /rename, /fork and
-// /plugins. They
+// Package commands is the kernel's own slash commands: /model, /help, /permissions,
+// /rename, /fork and /plugins. They
 // have no private path to the server either, each is a plugin.Command registered through the
 // same Host interface a spawned plugin's /foo would use.
 package commands
@@ -12,6 +12,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/session"
 )
 
 type cmdPlugin struct{}
@@ -35,6 +36,18 @@ func (cmdPlugin) Init(ctx context.Context, h plugin.Host) error {
 				fmt.Fprintf(&b, "/%s  %s\n", cmd.Name, cmd.Description)
 			}
 			return plugin.Notice{Text: strings.TrimRight(b.String(), "\n")}, nil
+		}},
+		{Name: "permissions", Description: "Show or set how rudy asks before an unsafe tool: /permissions [strict|permissive|off]", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
+			want := session.Mode(strings.TrimSpace(c.Args))
+			if want == "" {
+				return plugin.Notice{Text: fmt.Sprintf(
+					"permissions: %s\n  strict      ask before an unsafe tool, and deny it when nobody can answer\n  permissive  allow an unsafe tool unless it is in the dangerous set\n  off         allow everything, and record every decision anyway",
+					c.Mode)}, nil
+			}
+			if !want.Valid() {
+				return nil, fmt.Errorf("/permissions: %q is not strict, permissive or off", c.Args)
+			}
+			return plugin.SetMode{Mode: want}, nil
 		}},
 		{Name: "rename", Description: "Name this session: /rename <name>", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
 			name := strings.TrimSpace(c.Args)

@@ -987,7 +987,11 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 	if !ok {
 		return nil, perr(protocol.CodeNotFound, "unknown command /"+p.Name)
 	}
-	call := plugin.CommandCall{SessionID: ls.sess.ID(), Workspace: deriveInfo(ls.sess.ID(), ls.snapshotEntries()).Workspace, Args: p.Args}
+	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
+	call := plugin.CommandCall{
+		SessionID: ls.sess.ID(), Workspace: view.Workspace, Args: p.Args,
+		Mode: view.Mode, Model: view.Model, Thinking: view.Thinking,
+	}
 	act, err := cmd.Run(ctx, call)
 	if err != nil {
 		return nil, perr(protocol.CodePluginError, err.Error())
@@ -1019,6 +1023,18 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 			return nil, serr
 		}
 		notice := "model set to " + m.Ref.String()
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
+		return protocol.CommandRunResult{Notice: notice}, nil
+	case plugin.SetMode:
+		if !a.Mode.Valid() {
+			return nil, perr(protocol.CodeInvalidArgument, "invalid mode")
+		}
+		if _, e := s.setEntry(p.SessionID, session.KindModeChange, func(view protocol.SessionInfo) (bool, session.Payload) {
+			return view.Mode == a.Mode, session.ModeChange{Mode: a.Mode}
+		}); e != nil {
+			return nil, e
+		}
+		notice := "permissions: " + string(a.Mode)
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
 		return protocol.CommandRunResult{Notice: notice}, nil
 	case plugin.SetTitle:
