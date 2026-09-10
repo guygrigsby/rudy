@@ -13,9 +13,8 @@ jobs:
       # memory/, which makes ../memory/memory-go resolve from rudy/. A path outside the
       # workspace is not allowed, so neither checkout can use ../.
       #
-      # This job cannot pass until the memory repository is pushed to aeryx-ai/memory; the
-      # checkout below fails with a 404 against a repository that does not exist yet.
-      # vimbubble v2 is required from GitHub, no sibling needed.
+      # vimbubble v2 and memory-go are both required from GitHub; the sibling checkout is
+      # what the replace resolves against.
       - uses: actions/checkout@v4
         with:
           path: rudy
@@ -27,9 +26,9 @@ jobs:
         with:
           go-version: "1.26"
           cache-dependency-path: rudy/go.sum
-      - uses: golangci/golangci-lint-action@v8
-        with:
-          version: latest
-          install-only: true
+      # The linter is installed, not run, here: `make check` is the one definition of the
+      # gate (CLAUDE.md) and runs it itself. golangci-lint-action v8 dropped install-only
+      # and lints on its own, at the workspace root, where there is no module.
+      - run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
       - run: make check
         working-directory: rudy
