@@ -39,7 +39,10 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
   A new key means a default, a catalogue entry, a contracts row and a
   regenerated example; the guards in `internal/config` fail until all four
   agree.
-- CLI is noun then verb (`rudy skills migrate`). Long flags take two dashes.
+- CLI is noun then verb (`rudy skills migrate`), collection nouns plural, and a
+  top-level command that acts without a verb is named in `internal/cli/shape_test.go`
+  with a reason. Those tests are the rule; adding a verb means adding it to their
+  vocabulary. Long flags take two dashes. ADR 0022.
 - No model lists in config beyond a default. The registry comes from
   `/v1/models`.
 - No timers for refresh. Registry refreshes on session open, picker open and

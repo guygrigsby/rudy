@@ -564,10 +564,10 @@ Values in `env` and `headers` are secret references resolved like `providers.<na
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `plugins.<name>.source` | string | required | the git URL or absolute path `rudy plugin install` was given |
+| `plugins.<name>.source` | string | required | the git URL or absolute path `rudy plugins install` was given |
 | `plugins.<name>.commit` | string | required | the checked-out commit; empty for a path source that is not a repository |
 | `plugins.<name>.installed_at` | rfc3339 | required | |
-| `plugins.<name>.enabled` | bool | true | `rudy plugin disable` sets false; a disabled plugin is not spawned |
+| `plugins.<name>.enabled` | bool | true | `rudy plugins disable` sets false; a disabled plugin is not spawned |
 
 ### agents/<name>.md
 

@@ -162,7 +162,7 @@ Hook points, a closed set: `session_opened`, `before_turn`, `before_request`,
 [contracts](rudy-contracts.md).
 
 Spawned plugin manifests are discovered from `$XDG_DATA_HOME/rudy/plugins/`
-(what `rudy plugin install` writes), then `$XDG_CONFIG_HOME/rudy/plugins/`,
+(what `rudy plugins install` writes), then `$XDG_CONFIG_HOME/rudy/plugins/`,
 then the workspace's `.rudy/plugins/`, the first manifest for a name
 winning. A
 user-installed plugin therefore shadows one a repository ships, not the other
@@ -348,9 +348,9 @@ dedicated files and nothing else.
 | `rudy -p "prompt"`, `rudy --print` | headless printer client; `--output text|json|stream-json`, `--mode`, `--model`; attaches or embeds exactly as `rudy` does, with `--socket <path>` and `--embed` (ADR 0014) |
 | `rudy serve` | server on `$XDG_RUNTIME_DIR/rudy/rudy.sock` (directory 0700, socket 0600, peer uid checked); `--socket <path>`; foreground, SIGINT or SIGTERM cancels active turns, shuts down and removes the socket |
 | `rudy sessions list|resume|fork` | session management; `resume` and `fork` attach or embed as `rudy` does, with `--socket <path>` and `--embed` (ADR 0014); `list` reads the store directly and takes neither |
-| `rudy models` | the discovered registry with prices |
+| `rudy models list` | the discovered registry with prices |
 | `rudy mcp add|remove|list|get` | MCP servers, the Claude Code shape: `add <name> <command…>`, `add --transport http <name> <url>`, `--scope user|project`; writes `mcp.toml` under XDG config or the workspace's `.rudy/` |
-| `rudy plugin install|uninstall|list|enable|disable|update` | spawned plugins, the Claude Code shape; installs under `$XDG_DATA_HOME/rudy/plugins/<name>/` with a lock file |
+| `rudy plugins install|uninstall|list|enable|disable|update` | spawned plugins, the Claude Code shape; installs under `$XDG_DATA_HOME/rudy/plugins/<name>/` with a lock file |
 | `rudy skills list|migrate` | discovered skills; one-way import from `.claude/skills` and pi |
 | `rudy keys migrate pi`, `rudy themes migrate pi` | one-way imports of pi keybindings and themes |
 | `rudy update` | self-update the binary from the release channel, the Claude Code shape |
@@ -413,7 +413,7 @@ stale), Go `plugin` (cgo, dead).
    skills, hooks, subagents, compaction, MCP, memory.
 4. TUI: slots, transcript, vimbubble v2, keys, theme, Esc.
 5. `rudy serve`, unix socket, reattach.
-6. Migrations, `rudy models`, `rudy plugins`.
+6. Migrations, `rudy models list`, `rudy plugins`.
 
 The implementation plan breaks these into tasks.
 

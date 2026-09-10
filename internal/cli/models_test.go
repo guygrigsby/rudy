@@ -56,7 +56,7 @@ func TestModelsCommand(t *testing.T) {
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
-	root.SetArgs([]string{"models"})
+	root.SetArgs([]string{"models", "list"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("execute: %v\n%s", err, out.String())
 	}
@@ -64,7 +64,7 @@ func TestModelsCommand(t *testing.T) {
 		t.Fatalf("output %q", out.String())
 	}
 	out.Reset()
-	root.SetArgs([]string{"models", "--json"})
+	root.SetArgs([]string{"models", "list", "--json"})
 	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("execute --json: %v", err)
 	}

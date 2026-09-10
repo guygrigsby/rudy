@@ -16,10 +16,23 @@ import (
 
 // newModelsCommand builds the models list. It runs the full wiring (build), which refreshes
 // the registry, so the table always reflects a fresh /v1/models call.
+// newModelsCommand is `rudy models`, a noun whose verbs do the work: the CLI is noun then
+// verb, and a bare noun prints its help (ADR 0022).
 func newModelsCommand(build buildFunc) *cobra.Command {
-	var asJSON bool
 	cmd := &cobra.Command{
 		Use:   "models",
+		Short: "the model registry",
+		Args:  cobra.NoArgs,
+		RunE:  func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
+	}
+	cmd.AddCommand(newModelsListCommand(build))
+	return cmd
+}
+
+func newModelsListCommand(build buildFunc) *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "list",
 		Short: "list the discovered models with context windows and prices",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {

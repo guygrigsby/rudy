@@ -963,7 +963,7 @@ Value object. One row of `plugins.lock.toml`.
 | Field | Type | Meaning |
 |---|---|---|
 | `name` | string | The manifest name; the checkout directory |
-| `source` | string | Git URL or absolute path given to `rudy plugin install` |
+| `source` | string | Git URL or absolute path given to `rudy plugins install` |
 | `commit` | string | Checked-out commit; empty when the source is a path outside a repository |
 | `installedAt` | instant | |
 | `enabled` | bool | A disabled plugin is discovered and not spawned |

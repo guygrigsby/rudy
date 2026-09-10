@@ -22,8 +22,11 @@ import (
 // files Build's spawnedPlugins reads at boot.
 func newPluginCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "plugin",
-		Short: "install and manage plugins",
+		Use: "plugins",
+		// The nouns are plural everywhere else (sessions, skills, models); "plugin" is
+		// what this command was called first and still answers to.
+		Aliases: []string{"plugin"},
+		Short:   "install and manage plugins",
 	}
 	cmd.AddCommand(
 		newPluginInstallCommand(),

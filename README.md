@@ -188,7 +188,7 @@ login session alike, so those agree on the socket too.
 
 ## Inspect
 
-    rudy models          # the discovered registry with prices
+    rudy models list     # the discovered registry with prices
     rudy sessions list    # sessions, newest first
 
 Sessions live under `~/.local/share/rudy/sessions/<id>/entries.jsonl`, one
