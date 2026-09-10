@@ -476,3 +476,53 @@ func waitExit(t *testing.T, cmd *exec.Cmd, log *ptyLog) {
 		t.Fatalf("rudy did not exit within %s of the exit command; the terminal read:\n%s", exitWait, tail(log.text()))
 	}
 }
+
+// TestRealTUIExitsZero: every way out of the client is a clean exit. A shell that shows a
+// failure after a session somebody ended on purpose is telling them something went wrong
+// when nothing did, and it is the shell they read, not the code.
+//
+// One process per way out, all against the operator's own config and none of them asking a
+// provider for anything but its model list.
+func TestRealTUIExitsZero(t *testing.T) {
+	if os.Getenv(realEnv) != "1" {
+		t.Skip("the real path test opens a live session against the configured provider; set " + realEnv + "=1 to run it")
+	}
+	cfg, path := realConfig(t)
+	ref := defaultModel(t, cfg, path)
+	root := t.TempDir()
+	scratchConfig(t, root, cfg)
+	bin := buildRudy(t, root)
+
+	for _, way := range []struct {
+		name string
+		keys string
+	}{
+		{"the exit command", slashCommand + keyEnter},
+		{"ctrl+d on an empty editor", keyCtrlD},
+	} {
+		t.Run(way.name, func(t *testing.T) {
+			pty, err := xpty.NewPty(ptyWidth, ptyHeight)
+			if err != nil {
+				t.Fatalf("open pty: %v", err)
+			}
+			t.Cleanup(func() { _ = pty.Close() })
+			cmd := exec.Command(bin)
+			cmd.Dir = root
+			cmd.Env = scratchEnv(root)
+			if err := pty.Start(cmd); err != nil {
+				t.Fatalf("start rudy under a pty: %v", err)
+			}
+			t.Cleanup(func() {
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+			})
+			log := drain(pty)
+			waitFor(t, log, "the client to draw", firstFrameWait, func(s string) bool {
+				return strings.Contains(s, "INSERT") && strings.Contains(s, ref)
+			})
+			press(t, pty, way.keys)
+			waitExit(t, cmd, log)
+		})
+	}
+}
