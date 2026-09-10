@@ -92,6 +92,10 @@ type Options struct {
 	// Changelog is CHANGELOG.md as the binary carries it, which the startup header reads
 	// the newest release out of. Empty draws no news (ADR 0016).
 	Changelog string
+	// Cat fixes the face the status line's cat cell wears. Empty picks one at random from
+	// internal/cats, which is what a run does; a test sets it so a golden is not a dice
+	// roll.
+	Cat string
 	// Now fixes the clock the header's greeting and tips are resolved against. Zero means
 	// time.Now, which is what a run does; a test sets it so a golden is not a clock.
 	Now time.Time
@@ -147,6 +151,8 @@ type Model struct {
 	// header is the startup header: where it is drawn, how far its reveal has got and the
 	// greeting it was opened with (header.go).
 	header headerState
+	// cat is the face the status line wears for this run (cat.go).
+	cat string
 	// version and changelog are what the header's title and its news are drawn from.
 	version   string
 	changelog string
@@ -240,6 +246,12 @@ func New(o Options) *Model {
 		m.ic = icons.Default()
 	}
 	m.version, m.changelog = o.Version, o.Changelog
+	if cfg.UI.Cats {
+		m.cat = o.Cat
+		if m.cat == "" {
+			m.cat = pickCat()
+		}
+	}
 	m.header = m.newHeader(o)
 	m.tr = m.newTranscript()
 	m.ed = input.New(cfg.UI.Vim, o.Theme, defaultWidth, table)

@@ -168,7 +168,7 @@ func TestTheMarkRevealSettlesAndStops(t *testing.T) {
 	if ticks != banner.Frames+1 {
 		t.Errorf("the reveal took %d ticks, want %d", ticks, banner.Frames+1)
 	}
-	if !strings.Contains(ansi.Strip(h.view()), `( o.o )`) {
+	if !strings.Contains(ansi.Strip(h.view()), `/ o o \`) {
 		t.Errorf("and the settled cat is drawn:\n%s", ansi.Strip(h.view()))
 	}
 }

@@ -4,17 +4,27 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
+
+	"github.com/guygrigsby/rudy/internal/cats"
 )
 
-// mark is the picture the header draws: a cat, loafed, five rows of line art. It is drawn
-// in plain ASCII rather than block characters so it renders the same in any font, and every
-// row is padded to the same width so the reveal below can sweep it column by column.
-var mark = []string{
-	`     /\_/\     `,
-	`    ( o.o )    `,
-	`   __> ^ <__   `,
-	`  /         \  `,
-	` (___________) `,
+// mark is the picture the header draws, from internal/cats, with every row padded to the
+// same width: the reveal below sweeps it column by column and a short row would finish
+// early. The artwork itself is left as it was drawn, signature included.
+var mark = squared(cats.Art)
+
+// squared makes every row as wide as the widest, which is what the reveal needs and what
+// the artwork itself does not owe it.
+func squared(art []string) []string {
+	w := 0
+	for _, row := range art {
+		w = max(w, ansi.StringWidth(row))
+	}
+	out := make([]string, len(art))
+	for i, row := range art {
+		out[i] = row + strings.Repeat(" ", w-ansi.StringWidth(row))
+	}
+	return out
 }
 
 // The characters the leading edge of the reveal is drawn with: a dim one at the front and a

@@ -87,6 +87,9 @@ type UIConfig struct {
 	Theme      map[string]string `mapstructure:"theme"`
 	// Icons holds ui.icons.set plus per-name overrides, merged the same way Theme is.
 	Icons map[string]string `mapstructure:"icons"`
+	// Cats draws a random cat face in the status line's cat cell, one for the life of the
+	// client. False leaves the cell empty wherever ui.status.items placed it.
+	Cats bool `mapstructure:"cats"`
 }
 
 // themeDefaults are the design's twelve ui.theme role values
@@ -207,6 +210,7 @@ func Defaults() map[string]any {
 		"ui.header.updates":                3,
 		"ui.header.max_width":              120,
 		"ui.input.rules":                   true,
+		"ui.cats":                          true,
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,
@@ -215,7 +219,7 @@ func Defaults() map[string]any {
 		"ui.transcript.user_prefix":        "›",
 		"ui.transcript.block_gap":          1,
 		"ui.diff.style":                    "text",
-		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn"},
+		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"},
 		"ui.notices.max":                   3,
 	}
 }
@@ -489,7 +493,7 @@ var requiredSlots = []string{"transcript", "input", "status"}
 // non-empty "<plugin>:<key>" pair.
 var builtinStatusItems = map[string]bool{
 	"vim_mode": true, "model": true, "permission_mode": true,
-	"context": true, "cost": true, "workspace": true, "turn": true,
+	"context": true, "cost": true, "workspace": true, "turn": true, "cat": true,
 }
 
 func (c *Config) validateUI() []error {

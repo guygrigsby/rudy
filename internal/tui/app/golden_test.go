@@ -98,12 +98,15 @@ func screen(t *testing.T, over map[string]any, drive func(tm *teatest.TestModel,
 // startupScreen is the frame a client opens on, before anything has been said: the header
 // over an empty transcript. It is its own helper because screen drives the design's whole
 // conversation through the model first, which is the frame every other golden pins.
-func startupScreen(t *testing.T, over map[string]any) string {
+func startupScreen(t *testing.T, over map[string]any, opts func(*Options)) string {
 	t.Helper()
 	h := newHarnessWith(t, over, func(o *Options) {
 		o.Now = time.Date(2026, 9, 9, 13, 30, 0, 0, time.UTC)
 		o.Version = "0.1.0"
 		o.Changelog = "# Changelog\n\n## 0.1.0\n\n- Opens full screen, and every row stays expandable\n- Typing / lists the commands as you type\n- /exit closes the client, the daemon keeps running\n"
+		if opts != nil {
+			opts(o)
+		}
 	})
 	h.update(tea.WindowSizeMsg{Width: goldenWidth, Height: goldenHeight})
 	return h.m.View().Content
@@ -254,6 +257,14 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 	}))
 }
 
+// TestGoldenTheCat pins the face in the status line. The face itself is fixed here: which
+// one a run wears is a dice roll, and what this golden is about is the cell.
+func TestGoldenTheCat(t *testing.T) {
+	golden(t, "cat", startupScreen(t, map[string]any{"ui.cats": true, "ui.header.show": false}, func(o *Options) {
+		o.Cat = "(=^･ω･^=)"
+	}))
+}
+
 // TestGoldenNerdIcons pins the default icon set, which every other golden turns down to
 // the unicode one so its bytes stay readable in a diff. What this file carries is Nerd
 // Font codepoints in the private use area: a terminal whose font is not patched draws a
@@ -272,7 +283,7 @@ func TestGoldenStartupHeader(t *testing.T) {
 		"ui.header.animate": false,
 		"ui.header.name":    "Guy",
 	}
-	golden(t, "startup_header", startupScreen(t, over))
+	golden(t, "startup_header", startupScreen(t, over, nil))
 }
 
 // TestGoldenSlashMenu pins the completion above the editor: what command.list answered

@@ -57,9 +57,10 @@ const (
 // ui.render = "altscreen" means on the wire and what the default now does (ADR 0015).
 const altScreenEnter = "\x1b[?1049h"
 
-// settledMarkRow is the cat's last row, whose rightmost character is the last column the
-// reveal draws. A row still being revealed carries the shimmer characters instead.
-const settledMarkRow = "(___________)"
+// settledMarkRow is the cat's second row, which carries the rightmost character in the
+// drawing and so is whole only once the reveal has passed the last column. A row still
+// being revealed carries the shimmer characters instead.
+const settledMarkRow = `/ o o \ \ \`
 
 // slashCommand is the one this run completes and then runs: /exit is the client's own, so
 // it needs no provider and it is what ends the process.

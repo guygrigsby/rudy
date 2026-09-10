@@ -27,6 +27,7 @@ const (
 	itemCost           = "cost"
 	itemWorkspace      = "workspace"
 	itemTurn           = "turn"
+	itemCat            = "cat"
 )
 
 // statusGap separates two items, as the design's screen spaces them.
@@ -71,6 +72,10 @@ func (m *Model) statusItem(id string) string {
 		return m.styled(theme.RoleMuted, m.workspaceCell())
 	case itemTurn:
 		return m.styled(theme.RoleMuted, m.turnCell())
+	case itemCat:
+		// Empty when ui.cats is off, which draws no cell and takes no separator with it,
+		// the way vim off leaves no mode cell.
+		return m.styled(theme.RoleMuted, m.cat)
 	}
 	// A plugin's item. One no plugin has set renders nothing rather than a placeholder:
 	// the config placed a cell, the plugin decides whether there is anything in it.

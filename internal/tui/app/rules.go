@@ -60,7 +60,13 @@ func (m *Model) composerRules() (above, below []string) {
 	// The upper rule carries the session's name once it has one, which is what /rename
 	// gives it: the box the header drew has scrolled away by then (ADR 0019).
 	top := m.rule(m.session.Title)
-	bottom := m.rule(m.ic.Label(icons.Context, contextLabel(contextPercent(m.model.ContextWindow, m.lastPrompt))))
+	// Nothing to say about the context leaves the rule plain: an icon with no number
+	// beside it labels nothing.
+	var label string
+	if text := contextLabel(contextPercent(m.model.ContextWindow, m.lastPrompt)); text != "" {
+		label = m.ic.Label(icons.Context, text)
+	}
+	bottom := m.rule(label)
 	if top == "" || bottom == "" {
 		return nil, nil
 	}

@@ -225,7 +225,7 @@ func TestTheMarkMaterializes(t *testing.T) {
 	if !strings.ContainsAny(mid, "▓▒") {
 		t.Errorf("a step in flight has a leading edge:\n%s", mid)
 	}
-	if !strings.Contains(mid, "(") {
+	if !strings.Contains(mid, "/") {
 		t.Errorf("and the drawing itself behind it, not a wall of blocks:\n%s", mid)
 	}
 	if last := strings.Join(Mark(Frames), "\n"); last != whole {

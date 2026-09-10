@@ -79,6 +79,9 @@ func testConfig(t *testing.T, over map[string]any) *config.Config {
 	m := map[string]any{
 		"default.provider": "fake", "default.model": "m1",
 		"ui.header.show": false, "ui.icons.set": "unicode",
+		// A random face is a dice roll, and every golden but the cat's own would carry
+		// whichever one came up.
+		"ui.cats": false,
 	}
 	maps.Copy(m, over)
 	cfg, err := config.Load(paths, m)

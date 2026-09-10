@@ -57,8 +57,8 @@ func TestTheComposerSitsBetweenTwoRules(t *testing.T) {
 // once there is something to say about it.
 func TestTheLowerRuleCarriesTheContextPercentage(t *testing.T) {
 	h := newHarness(t, nil)
-	if got := ruleLines(h)[1]; strings.Contains(got, "context") {
-		t.Errorf("a session that has sent nothing says nothing about its context: %q", got)
+	if got := ruleLines(h)[1]; strings.Contains(got, "context") || strings.Contains(got, "◔") {
+		t.Errorf("a session that has sent nothing says nothing about its context, icon included: %q", got)
 	}
 	// The context percentage is the last request's prompt against the model's window,
 	// which is what an assistant message carries.
