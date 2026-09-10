@@ -80,6 +80,10 @@ turn, and `ctrl+d` on an empty editor exits, as does `/exit`. An unsafe tool
 asks where its row will be: `y` allows once, `a` for the session, `n` and Esc
 deny.
 
+A draft that opens with `!` is a shell command: the composer changes colour, Enter runs
+it in the workspace, and the command with its output is recorded so the model reads it
+with your next message. No turn starts.
+
 Typing `/` lists the commands above the editor with what each does, filtered as
 you type. The arrows move the selection, tab completes the name, Esc dismisses
 the list. Enter completes a half-typed name and runs a whole one.

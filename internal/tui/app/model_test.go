@@ -82,6 +82,10 @@ func testConfig(t *testing.T, over map[string]any) *config.Config {
 		// A random face is a dice roll, and every golden but the cat's own would carry
 		// whichever one came up.
 		"ui.cats": false,
+		// Notices do not expire on their own here: a lifetime arms a timer, and a test that
+		// runs the commands an update returned would wait out the clock. notice_test.go
+		// turns it on and owns the clock while it does.
+		"ui.notices.ttl_ms": 0,
 	}
 	maps.Copy(m, over)
 	cfg, err := config.Load(paths, m)

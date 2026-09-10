@@ -64,6 +64,10 @@ func (t *Transcript) Render(r *Row) []string {
 			text = t.opts.UserPrefix + " " + text
 		}
 		return t.wrap(theme.RoleUser, 0, text)
+	case RowShell:
+		// The command already carries its own "$ " from the log, and its output follows it
+		// verbatim: what the operator saw in their terminal is what the row shows.
+		return t.wrap(theme.RoleShell, 0, r.Text)
 	case RowAssistant:
 		return t.assistant(r)
 	case RowTool:

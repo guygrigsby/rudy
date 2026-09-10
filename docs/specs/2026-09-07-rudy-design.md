@@ -272,6 +272,7 @@ items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "c
 
 [ui.notices]
 max = 3
+ttl_ms = 8000
 
 cats = true
 
@@ -291,6 +292,7 @@ error = "#f7768e"
 warning = "#e0af68"
 diff_add = "success"
 diff_del = "error"
+shell = "warning"
 code = "chroma:tokyonight-night"
 ```
 
@@ -331,6 +333,11 @@ the transcript rather than a slot, so the conversation scrolls it away; inline
 prints it into the terminal's own scrollback instead. Every part is a
 `[ui.header]` field, and the status line wears a face from the same package
 under `ui.cats`. ADR 0016, ADR 0017, ADR 0019.
+
+A draft that opens with `!` is a shell command, not a message: the composer changes
+to the `shell` colour, Enter runs it in the workspace through the registered `bash`
+tool with no gate, and the command with its output is recorded as one `user_message`
+the model reads with the next thing sent. No turn starts. ADR 0023.
 
 A draft that opens with `/` and carries no space yet lists the matching commands
 above the editor, name and description, filtered as it is typed. The editor keeps

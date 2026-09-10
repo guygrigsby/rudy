@@ -21,6 +21,7 @@ const (
 	MethodSessionList        = "session.list"
 	MethodSessionClose       = "session.close"
 	MethodSessionSubmit      = "session.submit"
+	MethodSessionShell       = "session.shell"
 	MethodSessionInterrupt   = "session.interrupt"
 	MethodSessionAnswer      = "session.answer"
 	MethodSessionSetModel    = "session.set_model"
@@ -247,6 +248,20 @@ type RegistryListResult struct {
 
 // CommandInfo is one registered slash command as a client sees it: what to type and what
 // it does. A client asks for the set once (see MethodCommandList) and completes from it.
+// SessionShellParams is a shell command the operator ran from the composer with `!`.
+type SessionShellParams struct {
+	SessionID string `json:"session_id"`
+	Command   string `json:"command"`
+}
+
+// SessionShellResult is where it landed and whether it failed. The command and its output
+// reach every attached client as the entry.appended notification for the user_message,
+// which is the same way a typed message arrives, so nothing is sent twice.
+type SessionShellResult struct {
+	EntryID string `json:"entry_id"`
+	IsError bool   `json:"is_error"`
+}
+
 type CommandInfo struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`

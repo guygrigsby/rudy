@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tool"
 	"github.com/guygrigsby/rudy/internal/turn"
 	"github.com/guygrigsby/rudy/internal/workspace"
 )
@@ -343,6 +345,8 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 			cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "registry refresh: " + err.Error()})
 		}
 		return protocol.RegistryListResult{Models: s.d.Registry.Models()}, nil
+	case protocol.MethodSessionShell:
+		return s.handleShell(ctx, req.Params)
 	case protocol.MethodCommandList:
 		return commandList(s.d.Plugins.Commands()), nil
 	case protocol.MethodCommandRun:
@@ -813,6 +817,103 @@ func (s *Server) handleAppendNote(cn *conn, raw json.RawMessage) (any, *protocol
 		return nil, protocol.ErrorFrom(aerr)
 	}
 	return EntryIDResult{EntryID: e.ID.String()}, nil
+}
+
+// shellTool is the tool `!` runs through. The operator's shell command is the same tool the
+// model calls, invoked by hand: the kernel has no private path to a shell either.
+const shellTool = "bash"
+
+// handleShell runs a shell command the operator typed with `!` and records it with its
+// output as one user_message, starting no turn. ADR 0023.
+//
+// The gate does not run: the gate exists so a human answers for what the model wants to do,
+// and here the human is the one who typed it. A session with no bash tool in its view (an
+// agent definition that took it away) has nowhere to run it and says so.
+func (s *Server) handleShell(ctx context.Context, raw json.RawMessage) (any, *protocol.Error) {
+	var p protocol.SessionShellParams
+	if e := decode(raw, &p); e != nil {
+		return nil, e
+	}
+	// Trimmed once, here: what runs and what is recorded have to be the same command, and
+	// the shell has no use for the spaces around it either.
+	command := strings.TrimSpace(p.Command)
+	if command == "" {
+		return nil, perr(protocol.CodeInvalidArgument, "empty command")
+	}
+	ls, e := s.lookup(p.SessionID)
+	if e != nil {
+		return nil, e
+	}
+	// What the run needs is read under the lock; the run itself is not, since a command can
+	// take as long as the tool timeout and nothing else could touch the session meanwhile.
+	ls.mu.Lock()
+	if ls.closed {
+		ls.mu.Unlock()
+		return nil, perr(protocol.CodeNotFound, "session closed")
+	}
+	if st, _ := ls.mirroredState(); ls.runner != nil && isActive(st) {
+		ls.mu.Unlock()
+		return nil, perr(protocol.CodeConflict, "a turn is active")
+	}
+	var tools turn.Tools = s.d.Plugins
+	if ls.tools != nil {
+		tools = ls.tools
+	}
+	ws := deriveInfo(ls.sess.ID(), ls.snapshotEntries()).Workspace
+	sid := ls.sess.ID()
+	ls.mu.Unlock()
+
+	bt, ok := tools.Tool(shellTool)
+	if !ok {
+		return nil, perr(protocol.CodeNotFound, "this session has no "+shellTool+" tool to run a command with")
+	}
+	input, err := json.Marshal(map[string]string{"command": command})
+	if err != nil {
+		return nil, perr(protocol.CodeInternal, err.Error())
+	}
+	runCtx := ctx
+	if d := time.Duration(s.d.Config.ToolTimeoutMS) * time.Millisecond; d > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	res, err := bt.Invoke(runCtx, tool.Call{ID: session.NewID().String(), Name: shellTool, Input: input, Workspace: ws, SessionID: sid})
+	if err != nil {
+		// The tool could not run at all, which is not something to write into the log as
+		// though the command had answered.
+		return nil, perr(protocol.CodeInternal, err.Error())
+	}
+	msg := session.UserMessage{
+		Source:  session.SourceShell,
+		Content: []session.Block{session.TextBlock(shellTranscript(command, res.Content))},
+	}
+	if err := session.Validate(msg); err != nil {
+		return nil, perr(protocol.CodeInvalidArgument, err.Error())
+	}
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.closed {
+		return nil, perr(protocol.CodeNotFound, "session closed")
+	}
+	entry, err := ls.appendAndBroadcastLocked(msg)
+	if err != nil {
+		return nil, protocol.ErrorFrom(err)
+	}
+	return protocol.SessionShellResult{EntryID: entry.ID.String(), IsError: res.IsError}, nil
+}
+
+// shellTranscript is what the log records and the model reads: the command as a person
+// would write it at a prompt, then whatever it printed. A command that printed nothing is
+// still worth recording, since the operator saw that too.
+func shellTranscript(command string, out []session.Block) string {
+	var b strings.Builder
+	b.WriteString("$ " + command)
+	for _, blk := range out {
+		if text := strings.TrimRight(blk.Text, "\n"); text != "" {
+			b.WriteString("\n" + text)
+		}
+	}
+	return b.String()
 }
 
 // commandList is the registered commands as a client reads them. Name and description and

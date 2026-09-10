@@ -181,6 +181,7 @@ var Sections = []Section{
 		Comment: []string{"Notices are chrome under the transcript and never reach a session log."},
 		Keys: []Doc{
 			{Key: "ui.notices.max", Comment: "Lines drawn, newest last. 0 draws none."},
+			{Key: "ui.notices.ttl_ms", Comment: "How long a notice stays before it goes. 0 keeps it until a newer one pushes it out.", Example: "0"},
 		},
 	},
 	{

@@ -330,6 +330,15 @@ func (m *Model) submit() tea.Cmd {
 		return nil
 	}
 	text := m.ed.Text()
+	// A shell command is not a message and never steers a turn: it runs, it is recorded,
+	// and the model reads it next time something is sent (ADR 0023).
+	if command, ok := shellIn(text); ok {
+		m.ed.Clear()
+		return m.call(protocol.MethodSessionShell, protocol.SessionShellParams{
+			SessionID: m.session.SessionID,
+			Command:   command,
+		})
+	}
 	m.ed.Clear()
 	if m.turn.steering() {
 		return m.submitText(text, session.SourceSteer)
@@ -344,6 +353,18 @@ func (m *Model) submitText(text string, source session.Source) tea.Cmd {
 		Content:   []session.Block{session.TextBlock(text)},
 		Source:    source,
 	})
+}
+
+// shellIn reads a draft that opens with a bang as a shell command, and reports whether it
+// is one. Everything after the bang is the command, the whole draft, so a multi-line script
+// is one command the way a person would paste it.
+func shellIn(draft string) (string, bool) {
+	rest, ok := strings.CutPrefix(draft, shellPrefix)
+	if !ok {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest)
+	return rest, rest != ""
 }
 
 // commandIn reads a draft that opens with a slash as a command and its arguments: the

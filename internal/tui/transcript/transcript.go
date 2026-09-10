@@ -114,8 +114,12 @@ func (t *Transcript) Apply(e session.Entry) []string {
 			t.turn = e.ID.String()
 		}
 		t.liveTurn = ""
+		kind := RowUser
+		if p.Source == session.SourceShell {
+			kind = RowShell
+		}
 		return t.addOnce(&Row{
-			Key: e.ID.String(), Kind: RowUser, TurnID: t.turn,
+			Key: e.ID.String(), Kind: kind, TurnID: t.turn,
 			Entry: e, Text: session.TextOf(p.Content),
 		})
 	case session.AssistantMessage:

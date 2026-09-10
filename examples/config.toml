@@ -146,6 +146,9 @@ items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "c
 [ui.notices]
 # Lines drawn, newest last. 0 draws none.
 max = 3
+# How long a notice stays before it goes. 0 keeps it until a newer one pushes it out.
+# e.g. 0
+ttl_ms = 8000
 
 # The glyph set. nerd needs a patched font, unicode needs none, ascii is plain text.
 # Any single icon can be replaced, and "" turns one off.

@@ -59,8 +59,12 @@ var promptWidth = lipgloss.Width(promptFirst)
 
 // Editor is the composer. Zero value is not usable; call New.
 type Editor struct {
-	ta    textarea.Model
-	vim   *vimbubble.Modal
+	ta  textarea.Model
+	vim *vimbubble.Modal
+	// th and role are what the composer is painted from and what it is painted in now, so
+	// SetRole can repaint without the app holding the theme.
+	th    theme.Theme
+	role  theme.Role
 	queue []string
 }
 
@@ -73,7 +77,7 @@ func New(vim bool, th theme.Theme, width int, table *keys.Table) *Editor {
 	if table == nil {
 		table = keys.Default()
 	}
-	e := &Editor{ta: textarea.New()}
+	e := &Editor{ta: textarea.New(), th: th, role: theme.RoleAccent}
 	e.ta.Placeholder = ""
 	e.ta.ShowLineNumbers = false
 	// MaxHeight is the textarea's content limit as well as its viewport height, and a
@@ -105,10 +109,18 @@ func prompt(info textarea.PromptInfo) string {
 // paints a ground. The one exception is the visual-mode selection, which needs to read
 // as a block and gets reverse video: an attribute, not a color, so it borrows whatever
 // the terminal is already painting rather than choosing a ground of its own.
-func styles(th theme.Theme) textarea.Styles {
+func styles(th theme.Theme) textarea.Styles { return stylesIn(th, theme.RoleAccent) }
+
+// stylesIn is the same styles with the prompt, the cursor and the text painted in role,
+// which is how the composer says a draft is a shell command rather than a message: the
+// whole input area changes colour while it starts with a bang (ADR 0023).
+func stylesIn(th theme.Theme, role theme.Role) textarea.Styles {
 	text := th.Style(theme.RoleText)
+	if role != theme.RoleAccent {
+		text = th.Style(role)
+	}
 	muted := th.Style(theme.RoleMuted)
-	accent := th.Style(theme.RoleAccent)
+	accent := th.Style(role)
 	focused := textarea.StyleState{
 		Base:        lipgloss.NewStyle(),
 		Text:        text,
@@ -125,7 +137,7 @@ func styles(th theme.Theme) textarea.Styles {
 		Focused: focused,
 		Blurred: blurred,
 		Cursor: textarea.CursorStyle{
-			Color: th.Colors[theme.RoleAccent],
+			Color: th.Colors[role],
 			Shape: tea.CursorBlock,
 			Blink: true,
 		},
@@ -251,6 +263,18 @@ func (e *Editor) Mode() Mode {
 
 // Text is the draft, the queue excluded.
 func (e *Editor) Text() string { return e.ta.Value() }
+
+// SetRole paints the composer in one theme role, prompt, cursor and text together. The app
+// calls it when what the draft is has changed: a shell command wears the shell role, a
+// message wears the accent. Painting is idempotent and cheap, so the app need not remember
+// which role is on.
+func (e *Editor) SetRole(role theme.Role) {
+	if e.role == role {
+		return
+	}
+	e.role = role
+	e.ta.SetStyles(stylesIn(e.th, role))
+}
 
 // SetText replaces the draft, leaving the cursor at the end of it.
 func (e *Editor) SetText(s string) {

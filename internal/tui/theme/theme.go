@@ -21,10 +21,10 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 )
 
-// Role names one of the eleven paintable theme roles.
+// Role names one of the twelve paintable theme roles.
 type Role string
 
-// The eleven color roles. "code", the theme file's twelfth key, resolves to
+// The twelve color roles. "code", the theme file's thirteenth key, resolves to
 // Theme.Chroma instead and so has no Role constant.
 const (
 	RoleAccent    Role = "accent"
@@ -38,15 +38,19 @@ const (
 	RoleWarning   Role = "warning"
 	RoleDiffAdd   Role = "diff_add"
 	RoleDiffDel   Role = "diff_del"
+	// RoleShell paints the composer while a draft is a shell command, and the row that
+	// command becomes. It is its own role rather than warning's so a person can tell a
+	// shell from a warning at a glance (ADR 0023).
+	RoleShell Role = "shell"
 )
 
-// Roles lists the eleven color roles, in the order Theme.Colors resolves them.
+// Roles lists the twelve color roles, in the order Theme.Colors resolves them.
 var Roles = []Role{
 	RoleAccent, RoleText, RoleMuted, RoleUser, RoleAssistant, RoleTool,
-	RoleSuccess, RoleError, RoleWarning, RoleDiffAdd, RoleDiffDel,
+	RoleSuccess, RoleError, RoleWarning, RoleDiffAdd, RoleDiffDel, RoleShell,
 }
 
-// codeKey is the theme file's twelfth legal key; it names a chroma style, not a color.
+// codeKey is the theme file's thirteenth legal key; it names a chroma style, not a color.
 const codeKey = "code"
 
 // chromaPrefix is code's required value prefix: "chroma:<style>".

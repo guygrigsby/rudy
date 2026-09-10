@@ -2999,3 +2999,117 @@ func mustULID(t *testing.T, s string) ulid.ULID {
 	}
 	return id
 }
+
+// fakeBash is a plugin registering a tool called bash, which is what `!` runs through. It
+// echoes the command back so a test can see what it was given, and fails on one word.
+type fakeBash struct{}
+
+func (fakeBash) Name() string { return "fakebash" }
+
+func (fakeBash) Init(ctx context.Context, h plugin.Host) error {
+	return h.RegisterTool(tool.Tool{
+		Name:        "bash",
+		Description: "run a shell command",
+		Schema:      json.RawMessage(`{"type":"object"}`),
+		Safety:      tool.Unsafe,
+		Invoke: func(ctx context.Context, call tool.Call) (tool.Result, error) {
+			var in struct {
+				Command string `json:"command"`
+			}
+			if err := json.Unmarshal(call.Input, &in); err != nil {
+				return tool.Result{}, err
+			}
+			if in.Command == "boom" {
+				return tool.Result{Content: []session.Block{session.TextBlock("command not found")}, IsError: true}, nil
+			}
+			return tool.Result{Content: []session.Block{session.TextBlock("ran " + in.Command + " in " + call.Workspace.Root)}}, nil
+		},
+	})
+}
+
+// TestShellRecordsTheCommandAndStartsNoTurn is what `!` is: the command runs through the
+// registered bash tool with no gate, the command and its output are one user_message the
+// model reads next turn, and nothing else happens (ADR 0023).
+func TestShellRecordsTheCommandAndStartsNoTurn(t *testing.T) {
+	h := newHarnessWith(t, &scriptProvider{}, fakeBash{})
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	ctx := context.Background()
+
+	var res protocol.SessionShellResult
+	if err := cl.Call(ctx, protocol.MethodSessionShell, protocol.SessionShellParams{
+		SessionID: info.SessionID, Command: "  git status  ",
+	}, &res); err != nil {
+		t.Fatalf("session.shell: %v", err)
+	}
+	if res.EntryID == "" || res.IsError {
+		t.Fatalf("result %+v", res)
+	}
+	ns := drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.Entry.Kind == session.KindUserMessage
+	})
+	es := entries(t, ns)
+	um, ok := es[len(es)-1].Payload.(session.UserMessage)
+	if !ok {
+		t.Fatalf("payload %T", es[len(es)-1].Payload)
+	}
+	if um.Source != session.SourceShell {
+		t.Errorf("source %q, want shell", um.Source)
+	}
+	// The command as a person writes it, then what it printed.
+	if got := um.Content[0].Text; !strings.HasPrefix(got, "$ git status\n") || !strings.Contains(got, "ran git status in ") {
+		t.Errorf("recorded %q", got)
+	}
+	// No turn: nothing started, so the next typed message is the first turn of the session.
+	for _, n := range ns {
+		if n.Method == protocol.NotifyTurnState {
+			t.Errorf("`!` starts no turn, got %s", n.Params)
+		}
+	}
+}
+
+// TestShellRefusesWhatItCannotRun walks the three refusals.
+func TestShellRefusesWhatItCannotRun(t *testing.T) {
+	h := newHarnessWith(t, &scriptProvider{}, fakeBash{})
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	ctx := context.Background()
+
+	err := cl.Call(ctx, protocol.MethodSessionShell, protocol.SessionShellParams{SessionID: info.SessionID, Command: "   "}, &protocol.SessionShellResult{})
+	if code(t, err) != protocol.CodeInvalidArgument {
+		t.Errorf("an empty command is invalid_argument, got %v", err)
+	}
+	err = cl.Call(ctx, protocol.MethodSessionShell, protocol.SessionShellParams{SessionID: session.NewID().String(), Command: "ls"}, &protocol.SessionShellResult{})
+	if code(t, err) != protocol.CodeNotFound {
+		t.Errorf("an unknown session is not_found, got %v", err)
+	}
+
+	// A failing command is still recorded: the operator saw the failure and so should the
+	// model. It is reported, not refused.
+	var res protocol.SessionShellResult
+	if err := cl.Call(ctx, protocol.MethodSessionShell, protocol.SessionShellParams{SessionID: info.SessionID, Command: "boom"}, &res); err != nil {
+		t.Fatalf("a failing command answers rather than erroring: %v", err)
+	}
+	if !res.IsError || res.EntryID == "" {
+		t.Errorf("result %+v", res)
+	}
+}
+
+// TestShellNeedsABashToolInTheSessionsView: an agent definition that took bash away has
+// nowhere to run a command, and says so instead of running one somewhere else.
+func TestShellNeedsABashToolInTheSessionsView(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	err := cl.Call(context.Background(), protocol.MethodSessionShell, protocol.SessionShellParams{
+		SessionID: info.SessionID, Command: "ls",
+	}, &protocol.SessionShellResult{})
+	if code(t, err) != protocol.CodeNotFound {
+		t.Errorf("no bash tool is not_found, got %v", err)
+	}
+}

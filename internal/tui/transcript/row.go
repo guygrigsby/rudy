@@ -18,7 +18,10 @@ import (
 type RowKind string
 
 const (
-	RowUser      RowKind = "user"
+	RowUser RowKind = "user"
+	// RowShell is a shell command the operator ran with `!`, with its output. It is not a
+	// user row: the operator did not say it, they ran it (ADR 0023).
+	RowShell     RowKind = "shell"
 	RowAssistant RowKind = "assistant"
 	RowTool      RowKind = "tool"
 	RowPrompt    RowKind = "prompt"

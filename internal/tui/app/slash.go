@@ -55,6 +55,9 @@ func (m *Model) runLocal(name, args string) tea.Cmd {
 	return nil
 }
 
+// shellPrefix opens a draft that is a shell command rather than a message.
+const shellPrefix = "!"
+
 // menuState is the slash menu's own state: the row the keyboard is on, the draft that
 // selection was made under, and the draft an Esc dismissed the menu for. What is on screen
 // is derived from the draft itself, so nothing here has to be kept in step with it.

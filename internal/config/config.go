@@ -51,6 +51,10 @@ type StatusConfig struct {
 // off the frame, so the count is a config field like every other render choice.
 type NoticesConfig struct {
 	Max int `mapstructure:"max"`
+	// TTLMS is how long a notice stays on screen. A notice is chrome, not history: it
+	// says something happened and then gets out of the way. Zero keeps every notice until
+	// a newer one pushes it out, which is what the client did before it had a clock.
+	TTLMS int `mapstructure:"ttl_ms"`
 }
 
 // InputConfig is the [ui.input] table. Rules are the two lines that bracket the composer,
@@ -102,7 +106,7 @@ type UIConfig struct {
 	Cats bool `mapstructure:"cats"`
 }
 
-// themeDefaults are the design's twelve ui.theme role values
+// themeDefaults are the design's ui.theme role values
 // (docs/specs/2026-09-07-rudy-design.md, [ui.theme]): the eleven color roles plus code.
 // ThemeDefaults is the one exported copy of this data; internal/tui/theme.Default and
 // Load's built-in "default" theme resolve from it too, so it lives here once rather
@@ -123,10 +127,11 @@ var themeDefaults = map[string]string{
 	"warning":   "#e0af68",
 	"diff_add":  "success",
 	"diff_del":  "error",
+	"shell":     "warning",
 	"code":      "chroma:tokyonight-night",
 }
 
-// ThemeDefaults is the design's twelve ui.theme role values, a fresh copy each call.
+// ThemeDefaults is the design's ui.theme role values, a fresh copy each call.
 func ThemeDefaults() map[string]string {
 	out := make(map[string]string, len(themeDefaults))
 	for k, v := range themeDefaults {
@@ -235,6 +240,7 @@ func Defaults() map[string]any {
 		"ui.diff.style":                    "text",
 		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"},
 		"ui.notices.max":                   3,
+		"ui.notices.ttl_ms":                8000,
 		"plugins.disabled":                 []string{},
 		// The two tables merged by hand below still take their defaults from here, so a
 		// default lives in one place whatever shape its table has.
@@ -537,6 +543,9 @@ func (c *Config) validateUI() []error {
 	}
 	if c.UI.Transcript.BlockGap < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.transcript.block_gap %d must be zero or positive", c.UI.Transcript.BlockGap))
+	}
+	if c.UI.Notices.TTLMS < 0 {
+		errs = append(errs, fmt.Errorf("config: ui.notices.ttl_ms %d must be zero or positive", c.UI.Notices.TTLMS))
 	}
 	if c.UI.Notices.Max < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.notices.max %d must be zero or positive", c.UI.Notices.Max))

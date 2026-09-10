@@ -78,9 +78,20 @@ const (
 	SourceTyped  Source = "typed"
 	SourceQueued Source = "queued"
 	SourceSteer  Source = "steer"
+	// SourceShell is a shell command the operator ran from the composer with `!`, recorded
+	// with its output so the model reads it on the next turn. It is a user message because
+	// that is what reaches the model, and its own source because it is not something the
+	// operator said (ADR 0023).
+	SourceShell Source = "shell"
 )
 
-func (s Source) Valid() bool { return s == SourceTyped || s == SourceQueued || s == SourceSteer }
+func (s Source) Valid() bool {
+	switch s {
+	case SourceTyped, SourceQueued, SourceSteer, SourceShell:
+		return true
+	}
+	return false
+}
 
 // StopReason is the domain classification of why a completion ended.
 type StopReason string

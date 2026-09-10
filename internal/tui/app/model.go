@@ -99,6 +99,9 @@ type Options struct {
 	// Now fixes the clock the header's greeting and tips are resolved against. Zero means
 	// time.Now, which is what a run does; a test sets it so a golden is not a clock.
 	Now time.Time
+	// Clock is what the client reads the time from while it runs, for the notices that
+	// expire. Nil means time.Now; a test hands over one it can move.
+	Clock func() time.Time
 	// Workspace overrides the workspace status item. Empty means read it from git in
 	// Cwd, which is what a run does; a test sets it so drawing a status line never
 	// depends on the directory the test happens to run in.
@@ -110,6 +113,8 @@ type Options struct {
 type notice struct {
 	level string
 	text  string
+	// at is when it arrived, which is what ui.notices.ttl_ms measures from.
+	at time.Time
 }
 
 // Model is the client. Zero value is not usable; call New.
@@ -153,6 +158,12 @@ type Model struct {
 	header headerState
 	// cat is the face the status line wears for this run (cat.go).
 	cat string
+	// clock is what a notice's age is measured against, and the one place the client reads
+	// the time while it is running.
+	clock func() time.Time
+	// noticeTick is whether a sweep is already scheduled: notices expire on their own, and
+	// a client with none on screen schedules nothing.
+	noticeTick bool
 	// version and changelog are what the header's title and its news are drawn from.
 	version   string
 	changelog string
@@ -245,6 +256,10 @@ func New(o Options) *Model {
 	if m.ic == nil {
 		m.ic = icons.Default()
 	}
+	m.clock = o.Clock
+	if m.clock == nil {
+		m.clock = time.Now
+	}
 	m.version, m.changelog = o.Version, o.Changelog
 	if cfg.UI.Cats {
 		m.cat = o.Cat
@@ -257,6 +272,9 @@ func New(o Options) *Model {
 	m.ed = input.New(cfg.UI.Vim, o.Theme, defaultWidth, table)
 	if o.Prompt != "" {
 		m.ed.SetText(o.Prompt)
+		// A prompt from the command line is a draft like any other, and `rudy "!ls"` is a
+		// shell draft: paint it before the first frame rather than at the first keystroke.
+		m.paintComposer()
 	}
 	m.vp = viewport.New(viewport.WithWidth(defaultWidth), viewport.WithHeight(defaultHeight))
 	m.spin = newSpinner()
@@ -316,9 +334,21 @@ func (m *Model) setModel(ref session.ModelRef) tea.Cmd {
 	return m.call(protocol.MethodRegistryList, nil)
 }
 
+// noticeSweepMsg asks the model to drop the notices that have outlived ui.notices.ttl_ms.
+type noticeSweepMsg struct{}
+
 // Update folds one message in. A notification re-arms the pump, so exactly one is in
 // flight at a time and they land in the order the server sent them.
+//
+// Every message goes through update below, which is where the notice sweep is armed: a
+// notice can be added by any of them, and arming in one place is what keeps at most one
+// sweep in flight.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	return next, tea.Batch(cmd, m.noticeSweep())
+}
+
+func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case NotificationMsg:
 		return m, tea.Batch(m.notification(protocol.Notification(msg)), pump(m.cl))
@@ -343,6 +373,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.headerStart()
 	case headerTickMsg:
 		return m, m.headerTicked()
+	case noticeSweepMsg:
+		return m, m.noticeSwept()
 	case tea.KeyPressMsg:
 		return m, m.key(msg)
 	case tea.MouseClickMsg:
@@ -355,7 +387,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.spinTicked(msg)
 	}
 	// Everything else, a cursor blink among it, belongs to the editor.
-	return m, m.ed.Update(msg)
+	cmd := m.ed.Update(msg)
+	m.paintComposer()
+	return m, cmd
 }
 
 // notification dispatches one server notification by method. It returns a command for the
@@ -947,10 +981,51 @@ func (m *Model) result(r CallResultMsg, v any) bool {
 
 // note appends a notice, oldest falling off past maxNotices.
 func (m *Model) note(level, text string) {
-	m.notices = append(m.notices, notice{level: level, text: text})
+	m.notices = append(m.notices, notice{level: level, text: text, at: m.clock()})
 	if len(m.notices) > maxNotices {
 		m.notices = slices.Delete(m.notices, 0, len(m.notices)-maxNotices)
 	}
+}
+
+// noticeSweep is the command that takes an expired notice off the screen, or nothing when
+// none can expire: ui.notices.ttl_ms is zero, or one sweep is already scheduled, or there
+// is nothing on screen to sweep. A client at rest schedules nothing, which is the same rule
+// the turn spinner and the header's reveal keep.
+func (m *Model) noticeSweep() tea.Cmd {
+	ttl := m.noticeTTL()
+	if ttl == 0 || m.noticeTick || len(m.notices) == 0 {
+		return nil
+	}
+	m.noticeTick = true
+	return tea.Tick(ttl, func(time.Time) tea.Msg { return noticeSweepMsg{} })
+}
+
+// noticeSwept drops what has expired and schedules the next sweep for whatever is left.
+func (m *Model) noticeSwept() tea.Cmd {
+	m.noticeTick = false
+	m.dropExpired()
+	return m.noticeSweep()
+}
+
+// dropExpired removes the notices past their lifetime. Zero means they never expire.
+func (m *Model) dropExpired() {
+	ttl := m.noticeTTL()
+	if ttl == 0 {
+		return
+	}
+	cutoff := m.clock().Add(-ttl)
+	kept := m.notices[:0]
+	for _, n := range m.notices {
+		if n.at.After(cutoff) {
+			kept = append(kept, n)
+		}
+	}
+	m.notices = kept
+}
+
+// noticeTTL is ui.notices.ttl_ms as a duration.
+func (m *Model) noticeTTL() time.Duration {
+	return time.Duration(m.cfg.UI.Notices.TTLMS) * time.Millisecond
 }
 
 // setStatus replaces the plugin half of the status line. status.updated carries the whole
@@ -1088,7 +1163,21 @@ func (m *Model) key(k tea.KeyPressMsg) tea.Cmd {
 			// key reaches the editor below, which is what an unbound key does.
 		}
 	}
-	return m.ed.Update(k)
+	cmd := m.ed.Update(k)
+	// After the key, not before: what the draft is now is what the composer says it is.
+	m.paintComposer()
+	return cmd
+}
+
+// paintComposer puts the composer in the role its draft calls for: the shell role while it
+// is a shell command, the accent otherwise. The editor ignores a repaint into the role it
+// already wears (ADR 0023).
+func (m *Model) paintComposer() {
+	role := theme.RoleAccent
+	if strings.HasPrefix(m.ed.Text(), shellPrefix) {
+		role = theme.RoleShell
+	}
+	m.ed.SetRole(role)
 }
 
 // expandNewestTool toggles the newest tool row on screen and reports whether there was
@@ -1372,6 +1461,9 @@ func (m *Model) noticeLines() []string {
 	if limit <= 0 {
 		return nil
 	}
+	// Dropped at draw time as well as on the sweep: a frame drawn for another reason after
+	// a notice expired must not show it again while the sweep is still pending.
+	m.dropExpired()
 	var out []string
 	for _, n := range m.notices {
 		role, ok := noticeRoles[n.level]

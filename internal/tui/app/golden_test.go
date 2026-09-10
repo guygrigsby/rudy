@@ -257,6 +257,14 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 	}))
 }
 
+// TestGoldenAShellDraft pins what `!` looks like before it runs: the composer in the shell
+// role, and a command already run above it (ADR 0023).
+func TestGoldenAShellDraft(t *testing.T) {
+	golden(t, "shell", startupScreen(t, map[string]any{"ui.header.show": false}, func(o *Options) {
+		o.Prompt = "!git status"
+	}))
+}
+
 // TestGoldenTheCat pins the face in the status line. The face itself is fixed here: which
 // one a run wears is a dice roll, and what this golden is about is the cell.
 func TestGoldenTheCat(t *testing.T) {
