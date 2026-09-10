@@ -116,6 +116,18 @@ max_width = 120
 # A rule above the composer carrying the session's name, and one below carrying the context percentage.
 rules = true
 
+# The glyph the turn cell animates while the model is working.
+[ui.spinner]
+# arc, blocks, pulse, paw or dots (the braille one every other CLI uses).
+# e.g. "dots"
+name = "arc"
+# Your own frames, in order, each one cell wide. Empty uses the preset's.
+# e.g. ["\u25f4", "\u25f7", "\u25f6", "\u25f5"]
+frames = []
+# How long each frame is on screen. 0 uses the preset's own timing.
+# e.g. 150
+interval_ms = 0
+
 # Rows: what a tool call folds to, and what an assistant message looks like.
 [ui.transcript]
 # False opens every tool row.

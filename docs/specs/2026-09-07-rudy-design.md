@@ -224,7 +224,7 @@ glob show a one-line count. Thinking hidden. Every row and the status line sit
 one column in, the gutter the screen above draws. Icons come from `[ui.icons]`: the branch
 in the workspace cell, the model, the context, one per tool on a tool row and
 one per notice level. Status under the input, vim
-mode first and `turn` last: a spinner and one word for what the turn is doing
+mode first and `turn` last: a spinner from `[ui.spinner]` and one word for what the turn is doing
 (`thinking` until an answer streams, then `streaming`, `tool`, `steering`,
 `waiting`), drawing nothing at rest. Enter or a click expands a row. A permission
 question renders inline where the tool row would be. Assistant markdown renders
@@ -269,6 +269,11 @@ style = "text"
 
 [ui.status]
 items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "turn", "cat"]
+
+[ui.spinner]
+name = "arc"
+frames = []
+interval_ms = 0
 
 [ui.notices]
 max = 3

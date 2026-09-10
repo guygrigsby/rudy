@@ -57,6 +57,14 @@ type NoticesConfig struct {
 	TTLMS int `mapstructure:"ttl_ms"`
 }
 
+// SpinnerConfig is the [ui.spinner] table: the glyph the turn cell animates. Frames
+// replace the preset's own when they are given, and IntervalMS its timing when positive.
+type SpinnerConfig struct {
+	Name       string   `mapstructure:"name"`
+	Frames     []string `mapstructure:"frames"`
+	IntervalMS int      `mapstructure:"interval_ms"`
+}
+
 // InputConfig is the [ui.input] table. Rules are the two lines that bracket the composer,
 // the lower one carrying the context percentage (ADR 0017).
 type InputConfig struct {
@@ -98,6 +106,7 @@ type UIConfig struct {
 	Notices    NoticesConfig     `mapstructure:"notices"`
 	Header     HeaderConfig      `mapstructure:"header"`
 	Input      InputConfig       `mapstructure:"input"`
+	Spinner    SpinnerConfig     `mapstructure:"spinner"`
 	Theme      map[string]string `mapstructure:"theme"`
 	// Icons holds ui.icons.set plus per-name overrides, merged the same way Theme is.
 	Icons map[string]string `mapstructure:"icons"`
@@ -229,6 +238,9 @@ func Defaults() map[string]any {
 		"ui.header.updates":                3,
 		"ui.header.max_width":              120,
 		"ui.input.rules":                   true,
+		"ui.spinner.name":                  "arc",
+		"ui.spinner.frames":                []string{},
+		"ui.spinner.interval_ms":           0,
 		"ui.cats":                          true,
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
@@ -543,6 +555,9 @@ func (c *Config) validateUI() []error {
 	}
 	if c.UI.Transcript.BlockGap < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.transcript.block_gap %d must be zero or positive", c.UI.Transcript.BlockGap))
+	}
+	if c.UI.Spinner.IntervalMS < 0 {
+		errs = append(errs, fmt.Errorf("config: ui.spinner.interval_ms %d must be zero or positive", c.UI.Spinner.IntervalMS))
 	}
 	if c.UI.Notices.TTLMS < 0 {
 		errs = append(errs, fmt.Errorf("config: ui.notices.ttl_ms %d must be zero or positive", c.UI.Notices.TTLMS))

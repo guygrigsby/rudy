@@ -15,6 +15,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
+	tuispinner "github.com/guygrigsby/rudy/internal/tui/spinner"
 )
 
 // The frame every golden is taken at. Wide enough that the design's rows do not wrap on
@@ -91,7 +92,7 @@ func screen(t *testing.T, over map[string]any, drive func(tm *teatest.TestModel,
 	// The turn spinner is a clock too: the permutation that leaves a turn running spins
 	// one, and a tick that landed before the program quit would move the glyph. A fresh
 	// spinner stands at its first frame, which is the frame these goldens pin.
-	final.spin = newSpinner()
+	final.spin = newSpinner(tuispinner.Default())
 	return final.View().Content
 }
 

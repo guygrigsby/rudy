@@ -13,6 +13,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
+	tuispinner "github.com/guygrigsby/rudy/internal/tui/spinner"
 )
 
 func TestStatusLineIsTheDesignScreen(t *testing.T) {
@@ -163,7 +164,9 @@ func TestWorkspaceItem(t *testing.T) {
 // schedules no timer at all.
 func TestTurnItemSpinsWhileTheTurnRuns(t *testing.T) {
 	h := newHarness(t, map[string]any{"ui.status.items": []string{"turn"}})
-	glyph := spinner.MiniDot.Frames[0]
+	// The default preset's frames, whichever preset that is (ADR 0024).
+	frames := tuispinner.Default().Frames
+	glyph := frames[0]
 	if got := ansi.Strip(h.m.statusLine()); got != "" {
 		t.Fatalf("a client that has done nothing draws no turn cell: %q", got)
 	}
@@ -192,7 +195,7 @@ func TestTurnItemSpinsWhileTheTurnRuns(t *testing.T) {
 	// A tick advances the glyph and asks for the next one, so the cell animates while the
 	// turn runs.
 	h.update(spinner.TickMsg{ID: h.m.spin.ID()})
-	if got := ansi.Strip(h.m.statusLine()); got != " "+spinner.MiniDot.Frames[1]+" streaming" {
+	if got := ansi.Strip(h.m.statusLine()); got != " "+frames[1]+" streaming" {
 		t.Errorf("a tick advances the glyph: %q", got)
 	}
 	for _, c := range []struct{ state, word string }{
@@ -201,7 +204,7 @@ func TestTurnItemSpinsWhileTheTurnRuns(t *testing.T) {
 		{stateSteering, "steering"},
 	} {
 		h.notify(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: sid, TurnID: turn, State: c.state})
-		if got := ansi.Strip(h.m.statusLine()); got != " "+spinner.MiniDot.Frames[1]+" "+c.word {
+		if got := ansi.Strip(h.m.statusLine()); got != " "+frames[1]+" "+c.word {
 			t.Errorf("%s reads as %q: %q", c.state, c.word, got)
 		}
 	}

@@ -499,6 +499,9 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.header.tips` | int | 2 | tips drawn in the right column, rotated by the day; `0` draws none |
 | `ui.header.updates` | int | 3 | bullets from the newest `CHANGELOG.md` release the binary was built with; `0` draws none |
 | `ui.header.max_width` | int | 120 | the widest the box draws; a wider terminal leaves the rest of the line empty rather than stretching |
+| `ui.spinner.name` | `arc`, `blocks`, `pulse`, `paw`, `dots` | `arc` | the glyph the turn cell animates; `dots` is the braille spinner every other CLI uses |
+| `ui.spinner.frames` | [string] | `[]` | frames of your own, in order, each one cell wide; empty uses the preset's |
+| `ui.spinner.interval_ms` | int | 0 | how long each frame is on screen; `0` uses the preset's own timing |
 | `ui.notices.ttl_ms` | int | 8000 | how long a notice stays on screen before it goes; `0` keeps it until a newer one pushes it out |
 | `ui.notices.max` | int | 3 | notice lines the client draws under the transcript, newest first; `0` draws none |
 | `ui.cats` | bool | true | a random cat face from `internal/cats` in the status line's `cat` cell, one for the life of the client; false leaves the cell empty wherever `ui.status.items` placed it |

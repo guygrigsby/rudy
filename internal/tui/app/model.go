@@ -33,6 +33,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
+	tuispinner "github.com/guygrigsby/rudy/internal/tui/spinner"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
 )
@@ -78,6 +79,7 @@ type Options struct {
 	Config  *config.Config
 	Theme   theme.Theme
 	Icons   icons.Set
+	Spinner tuispinner.Set
 	Keys    *keys.Table
 	Client  *protocol.Client
 	Session protocol.SessionInfo // already opened or resumed by the caller
@@ -277,7 +279,7 @@ func New(o Options) *Model {
 		m.paintComposer()
 	}
 	m.vp = viewport.New(viewport.WithWidth(defaultWidth), viewport.WithHeight(defaultHeight))
-	m.spin = newSpinner()
+	m.spin = newSpinner(o.Spinner)
 	m.model = pickModel(m.models, m.session.Model)
 	if m.workspace == "" {
 		m.workspace = detectWorkspace(m.session.Workspace.GitRoot, m.cwd)
@@ -1266,8 +1268,11 @@ func (m *Model) scroll(a keys.Action) bool {
 
 // newSpinner is the turn item's glyph: one cell, unstyled, so the item paints the glyph
 // and its word in one role the way every other built-in item paints itself.
-func newSpinner() spinner.Model {
-	return spinner.New(spinner.WithSpinner(spinner.MiniDot))
+func newSpinner(set tuispinner.Set) spinner.Model {
+	if len(set.Frames) == 0 {
+		set = tuispinner.Default()
+	}
+	return spinner.New(spinner.WithSpinner(spinner.Spinner{Frames: set.Frames, FPS: set.Every}))
 }
 
 // spinTick arms or disarms the turn spinner against what the turn is now doing. It returns

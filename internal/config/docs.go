@@ -152,6 +152,15 @@ var Sections = []Section{
 		},
 	},
 	{
+		Table:   "ui.spinner",
+		Comment: []string{"The glyph the turn cell animates while the model is working."},
+		Keys: []Doc{
+			{Key: "ui.spinner.name", Comment: "arc, blocks, pulse, paw or dots (the braille one every other CLI uses).", Example: `"dots"`},
+			{Key: "ui.spinner.frames", Comment: "Your own frames, in order, each one cell wide. Empty uses the preset's.", Example: `["\u25f4", "\u25f7", "\u25f6", "\u25f5"]`},
+			{Key: "ui.spinner.interval_ms", Comment: "How long each frame is on screen. 0 uses the preset's own timing.", Example: "150"},
+		},
+	},
+	{
 		Table:   "ui.transcript",
 		Comment: []string{"Rows: what a tool call folds to, and what an assistant message looks like."},
 		Keys: []Doc{

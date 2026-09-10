@@ -30,6 +30,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
+	tuispinner "github.com/guygrigsby/rudy/internal/tui/spinner"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
 )
@@ -106,6 +107,16 @@ func testIcons(t *testing.T, cfg *config.Config) icons.Set {
 	return set
 }
 
+// testSpinner resolves ui.spinner the way the launcher does.
+func testSpinner(t *testing.T, cfg *config.Config) tuispinner.Set {
+	t.Helper()
+	set, err := tuispinner.Load(cfg.UI.Spinner.Name, cfg.UI.Spinner.Frames, cfg.UI.Spinner.IntervalMS)
+	if err != nil {
+		t.Fatalf("spinner: %v", err)
+	}
+	return set
+}
+
 // harness drives one Model over a real protocol.Client whose server side is the test: it
 // pushes notifications in, hands whatever the pump reads to Update, and records every
 // request the client made, so a test can see what the model asked the server to do
@@ -149,11 +160,12 @@ func newHarnessWith(t *testing.T, over map[string]any, opts func(*Options)) *har
 	t.Cleanup(func() { _ = cl.Close(); _ = sc.Close() })
 	cfg := testConfig(t, over)
 	o := Options{
-		Config: cfg,
-		Icons:  testIcons(t, cfg),
-		Theme:  theme.Default(),
-		Keys:   keys.Default(),
-		Client: cl,
+		Config:  cfg,
+		Icons:   testIcons(t, cfg),
+		Spinner: testSpinner(t, cfg),
+		Theme:   theme.Default(),
+		Keys:    keys.Default(),
+		Client:  cl,
 		Session: protocol.SessionInfo{
 			SessionID: session.NewID().String(),
 			Workspace: session.Workspace{Root: "/w", GitRoot: "/w", ProjectID: "local/w"},

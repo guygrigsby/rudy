@@ -18,6 +18,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/tui/app"
 	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
+	"github.com/guygrigsby/rudy/internal/tui/spinner"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
 )
 
@@ -25,9 +26,10 @@ import (
 // config before anything else happens: a bad ui.theme.name or [keys] entry is a
 // configuration error, and it costs a message rather than a half-opened session.
 type look struct {
-	theme theme.Theme
-	icons icons.Set
-	keys  *keys.Table
+	theme   theme.Theme
+	icons   icons.Set
+	spinner spinner.Set
+	keys    *keys.Table
 }
 
 // resolveFunc is how one command decides which session the client opens on, given a
@@ -193,7 +195,11 @@ func loadLook(paths config.Paths, cfg *config.Config) (look, error) {
 	if err != nil {
 		return look{}, err
 	}
-	return look{theme: th, icons: set, keys: table}, nil
+	spin, err := spinner.Load(cfg.UI.Spinner.Name, cfg.UI.Spinner.Frames, cfg.UI.Spinner.IntervalMS)
+	if err != nil {
+		return look{}, err
+	}
+	return look{theme: th, icons: set, spinner: spin, keys: table}, nil
 }
 
 // launchApp is the real launcher: the model registry as the client's snapshot of it, then
@@ -211,6 +217,7 @@ func launchApp(ctx context.Context, r clientRun) error {
 		Changelog: rudy.Changelog,
 		Theme:     r.look.theme,
 		Icons:     r.look.icons,
+		Spinner:   r.look.spinner,
 		Keys:      r.look.keys,
 		Client:    r.dial.Client,
 		Session:   r.info,
