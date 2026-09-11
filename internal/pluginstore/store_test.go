@@ -1265,3 +1265,42 @@ func TestInstallSweepsAStaleOldBackup(t *testing.T) {
 		t.Fatalf("fresh .old was swept: %v", err)
 	}
 }
+
+// TestInstallsTheShippedHelloExample installs examples/plugins/hello through the real store,
+// the way `rudy install ./examples/plugins/hello` does: the path kind, the example's own
+// manifest, and the build command that manifest names. Nothing else in the suite installs the
+// shipped example, which is how it shipped unbuildable: the stage holds that directory alone,
+// under the data root and outside every module, so its `go build -o hello .` fails with "go.mod
+// file not found" unless the example carries its own go.mod. The binary is the assertion, since
+// the manifest's command is "./hello" and a checkout without it cannot spawn at all.
+func TestInstallsTheShippedHelloExample(t *testing.T) {
+	requireGo(t)
+	s := newTestStore(t)
+	src := filepath.Join("..", "..", "examples", "plugins", "hello")
+	inst, m, err := s.Install(context.Background(), src, time.Now())
+	if err != nil {
+		t.Fatalf("Install %s: %v", src, err)
+	}
+	if m.Name != "hello" || inst.Name != "hello" {
+		t.Fatalf("manifest name %q, lock name %q, want hello for both", m.Name, inst.Name)
+	}
+	abs, err := filepath.Abs(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := s.Lock().Plugins["hello"]
+	if locked.Kind != KindPath {
+		t.Fatalf("Kind = %s, want %s", locked.Kind, KindPath)
+	}
+	if locked.Source != abs {
+		t.Fatalf("Source = %q, want the absolute example path %q", locked.Source, abs)
+	}
+	bin := filepath.Join(s.PluginDir("hello"), "hello")
+	fi, err := os.Stat(bin)
+	if err != nil {
+		t.Fatalf("the manifest's build command produced no binary: %v", err)
+	}
+	if fi.Mode()&0o111 == 0 {
+		t.Fatalf("%s mode = %v, want it executable", bin, fi.Mode())
+	}
+}

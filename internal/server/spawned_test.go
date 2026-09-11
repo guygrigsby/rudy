@@ -36,8 +36,12 @@ func TestMain(m *testing.M) {
 		}
 		defer func() { _ = os.RemoveAll(dir) }()
 		bin := filepath.Join(dir, "hello")
-		build := exec.Command("go", "build", "-o", bin, "./examples/plugins/hello")
-		build.Dir = filepath.Join("..", "..")
+		// Built from inside the example's own directory, not as ./examples/plugins/hello from
+		// the repository root: the example carries its own go.mod (so that installing it runs
+		// its manifest's build outside any other module), which puts it outside this module's
+		// ./... entirely.
+		build := exec.Command("go", "build", "-o", bin, ".")
+		build.Dir = filepath.Join("..", "..", "examples", "plugins", "hello")
 		if out, err := build.CombinedOutput(); err != nil {
 			fmt.Fprintf(os.Stderr, "build hello plugin: %v\n%s", err, out)
 			return 1

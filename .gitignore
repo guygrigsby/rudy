@@ -1,5 +1,7 @@
 /rudy
 /bin/
+# what the hello example's own build command leaves behind when it is built in place
+/examples/plugins/hello/hello
 /dist/
 *.test
 *.out
