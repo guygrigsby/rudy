@@ -1,6 +1,6 @@
 # rudy contracts
 
-Pass 5, 2026-09-10: the subagents wave (ADR 0028). Tool calls run concurrently, so the Gate coalesces asks, a Tool scheduler joins the domain services and `tool.state` joins the notifications; a session's tool set becomes one narrowing chain that a caller may only shrink, which closes a child's view escaping its parent's; `plugin.register_agent` lets a plugin contribute an agent definition; a child's notifications reach its parent's subscribers without conferring authority over the child. Written before the code, as the rules require. Pass 4, 2026-09-09: the socket transport, attach and the asker rules (ADR 0014). Pass 4 implemented 2026-09-09; its rows were walked against the code and one was corrected: `server.socket` was listed as a config key and is not one, since ADR 0014 makes the socket `Paths.Socket()` with `--socket` overriding it. Pass 3, 2026-09-08. Pass 3 implemented 2026-09-09; the rows below were walked against the code and corrected where they differed. Pass 2 aligned the protocol section with the kernel implementation; pass 3 adds the plugins wave (ADR 0012): child sessions for subagents, `session.compact` and the ninth hook point `before_compaction`, the clinepass dialect key, the memory summary model, skill migration sources, and the `mcp.toml` and `plugins.lock.toml` records. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
+Pass 6, 2026-09-11: the plugin install wave (ADR 0025). `plugins.lock.toml` gains `kind`, `ref` and `digest` so an install is reproducible per source kind; the source vocabulary is `go:`, `git:`, `https://` and a path; the manifest's `build` row, normative since pass 5 but never run, is implemented at install and update; `rudy install` is the top-level spelling. The trust model was already implemented and documented before this pass. Written before the code. Pass 5, 2026-09-10: the subagents wave (ADR 0028). Tool calls run concurrently, so the Gate coalesces asks, a Tool scheduler joins the domain services and `tool.state` joins the notifications; a session's tool set becomes one narrowing chain that a caller may only shrink, which closes a child's view escaping its parent's; `plugin.register_agent` lets a plugin contribute an agent definition; a child's notifications reach its parent's subscribers without conferring authority over the child. Written before the code, as the rules require. Pass 4, 2026-09-09: the socket transport, attach and the asker rules (ADR 0014). Pass 4 implemented 2026-09-09; its rows were walked against the code and one was corrected: `server.socket` was listed as a config key and is not one, since ADR 0014 makes the socket `Paths.Socket()` with `--socket` overriding it. Pass 3, 2026-09-08. Pass 3 implemented 2026-09-09; the rows below were walked against the code and corrected where they differed. Pass 2 aligned the protocol section with the kernel implementation; pass 3 adds the plugins wave (ADR 0012): child sessions for subagents, `session.compact` and the ninth hook point `before_compaction`, the clinepass dialect key, the memory summary model, skill migration sources, and the `mcp.toml` and `plugins.lock.toml` records. Companion to [rudy-domain-model.md](rudy-domain-model.md) and [rudy-context-map.md](rudy-context-map.md). Three contracts: the protocol, the domain events and the record layer. A transition that appears in one and not the others is listed in the cross-check with a reason.
 
 ## Error taxonomy
 
@@ -250,7 +250,7 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | `$XDG_CONFIG_HOME/rudy/mcp.toml` | `rudy mcp` | user-scope MCP servers; written only by `rudy mcp add` and `remove` |
 | `<workspace>/.rudy/mcp.toml` | `rudy mcp` | project-scope MCP servers, merged over the user scope by name |
 | `$XDG_DATA_HOME/rudy/plugins/<name>/` | `rudy plugin` | an installed spawned plugin, a git checkout holding `plugin.toml` |
-| `$XDG_DATA_HOME/rudy/plugins.lock.toml` | `rudy plugin` | what is installed, from where, at which commit, enabled or not |
+| `$XDG_DATA_HOME/rudy/plugins.lock.toml` | `rudy plugin` | what is installed, from which kind of source, pinned to which ref, resolved to which commit or digest, enabled or not |
 
 ### entries.jsonl
 
@@ -596,10 +596,15 @@ Values in `env` and `headers` are secret references resolved like `providers.<na
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `plugins.<name>.source` | string | required | the git URL or absolute path `rudy plugins install` was given |
-| `plugins.<name>.commit` | string | required | the checked-out commit; empty for a path source that is not a repository |
+| `plugins.<name>.source` | string | required | the source as typed to `rudy install`: `go:module/path@version`, `git:host/user/repo@ref`, an `https://` URL, or a local path. A bare git URL or scp form without the `git:` prefix reads as `git:` |
+| `plugins.<name>.kind` | string | required | `git`, `path`, `go` or `https`: what `source` resolved as. A lock written before this key reads as `git` when `commit` is set and `path` otherwise |
+| `plugins.<name>.ref` | string | `""` | what the operator asked for, as typed: the part after `@`. Empty means the default branch for `git` and `latest` for `go`; `path` and `https` carry none. `rudy plugins update` re-resolves this, never the tip of whatever the checkout happens to track |
+| `plugins.<name>.commit` | string | `""` | the checked-out commit for `git`; empty for every other kind |
+| `plugins.<name>.digest` | string | `""` | what a non-git source resolved to: `<version> <h1:sum>` from the module proxy for `go`, `sha256:<hex>` of the downloaded bytes for `https`; empty for `git` and `path`. With `commit`, this is what makes an install reproducible and an update a diff rather than a surprise (ADR 0025) |
 | `plugins.<name>.installed_at` | rfc3339 | required | |
 | `plugins.<name>.enabled` | bool | true | `rudy plugins disable` sets false; a disabled plugin is not spawned |
+
+The four kinds and what install does with each. `git`: clone at `ref`, or the default branch when empty, recording the commit. `path`: copy the directory, or clone it when it is itself a repository. `go`: `go mod download -json module@version` against the module proxy, copy the module directory it names, record the version and sum it reports; no git host is contacted. `https`: download a `.tar.gz` whose root holds `plugin.toml`, unpack it, record the sha256 of the bytes as downloaded. In every kind the manifest's `build` command, when present, runs once in the staged checkout after the source lands and before the manifest is accepted, and its output and any failure are shown; `rudy plugins update` runs it again after re-resolving. `rudy install <source>` is the top-level spelling of `rudy plugins install <source>` and does the same thing; it is the one verb this CLI adds to its top-level exceptions beyond `serve`, with the reason recorded in the shape test (ADR 0025).
 
 ### agents/<name>.md
 
@@ -646,7 +651,7 @@ Every transition traced through protocol, event and record, else a recorded reas
 | Turn.Fail | none | `TurnFailedEvent`, `TurnFailed` | `turn_failed` |
 | Compactor | `session.compact`, implicit on threshold | `CompactionRequested`, `CompactionRecorded` | `compaction` |
 | MCP server connect | none; boot | none; a failure is a `notice` | `mcp.toml` read, nothing written |
-| Plugin install, enable, disable, update | `rudy plugin` CLI, not protocol | none | `plugins.lock.toml`, the checkout |
+| Plugin install, enable, disable, update | `rudy install` and the `rudy plugins` CLI, not protocol | none | `plugins.lock.toml`, the checkout, and the manifest's `build` run inside it |
 | Plugin.Load, Ready, Fail, Stop | `plugin.init`; state via `plugin.state` | `PluginLoading`, `PluginReady`, `PluginFailed`, `PluginStopped` | none; plugin state is runtime, rebuilt at boot from config |
 | PluginRegistry.Register* | `plugin.register_*`, `plugin.set_status` | `CapabilityRegistered`, `CapabilityRejected` | none; capabilities are runtime |
 | Registry.Refresh | `registry.refresh`, implicit on open | `RegistryRefreshed` | `registry.json` |
