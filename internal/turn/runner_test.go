@@ -1223,7 +1223,11 @@ func TestMalformedToolInputIsAnErrorResult(t *testing.T) {
 
 // recordingHooks is a HookFirer that records every call and answers each point from a fixed
 // table, standing in for a plugin registry's handlers.
+// Guarded: Fire runs on every goroutine a turn's tool calls run on, so a test scripting two
+// calls in one message would race these slices (ADR 0028). results is written before the turn
+// starts and only read here.
 type recordingHooks struct {
+	mu      sync.Mutex
 	calls   []plugin.HookCall
 	fired   []fireCtx // what the context looked like at each fire, in the same order
 	results map[plugin.HookPoint][]any
@@ -1239,13 +1243,17 @@ type fireCtx struct {
 
 func (h *recordingHooks) Fire(ctx context.Context, c plugin.HookCall) []any {
 	_, hasDeadline := ctx.Deadline()
+	h.mu.Lock()
 	h.calls = append(h.calls, c)
 	h.fired = append(h.fired, fireCtx{err: ctx.Err(), deadline: hasDeadline})
+	h.mu.Unlock()
 	return h.results[c.Point]
 }
 
 // firedAt is the context state of the first fire of point, and whether it fired at all.
 func (h *recordingHooks) firedAt(point plugin.HookPoint) (fireCtx, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for i, c := range h.calls {
 		if c.Point == point {
 			return h.fired[i], true
@@ -1255,11 +1263,26 @@ func (h *recordingHooks) firedAt(point plugin.HookPoint) (fireCtx, bool) {
 }
 
 func (h *recordingHooks) points() []plugin.HookPoint {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	out := make([]plugin.HookPoint, 0, len(h.calls))
 	for _, c := range h.calls {
 		out = append(out, c.Point)
 	}
 	return out
+}
+
+// call is the nth fire, and last is the final one.
+func (h *recordingHooks) call(i int) plugin.HookCall {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls[i]
+}
+
+func (h *recordingHooks) last() plugin.HookCall {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.calls[len(h.calls)-1]
 }
 
 // fixtureTools is the tool set the hook tests use: echo returns its input and sleep waits
@@ -1348,7 +1371,7 @@ func TestRunnerFiresHooksInOrder(t *testing.T) {
 	if got := hooks.points(); !reflect.DeepEqual(got, want) {
 		t.Errorf("points %v\nwant   %v", got, want)
 	}
-	last := hooks.calls[len(hooks.calls)-1]
+	last := hooks.last()
 	tc, ok := last.Payload.(*plugin.TurnCompletedPayload)
 	if !ok || tc.Usage.Input != 13 || tc.Usage.Output != 3 || tc.TurnID != r.TurnID() {
 		t.Errorf("turn_completed payload %+v", last.Payload)
@@ -1422,7 +1445,7 @@ func TestRunnerHookDenyAndModify(t *testing.T) {
 	if got := hooks.points(); !reflect.DeepEqual(got, want) {
 		t.Errorf("points %v\nwant   %v", got, want)
 	}
-	if got := string(hooks.calls[3].Payload.(*plugin.BeforeToolPayload).Input); got != `{"x":1}` {
+	if got := string(hooks.call(3).Payload.(*plugin.BeforeToolPayload).Input); got != `{"x":1}` {
 		t.Errorf("before_tool saw input %s", got)
 	}
 }

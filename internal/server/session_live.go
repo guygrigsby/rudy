@@ -48,7 +48,8 @@ var errNoAsker = fmt.Errorf("server: %w", turn.ErrNoAsker)
 //     here): those callbacks run while the turn.Runner holds its own mutex, so taking mu, or
 //     calling any Runner method, from inside one would risk the same deadlock mu's own rule
 //     guards against. They also run on every goroutine a turn's tool calls run on, not only
-//     the turn's own (ADR 0028), which obsMu is equally what makes safe. Every read of the runner's current state or turn id anywhere in this package,
+//     the turn's own (ADR 0028), which obsMu is equally what makes safe. Every read of the
+//     runner's current state or turn id anywhere in this package,
 //     even from a handler that also holds mu, goes through this mirror instead of the runner,
 //     except where no liveSession lock is held at all (session.interrupt, and the two lines in
 //     startTurn and runTurn noted there) - calling the runner directly is fine, and fresher,

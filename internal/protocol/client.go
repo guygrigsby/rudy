@@ -90,6 +90,10 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	}
 	c.pending[id] = ch
 	c.mu.Unlock()
+	// Registered first, so LIFO runs it last: after the c.done branch below has released mu
+	// with its own defer. The order is load-bearing, not incidental. Moving this below that
+	// branch's `defer c.mu.Unlock()`, or turning either into an inline call, deadlocks on a
+	// mutex that is not reentrant.
 	defer func() {
 		c.mu.Lock()
 		delete(c.pending, id)
@@ -118,6 +122,8 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		if resp, ok := delivered(ch); ok {
 			return unpack(resp, result)
 		}
+		// Unlocked by this defer before the pending-map cleanup registered above runs, which
+		// is the whole reason that one is a defer and not a line at the end of this branch.
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.err != nil {
