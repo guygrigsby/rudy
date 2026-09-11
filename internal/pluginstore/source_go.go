@@ -41,8 +41,11 @@ func (s *Store) stageGo(ctx context.Context, src Source, dir string) (string, er
 	return dl.Version + " " + dl.Sum, nil
 }
 
-// stageGoUpdate is stageGo for rudy plugins update. An empty src.Ref re-resolves "latest" and
-// accepts whatever that is now, same as a fresh install. A pinned ref (src.Ref set) carries a
+// stageGoUpdate is stageGo for rudy plugins update. An empty src.Ref or the literal "latest"
+// (an operator can type either; ParseSource leaves "latest" as typed rather than collapsing it
+// with empty, since the lock records what was asked for) both re-resolve on every update and
+// accept whatever that is now, same as a fresh install: "latest" naming something new is the
+// entire point of asking for it, not a tamper signal. A concrete pinned version carries a
 // stronger expectation: the module proxy and the checksum database both exist to guarantee a
 // given module@version never changes content once published, so a pinned version that now
 // resolves to a different digest than the lock already recorded means that guarantee broke
@@ -55,11 +58,16 @@ func (s *Store) stageGoUpdate(ctx context.Context, src Source, dir, priorDigest 
 	if err != nil {
 		return "", err
 	}
-	if src.Ref != "" && priorDigest != "" && resolved != priorDigest {
+	if pinned(src.Ref) && priorDigest != "" && resolved != priorDigest {
 		return "", fmt.Errorf("pluginstore: %s@%s: proxy now reports %s, previously %s: refusing to replace a pinned module whose content changed", src.Location, src.Ref, resolved, priorDigest)
 	}
 	return resolved, nil
 }
+
+// pinned reports whether ref names one concrete version the tamper check in stageGoUpdate
+// should hold immutable, as opposed to a moving target that is expected to resolve to
+// something new over time: an empty ref and the literal "latest" are both the latter.
+func pinned(ref string) bool { return ref != "" && ref != "latest" }
 
 // goModDownload runs `go mod download -json module@ref` hermetically: GOFLAGS pinned to
 // -mod=mod (there is no consuming go.mod here for the download to treat as read-only) and

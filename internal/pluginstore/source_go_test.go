@@ -60,6 +60,18 @@ func goModuleFixture(t *testing.T) (module, version, proxyURL string) {
 	t.Helper()
 	module = "example.com/rudytest/hello"
 	version = "v0.1.0"
+	proxyDir := t.TempDir()
+	writeProxyVersion(t, proxyDir, module, version)
+	return module, version, "file://" + proxyDir
+}
+
+// writeProxyVersion adds one version of module to a file-based GOPROXY tree already rooted at
+// proxyDir: its @v/list entry (appended, never replacing what is already there, since go
+// resolves "@latest" by picking the highest semver the list names), .info, .mod and .zip. A
+// second call against the same proxyDir is how a test simulates a new release landing after an
+// install already happened.
+func writeProxyVersion(t *testing.T, proxyDir, module, version string) {
+	t.Helper()
 	goMod := "module " + module + "\n\ngo 1.21\n"
 	files := map[string]string{
 		"go.mod": goMod,
@@ -69,12 +81,13 @@ func goModuleFixture(t *testing.T) (module, version, proxyURL string) {
 		"main.go":     "package main\n\nfunc main() {}\n",
 	}
 
-	proxyDir := t.TempDir()
 	verDir := filepath.Join(proxyDir, filepath.FromSlash(module), "@v")
 	if err := os.MkdirAll(verDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(verDir, "list"), []byte(version+"\n"), 0o644); err != nil {
+	listPath := filepath.Join(verDir, "list")
+	existing, _ := os.ReadFile(listPath) // absent on the first version; fine either way
+	if err := os.WriteFile(listPath, append(existing, []byte(version+"\n")...), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	info := fmt.Sprintf(`{"Version":%q,"Time":"2024-01-01T00:00:00Z"}`, version)
@@ -87,7 +100,6 @@ func goModuleFixture(t *testing.T) (module, version, proxyURL string) {
 	if err := writeModuleZip(filepath.Join(verDir, version+".zip"), module, version, files); err != nil {
 		t.Fatal(err)
 	}
-	return module, version, "file://" + proxyDir
 }
 
 // writeModuleZip builds a module proxy .zip: every file rooted under one top-level
@@ -119,25 +131,29 @@ func writeModuleZip(path, module, version string, files map[string]string) error
 
 // TestInstallsAGoModuleFromTheProxy covers ADR 0025 decision 1's go: kind end to end: the
 // module proxy resolves the source (go mod download is the only thing stageGo runs, no git
-// invocation anywhere in source_go.go), and the lock records what it reported.
+// invocation anywhere in source_go.go), and the lock records what it reported. Assertions read
+// the lock back off disk (s.Lock(), the file's own convention: see store_test.go's
+// TestInstallClonesGitSourceAndRecordsLock) rather than the Installed value Install happens to
+// return in memory, so a TOML round-trip bug would actually be caught.
 func TestInstallsAGoModuleFromTheProxy(t *testing.T) {
 	requireGo(t)
 	module, version, proxyURL := goModuleFixture(t)
 	s := newGoTestStore(t)
 	s.GoEnv = []string{"GOPROXY=" + proxyURL, "GONOSUMDB=*"}
 
-	inst, m, err := s.Install(context.Background(), "go:"+module+"@"+version, time.Now())
+	_, m, err := s.Install(context.Background(), "go:"+module+"@"+version, time.Now())
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if inst.Kind != KindGo {
-		t.Fatalf("Kind = %s, want %s", inst.Kind, KindGo)
+	locked := s.Lock().Plugins["hello"]
+	if locked.Kind != KindGo {
+		t.Fatalf("Kind = %s, want %s", locked.Kind, KindGo)
 	}
-	if inst.Ref != version {
-		t.Fatalf("Ref = %q, want %q", inst.Ref, version)
+	if locked.Ref != version {
+		t.Fatalf("Ref = %q, want %q", locked.Ref, version)
 	}
-	if !strings.HasPrefix(inst.Digest, version) || !strings.Contains(inst.Digest, " h1:") {
-		t.Fatalf("Digest = %q, want it to start with %q and contain \" h1:\"", inst.Digest, version)
+	if !strings.HasPrefix(locked.Digest, version) || !strings.Contains(locked.Digest, " h1:") {
+		t.Fatalf("Digest = %q, want it to start with %q and contain \" h1:\"", locked.Digest, version)
 	}
 	if m.Name != "hello" {
 		t.Fatalf("Name = %s, want hello", m.Name)
@@ -157,45 +173,26 @@ func TestInstallsAGoModuleAtLatestWhenNoVersionGiven(t *testing.T) {
 	s := newGoTestStore(t)
 	s.GoEnv = []string{"GOPROXY=" + proxyURL, "GONOSUMDB=*"}
 
-	inst, _, err := s.Install(context.Background(), "go:"+module, time.Now())
-	if err != nil {
+	if _, _, err := s.Install(context.Background(), "go:"+module, time.Now()); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
-	if inst.Ref != "" {
-		t.Fatalf("Ref = %q, want empty (nothing was typed)", inst.Ref)
+	locked := s.Lock().Plugins["hello"]
+	if locked.Ref != "" {
+		t.Fatalf("Ref = %q, want empty (nothing was typed)", locked.Ref)
 	}
-	if !strings.HasPrefix(inst.Digest, version) {
-		t.Fatalf("Digest = %q, want it to start with the resolved latest version %q", inst.Digest, version)
-	}
-}
-
-// TestStageGoUpdateAcceptsAnUnchangedPin exercises stageGoUpdate directly, the way
-// Store.Update calls it for a plugin pinned to a version: re-running the download for the same
-// pinned ref must reproduce the same digest and must not error.
-func TestStageGoUpdateAcceptsAnUnchangedPin(t *testing.T) {
-	requireGo(t)
-	module, version, proxyURL := goModuleFixture(t)
-	s := newGoTestStore(t)
-	s.GoEnv = []string{"GOPROXY=" + proxyURL, "GONOSUMDB=*"}
-	src := Source{Kind: KindGo, Location: module, Ref: version}
-
-	first, err := s.stageGo(context.Background(), src, t.TempDir())
-	if err != nil {
-		t.Fatalf("stageGo: %v", err)
-	}
-
-	second, err := s.stageGoUpdate(context.Background(), src, t.TempDir(), first)
-	if err != nil {
-		t.Fatalf("stageGoUpdate on an unchanged pin: %v", err)
-	}
-	if second != first {
-		t.Fatalf("digest changed on an unchanged pin: %q -> %q", first, second)
+	if !strings.HasPrefix(locked.Digest, version) {
+		t.Fatalf("Digest = %q, want it to start with the resolved latest version %q", locked.Digest, version)
 	}
 }
 
-// TestStageGoUpdateRefusesAChangedPin covers the other half: a pinned ref whose freshly
-// resolved digest no longer matches the lock's recorded one must error rather than swap the
-// checkout in, since a go module@version is supposed to be immutable once published.
+// TestStageGoUpdateRefusesAChangedPin covers the tamper guard itself, called directly rather
+// than through Store.Update: a real "the proxy served different content for the same pinned
+// version" scenario cannot be constructed cheaply through the full Install/Update path, since
+// go's own module cache never re-verifies a version it has already downloaded (confirmed
+// empirically: re-querying a cached module@version returns the cached digest regardless of
+// what the proxy now serves). There is also no lock entry to assert here, since the whole point
+// is that Update must refuse before anything is staged, built or swapped in, let alone written
+// to the lock.
 func TestStageGoUpdateRefusesAChangedPin(t *testing.T) {
 	requireGo(t)
 	module, version, proxyURL := goModuleFixture(t)
@@ -209,30 +206,71 @@ func TestStageGoUpdateRefusesAChangedPin(t *testing.T) {
 	}
 }
 
-// TestUpdateRunsAGoModuleThroughTheFullDispatch covers Store.Update's own wiring end to end,
-// not just stageGoUpdate in isolation: install a plugin pinned to a version, update it, and
-// confirm the lock still carries the same ref and digest, and the checkout still holds
-// plugin.toml, the way a Update with nothing new to fetch should leave things.
+// TestUpdateAtLatestAdvancesAcrossANewRelease covers fix round 1's Important 1: an explicit or
+// implicit "latest" is a moving target, not a pin, so a new release landing between an install
+// and an update must advance the digest rather than be refused as tampering. ParseSource leaves
+// "latest" in Ref exactly as typed (never collapsed with empty), so the lock's ref column
+// stays "latest"; only stageGoUpdate's tamper check needs to treat the two alike.
+func TestUpdateAtLatestAdvancesAcrossANewRelease(t *testing.T) {
+	requireGo(t)
+	module, first, proxyURL := goModuleFixture(t)
+	proxyDir := strings.TrimPrefix(proxyURL, "file://")
+	s := newGoTestStore(t)
+	s.GoEnv = []string{"GOPROXY=" + proxyURL, "GONOSUMDB=*"}
+
+	if _, _, err := s.Install(context.Background(), "go:"+module+"@latest", time.Now()); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	before := s.Lock().Plugins["hello"]
+	if before.Ref != "latest" {
+		t.Fatalf("Ref = %q, want the literal \"latest\" as typed", before.Ref)
+	}
+	if !strings.HasPrefix(before.Digest, first) {
+		t.Fatalf("Digest = %q, want it to start with %q", before.Digest, first)
+	}
+
+	second := "v0.2.0"
+	writeProxyVersion(t, proxyDir, module, second)
+
+	if _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
+		t.Fatalf("Update at latest across a new release: %v", err)
+	}
+	after := s.Lock().Plugins["hello"]
+	if after.Ref != "latest" {
+		t.Fatalf("Ref after Update = %q, want it to stay the literal \"latest\"", after.Ref)
+	}
+	if !strings.HasPrefix(after.Digest, second) {
+		t.Fatalf("Digest after Update = %q, want it to advance to %q", after.Digest, second)
+	}
+	if after.Digest == before.Digest {
+		t.Fatal("digest did not advance across the new release")
+	}
+}
+
+// TestUpdateRunsAGoModuleThroughTheFullDispatch covers Store.Update's own wiring end to end:
+// install a plugin pinned to a version, update it, and confirm the lock still carries the same
+// ref and digest, and the checkout still holds plugin.toml, the way an update with nothing new
+// to fetch should leave things.
 func TestUpdateRunsAGoModuleThroughTheFullDispatch(t *testing.T) {
 	requireGo(t)
 	module, version, proxyURL := goModuleFixture(t)
 	s := newGoTestStore(t)
 	s.GoEnv = []string{"GOPROXY=" + proxyURL, "GONOSUMDB=*"}
 
-	inst, _, err := s.Install(context.Background(), "go:"+module+"@"+version, time.Now())
-	if err != nil {
+	if _, _, err := s.Install(context.Background(), "go:"+module+"@"+version, time.Now()); err != nil {
 		t.Fatalf("Install: %v", err)
 	}
+	before := s.Lock().Plugins["hello"]
 
-	updated, err := s.Update(context.Background(), "hello", time.Now())
-	if err != nil {
+	if _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if updated.Ref != version {
-		t.Fatalf("Ref after Update = %q, want %q", updated.Ref, version)
+	after := s.Lock().Plugins["hello"]
+	if after.Ref != version {
+		t.Fatalf("Ref after Update = %q, want %q", after.Ref, version)
 	}
-	if updated.Digest != inst.Digest {
-		t.Fatalf("Digest after Update = %q, want it unchanged at %q", updated.Digest, inst.Digest)
+	if after.Digest != before.Digest {
+		t.Fatalf("Digest after Update = %q, want it unchanged at %q", after.Digest, before.Digest)
 	}
 	if _, err := os.Stat(filepath.Join(s.PluginDir("hello"), "plugin.toml")); err != nil {
 		t.Fatalf("plugin.toml missing from the updated checkout: %v", err)
