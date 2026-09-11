@@ -1241,7 +1241,8 @@ git commit -m "tui: a subagent's work renders under the call that opened it"
 - Produces:
   - `Host.RegisterAgent(d agentdef.Definition) error`
   - `Registry.AgentDefs() map[string]agentdef.Definition`
-  - Task 9 mirrors this over stdio; Task 10 reads `AgentDefs` for the roster.
+  - `Host.AgentDefs() map[string]agentdef.Definition`, the read accessor, beside the existing `Tools()`, `Commands()` and `Statuses()` (`plugin.go:136-138`)
+  - Task 9 mirrors the write side over stdio and its test reads `AgentDefs`; Task 10 reads it for the roster. Both need the accessor, so it lands here with the state it reads rather than in Task 10.
 
 **Template:** `RegisterProvider` is the established shape for a resource that is registered rather than called. Copy it exactly: a map and order slice on `Registry` and on `host`, a `stageRegister` call, a commit branch, a `withdraw` in `Fail`, and a getter. One difference: `agentdef.Definition` is a plain struct with no `Name()` method, so `stageRegister` takes `d.Name` directly the way `RegisterTool` takes `t.Name`.
 
@@ -1684,7 +1685,7 @@ func (p *agentPlugin) roster(_ context.Context, call plugin.HookCall) (any, erro
 
 This is the shape `skills/plugin.go:34-48` uses: `Host.RegisterHook` takes one `plugin.HookHandler{Point, Handle}` (`plugin.go:118`), `call.Payload` type-asserts to `*plugin.SessionOpenedPayload` (`hooks.go:64`), and the return is `*plugin.SessionOpenedResult` (`hooks.go:78`) whose `Context` is appended to the session's system prompt. Returning `nil, nil` means the hook has nothing to add, which is what the skills plugin does for an empty list.
 
-Add `AgentDefs() map[string]agentdef.Definition` to the `Host` interface as a read-side accessor beside the existing `Tools()`, `Commands()` and `Statuses()` (`plugin.go:136-138`), backed by `Registry.AgentDefs` from Task 8.
+`Host.AgentDefs()` already exists: Task 8 adds it beside `Registry.AgentDefs()`, because Task 9's test reads it too. This task only consumes it.
 
 - [ ] **Step 4: Run to verify it passes**
 
