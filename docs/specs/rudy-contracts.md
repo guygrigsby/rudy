@@ -275,7 +275,7 @@ Kinds:
 
 | field | type | null | meaning |
 |---|---|---|---|
-| `schema_version` | int | no | 1 |
+| `schema_version` | int | no | 2. Version 1 lacks `tools` |
 | `rudy_version` | string | no | the binary that opened it |
 | `workspace` | Workspace | no | `git_root` empty means not a repo |
 | `model` | ModelRef | no | initial selection |
@@ -284,6 +284,7 @@ Kinds:
 | `agent` | string | no | agent definition name; `default` when none |
 | `parent_session_id` | ulid string | no | the session whose tool call opened this one; empty means a root session |
 | `parent_tool_use_id` | string | no | the `tool_use` id in the parent that opened this one; empty exactly when `parent_session_id` is empty |
+| `tools` | [string] | yes | the tool set resolved at open, before the `agent` deny. `null` means every tool the registry offers, an empty list means none. The one nullable field in the log, because the distinction it carries is the difference between an unrestricted session and a restricted one |
 
 ```json
 {"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":2,"rudy_version":"0.1.0","workspace":{"root":"/Users/guy/projects/rudy","git_root":"/Users/guy/projects/rudy","project_id":"local/rudy"},"model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"thinking":"high","mode":"strict","agent":"default","parent_session_id":"","parent_tool_use_id":"","tools":null}
@@ -295,7 +296,9 @@ A pass 1 log lacks the two parent fields; `Load` reads their absence as empty.
 
 This field is why `schema_version` is 2. A version 1 log has no `tools` key, and an absent key is indistinguishable from an explicit `null` once decoded into a slice, so reading one as `null` would hand every pre-existing session the whole registry on its next resume: for a child that is the escalation this field exists to close. `Load` takes the definition's list for a version 1 log and the recorded value from version 2 on.
 
-That leaves one residual, stated rather than left to be discovered: a version 1 child log whose own definition named no tools resumes holding every tool, because there is nothing recorded to bound it and its parent is long gone. It is not a new escalation, since that session held exactly that set while it was live and nothing bounded it then either, but it is looser than anything opened from now on. Refusing to resume such a log was considered and rejected: it would break sessions that predate the field, to retroactively enforce a rule they never ran under.
+That leaves one residual, stated rather than left to be discovered: a version 1 child log resumes under its own definition's list, which for any definition wider than its parent's set is wider than the bound a session opened today would get. There is nothing recorded to bound it and its parent is long gone. It is not a new escalation, since a session written before the field ran unbounded while it was live too, but it is looser than anything opened from now on. Refusing to resume such a log was considered and rejected: it would break sessions that predate the field, to retroactively enforce a rule they never ran under.
+
+A version 1 log that does carry `tools` is a different case and is not covered by that argument. It can only come from a build made while this field was landing, and it holds a bound that was genuinely applied when the session was live, so discarding it would resume that session wider than it ran. `Load` falls back to the definition only when the recorded value is absent, never when it is present.
 
 **`fork_point`**
 
@@ -663,7 +666,7 @@ Invariants and where they are enforced:
 - [x] every request has every field
 - [x] every notification has payload and delivery
 - [x] every event has all eight fields
-- [x] every record kind has every field with nullability stated; no field is nullable
+- [x] every record kind has every field with nullability stated; `session_opened.tools` is the only nullable one, because `null` there means every tool and an empty list means none, and collapsing the two would make an unrestricted session indistinguishable from a fully restricted one
 - [x] every caller class reaches at least one method
 - [x] no method admits a class not enumerated
 - [x] every transition traces through all three or carries a reason
