@@ -78,18 +78,31 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    are contending because the model asked for that, and serializing them would
    hide it rather than fix it.
 
-4. **Concurrent calls matching one outstanding question ask once.** Allowances
-   are read when a call begins and the allow is appended when the asker answers,
-   so without this two concurrent calls to one unsafe tool both prompt and
-   "allow for the session" stops meaning what it says. A call that finds a
-   question already outstanding for the same matcher and scope waits on it
-   rather than raising a second one, and takes its answer.
+4. **Concurrent calls ask once for the same question, and a session allow
+   settles the questions already parked.** Two mechanisms, because there are two
+   different reasons a second prompt is redundant and neither covers the other.
 
-   It is enforced at the asker rather than in the verdict. `Gate.Evaluate` is a
-   pure function of the input it is handed and holds no session, so it has
+   Identical calls share one question. The key is the matcher together with the
+   call's input bytes, not the matcher alone. A matcher is coarse on purpose:
+   every tool but `bash` reduces to its own name, and `bash` to its first two
+   words. Keying on it alone would show the operator one call's input and bind a
+   different call to the answer, so `once` would mean "every call parked under
+   this tool name", including one whose arguments the operator never saw.
+   Identical inputs cannot have that problem, and a coarse key is not worth the
+   consent it forges.
+
+   A session-scope allow resolves every parked question it covers. This is the
+   case the wave itself creates: two calls read the allowances before either has
+   recorded one, both park, and the operator answering "allow for the session"
+   on the first leaves the second still asking for something that is now
+   allowed. The new allowance settles it by the same matcher rule the Gate
+   applies everywhere else, which is what the operator was told they were
+   granting.
+
+   Both are enforced at the asker rather than in the verdict. `Gate.Evaluate` is
+   a pure function of the input it is handed and holds no session, so it has
    nothing to coalesce against; the asker already keys every pending question by
-   `tool_use` id and already holds the session lock, so the joining is the only
-   part that is new.
+   `tool_use` id and already holds the session lock.
 
    This is a permission bug that concurrency exposes, not a concurrency bug, and
    it is fixed on the permission path rather than by serializing the caller.
