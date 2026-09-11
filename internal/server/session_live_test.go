@@ -21,6 +21,25 @@ import (
 	"github.com/guygrigsby/rudy/internal/turn"
 )
 
+// TestToolStateVocabularyMatchesTheProtocol is the drift guard on the two copies of the tool
+// state vocabulary. fanout.ToolStateChanged sends turn.ToolState straight onto the wire as a
+// string, so a value renamed on one side and not the other would be a notification no client
+// understands, with nothing else to catch it.
+func TestToolStateVocabularyMatchesTheProtocol(t *testing.T) {
+	for _, c := range []struct {
+		domain turn.ToolState
+		wire   string
+	}{
+		{turn.ToolRunning, protocol.ToolStateRunning},
+		{turn.ToolAwaitingPermission, protocol.ToolStateAwaitingPermission},
+		{turn.ToolDone, protocol.ToolStateDone},
+	} {
+		if string(c.domain) != c.wire {
+			t.Errorf("turn.ToolState %q is sent as %q", c.domain, c.wire)
+		}
+	}
+}
+
 // TestMarkStartingBeforeAnyObserverCallback is the unit-level regression test for the fix
 // round 2 residual: installing a runner must make isActive(ls.mirroredState()) true the
 // instant mu is released, with no reliance on the runner's own first StateChanged callback

@@ -43,11 +43,12 @@ var errNoAsker = fmt.Errorf("server: %w", turn.ErrNoAsker)
 //     because subscribeLocked reads them under the Server.mu it already holds, and waiting
 //     there on mu, which a compaction owns for the length of a provider request, would stall
 //     every session lookup in the process (see claimCloseIfIdle). obsMu is the ONLY lock a
-//     turn.Observer callback (fanout's EntryAppended/Delta/StateChanged) may take, together
-//     with each connection's own outbox lock (conn.mu, unrelated to either lock here): those
-//     callbacks run while the turn.Runner holds its own mutex, so taking mu, or calling any
-//     Runner method, from inside one would risk the same deadlock mu's own rule guards
-//     against. Every read of the runner's current state or turn id anywhere in this package,
+//     turn.Observer callback (fanout's EntryAppended/Delta/StateChanged/ToolStateChanged) may
+//     take, together with each connection's own outbox lock (conn.mu, unrelated to either lock
+//     here): those callbacks run while the turn.Runner holds its own mutex, so taking mu, or
+//     calling any Runner method, from inside one would risk the same deadlock mu's own rule
+//     guards against. They also run on every goroutine a turn's tool calls run on, not only
+//     the turn's own (ADR 0028), which obsMu is equally what makes safe. Every read of the runner's current state or turn id anywhere in this package,
 //     even from a handler that also holds mu, goes through this mirror instead of the runner,
 //     except where no liveSession lock is held at all (session.interrupt, and the two lines in
 //     startTurn and runTurn noted there) - calling the runner directly is fine, and fresher,
@@ -77,8 +78,10 @@ type liveSession struct {
 
 	// overrides is what after_tool handlers replaced, by tool_use id, for as long as this
 	// session is live. The map reference is set once in newLive and never replaced, so it
-	// needs no lock; its contents belong to whichever turn.Runner is currently running and
-	// are only touched on that runner's own goroutine (see turn.Config.Overrides).
+	// needs no lock; its contents belong to whichever turn.Runner is currently running, which
+	// serializes the concurrent tool calls that write them (see turn.Config.Overrides).
+	// session.compact reads the map through the same Compactor and has already refused an
+	// active turn, so it never reads while a call is writing.
 	overrides map[string][]session.Block
 
 	// The agent definition's effect on every turn this session runs, and the parent that
@@ -534,6 +537,17 @@ func (f *fanout) StateChanged(turnID string, s turn.State) {
 		clear(f.ls.answered)
 	}
 	f.ls.broadcastObsLocked(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: f.sid, TurnID: turnID, State: string(s)})
+	f.ls.obsMu.Unlock()
+}
+
+// ToolStateChanged forwards one call's progress. turn.state cannot carry it: the calls of an
+// assistant message run at once (ADR 0028), so the turn's own state cannot say which of them
+// is running and which is the one waiting on the operator.
+func (f *fanout) ToolStateChanged(turnID, toolUseID, name string, state turn.ToolState) {
+	f.ls.obsMu.Lock()
+	f.ls.broadcastObsLocked(protocol.NotifyToolState, protocol.ToolStateChanged{
+		SessionID: f.sid, TurnID: turnID, ToolUseID: toolUseID, Name: name, State: string(state),
+	})
 	f.ls.obsMu.Unlock()
 }
 

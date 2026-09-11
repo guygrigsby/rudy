@@ -86,11 +86,20 @@ func toolCall(id, name, input string) []provider.Part {
 	}
 }
 
+// toolStateRecord is one ToolStateChanged callback, kept whole so a test can ask what a named
+// call was reported as rather than what the Nth callback happened to be.
+type toolStateRecord struct {
+	toolUseID string
+	name      string
+	state     ToolState
+}
+
 type recorder struct {
-	mu      sync.Mutex
-	entries []session.Entry
-	states  []State
-	deltas  []provider.Part
+	mu         sync.Mutex
+	entries    []session.Entry
+	states     []State
+	deltas     []provider.Part
+	toolStates []toolStateRecord
 }
 
 func (r *recorder) EntryAppended(e session.Entry) {
@@ -111,6 +120,12 @@ func (r *recorder) StateChanged(_ string, s State) {
 	r.states = append(r.states, s)
 }
 
+func (r *recorder) ToolStateChanged(_, toolUseID, name string, s ToolState) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.toolStates = append(r.toolStates, toolStateRecord{toolUseID: toolUseID, name: name, state: s})
+}
+
 func (r *recorder) kinds() []session.Kind {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -119,6 +134,45 @@ func (r *recorder) kinds() []session.Kind {
 		out = append(out, e.Kind)
 	}
 	return out
+}
+
+// count, payloads and sawToolState are what a test asserts with once a turn runs more than one
+// tool call: the calls overlap, so rec.entries[2] is no longer a fixed entry and rec.states is
+// no longer a fixed sequence. They look entries up by what they are instead of by where they
+// landed.
+func (r *recorder) count(k session.Kind) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, e := range r.entries {
+		if e.Kind == k {
+			n++
+		}
+	}
+	return n
+}
+
+func (r *recorder) payloads(k session.Kind) []session.Payload {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []session.Payload
+	for _, e := range r.entries {
+		if e.Kind == k {
+			out = append(out, e.Payload)
+		}
+	}
+	return out
+}
+
+func (r *recorder) sawToolState(toolUseID string, s ToolState) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, ts := range r.toolStates {
+		if ts.toolUseID == toolUseID && ts.state == s {
+			return true
+		}
+	}
+	return false
 }
 
 type askerFunc func(ctx context.Context, q Question) (Answer, error)
@@ -173,6 +227,183 @@ func equalKinds(a, b []session.Kind) bool {
 		}
 	}
 	return true
+}
+
+// twoCalls is one assistant message asking for the same tool twice, which is what a model
+// delegating two subagents sends.
+func twoCalls(name, id1, id2 string) []provider.Part {
+	p := []provider.Part{text("two")}
+	p = append(p, toolCall(id1, name, `{}`)...)
+	p = append(p, toolCall(id2, name, `{}`)...)
+	return append(p, usage(5, 5), stop(session.StopToolUse, "tool_calls"))
+}
+
+func TestToolCallsRunConcurrently(t *testing.T) {
+	s := openTestSession(t, session.ModePermissive)
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	slow := tool.Tool{
+		Name: "slow", Description: "waits", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe,
+		Invoke: func(_ context.Context, c tool.Call) (tool.Result, error) {
+			entered <- c.ID
+			<-release
+			return tool.Result{Content: []session.Block{session.TextBlock("done " + c.ID)}}, nil
+		},
+	}
+	p := &scripted{scripts: [][]provider.Part{
+		twoCalls("slow", "tu1", "tu2"),
+		{text("finished"), usage(6, 1), stop(session.StopEndTurn, "stop")},
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"slow": slow}, nil, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+
+	// Both calls must be inside Invoke at once. Serial dispatch cannot satisfy this: the
+	// second never starts until the first returns, and the first is blocked on release.
+	first := <-entered
+	second := <-entered
+	if first == second {
+		t.Fatalf("the same call entered twice: %q", first)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.count(session.KindToolResult); got != 2 {
+		t.Fatalf("tool results = %d, want 2", got)
+	}
+	for _, pl := range rec.payloads(session.KindToolResult) {
+		tr := pl.(session.ToolResult)
+		if tr.Outcome != session.OutcomeOK || tr.Content[0].Text != "done "+tr.ToolUseID {
+			t.Fatalf("tool result %+v", tr)
+		}
+	}
+}
+
+// TestInterruptStopsEveryRunningCall is the invariant an interrupted turn records no call as
+// succeeding: the interrupt is observed by each call, not consumed by whichever looked first.
+func TestInterruptStopsEveryRunningCall(t *testing.T) {
+	s := openTestSession(t, session.ModePermissive)
+	started := make(chan struct{}, 2)
+	blocking := tool.Tool{
+		Name: "block", Description: "blocks", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe,
+		Invoke: func(ctx context.Context, _ tool.Call) (tool.Result, error) {
+			started <- struct{}{}
+			<-ctx.Done()
+			return tool.Result{}, ctx.Err()
+		},
+	}
+	p := &scripted{scripts: [][]provider.Part{twoCalls("block", "tu1", "tu2")}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"block": blocking}, nil, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+	<-started
+	<-started
+	r.Interrupt(session.InterruptCancel)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	results := rec.payloads(session.KindToolResult)
+	if len(results) != 2 {
+		t.Fatalf("tool results = %d, want 2", len(results))
+	}
+	for _, pl := range results {
+		tr := pl.(session.ToolResult)
+		if tr.Outcome != session.OutcomeKilled {
+			t.Fatalf("call %s outcome = %q, want killed", tr.ToolUseID, tr.Outcome)
+		}
+	}
+	// One turn, one ending: N calls seeing one interrupt must not each record one.
+	if got := rec.count(session.KindTurnInterrupted); got != 1 {
+		t.Fatalf("turn_interrupted entries = %d, want 1", got)
+	}
+	if r.State() != Idle {
+		t.Fatalf("state %s", r.State())
+	}
+}
+
+func TestToolStateReportsEachCall(t *testing.T) {
+	s := openTestSession(t, session.ModePermissive)
+	p := &scripted{scripts: [][]provider.Part{
+		twoCalls("echo", "tu1", "tu2"),
+		{text("done"), usage(6, 1), stop(session.StopEndTurn, "stop")},
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"echo": echoTool(tool.Safe, "echo")}, nil, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"tu1", "tu2"} {
+		if !rec.sawToolState(id, ToolRunning) || !rec.sawToolState(id, ToolDone) {
+			t.Fatalf("call %s was not reported running and done: %+v", id, rec.toolStates)
+		}
+	}
+	for _, ts := range rec.toolStates {
+		if ts.name != "echo" {
+			t.Fatalf("tool state names %q: %+v", ts.name, ts)
+		}
+	}
+}
+
+// TestToolStateReportsTheCallAwaitingPermission is what turn.state cannot say: with two calls
+// in flight the turn is AwaitingPermission, and only the per-call state names which of them
+// the operator is being asked about.
+func TestToolStateReportsTheCallAwaitingPermission(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	// tu1 is the unsafe call that has to ask; tu2 is safe and never does.
+	parts := []provider.Part{text("two")}
+	parts = append(parts, toolCall("tu1", "bash", `{"command":"ls"}`)...)
+	parts = append(parts, toolCall("tu2", "read", `{"path":"a"}`)...)
+	parts = append(parts, usage(5, 5), stop(session.StopToolUse, "tool_calls"))
+	p := &scripted{scripts: [][]provider.Part{parts, {text("done"), stop(session.StopEndTurn, "stop")}}}
+	asker := askerFunc(func(_ context.Context, q Question) (Answer, error) {
+		return Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "fine"}, nil
+	})
+	rec := &recorder{}
+	tools := toolSet{"bash": echoTool(tool.Unsafe, "bash"), "read": echoTool(tool.Safe, "read")}
+	r := newRunner(t, s, p, tools, asker, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); err != nil {
+		t.Fatal(err)
+	}
+	if !rec.sawToolState("tu1", ToolAwaitingPermission) {
+		t.Fatalf("the asking call was never reported awaiting permission: %+v", rec.toolStates)
+	}
+	if rec.sawToolState("tu2", ToolAwaitingPermission) {
+		t.Fatalf("a safe call was reported awaiting permission: %+v", rec.toolStates)
+	}
+	if rec.count(session.KindToolResult) != 2 {
+		t.Fatalf("tool results = %d, want 2", rec.count(session.KindToolResult))
+	}
+}
+
+// TestConcurrentCallsEachRecordTheirOwnDecision is the log invariant under fan-out: one
+// permission_decision and one tool_result per tool_use, whatever order the calls finished in.
+func TestConcurrentCallsEachRecordTheirOwnDecision(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	p := &scripted{scripts: [][]provider.Part{
+		twoCalls("echo", "tu1", "tu2"),
+		{text("done"), stop(session.StopEndTurn, "stop")},
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"echo": echoTool(tool.Safe, "echo")}, nil, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, pl := range rec.payloads(session.KindPermissionDecision) {
+		seen[pl.(session.PermissionDecision).ToolUseID]++
+	}
+	for _, pl := range rec.payloads(session.KindToolResult) {
+		seen[pl.(session.ToolResult).ToolUseID]++
+	}
+	if seen["tu1"] != 2 || seen["tu2"] != 2 {
+		t.Fatalf("each call needs one decision and one result: %v", seen)
+	}
 }
 
 func TestRunTextOnly(t *testing.T) {

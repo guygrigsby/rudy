@@ -70,6 +70,7 @@ const (
 	NotifyEntryAppended       = "entry.appended"
 	NotifyStreamDelta         = "stream.delta"
 	NotifyTurnState           = "turn.state"
+	NotifyToolState           = "tool.state"
 	NotifyPermissionRequested = "permission.requested"
 	NotifyNotice              = "notice"
 	NotifyStatusUpdated       = "status.updated"
@@ -309,6 +310,25 @@ type TurnStateChanged struct {
 	TurnID    string `json:"turn_id"`
 	State     string `json:"state"`
 }
+
+// ToolStateChanged reports where one tool call has got to. Tool calls of an assistant message
+// run concurrently (ADR 0028), so turn.state cannot say which of several is waiting on the
+// operator; this can. Not replayed: a finished call is its tool_result entry.
+type ToolStateChanged struct {
+	SessionID string `json:"session_id"`
+	TurnID    string `json:"turn_id"`
+	ToolUseID string `json:"tool_use_id"`
+	Name      string `json:"name"`
+	State     string `json:"state"`
+}
+
+// The states a tool call is reported in. turn.ToolState carries the same three values; the
+// server converts by taking the string, so a drift test holds them together.
+const (
+	ToolStateRunning            = "running"
+	ToolStateAwaitingPermission = "awaiting_permission"
+	ToolStateDone               = "done"
+)
 
 type PermissionRequested struct {
 	SessionID string          `json:"session_id"`

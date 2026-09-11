@@ -523,6 +523,60 @@ func TestTurnWithAskerAllows(t *testing.T) {
 	})
 }
 
+// TestToolStateReachesAClient walks the whole path the notification exists for: the runner
+// reports one call's progress, the fanout puts it on the wire, and a subscribed client reads
+// it. turn.state cannot answer "which call is the operator being asked about" once the calls
+// of a message run at once (ADR 0028), and this is what can.
+func TestToolStateReachesAClient(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	ctx := context.Background()
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	var states []protocol.ToolStateChanged
+	drain(t, cl, func(n protocol.Notification) bool {
+		switch n.Method {
+		case protocol.NotifyPermissionRequested:
+			var pr protocol.PermissionRequested
+			_ = json.Unmarshal(n.Params, &pr)
+			go func() {
+				_ = cl.Call(ctx, protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
+					SessionID: info.SessionID, ToolUseID: pr.ToolUseID,
+					Decision: session.Allow, Scope: session.ScopeOnce, Reason: "test allows",
+				}, &struct{}{})
+			}()
+		case protocol.NotifyToolState:
+			var ts protocol.ToolStateChanged
+			_ = json.Unmarshal(n.Params, &ts)
+			states = append(states, ts)
+		case protocol.NotifyTurnState:
+			var ts protocol.TurnStateChanged
+			_ = json.Unmarshal(n.Params, &ts)
+			return ts.State == "completed"
+		}
+		return false
+	})
+	var seq []string
+	for _, ts := range states {
+		if ts.SessionID != info.SessionID || ts.TurnID != sub.TurnID || ts.ToolUseID != "tu1" || ts.Name != "danger" {
+			t.Fatalf("tool.state = %+v, want the turn's own call tu1", ts)
+		}
+		seq = append(seq, ts.State)
+	}
+	want := []string{
+		protocol.ToolStateRunning, protocol.ToolStateAwaitingPermission,
+		protocol.ToolStateRunning, protocol.ToolStateDone,
+	}
+	if !slices.Equal(seq, want) {
+		t.Fatalf("tool.state sequence = %v, want %v", seq, want)
+	}
+}
+
 func TestStrictWithoutAskerDenies(t *testing.T) {
 	h := newHarness(t, &scriptProvider{})
 	cl := h.dial(t, false)

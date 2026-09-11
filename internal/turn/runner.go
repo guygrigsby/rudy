@@ -33,6 +33,18 @@ const (
 	Failed             State = "failed"
 )
 
+// ToolState is where one tool call has got to. State is one value for the whole turn and
+// several calls run inside it at once (ADR 0028), so this is reported per tool_use id: a turn
+// in RunningTool says at least one call is running, and these say which, and which of them is
+// the one the operator is being asked about.
+type ToolState string
+
+const (
+	ToolRunning            ToolState = "running"
+	ToolAwaitingPermission ToolState = "awaiting_permission"
+	ToolDone               ToolState = "done"
+)
+
 // interruptedText is the tool_result content for a tool_use killed while its permission
 // question was still with the asker.
 const interruptedText = "interrupted while awaiting permission"
@@ -67,11 +79,16 @@ type Asker interface {
 // when nothing was attached at all, down to the reason, rather than an asker error.
 var ErrNoAsker = errors.New("turn: no asker attached")
 
-// Observer sees every entry, every stream part and every state change.
+// Observer sees every entry, every stream part and every state change. Its methods are called
+// from every goroutine a turn runs on, one per tool call as well as the turn's own, so an
+// implementation has to be safe for concurrent use.
 type Observer interface {
 	EntryAppended(e session.Entry)
 	Delta(turnID string, p provider.Part)
 	StateChanged(turnID string, s State)
+	// ToolStateChanged reports one call's progress. Several calls run at once, so this carries
+	// the tool_use id that StateChanged cannot.
+	ToolStateChanged(turnID, toolUseID, name string, state ToolState)
 }
 
 // Tools resolves tool names for a turn.
@@ -115,33 +132,49 @@ type Config struct {
 	// session is live: a redaction has to hold for every later request, not just the turn
 	// that made it, so the server keeps one map per session and hands it to every runner it
 	// builds. Nil means this runner allocates its own, which is what a turn with no session
-	// behind it (a test) wants. The map is read and written only on the Run goroutine, and
-	// only during a turn; between turns nothing touches it.
+	// behind it (a test) wants.
+	//
+	// Every write goes through the Runner's appendToolResult under its mutex, because the
+	// calls of one assistant message finish concurrently (ADR 0028). The readers, Assemble
+	// here and the Compactor's own, run on the Run goroutine after every call of the message
+	// has been joined, so they see every write without taking that mutex; the Compactor holds
+	// the same map and could not take it anyway.
 	Overrides map[string][]session.Block
 }
 
 type noopObserver struct{}
 
-func (noopObserver) EntryAppended(session.Entry) {}
-func (noopObserver) Delta(string, provider.Part) {}
-func (noopObserver) StateChanged(string, State)  {}
+func (noopObserver) EntryAppended(session.Entry)                        {}
+func (noopObserver) Delta(string, provider.Part)                        {}
+func (noopObserver) StateChanged(string, State)                         {}
+func (noopObserver) ToolStateChanged(string, string, string, ToolState) {}
 
 // Runner drives one turn at a time over a session.
 type Runner struct {
 	cfg Config
 
-	// The current turn's working state, and cfg.Overrides alongside it. Run, loop, stream
-	// and runTool execute in sequence on the one goroutine inside Run and are the only
-	// readers or writers, so unlike the fields below these need no lock: nothing outside a
-	// turn (Interrupt, State, TurnID) touches them.
-	system    string        // cfg.System plus this turn's before_turn additions
-	turnUsage session.Usage // sum of this turn's assistant message usages
+	// system is written once, by startTurnState, before the turn's first request, and never
+	// again while the turn runs: only the Run goroutine reads it back, so it needs no lock.
+	// turnUsage is also the Run goroutine's alone, added to by appendAssistant and read by
+	// rest, but it is under mu all the same: a tool call's outcome is now what decides when
+	// and how the turn rests (see toolOutcome), and a field whose safety rests on that
+	// reasoning is one edit away from a race.
+	system string
 
 	mu        sync.Mutex
 	state     State
 	turn      ulid.ULID         // id of the user_message entry that started the current or most recent turn
-	interrupt session.Interrupt // pending interrupt, cleared by takeInterrupt
-	cancel    context.CancelFunc
+	interrupt session.Interrupt // this turn's interrupt; observed by every call, cleared when the turn rests
+	turnUsage session.Usage     // sum of this turn's assistant message usages
+	// streamCancel cancels the one provider request in flight. It stays a single slot where
+	// the tool calls need a set: a turn streams once at a time, and a stream never overlaps
+	// the calls of the message it produced. It is never cleared, because a cancel func for a
+	// request that already returned is inert.
+	streamCancel context.CancelFunc
+
+	// calls is every tool call currently running. Self-locking, and the reference never
+	// changes: Run resets its contents instead (see inflight.reset).
+	calls *inflight
 }
 
 // NewRunner returns an idle runner.
@@ -152,7 +185,7 @@ func NewRunner(c Config) *Runner {
 	if c.Overrides == nil {
 		c.Overrides = map[string][]session.Block{}
 	}
-	return &Runner{cfg: c, state: Idle}
+	return &Runner{cfg: c, state: Idle, calls: newInflight()}
 }
 
 // TurnID is the id of the current or most recent turn: the ULID of the user_message entry
@@ -205,9 +238,15 @@ func (r *Runner) Interrupt(how session.Interrupt) {
 	if r.interrupt != session.InterruptCancel {
 		r.interrupt = how
 	}
-	if r.cancel != nil {
-		r.cancel()
+	if r.streamCancel != nil {
+		r.streamCancel()
 	}
+	// Under mu, with the flag, because Run clears the flag and reopens this set under the same
+	// lock. Split across two critical sections they could interleave: Run could clear the flag
+	// between the two, leaving the next turn's calls cancelled by a latched set with no
+	// interrupt to explain it. Nothing in a context's cancel func waits on this runner, so
+	// holding mu over them costs only the wakeups the cancellation was for.
+	r.calls.cancelAll()
 }
 
 // Run appends msg and drives the loop until Completed, Failed, Steering or Idle after a
@@ -238,6 +277,10 @@ func (r *Runner) Run(ctx context.Context, msg session.UserMessage) error {
 		return fmt.Errorf("%w: turn already active", session.ErrInvariant)
 	}
 	r.interrupt = ""
+	// cancelAll latches, so the set the last turn left behind would refuse every call of this
+	// one. A steer resume is exactly that case: the interrupt that steered cancelled the set,
+	// and the turn it resumes still has tools to run.
+	r.calls.reset()
 	r.mu.Unlock()
 
 	e, err := r.append(msg)
@@ -261,7 +304,9 @@ func (r *Runner) Run(ctx context.Context, msg session.UserMessage) error {
 // deliberately not reset: they outlive the turn that made them (see Config.Overrides).
 func (r *Runner) startTurnState(ctx context.Context, e session.Entry) {
 	r.system = r.cfg.System
+	r.mu.Lock()
 	r.turnUsage = session.Usage{}
+	r.mu.Unlock()
 	sid, tid := r.ids()
 	for _, res := range r.fire(ctx, plugin.HookBeforeTurn, &plugin.BeforeTurnPayload{SessionID: sid, TurnID: tid, Message: e}) {
 		bt, ok := res.(*plugin.BeforeTurnResult)
@@ -320,7 +365,7 @@ func (r *Runner) loop(ctx context.Context) error {
 		}
 		r.setState(Streaming)
 		am, err := r.stream(ctx)
-		if how := r.takeInterrupt(); how != "" {
+		if how := r.observeInterrupt(); how != "" {
 			am.StopReason = session.StopInterrupted
 			am.StopReasonRaw = ""
 			am.Content = dropIncompleteToolUses(am.Content)
@@ -361,6 +406,10 @@ func (r *Runner) loop(ctx context.Context) error {
 		if len(toolUses) == 0 {
 			return r.rest(ctx, Completed)
 		}
+		// Every call of this message runs at once (ADR 0028). Malformed inputs are refused
+		// first and in order, since they append without running anything and keeping them
+		// ordered keeps the log readable.
+		var runnable []session.Block
 		for _, tu := range toolUses {
 			if raw, bad := malformed[tu.ID]; bad {
 				if err := r.refuse(ctx, r.classDeny(tu, "malformed input"), session.OutcomeError, "malformed tool input: "+raw); err != nil {
@@ -368,22 +417,62 @@ func (r *Runner) loop(ctx context.Context) error {
 				}
 				continue
 			}
-			done, err := r.runTool(ctx, tu)
-			if err != nil {
-				return err
-			}
-			if done {
-				return nil
-			}
+			runnable = append(runnable, tu)
+		}
+		outcomes := make([]toolOutcome, len(runnable))
+		var wg sync.WaitGroup
+		for i, tu := range runnable {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				outcomes[i] = r.runTool(ctx, tu)
+			}()
+		}
+		wg.Wait()
+		// One slot per call, read in call order, so the turn ends on the same outcome
+		// whatever order the calls finished in. Each goroutine writes only its own index,
+		// and wg.Wait is what publishes the writes, so the slice needs no lock.
+		if ended, err := r.endTurn(ctx, outcomes); ended {
+			return err
 		}
 	}
+}
+
+// toolOutcome is what one finished call asks the turn to do. A call appends its own
+// permission_decision and tool_result, but never the turn's ending: N calls observing one
+// interrupt would append N turn_interrupted entries, and two calls failing would race over
+// which failure the log records. So each leaves its answer here and the loop acts on the
+// answers once, in call order.
+type toolOutcome struct {
+	interrupt session.Interrupt  // the turn was cut short and finishes this way
+	ctxErr    error              // the caller's context ended the turn; Run returns this
+	class     session.ErrorClass // with err, the turn_failed to record
+	err       error
+}
+
+// endTurn walks the calls' outcomes in call order and performs the first ending any of them
+// asks for, reporting whether the turn is over. Calls with nothing to say are skipped, which
+// is every call that simply ran and appended its result.
+func (r *Runner) endTurn(ctx context.Context, outcomes []toolOutcome) (ended bool, err error) {
+	for _, o := range outcomes {
+		switch {
+		case o.err != nil:
+			return true, r.fail(o.class, o.err)
+		case o.ctxErr != nil:
+			_ = r.finishInterrupt(ctx, session.InterruptCancel)
+			return true, o.ctxErr
+		case o.interrupt != "":
+			return true, r.finishInterrupt(ctx, o.interrupt)
+		}
+	}
+	return false, nil
 }
 
 // stream runs one completion and accumulates the assistant message. The returned message
 // is partial when err is non-nil.
 func (r *Runner) stream(ctx context.Context) (session.AssistantMessage, error) {
 	stepCtx, cancel := context.WithCancel(ctx)
-	r.setCancel(cancel)
+	r.setStreamCancel(cancel)
 	defer cancel()
 
 	acc := newAccumulator()
@@ -426,15 +515,22 @@ func (r *Runner) stream(ctx context.Context) (session.AssistantMessage, error) {
 	return am, err
 }
 
-// runTool gates and runs one tool_use. done is true when an interrupt ended the turn.
-func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err error) {
+// runTool gates and runs one tool_use, appending its permission_decision and its tool_result.
+// It runs on a goroutine of its own, beside every other call of the same assistant message
+// (ADR 0028), so it never ends the turn itself: what it returns is what it asks the loop to do
+// once every call has finished.
+func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 	s := r.cfg.Session
+	turnID := r.TurnID()
+	r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolRunning)
+	defer r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolDone)
+
 	t, ok := r.cfg.Tools.Tool(tu.Name)
 	if !ok {
 		if err := r.refuse(ctx, r.classDeny(tu, "unknown tool"), session.OutcomeError, "unknown tool "+tu.Name); err != nil {
-			return true, r.fail(session.ErrInternal, err)
+			return toolOutcome{class: session.ErrInternal, err: err}
 		}
-		return false, nil
+		return toolOutcome{}
 	}
 
 	input, modified, hookDec := r.askHooks(ctx, tu, t.Safety)
@@ -485,22 +581,23 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 	}
 	if ask {
 		r.setState(AwaitingPermission)
+		r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolAwaitingPermission)
 		askCtx, cancel := context.WithCancel(ctx)
-		r.setCancel(cancel)
+		r.calls.add(tu.ID, cancel)
 		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: input, Matcher: dec.Matcher, Dangerous: dangerous})
+		r.calls.remove(tu.ID)
 		cancel()
-		if how := r.takeInterrupt(); how != "" {
+		if how := r.observeInterrupt(); how != "" {
 			if err := r.refuse(ctx, interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {
-				return true, r.fail(session.ErrInternal, err)
+				return toolOutcome{class: session.ErrInternal, err: err}
 			}
-			return true, r.finishInterrupt(ctx, how)
+			return toolOutcome{interrupt: how}
 		}
 		if ctx.Err() != nil {
 			if err := r.refuse(ctx, interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {
-				return true, r.fail(session.ErrInternal, err)
+				return toolOutcome{class: session.ErrInternal, err: err}
 			}
-			_ = r.finishInterrupt(ctx, session.InterruptCancel)
-			return true, ctx.Err()
+			return toolOutcome{ctxErr: ctx.Err()}
 		}
 		switch {
 		case errors.Is(askErr, ErrNoAsker):
@@ -522,7 +619,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		}
 	}
 	if _, err := r.append(dec); err != nil {
-		return true, r.fail(session.ErrInternal, err)
+		return toolOutcome{class: session.ErrInternal, err: err}
 	}
 	if dec.Decision == session.Deny {
 		_, err := r.appendToolResult(ctx, session.ToolResult{
@@ -531,14 +628,19 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 			Content:   []session.Block{session.TextBlock("denied: " + dec.Reason)},
 		})
 		if err != nil {
-			return true, r.fail(session.ErrInternal, err)
+			return toolOutcome{class: session.ErrInternal, err: err}
 		}
-		return false, nil
+		return toolOutcome{}
 	}
 
 	r.setState(RunningTool)
+	if ask {
+		// Back from the operator, so this call is running again rather than waiting on an
+		// answer. Only a call that asked has anything to correct here.
+		r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolRunning)
+	}
 	if t.Invoke == nil {
-		return true, r.fail(session.ErrPlugin, fmt.Errorf("tool %s has no Invoke", tu.Name))
+		return toolOutcome{class: session.ErrPlugin, err: fmt.Errorf("tool %s has no Invoke", tu.Name)}
 	}
 	var toolCtx context.Context
 	var cancel context.CancelFunc
@@ -547,7 +649,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 	} else {
 		toolCtx, cancel = context.WithCancel(ctx)
 	}
-	r.setCancel(cancel)
+	r.calls.add(tu.ID, cancel)
 	start := time.Now()
 	res, panicked, invokeErr := invokeTool(t, toolCtx, tool.Call{
 		ID:        tu.ID,
@@ -559,31 +661,33 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 	// Read the deadline before cancelling: after cancel every context reads as done, and
 	// only the deadline distinguishes a tool that ran out of time from one the turn killed.
 	timedOut := errors.Is(toolCtx.Err(), context.DeadlineExceeded)
+	r.calls.remove(tu.ID)
 	cancel()
 	dur := time.Since(start).Milliseconds()
 	if panicked != nil {
 		// A panic is a plugin fault, not a tool that ran and reported an error.
-		return true, r.fail(session.ErrPlugin, fmt.Errorf("tool %s panicked: %v", tu.Name, panicked))
+		return toolOutcome{class: session.ErrPlugin, err: fmt.Errorf("tool %s panicked: %v", tu.Name, panicked)}
 	}
 	content := res.Content
-	if how := r.takeInterrupt(); how != "" {
+	// Observed, not consumed: every call that was running has to see the same interrupt, or
+	// the ones that did not would record success for a turn that was cut (ADR 0028).
+	if how := r.observeInterrupt(); how != "" {
 		if len(content) == 0 {
 			content = []session.Block{session.TextBlock("killed")}
 		}
 		if _, err := r.appendToolResult(ctx, session.ToolResult{ToolUseID: tu.ID, Outcome: session.OutcomeKilled, Content: content, DurationMS: dur}); err != nil {
-			return true, r.fail(session.ErrInternal, err)
+			return toolOutcome{class: session.ErrInternal, err: err}
 		}
-		return true, r.finishInterrupt(ctx, how)
+		return toolOutcome{interrupt: how}
 	}
 	if ctx.Err() != nil {
 		if len(content) == 0 {
 			content = []session.Block{session.TextBlock("killed")}
 		}
 		if _, err := r.appendToolResult(ctx, session.ToolResult{ToolUseID: tu.ID, Outcome: session.OutcomeKilled, Content: content, DurationMS: dur}); err != nil {
-			return true, r.fail(session.ErrInternal, err)
+			return toolOutcome{class: session.ErrInternal, err: err}
 		}
-		_ = r.finishInterrupt(ctx, session.InterruptCancel)
-		return true, ctx.Err()
+		return toolOutcome{ctxErr: ctx.Err()}
 	}
 	outcome := session.OutcomeOK
 	switch {
@@ -602,9 +706,9 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		content = []session.Block{session.TextBlock("")}
 	}
 	if _, err := r.appendToolResult(ctx, session.ToolResult{ToolUseID: tu.ID, Outcome: outcome, Content: content, DurationMS: dur}); err != nil {
-		return true, r.fail(session.ErrInternal, err)
+		return toolOutcome{class: session.ErrInternal, err: err}
 	}
-	return false, nil
+	return toolOutcome{}
 }
 
 // hookVerdict is a before_tool handler's allow or deny, already normalized: Reason is never
@@ -709,7 +813,9 @@ func (r *Runner) appendAssistant(ctx context.Context, am session.AssistantMessag
 	if err != nil {
 		return e, err
 	}
+	r.mu.Lock()
 	r.turnUsage = r.turnUsage.Add(am.Usage)
+	r.mu.Unlock()
 	sid, tid := r.ids()
 	r.fire(ctx, plugin.HookAfterResponse, &plugin.AfterResponsePayload{SessionID: sid, TurnID: tid, Message: e})
 	return e, nil
@@ -730,7 +836,12 @@ func (r *Runner) appendToolResult(ctx context.Context, tr session.ToolResult) (s
 		if !ok || len(at.Content) == 0 {
 			continue
 		}
+		// Under mu because this runs on each call's own goroutine and the calls of one
+		// message finish together (see Config.Overrides): the map's only concurrency is
+		// writer against writer, and this is the only writer.
+		r.mu.Lock()
 		r.cfg.Overrides[tr.ToolUseID] = at.Content
+		r.mu.Unlock()
 		break
 	}
 	return e, nil
@@ -785,8 +896,9 @@ func (r *Runner) rest(ctx context.Context, s State) error {
 	}
 	if s == Completed {
 		sid, tid := r.ids()
-		r.fire(ctx, plugin.HookTurnCompleted, &plugin.TurnCompletedPayload{SessionID: sid, TurnID: tid, Usage: r.turnUsage})
+		r.fire(ctx, plugin.HookTurnCompleted, &plugin.TurnCompletedPayload{SessionID: sid, TurnID: tid, Usage: r.usage()})
 	}
+	r.clearInterrupt()
 	r.setState(s)
 	return nil
 }
@@ -829,6 +941,7 @@ func (r *Runner) fail(class session.ErrorClass, err error) error {
 	if serr := r.cfg.Session.Sync(); serr != nil {
 		log.Printf("turn: sync session log at turn_failed: %v", serr)
 	}
+	r.clearInterrupt()
 	r.setState(Failed)
 	return err
 }
@@ -862,9 +975,6 @@ func (r *Runner) setStateLocked(s State) {
 		return
 	}
 	r.state = s
-	if s != Streaming && s != RunningTool && s != AwaitingPermission {
-		r.cancel = nil
-	}
 	id := ""
 	if !r.turn.IsZero() {
 		id = r.turn.String()
@@ -872,21 +982,40 @@ func (r *Runner) setStateLocked(s State) {
 	r.cfg.Observer.StateChanged(id, s)
 }
 
-func (r *Runner) setCancel(c context.CancelFunc) {
+// setStreamCancel installs the cancel func for the request stream now starting, and cancels it
+// at once when this turn is already under an interrupt: the interrupt is no longer consumed by
+// whoever looks first, so a stream starting after one landed has to be stopped on sight.
+func (r *Runner) setStreamCancel(c context.CancelFunc) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.cancel = c
+	r.streamCancel = c
 	if r.interrupt != "" {
 		c()
 	}
 }
 
-func (r *Runner) takeInterrupt() session.Interrupt {
+// observeInterrupt reports the interrupt this turn is under, if any. It does not consume it:
+// every call in flight has to see it, or the ones that did not would record success for a turn
+// that was cut (ADR 0028). It is cleared when the turn rests, not when a call reads it.
+func (r *Runner) observeInterrupt() session.Interrupt {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	how := r.interrupt
+	return r.interrupt
+}
+
+// clearInterrupt retires this turn's interrupt. Every path that brings the turn to rest calls
+// it, because nothing else does any more: an interrupt left standing would cut the next turn
+// before it had done anything.
+func (r *Runner) clearInterrupt() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.interrupt = ""
-	return how
+}
+
+func (r *Runner) usage() session.Usage {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.turnUsage
 }
 
 // accumulator folds stream parts into content blocks in arrival order.
