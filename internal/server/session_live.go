@@ -411,13 +411,34 @@ func (ls *liveSession) broadcastObsLocked(method string, params any) {
 // attachment is everything a newly subscribed connection is owed, in the order the contract
 // hands it over: every entry as entry.appended, then the current turn.state when a turn is
 // active, then a tool.state for every call still in flight, then each standing
-// permission.requested when the newcomer is an asker, and last the response carrying info.
+// permission.requested when the newcomer is an asker, then what each live child of this session
+// is owed, and last the response carrying info.
 type attachment struct {
 	entries    []session.Entry
 	state      *protocol.TurnStateChanged
 	toolStates []protocol.ToolStateChanged
 	standing   []protocol.PermissionRequested
+	children   []childAttachment
 	info       protocol.SessionInfo
+}
+
+// childAttachment is what a connection attaching to a parent is owed about one child of it that
+// is live right now: the session_opened entry that names the agent call the child's own
+// notifications render under, and every question standing on the child when the newcomer is an
+// asker. Neither is reachable any other way. session_opened is broadcast to the parent's
+// watchers exactly once, when the child opens (see Server.open), and the parent's own log names
+// no live child at all, so a client that attaches a moment later receives every one of that
+// child's notifications and has nowhere to put any of them; and a question standing on a child
+// is answered by the parent's askers (see askers), so an asker arriving after it was raised is
+// owed it exactly as it is owed one standing on the session it attached to (rudy-uvj).
+//
+// Only the one entry, not the child's log: the rest of a child's entries are deliberately not
+// replayed to a parent (rudy-contracts.md, entry.appended), since the parent's own tool_result
+// carries the answer and a finished child is read by resuming it.
+type childAttachment struct {
+	sid      string
+	opened   session.Entry
+	standing []protocol.PermissionRequested
 }
 
 // subscribeLocked registers cn as a subscriber and returns what it is owed: the entries to
@@ -469,6 +490,38 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 	cn.mu.Unlock()
 
 	return at
+}
+
+// watchAttachment is what this session, as a live child, owes a connection attaching to its
+// parent: see childAttachment. ok is false when the first entry is not a session_opened naming
+// the call that opened it, which is what a child always begins with (Server.open writes it) and
+// what the routing on the reading end keys on; anything else is not a child worth announcing.
+// asker says whether the newcomer may be told the standing questions; a headless client is owed
+// the mapping and nothing more, the same split subscribeLocked makes for the session's own.
+//
+// Self-locking (takes obsMu, and no other lock). The caller holds Server.mu and does not hold
+// the parent's obsMu, so this never has two sessions' locks at once, the rule the type doc sets.
+func (ls *liveSession) watchAttachment(asker bool) (childAttachment, bool) {
+	ls.obsMu.Lock()
+	defer ls.obsMu.Unlock()
+	if len(ls.entries) == 0 {
+		return childAttachment{}, false
+	}
+	opened, ok := ls.entries[0].Payload.(session.SessionOpened)
+	if !ok || opened.ParentToolUseID == "" {
+		return childAttachment{}, false
+	}
+	at := childAttachment{sid: ls.sess.ID().String(), opened: ls.entries[0]}
+	if asker {
+		for _, q := range ls.standing {
+			at.standing = append(at.standing, q.req)
+		}
+		// Map order is not an order, the same reason subscribeLocked sorts its own.
+		slices.SortFunc(at.standing, func(a, b protocol.PermissionRequested) int {
+			return strings.Compare(a.ToolUseID, b.ToolUseID)
+		})
+	}
+	return at, true
 }
 
 // mirror records an entry appended to the session by something other than a turn and sends it

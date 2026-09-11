@@ -2471,6 +2471,20 @@ type agentProvider struct {
 	armed         bool
 	delegateAgent string
 	delegateTools []string
+
+	armedCall                   bool
+	callID, callName, callInput string
+}
+
+// armTool makes agentProvider's very next Complete call, whatever session it is for, answer with
+// one tool_use for name rather than running the root/child switch below. It is armDelegate's
+// sibling for a test that needs a specific call inside a CHILD's turn, which the switch's own
+// child script (echo, then text) cannot express: a child asking permission for an unsafe tool,
+// in particular, which is what the agent tool's whole permission story rests on.
+func (p *agentProvider) armTool(id, name, input string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.armedCall, p.callID, p.callName, p.callInput = true, id, name, input
 }
 
 // armDelegate makes agentProvider's very next Complete call, whatever session it is for, open a
@@ -2517,7 +2531,8 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 	p.reqs[req.SessionID] = append(p.reqs[req.SessionID], req)
 	root := req.SessionID == p.root
 	fire, delegateAgent, delegateTools := p.armed, p.delegateAgent, p.delegateTools
-	p.armed = false
+	fireCall, callID, callName, callInput := p.armedCall, p.callID, p.callName, p.callInput
+	p.armed, p.armedCall = false, false
 	p.mu.Unlock()
 
 	call := func(id, name, input string) []provider.Part {
@@ -2538,6 +2553,8 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 	}
 	var parts []provider.Part
 	switch {
+	case fireCall:
+		parts = call(callID, callName, callInput)
 	case fire:
 		in, _ := json.Marshal(struct {
 			Agent string   `json:"agent"`
@@ -3600,31 +3617,173 @@ func TestThePluginDoesNotReceiveItsOwnChildsEcho(t *testing.T) {
 	}
 }
 
-// TestAttachToParentDoesNotReplayAFinishedChildsEntries confirms the attach path does not walk
-// down: watchers() only ever forwards a live broadcast, so it has nothing to do with what a
-// resume replays, and a child's own entries live only in its own log. A parent's tool_result for
-// the agent call is what carries the child's answer, and a finished child is read by resuming
-// it directly (rudy-contracts.md's notifications section).
-func TestAttachToParentDoesNotReplayAFinishedChildsEntries(t *testing.T) {
+// TestAttachToParentReplaysOnlyAChildsSessionOpened is the rule and its one exception together
+// (rudy-contracts.md's notifications section). The rule: a child's own entries are not replayed
+// to a parent, since the parent's own tool_result carries the answer and a finished child is
+// read by resuming it. The exception: its session_opened is, while the child is live, because
+// that entry is the only thing that names the agent call the child's notifications render under
+// and it is broadcast exactly once, at open, which a client attaching later has already missed.
+func TestAttachToParentReplaysOnlyAChildsSessionOpened(t *testing.T) {
 	srv, cn := newTestServer(t)
 	parent := openSession(t, cn, sessionOpenParams{})
 	child := openChildSession(t, cn, parent, "default")
-	driveTurn(t, srv, child) // a genuinely finished child, not merely an opened one
+	driveTurn(t, srv, child) // entries of the child's own beyond the one it opened with
 
 	raw := rawDialAs(t, srv.srv, false)
 	_, raws := raw.call(protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: parent})
+	var got []session.Kind
 	for _, m := range raws {
 		if m.Method != protocol.NotifyEntryAppended {
 			continue
 		}
-		var ea protocol.EntryAppended
-		if err := json.Unmarshal(m.Params, &ea); err != nil {
-			t.Fatal(err)
-		}
+		ea := rawParams[protocol.EntryAppended](t, m)
 		if ea.SessionID == child {
-			t.Fatalf("attaching to the parent replayed the child's own entry: %+v", ea)
+			got = append(got, ea.Entry.Kind)
 		}
 	}
+	if !equalKinds(got, []session.Kind{session.KindSessionOpened}) {
+		t.Fatalf("attaching to the parent replayed the child's %v, want only its session_opened", got)
+	}
+}
+
+// TestAttachToAParentNamesALiveChild is rudy-uvj's first half, on the real reattach path: a
+// client arriving after a child opened is told that child's session_opened, which is the only
+// thing that says which agent call the child's later notifications belong to. Nothing is
+// hand-sent; the assertion is on what a real session.resume delivered ahead of its own response.
+func TestAttachToAParentNamesALiveChild(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	// The child opens, and its one broadcast to the parent's watchers goes out, before this
+	// connection exists at all: the reconnect an operator makes mid-turn.
+	child := openChildSession(t, cn, parent, "default")
+
+	raw := rawDialAs(t, srv.srv, false)
+	_, raws := raw.call(protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: parent})
+
+	// The agent tool_use ids the parent actually emitted, so what follows asserts the child names
+	// one of them rather than any non-empty string.
+	agentCalls := map[string]bool{}
+	var opened *session.SessionOpened
+	for _, m := range raws {
+		if m.Method != protocol.NotifyEntryAppended {
+			continue
+		}
+		ea := rawParams[protocol.EntryAppended](t, m)
+		switch ea.SessionID {
+		case parent:
+			am, ok := ea.Entry.Payload.(session.AssistantMessage)
+			if !ok {
+				continue
+			}
+			for _, b := range am.Content {
+				if b.Type == session.BlockToolUse && b.Name == "agent" {
+					agentCalls[b.ID] = true
+				}
+			}
+		case child:
+			o, ok := ea.Entry.Payload.(session.SessionOpened)
+			if !ok {
+				t.Fatalf("the attach carried a %s for the child, want its session_opened", ea.Entry.Kind)
+			}
+			opened = &o
+		}
+	}
+	if opened == nil {
+		t.Fatalf("attaching to the parent never named the live child %s: %v", child, rawMethods(sessionNotes(raws)))
+	}
+	if opened.ParentSessionID != parent {
+		t.Errorf("child's session_opened parent_session_id = %q, want %q", opened.ParentSessionID, parent)
+	}
+	if !agentCalls[opened.ParentToolUseID] {
+		t.Errorf("child names tool_use %q, which is not one of the parent's own agent calls %v", opened.ParentToolUseID, agentCalls)
+	}
+}
+
+// TestAttachToAParentHearsAChildsStandingQuestion is rudy-uvj's second half and its acceptance
+// criteria: an asker attaching to a parent while a question stands on a live child is told that
+// question and can answer it. Every hop is the real one. The child's own turn asks for an unsafe
+// tool through the Gate, the question stands on the child and reaches the asker that was already
+// there by the walk up the parent link (askers), the second asker arrives afterwards over its own
+// session.resume, and the answer it sends is what lets the tool run.
+func TestAttachToAParentHearsAChildsStandingQuestion(t *testing.T) {
+	sp := newSlowPlugin()
+	srv, cn := newTestServerWithPlugins(t, sp)
+	parent := openSession(t, cn, sessionOpenParams{})
+	// A question only stands while somebody could answer it: with no asker anywhere the Gate
+	// denies it outright (see stand). This is the asker that was there when it was raised.
+	first := dialAs(t, srv.srv, true)
+	resumeOn(t, first, parent)
+	child := openChildSession(t, cn, parent, "default")
+
+	// The child's own turn, driven over its own subscription the way the subagents plugin drives
+	// it, armed to call the unsafe tool this harness registered.
+	childConn := dialAs(t, srv.srv, false)
+	resumeOn(t, childConn, child)
+	srv.prov.armTool("tu_slow", "slow", `{}`)
+	if err := call(t, childConn, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: child, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}); err != nil {
+		t.Fatalf("submit to the child: %v", err)
+	}
+	pr, _ := question(t, first)
+	if pr.SessionID != child || pr.ToolUseID != "tu_slow" {
+		t.Fatalf("question = %+v, want tu_slow on the child %s", pr, child)
+	}
+
+	// The reconnect: a fresh asker attaches to the PARENT, never to the child, after the question
+	// was raised.
+	raw := rawDialAs(t, srv.srv, true)
+	_, raws := raw.call(protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: parent})
+	var standing *protocol.PermissionRequested
+	for _, m := range sessionNotes(raws) {
+		if m.Method != protocol.NotifyPermissionRequested {
+			continue
+		}
+		q := rawParams[protocol.PermissionRequested](t, m)
+		if q.SessionID == child && q.ToolUseID == pr.ToolUseID {
+			standing = &q
+		}
+	}
+	if standing == nil {
+		t.Fatalf("attaching to the parent never carried the child's standing question: %v", rawMethods(sessionNotes(raws)))
+	}
+	if standing.Tool != pr.Tool || standing.TurnID != pr.TurnID {
+		t.Fatalf("standing question = %+v, want %+v", *standing, pr)
+	}
+
+	// A headless client attaching to the same parent is told the child exists and nothing more:
+	// the question goes only to a connection that can answer it, the same split the session's own
+	// standing set makes (TestAnAskerAttachingMidQuestionHearsIt).
+	headless := rawDialAs(t, srv.srv, false)
+	_, quiet := headless.call(protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: parent})
+	var named bool
+	for _, m := range sessionNotes(quiet) {
+		switch m.Method {
+		case protocol.NotifyPermissionRequested:
+			t.Fatalf("a headless client was handed a question: %+v", rawParams[protocol.PermissionRequested](t, m))
+		case protocol.NotifyEntryAppended:
+			if rawParams[protocol.EntryAppended](t, m).SessionID == child {
+				named = true
+			}
+		}
+	}
+	if !named {
+		t.Fatalf("a headless client was not told the live child %s exists: %v", child, rawMethods(sessionNotes(quiet)))
+	}
+
+	// And it can be answered from there, which is what decides whether the call runs or waits out
+	// tool_timeout_ms.
+	answerer := dialAs(t, srv.srv, true)
+	if err := answerWith(answerer, child, standing.ToolUseID, session.Allow); err != nil {
+		t.Fatalf("answer the child's question from a connection attached to the parent: %v", err)
+	}
+	select {
+	case <-sp.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the allowed tool never ran")
+	}
+	close(sp.release)
+	drain(t, childConn, completedOn(child))
 }
 
 // toolNames drives one bare turn on sess and returns the tool names the server offered it in

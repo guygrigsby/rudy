@@ -1661,9 +1661,42 @@ func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInf
 	s.mu.Lock()
 	s.live[ls.sess.ID()] = ls
 	at := ls.subscribeLocked(cn)
+	at.children = s.childAttachmentsLocked(cn, ls)
 	s.mu.Unlock()
 	deliverAttach(cn, ls.sess.ID(), at)
 	return at.info
+}
+
+// childAttachmentsLocked is what cn is owed about the children of ls that are live right now
+// (see childAttachment): the walk down that mirrors the one notifyWatchers makes on every
+// broadcast, made once here because the attach itself is the moment a client learns what it
+// missed. The exclusions are watchers' own, for the same reasons: a plugin connection is the one
+// waiting on the tool call and has no use for its own echo, and a connection already subscribed
+// to the child gets that child's own replay directly.
+//
+// Depth is one, so there is no recursion: a child can never have a child (open refuses a parent
+// that is already one). Caller holds Server.mu, which is what makes reading s.live safe here and
+// what makes the answer consistent with the subscribeLocked that ran in the same critical
+// section; ls.parent on each candidate is written before its session is shared and never again
+// (see liveSession), so it needs no lock of its own. cn.subscribed takes cn.mu under Server.mu,
+// the nesting subscribeLocked already uses.
+func (s *Server) childAttachmentsLocked(cn *conn, ls *liveSession) []childAttachment {
+	if cn.plugin != "" {
+		return nil
+	}
+	var out []childAttachment
+	for sid, c := range s.live {
+		if c.parent != ls || cn.subscribed(sid) {
+			continue
+		}
+		if at, ok := c.watchAttachment(cn.isAsker()); ok {
+			out = append(out, at)
+		}
+	}
+	// Map order is not an order: sorting by session id makes what a newcomer hears the same on
+	// every attach, and a session id is a ULID, so that is also the order the children opened in.
+	slices.SortFunc(out, func(a, b childAttachment) int { return strings.Compare(a.sid, b.sid) })
+	return out
 }
 
 // attachIfLive subscribes cn to sid's live session, atomically with the s.live lookup: holding
@@ -1678,6 +1711,7 @@ func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bo
 		return protocol.SessionInfo{}, false
 	}
 	at := ls.subscribeLocked(cn)
+	at.children = s.childAttachmentsLocked(cn, ls)
 	s.mu.Unlock()
 	deliverAttach(cn, sid, at)
 	return at.info, true
@@ -1692,9 +1726,14 @@ func replay(cn *conn, sid ulid.ULID, entries []session.Entry) {
 
 // deliverAttach sends a new subscriber everything it is owed, in the contract's order: the
 // replay, then the turn's current state when one is running, then a tool.state for every call
-// still in flight, then each question standing for an asker. The response the caller returns
-// leaves after all of them, on the same ordered outbox (see conn.pump), which is what "then
-// this response" in the session.resume row means.
+// still in flight, then each question standing for an asker, then each live child's own
+// session_opened and standing questions. The response the caller returns leaves after all of
+// them, on the same ordered outbox (see conn.pump), which is what "then this response" in the
+// session.resume row means.
+//
+// The children come last, after the whole of this session's replay: the entry naming a child is
+// only useful once the agent call it names is on screen, and that call arrived in the replay
+// above.
 func deliverAttach(cn *conn, sid ulid.ULID, at attachment) {
 	replay(cn, sid, at.entries)
 	if at.state != nil {
@@ -1705,6 +1744,12 @@ func deliverAttach(cn *conn, sid ulid.ULID, at attachment) {
 	}
 	for _, q := range at.standing {
 		cn.notify(protocol.NotifyPermissionRequested, q)
+	}
+	for _, c := range at.children {
+		cn.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: c.sid, Entry: c.opened})
+		for _, q := range c.standing {
+			cn.notify(protocol.NotifyPermissionRequested, q)
+		}
 	}
 }
 
