@@ -158,7 +158,11 @@ type SessionOpenParams struct {
 	// Tools narrows the session's tool set to these names. It only ever removes: a name the
 	// agent definition or the parent did not hold is dropped rather than refused, since the
 	// set is an intersection and asking for less than you are owed is not an error (ADR 0028).
-	Tools []string `json:"tools,omitempty"`
+	// No omitempty: nil (absent or explicit null) means no narrowing, an explicit empty list
+	// means narrow to nothing, and omitempty collapses both to the same wire bytes, which lost
+	// the caller's own "give this subagent nothing" the moment the value crossed a real
+	// json.Marshal on its way to the wire (rudy-review round 1 on task 5).
+	Tools []string `json:"tools"`
 	// Parent names the session and tool_use a child session hangs off. Only a plugin may
 	// send it; a client gets invalid_argument.
 	Parent *ParentRef `json:"parent,omitempty"`

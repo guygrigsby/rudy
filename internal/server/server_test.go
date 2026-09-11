@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/oklog/ulid/v2"
+	yaml "go.yaml.in/yaml/v3"
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
@@ -3193,13 +3194,26 @@ func writeAgentDef(t *testing.T, srv *testServer, name, description string, tool
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	var b strings.Builder
-	b.WriteString("---\ndescription: " + description + "\n")
+	// A real yaml.Marshal, not string concatenation: a description built by hand with a colon
+	// in it (or a tool name that ever needed quoting) produced frontmatter agentdef.parse
+	// rejected, which Load then silently skips, and Resolve falls back to the implicit default,
+	// Tools == nil meaning every tool — the same failure mode as the shipped example that
+	// prompted this fix, just latent here until some test's description needed it (rudy-review
+	// round 1 on task 5). Marshaling the actual header struct's shape round-trips whatever the
+	// caller passes, colons included.
+	head := struct {
+		Description string    `yaml:"description"`
+		Tools       *[]string `yaml:"tools,omitempty"`
+	}{Description: description}
 	if tools != nil {
-		b.WriteString("tools: [" + strings.Join(tools, ", ") + "]\n")
+		head.Tools = &tools
 	}
-	b.WriteString("---\nTest agent.\n")
-	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(b.String()), 0o600); err != nil {
+	fm, err := yaml.Marshal(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "---\n" + string(fm) + "---\nTest agent.\n"
+	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -3257,6 +3271,12 @@ func toolNames(t *testing.T, srv *testServer, sess string) []string {
 func driveTurn(t *testing.T, srv *testServer, sess string) []string {
 	t.Helper()
 	cl := dialAs(t, srv.srv, false)
+	// Closed here rather than left to t.Cleanup: a test that forces a cold reload later in the
+	// same test (closing every other connection to sess) needs this resume's own attachment
+	// gone immediately, or it keeps sess in s.live on its own and the "reload" that test drives
+	// never actually reaches the log (rudy-review round 1 on task 5 — a resume narrowing test
+	// passed for this reason with no cold path ever exercised).
+	defer func() { _ = cl.Close() }()
 	var info protocol.SessionInfo
 	if err := cl.Call(context.Background(), protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: sess}, &info); err != nil {
 		t.Fatalf("resume %s: %v", sess, err)
@@ -3332,6 +3352,39 @@ func TestSessionOpenToolsOnlyNarrows(t *testing.T) {
 	}
 	if !slices.Contains(got, "read") {
 		t.Fatalf("read was dropped: %v", got)
+	}
+}
+
+// TestSessionOpenDropsUnregisteredNamesBeforePersisting is Minor 1 from round 1 review:
+// intersectTools(nil, tools) returns the caller's list verbatim when the definition holds every
+// tool, so an unfiltered caller narrowing persists a name no plugin answers to. ToolView already
+// keeps a live session from being offered it, which is why TestSessionOpenToolsOnlyNarrows alone
+// did not catch this, but a plugin registering that exact name later would then silently grant
+// it to a session that had already resumed once. The fix filters against the registry before
+// session_opened is written, so this checks the persisted entry directly rather than the live
+// view.
+func TestSessionOpenDropsUnregisteredNamesBeforePersisting(t *testing.T) {
+	srv, cn := newTestServer(t)
+	writeAgentDef(t, srv, "wide", "everything", nil)
+
+	s := openSession(t, cn, sessionOpenParams{Agent: "wide", Tools: []string{"read", "nonexistent"}})
+	sid, err := ulid.Parse(s)
+	if err != nil {
+		t.Fatalf("bad session id %q: %v", s, err)
+	}
+	if err := cn.Call(context.Background(), protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: s}, &struct{}{}); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	loaded, err := session.Load(srv.store, sid)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	defer func() { _ = loaded.Close() }()
+	if slices.Contains(loaded.Tools(), "nonexistent") {
+		t.Fatalf("session_opened persisted a name no plugin registered: %v", loaded.Tools())
+	}
+	if !slices.Contains(loaded.Tools(), "read") {
+		t.Fatalf("session_opened lost read, which is a real registered tool: %v", loaded.Tools())
 	}
 }
 

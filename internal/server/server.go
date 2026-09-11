@@ -1138,7 +1138,7 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	// 0028, rudy-ef4). SchemaVersion 2 is what tells that recorded value apart from a version 1
 	// log that has no tools key at all: both decode Tools() to nil, and reading a version 1
 	// log's absent key as "every tool" would be the same escalation one field earlier.
-	allow := resolveTools(parent, def, p.Tools)
+	allow := resolveTools(parent, def, registeredToolNames(s.d.Plugins, p.Tools))
 	opened := session.SessionOpened{
 		SchemaVersion: 2, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
 		Thinking: thinking, Mode: mode, Agent: def.Name, Tools: allow,
@@ -1219,6 +1219,25 @@ func resolveTools(parent *liveSession, def agentdef.Definition, tools []string) 
 		return allow
 	}
 	return intersectTools(allow, parentToolNames(parent))
+}
+
+// registeredToolNames drops any name in names that no plugin has actually registered, before it
+// can reach session_opened. Left unfiltered, a name nothing answers to at open time still
+// persists verbatim: today's ToolView already keeps it from being offered, so nothing looks
+// wrong, but a plugin that registers that exact name later would silently grant it to a session
+// that had already resumed once (rudy-review round 1 on task 5). A nil names is left nil: that
+// means the caller applied no narrowing at all, not a narrowing to an empty registry.
+func registeredToolNames(reg *plugin.Registry, names []string) []string {
+	if names == nil {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		if _, ok := reg.Tool(n); ok {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // intersectTools narrows want by have. A nil want means every tool, so the result is have; a

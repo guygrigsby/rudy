@@ -1,5 +1,5 @@
 ---
-description: The default subagent: gathers, reasons and reports back
+description: "Gathers, reasons and reports back; the caller decides what to keep"
 tools: [read, grep, glob, bash, edit, write]
 ---
 

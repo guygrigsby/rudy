@@ -85,3 +85,26 @@ func TestLoadDistinguishesMissingFromUnterminatedFence(t *testing.T) {
 		t.Errorf("want one of each fence error, got %v", errs)
 	}
 }
+
+// TestShippedExamplesParse loads every definition this repository ships under
+// examples/agents through the same Load a session uses. A file that fails to parse is not
+// refused: Load skips it and Resolve falls back to the implicit default, silently, with only
+// a warn notice naming the file. examples/agents/default.md shipped with an unquoted
+// description containing ": ", which yaml/v3 rejects as "mapping values are not allowed in
+// this context"; the file meant to remove the memory tools from a subagent instead vanished
+// and left every session that named it holding the whole registry (rudy-review round 1 on
+// task 5). This guard fails the moment a shipped example does that again.
+func TestShippedExamplesParse(t *testing.T) {
+	dir := filepath.Join("..", "..", "examples", "agents")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	if len(ents) == 0 {
+		t.Fatal("examples/agents ships no definitions to check")
+	}
+	_, errs := Load([]string{dir})
+	if len(errs) != 0 {
+		t.Fatalf("a shipped example under examples/agents does not parse: %v", errs)
+	}
+}

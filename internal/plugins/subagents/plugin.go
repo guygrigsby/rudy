@@ -65,12 +65,22 @@ func describe(defs map[string]agentdef.Definition) string {
 
 func (p *agentPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var a struct {
-		Agent  string   `json:"agent"`
-		Prompt string   `json:"prompt"`
-		Tools  []string `json:"tools"`
+		Agent  string          `json:"agent"`
+		Prompt string          `json:"prompt"`
+		Tools  json.RawMessage `json:"tools"`
 	}
 	if err := json.Unmarshal(call.Input, &a); err != nil || a.Agent == "" || strings.TrimSpace(a.Prompt) == "" {
 		return fsroot.Fail("agent: input needs agent and prompt"), nil
+	}
+	// Tools is decoded separately, on its own raw bytes, so a value of the wrong shape (a bare
+	// string, say) fails with its own message rather than folding into the generic one above,
+	// which named agent and prompt as the problem when neither was one (rudy-review round 1 on
+	// task 5). Absent or explicit null both mean no narrowing.
+	var tools []string
+	if len(a.Tools) > 0 && string(a.Tools) != "null" {
+		if err := json.Unmarshal(a.Tools, &tools); err != nil {
+			return fsroot.Fail("agent: tools must be an array of strings"), nil
+		}
 	}
 	client, err := p.host.Connect(ctx)
 	if err != nil {
@@ -80,7 +90,7 @@ func (p *agentPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, 
 
 	var info protocol.SessionInfo
 	err = client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
-		Cwd: call.Workspace.Root, Agent: a.Agent, Tools: a.Tools,
+		Cwd: call.Workspace.Root, Agent: a.Agent, Tools: tools,
 		Parent: &protocol.ParentRef{SessionID: call.SessionID.String(), ToolUseID: call.ID},
 	}, &info)
 	if err != nil {

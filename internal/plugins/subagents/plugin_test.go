@@ -71,6 +71,27 @@ func TestInvokeRefusesBadInputAndReportsNoServer(t *testing.T) {
 	}
 }
 
+// TestInvokeReportsTheActualProblemWithTools is Minor 3 from round 1 review: a malformed tools
+// value used to fail the whole json.Unmarshal and report "needs agent and prompt", naming
+// fields that were fine and hiding what was actually wrong. tools is decoded on its own now, so
+// this reports on tools specifically.
+func TestInvokeReportsTheActualProblemWithTools(t *testing.T) {
+	h := &plugintest.Host{Name: "subagents"}
+	if err := New(t.TempDir()).Init(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	invoke := h.RegisteredTools[0].Invoke
+	res, err := invoke(context.Background(), tool.Call{
+		ID: "tu1", Input: json.RawMessage(`{"agent":"explorer","prompt":"look","tools":"read"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || strings.Contains(text(res), "needs agent and prompt") || !strings.Contains(text(res), "tools") {
+		t.Errorf("result %+v %q", res, text(res))
+	}
+}
+
 func text(res tool.Result) string {
 	var b strings.Builder
 	for _, bl := range res.Content {
@@ -223,6 +244,31 @@ func TestAgentToolPassesItsNarrowing(t *testing.T) {
 	}
 	if !slices.Equal(cs.openParams.Tools, []string{"read", "grep"}) {
 		t.Errorf("session.open did not carry the tools narrowing: %+v", cs.openParams.Tools)
+	}
+}
+
+// TestAgentToolPassesAnEmptyToolsNarrowing is IMPORTANT 1 from round 1 review: an explicit
+// empty tools list means give this subagent nothing, distinct from omitting the field, which
+// means no narrowing at all. SessionOpenParams.Tools carried "omitempty", which drops a
+// zero-length slice exactly like a nil one on the way to the wire, so this real json.Marshal
+// (the pipe transport encodes for real) lost the distinction before session.open ever saw it.
+func TestAgentToolPassesAnEmptyToolsNarrowing(t *testing.T) {
+	cs, clientEnd := newChildServer(t)
+	cs.onSubmit = func(cs *childServer) {
+		cs.say("done")
+		cs.state("completed")
+	}
+	res, err := agentTool(t, clientEnd)(context.Background(), tool.Call{
+		ID: "tu1", Input: json.RawMessage(`{"agent":"explorer","prompt":"look","tools":[]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("result %+v %q", res, text(res))
+	}
+	if cs.openParams.Tools == nil {
+		t.Error("an explicit empty tools list arrived at session.open as nil: narrowing to nothing was lost on the wire")
 	}
 }
 
