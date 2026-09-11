@@ -253,17 +253,16 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %s: %w", recorded, err)
 	}
-	announceBuild(s.buildOut(), m.Name, m.Build)
-	if err := runBuild(ctx, stage, m.Build, s.buildOut()); err != nil {
-		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
-	}
-
 	locked, err := s.Read()
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, err
 	}
 	if _, ok := locked[m.Name]; ok {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("%s is already installed", m.Name)
+	}
+	announceBuild(s.buildOut(), m.Name, m.Build)
+	if err := runBuild(ctx, stage, m.Build, s.buildOut()); err != nil {
+		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
 	}
 	dest := s.checkoutDir(m.Name)
 	// Defense in depth: plugin.ReadManifest already refuses a name that could steer dest
@@ -340,12 +339,18 @@ func (s *Store) SetEnabled(name string, on bool) error {
 	return s.Write(locked)
 }
 
-// Update brings an installed plugin's checkout to the latest commit: a clone fetches and
-// hard-resets to the remote's default branch, a path-copied plugin is removed and re-copied
-// from its original source through a stage, the same way Install lands a fresh copy.
+// Update brings an installed plugin's checkout to the latest commit or content, staged the
+// same way Install lands a fresh copy: fetched or copied into Root/plugins/.update-*, built
+// there, and only a build that succeeds gets swapped into Root/plugins/<name> and recorded in
+// the lock. A build that fails leaves the live checkout, and the lock, exactly as they were:
+// Update either advances both together or advances neither. Every error path removes the
+// stage.
 func (s *Store) Update(ctx context.Context, name string, now time.Time) (Installed, error) {
 	if err := validateName(name); err != nil {
 		return Installed{}, err
+	}
+	if err := os.MkdirAll(s.pluginsDir(), 0o700); err != nil {
+		return Installed{}, fmt.Errorf("pluginstore: %w", err)
 	}
 	s.sweepStaleStages()
 	locked, err := s.Read()
@@ -356,35 +361,48 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 	if !ok {
 		return Installed{}, notInstalled(name)
 	}
-	dir := s.checkoutDir(name)
-	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-		if _, err := runGit(ctx, "-C", dir, "fetch", "--depth", "1", "origin"); err != nil {
-			return Installed{}, err
-		}
-		if _, err := runGit(ctx, "-C", dir, "reset", "--hard", "FETCH_HEAD"); err != nil {
-			return Installed{}, err
-		}
-		commit, err := headCommit(ctx, dir)
-		if err != nil {
-			return Installed{}, err
-		}
-		inst.Commit = commit
-	} else {
-		if err := s.recopy(inst.Source, dir); err != nil {
-			return Installed{}, err
-		}
-		inst.Commit = ""
-	}
 
-	m, err := plugin.ReadManifest(dir)
+	stage, err := os.MkdirTemp(s.pluginsDir(), ".update-*")
 	if err != nil {
 		return Installed{}, fmt.Errorf("pluginstore: %w", err)
 	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+
+	isClone, err := stageSource(ctx, inst.Source, stage)
+	if err != nil {
+		return Installed{}, err
+	}
+	m, err := plugin.ReadManifest(stage)
+	if err != nil {
+		return Installed{}, fmt.Errorf("pluginstore: %s: %w", inst.Source, err)
+	}
 	announceBuild(s.buildOut(), name, m.Build)
-	if err := runBuild(ctx, dir, m.Build, s.buildOut()); err != nil {
+	if err := runBuild(ctx, stage, m.Build, s.buildOut()); err != nil {
 		return Installed{}, fmt.Errorf("pluginstore: %w", err)
 	}
 
+	var commit string
+	if isClone {
+		if commit, err = headCommit(ctx, stage); err != nil {
+			return Installed{}, err
+		}
+	}
+
+	dir := s.checkoutDir(name)
+	if err := os.RemoveAll(dir); err != nil {
+		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+	}
+	if err := os.Rename(stage, dir); err != nil {
+		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+	}
+	keep = true
+
+	inst.Commit = commit
 	inst.InstalledAt = now
 	locked[name] = inst
 	if err := s.Write(locked); err != nil {
@@ -418,32 +436,6 @@ func announceBuild(out io.Writer, name, command string) {
 		return
 	}
 	_, _ = fmt.Fprintf(out, "building %s: %s\n", name, command)
-}
-
-// recopy replaces dir with a fresh copy of source, staged beside dir first so a failed copy
-// never leaves dir half written or missing.
-func (s *Store) recopy(source, dir string) error {
-	stage, err := os.MkdirTemp(s.pluginsDir(), ".update-*")
-	if err != nil {
-		return fmt.Errorf("pluginstore: %w", err)
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			_ = os.RemoveAll(stage)
-		}
-	}()
-	if err := os.CopyFS(stage, os.DirFS(source)); err != nil {
-		return fmt.Errorf("pluginstore: copy %s: %w", source, err)
-	}
-	if err := os.RemoveAll(dir); err != nil {
-		return fmt.Errorf("pluginstore: %w", err)
-	}
-	if err := os.Rename(stage, dir); err != nil {
-		return fmt.Errorf("pluginstore: %w", err)
-	}
-	keep = true
-	return nil
 }
 
 // sourceSchemeRe matches an explicit URL scheme (https://, git://, ssh://, file://, ...).

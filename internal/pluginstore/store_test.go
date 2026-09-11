@@ -207,6 +207,77 @@ func TestUpdateRunsTheBuildAgain(t *testing.T) {
 	}
 }
 
+// TestAFailingBuildDuringUpdateLeavesTheLiveCheckoutUntouched covers fix round 1's Critical:
+// Update stages a fetch or copy and its build the same way Install does, so a build that
+// fails during Update must leave the live checkout, its build artefact and the lock exactly
+// where a successful Update would have found them, not partway to the new commit.
+func TestAFailingBuildDuringUpdateLeavesTheLiveCheckoutUntouched(t *testing.T) {
+	requireGit(t)
+	const name = "stable"
+	src := newSourceRepo(t, `name = "stable"
+version = "0.1.0"
+protocol_version = 1
+command = "./stable"
+build = "echo v1 > marker"
+`)
+	s := newTestStore(t)
+	inst, _, err := s.Install(context.Background(), src, time.Now())
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	wantCommit := inst.Commit
+	marker := filepath.Join(s.PluginDir(name), "marker")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("marker not written by install's build: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(`name = "stable"
+version = "0.2.0"
+protocol_version = 1
+command = "./stable"
+build = "exit 3"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, src, "add", "-A")
+	runGitT(t, src, "commit", "-q", "-m", "break the build")
+
+	if _, err := s.Update(context.Background(), name, time.Now()); err == nil {
+		t.Fatal("an update whose build fails was accepted")
+	} else if !strings.Contains(err.Error(), "build") || !strings.Contains(err.Error(), "3") {
+		t.Fatalf("error names neither the step nor the exit code: %v", err)
+	}
+
+	// The live checkout must still be exactly what install left: the old manifest, the old
+	// commit, the old build artefact, nothing from the broken commit.
+	b, err := os.ReadFile(filepath.Join(s.PluginDir(name), "plugin.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "0.1.0") || strings.Contains(string(b), "0.2.0") {
+		t.Fatalf("checkout plugin.toml = %s, want the pre-update version still in place", b)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("original build artefact gone after a failed update: %v", err)
+	}
+	if got := wantHeadCommit(t, s.PluginDir(name)); got != wantCommit {
+		t.Fatalf("checkout HEAD = %s, want the pre-update commit %s", got, wantCommit)
+	}
+	if got := s.Lock().Plugins[name].Commit; got != wantCommit {
+		t.Fatalf("lock commit = %s, want the pre-update commit %s", got, wantCommit)
+	}
+
+	ents, err := os.ReadDir(filepath.Join(s.Root, "plugins"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), ".update-") {
+			t.Fatalf("stage left behind after a failed update: %s", e.Name())
+		}
+	}
+}
+
 func TestInstallClonesGitSourceAndRecordsLock(t *testing.T) {
 	requireGit(t)
 	src := newSourceRepo(t, helloManifest)
