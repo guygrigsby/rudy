@@ -14,15 +14,34 @@ import (
 // defect this file exists for was invisible in the domain request and visible only in the shape
 // that reaches the API.
 type wireBody struct {
-	Messages []struct {
-		Role    string `json:"role"`
-		Content []struct {
-			Type      string `json:"type"`
-			Text      string `json:"text"`
-			ToolUseID string `json:"tool_use_id"`
-			IsError   bool   `json:"is_error"`
-		} `json:"content"`
-	} `json:"messages"`
+	Messages []wireTurn `json:"messages"`
+}
+
+type wireTurn struct {
+	Role    string      `json:"role"`
+	Content []wireBlock `json:"content"`
+}
+
+// wireBlock is one content block, flat enough for every type this codec emits. Content is the
+// nested block list a tool_result carries; the rest leave it empty.
+type wireBlock struct {
+	Type      string      `json:"type"`
+	Text      string      `json:"text"`
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	ToolUseID string      `json:"tool_use_id"`
+	IsError   bool        `json:"is_error"`
+	Content   []wireBlock `json:"content"`
+}
+
+// hasText reports whether any block in the list says text.
+func hasText(blocks []wireBlock, text string) bool {
+	for _, b := range blocks {
+		if b.Text == text {
+			return true
+		}
+	}
+	return false
 }
 
 func buildWire(t *testing.T, req provider.Request) wireBody {

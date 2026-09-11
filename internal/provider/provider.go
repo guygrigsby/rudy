@@ -21,16 +21,25 @@ const (
 	RoleToolResult Role = "tool_result"
 )
 
-// Message is one turn of conversation in the shape the loop keeps it.
+// Message is one turn of conversation in the shape the loop keeps it. Content and Results are
+// both omitempty because exactly one of them is live for a given role, and a message reaching
+// a provider plugin over provider.complete carries only the field that says anything.
 type Message struct {
 	Role    Role            `json:"role"`
-	Content []session.Block `json:"content"`
-	// Results is what a RoleToolResult message carries, in call order, and Content is empty
-	// for that role. It is a list rather than one result because the calls of one assistant
-	// message are answered as a group: they run at once (ADR 0028) and every one of their
-	// results belongs to the same reply. Which shape that reply takes on the wire is the
-	// codec's to decide, and the two APIs want opposite ones, so the group travels as a group
-	// and each codec renders it.
+	Content []session.Block `json:"content,omitempty"`
+	// Results is what a RoleToolResult message carries, and Content is empty for that role.
+	// It is a list rather than one result because the calls of one assistant message are
+	// answered as a group: they run at once (ADR 0028) and every one of their results belongs
+	// to the same reply. Which shape that reply takes on the wire is the codec's to decide,
+	// and the two APIs want opposite ones, so the group travels as a group and each codec
+	// renders it.
+	//
+	// The order is the order the results landed, which is the order the log has them in and
+	// not the order of the tool_use blocks they answer: the calls run concurrently, so the
+	// slowest one's result is last whichever call the model asked for first. Nothing reads
+	// the position. Every result names its own ToolUseID and both codecs pair on that, which
+	// is what the Turn.RunTool contracts row means by the pairing being per tool_use rather
+	// than positional.
 	Results []ToolResult `json:"results,omitempty"`
 }
 
