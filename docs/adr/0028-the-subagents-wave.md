@@ -89,16 +89,35 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    This is a permission bug that concurrency exposes, not a concurrency bug. It
    is fixed in the gate, where it lives.
 
-5. **A subagent returns an answer and writes nothing durable.** Its default
-   tool view excludes the memory writes, because a subagent exists to gather and
-   report: it hands its result to the caller, and the caller decides what is
-   worth keeping. A child that records its own conclusions commits the parent to
-   them without the parent ever seeing them, and it does so from a session whose
-   transcript nobody reads.
+5. **Every agent runs under a tool list, and a caller may only narrow it.**
+   This is one mechanism, not a rule about subagents. Root or child, an agent
+   has a list of the tools it may call. Restricting an agent means removing
+   tools from that list, so nothing else in the system has to know why a tool is
+   missing.
 
-   Agent definitions already carry a tool list and the server already stamps it
-   onto the child, so this is what the shipped default definition says rather
-   than a new mechanism. A definition that wants the memory tools can name them.
+   Three things set it, each able only to remove:
+
+   The definition sets the agent's own list, as it does today.
+
+   The caller narrows it per call. The `agent` tool's input takes an optional
+   list, so the orchestrating model decides what this particular delegation
+   needs rather than being stuck with whatever the definition allows. It is a
+   judgement the orchestrator is well placed to make and the definition's author
+   is not: the author does not know what the task will be.
+
+   The parent bounds it. A child's list is intersected with its parent's, so a
+   parent cannot hand out a tool it does not itself hold. This does not work
+   today. `applyAgent` builds the child's view from the whole registry, so a
+   parent restricted to reading, holding `agent`, can open a child that writes.
+   Removal is the only way to restrict an agent, so delegation must not be a way
+   around removal, or restricting an agent means nothing.
+
+   The shipped default definition drops the memory writes, which is the
+   mechanism above being used rather than a special case in it. A subagent
+   gathers and reports; the caller decides what is worth keeping. A child that
+   records its own conclusions commits the parent to them without the parent
+   ever seeing them, from a session whose transcript nobody reads. A definition
+   that wants the memory tools can name them.
 
 6. **A child's notifications reach its parent's subscribers.** The child's
    fan-out also delivers to the parent's non-plugin subscribers, tagged with the
