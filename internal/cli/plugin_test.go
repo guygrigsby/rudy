@@ -149,6 +149,24 @@ func TestPluginDisableEnableUpdateUninstall(t *testing.T) {
 	}
 }
 
+// TestInstallIsTheSameCommandUnderBothSpellings holds root install and the plugins noun's
+// install to the same behavior: ADR 0025 decision 2 says the top-level spelling does the
+// same thing as rudy plugins install, not an approximation of it.
+func TestInstallIsTheSameCommandUnderBothSpellings(t *testing.T) {
+	requireGitCLI(t)
+	src := newPluginSourceRepo(t)
+	for _, argv := range [][]string{{"install", src}, {"plugins", "install", src}} {
+		tempXDG(t)
+		out, err := runPlugin(t, argv...)
+		if err != nil {
+			t.Fatalf("%v: %v\n%s", argv, err, out)
+		}
+		if !strings.Contains(out, "installed hello 0.1.0 at ") {
+			t.Fatalf("%v: output = %q", argv, out)
+		}
+	}
+}
+
 func TestPluginUninstallUnknownNameExitsWithMessage(t *testing.T) {
 	tempXDG(t)
 	_, err := runPlugin(t, "plugin", "uninstall", "nope")

@@ -22,6 +22,7 @@ var topLevelVerbs = map[string]string{
 	"serve":      "the daemon itself; there is no noun it acts on",
 	"help":       "cobra's own",
 	"completion": "cobra's own",
+	"install":    "the one verb everybody types; the noun form rudy plugins install remains (ADR 0025)",
 }
 
 // verbs are the subcommand names this CLI uses. A new one has to be added here, which is
@@ -42,13 +43,21 @@ func shapeRoot() *cobra.Command {
 	})
 }
 
+// cobraOwnedVerbs are the topLevelVerbs entries cobra registers for itself, lazily, inside
+// Execute (InitDefaultHelpCmd, InitDefaultCompletionCmd). shapeRoot builds the tree without
+// executing it, so these never show up in shapeRoot().Commands(); the existence check below
+// does not expect them to, unlike a verb this package registers itself.
+var cobraOwnedVerbs = map[string]bool{"help": true, "completion": true}
+
 // TestEveryTopLevelCommandIsANounOrANamedVerb: a bare noun that acts (the old `rudy models`,
 // which listed) leaves no room for a second verb and reads differently from every other
 // command.
 func TestEveryTopLevelCommandIsANounOrANamedVerb(t *testing.T) {
+	seen := make(map[string]bool, len(topLevelVerbs))
 	for _, cmd := range shapeRoot().Commands() {
 		name := cmd.Name()
 		if reason, ok := topLevelVerbs[name]; ok {
+			seen[name] = true
 			if len(cmd.Commands()) > 0 {
 				t.Errorf("`rudy %s` is listed as a top-level verb (%s) but has subcommands; drop it from topLevelVerbs", name, reason)
 			}
@@ -60,6 +69,14 @@ func TestEveryTopLevelCommandIsANounOrANamedVerb(t *testing.T) {
 		if cmd.Runnable() && cmd.Args == nil {
 			t.Errorf("`rudy %s` is a noun, so it should print its help and take no arguments", name)
 		}
+	}
+	// A named exception with nothing registered under it is a stale entry, or a promise
+	// nobody kept: either way the vocabulary and the tree have drifted apart.
+	for name, reason := range topLevelVerbs {
+		if cobraOwnedVerbs[name] || seen[name] {
+			continue
+		}
+		t.Errorf("topLevelVerbs names `rudy %s` (%s) but no such command is registered at the root", name, reason)
 	}
 }
 

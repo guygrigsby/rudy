@@ -29,7 +29,7 @@ func newPluginCommand() *cobra.Command {
 		Short:   "install and manage plugins",
 	}
 	cmd.AddCommand(
-		newPluginInstallCommand(),
+		newInstallCmd(),
 		newPluginUninstallCommand(),
 		newPluginListCommand(),
 		newPluginEnableCommand(),
@@ -63,7 +63,11 @@ func commitOrSource(inst pluginstore.Installed) string {
 	return inst.Commit
 }
 
-func newPluginInstallCommand() *cobra.Command {
+// newInstallCmd is install, mounted twice: as the top-level `rudy install` (ADR 0025
+// decision 2, the one verb everybody types) and as `rudy plugins install`, the noun-then-verb
+// form. Root and the plugins noun each call this to get their own instance rather than
+// sharing one *cobra.Command, since a command remembers a single parent.
+func newInstallCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "install <source>",
 		Short: "install a plugin from a git URL or a local path",
