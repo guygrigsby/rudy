@@ -35,9 +35,8 @@ func NewPeer(c Conn) *Peer {
 		closed:   make(chan struct{}),
 	}
 	p.inc.closeFn = p.Close
-	responses := make(chan Response, responseBuffer)
-	p.cl = newClientOn(c.Send, p.Close, responses)
-	go p.read(responses)
+	p.cl = newClientOn(c.Send, p.Close)
+	go p.read()
 	return p
 }
 
@@ -67,10 +66,10 @@ func (p *Peer) Close() error {
 	return err
 }
 
-// read is the one reader. Responses go to the Client's route goroutine, everything with a
-// method to the Incoming queue.
-func (p *Peer) read(responses chan<- Response) {
-	defer close(responses)
+// read is the one reader. Responses go straight to the Client's pending call, everything with
+// a method to the Incoming queue.
+func (p *Peer) read() {
+	defer p.cl.finishReading()
 	ctx := context.Background()
 	for {
 		raw, err := p.c.Recv(ctx)
@@ -89,7 +88,7 @@ func (p *Peer) read(responses chan<- Response) {
 			}
 			continue
 		}
-		responses <- Response{JSONRPC: Version, ID: m.ID, Result: m.Result, Error: m.Error}
+		p.cl.deliver(Response{JSONRPC: Version, ID: m.ID, Result: m.Result, Error: m.Error})
 	}
 }
 

@@ -293,3 +293,35 @@ func TestClientCloseStopsDrainWithNoConsumer(t *testing.T) {
 		}
 	}
 }
+
+// TestCallPrefersADeliveredResponseToACancel pins the outcome when a call's answer and its
+// caller's cancellation are both ready at once. A select between two ready cases picks at
+// random, so before the fix a call whose response had already arrived reported
+// context.Canceled about half the time and threw the result away.
+//
+// The race is staged rather than waited for: send delivers the response the way the reader
+// does and then cancels, so Call reaches its select with both cases ready every iteration.
+// The loop is what makes a coin flip a certainty.
+func TestCallPrefersADeliveredResponseToACancel(t *testing.T) {
+	for range 100 {
+		ctx, cancel := context.WithCancel(context.Background())
+		var c *Client
+		send := func(context.Context, any) error {
+			c.deliver(Response{ID: json.RawMessage("1"), Result: json.RawMessage(`{"turn_id":"t1"}`)})
+			cancel()
+			return nil
+		}
+		c = newClientOn(send, func() error { return nil })
+		var out struct {
+			TurnID string `json:"turn_id"`
+		}
+		err := c.Call(ctx, "session.submit", struct{}{}, &out)
+		cancel()
+		if err != nil {
+			t.Fatalf("call = %v, want the response that had already arrived", err)
+		}
+		if out.TurnID != "t1" {
+			t.Fatalf("result = %+v, want the turn id the server answered with", out)
+		}
+	}
+}

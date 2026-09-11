@@ -44,22 +44,17 @@ type Client struct {
 	once   sync.Once
 }
 
-// responseBuffer is how many responses the reader may run ahead of the routing goroutine
-// before it waits. Routing never blocks, so this only absorbs scheduling jitter.
-const responseBuffer = 64
-
-// NewClient starts the reader, the routing and the notification drain goroutines.
+// NewClient starts the reader and the notification drain goroutine.
 func NewClient(conn Conn) *Client {
-	responses := make(chan Response, responseBuffer)
-	c := newClientOn(conn.Send, conn.Close, responses)
-	go c.read(conn, responses)
+	c := newClientOn(conn.Send, conn.Close)
+	go c.read(conn)
 	return c
 }
 
 // newClientOn builds a Client over a transport somebody else reads: send writes one message,
-// closeFn ends the connection and responses is fed with every response that arrives, closed
-// when the feeder stops. It is what Peer uses; NewClient is this plus its own reader.
-func newClientOn(send func(ctx context.Context, msg any) error, closeFn func() error, responses <-chan Response) *Client {
+// closeFn ends the connection, and whoever reads hands every response to deliver and calls
+// finishReading when it stops. It is what Peer uses; NewClient is this plus its own reader.
+func newClientOn(send func(ctx context.Context, msg any) error, closeFn func() error) *Client {
 	c := &Client{
 		send:    send,
 		closeFn: closeFn,
@@ -69,7 +64,6 @@ func newClientOn(send func(ctx context.Context, msg any) error, closeFn func() e
 		closed:  make(chan struct{}),
 	}
 	c.qcond = sync.NewCond(&c.qmu)
-	go c.route(responses)
 	go c.drain()
 	return c
 }
@@ -107,16 +101,23 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 	}
 	select {
 	case resp := <-ch:
-		if resp.Error != nil {
-			return resp.Error
-		}
-		if result != nil && len(resp.Result) > 0 {
-			return json.Unmarshal(resp.Result, result)
-		}
-		return nil
+		return unpack(resp, result)
 	case <-ctx.Done():
+		// An answer that already arrived beats the reason for giving up on it. Both cases are
+		// ready whenever a call is cancelled just as its response lands, and a select between
+		// ready cases picks at random, so without this second look a call that in fact
+		// succeeded reports context.Canceled about half the time and its result is discarded.
+		// That is what the agent tool hit: a cancelled call's session.submit came back with
+		// the child's turn id, reported itself cancelled, and so never interrupted the child
+		// it had just started.
+		if resp, ok := delivered(ch); ok {
+			return unpack(resp, result)
+		}
 		return ctx.Err()
 	case <-c.done:
+		if resp, ok := delivered(ch); ok {
+			return unpack(resp, result)
+		}
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.err != nil {
@@ -124,6 +125,28 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		}
 		return io.EOF
 	}
+}
+
+// delivered takes the response already sitting in ch, if there is one. The channel holds one
+// and only this call reads it, so nothing else can take it in between.
+func delivered(ch chan Response) (Response, bool) {
+	select {
+	case resp := <-ch:
+		return resp, true
+	default:
+		return Response{}, false
+	}
+}
+
+// unpack is one response as the call's return: its error, or its result decoded into out.
+func unpack(resp Response, out any) error {
+	if resp.Error != nil {
+		return resp.Error
+	}
+	if out != nil && len(resp.Result) > 0 {
+		return json.Unmarshal(resp.Result, out)
+	}
+	return nil
 }
 
 // Close ends the connection. The reader then stops, and the drain goroutine follows: it
@@ -148,10 +171,10 @@ type incoming struct {
 }
 
 // read is the reader for a Client that owns its Conn: it appends notifications to the queue
-// itself and hands responses to route. It never blocks on a slow Notifications consumer, so
-// one pending Call always gets routed.
-func (c *Client) read(conn Conn, responses chan<- Response) {
-	defer close(responses)
+// itself and hands responses straight to deliver. Neither blocks on a slow Notifications
+// consumer, so one pending Call always gets its answer.
+func (c *Client) read(conn Conn) {
+	defer c.finishReading()
 	ctx := context.Background()
 	for {
 		raw, err := conn.Recv(ctx)
@@ -174,32 +197,31 @@ func (c *Client) read(conn Conn, responses chan<- Response) {
 			resp := NewErrorResponse(m.ID, NewError(CodeMethodNotFound, "client handles no requests", nil))
 			_ = conn.Send(ctx, resp)
 		default:
-			responses <- Response{JSONRPC: Version, ID: m.ID, Result: m.Result, Error: m.Error}
+			c.deliver(Response{JSONRPC: Version, ID: m.ID, Result: m.Result, Error: m.Error})
 		}
 	}
 }
 
-// route hands each response to the Call waiting for it. The per-call channel is buffered, so
-// this never blocks; a response for a call that has already given up, or a second response
-// for one id, is dropped. When the feeder closes responses the client is finished: pending
-// calls are released by finishReading closing done.
-func (c *Client) route(responses <-chan Response) {
-	defer c.finishReading()
-	for resp := range responses {
-		id, err := strconv.ParseInt(string(resp.ID), 10, 64)
-		if err != nil {
-			continue
-		}
-		c.mu.Lock()
-		ch, ok := c.pending[id]
-		c.mu.Unlock()
-		if !ok {
-			continue
-		}
-		select {
-		case ch <- resp:
-		default:
-		}
+// deliver hands one response to the Call waiting for it. The per-call channel is buffered, so
+// this never blocks; a response for a call that has already given up, or a second response for
+// one id, is dropped. It runs on the reader rather than on a goroutine of its own, so a reader
+// that has taken a message has already made every response before it visible to its Call: with
+// a queue in between, a call cancelled at that moment could not see an answer that had in fact
+// arrived, and would report itself cancelled instead.
+func (c *Client) deliver(resp Response) {
+	id, err := strconv.ParseInt(string(resp.ID), 10, 64)
+	if err != nil {
+		return
+	}
+	c.mu.Lock()
+	ch, ok := c.pending[id]
+	c.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case ch <- resp:
+	default:
 	}
 }
 
