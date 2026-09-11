@@ -65,6 +65,12 @@ type memPlugin struct {
 
 	mu       sync.Mutex
 	sessions map[string]*sessionState
+
+	// writes serializes memory_remember. memory.Remember reads a concept, revises it and
+	// writes it back, so two at once lose a revision. Tool calls run concurrently (ADR 0028)
+	// and a tool that is not reentrant guards itself rather than asking the scheduler to.
+	// rudy-0lz fixes this properly in memory-go; this keeps rudy correct meanwhile.
+	writes sync.Mutex
 }
 
 // New builds the plugin. sessionsDir locates a session's entries.jsonl for the fold; version

@@ -118,6 +118,8 @@ func (p *memPlugin) remember(ctx context.Context, call tool.Call) (tool.Result, 
 	if err := json.Unmarshal(call.Input, &a); err != nil {
 		return fsroot.Fail("memory_remember: bad input: %v", err), nil
 	}
+	p.writes.Lock()
+	defer p.writes.Unlock()
 	st, fail := p.scopeOf(call)
 	if fail != nil {
 		return *fail, nil
