@@ -256,23 +256,34 @@ func (ls *liveSession) askersObsLocked() []*conn {
 // The plugin connection that opened this session is excluded: it is the one waiting on the
 // tool call this session answers and is already reading these notifications as this session's
 // own subscriber, so routing them to it a second time here would echo every one of them back.
+// A connection already subscribed to this session directly is excluded for the same reason,
+// not only a plugin's: watching the parent and also resuming the child (the obvious gesture for
+// opening a subagent's own transcript) would otherwise put that connection in both lists, and
+// entry.appended can be de-duplicated by id but stream.delta is never replayed and cannot,
+// which would render a subagent's streamed text twice.
 //
-// Receiving these confers nothing: authority over a session follows subscription (ownSession,
-// handleSubmit), and a parent's client is never subscribed to the child just because it is
-// handed the child's notifications this way, so it gains no new way to submit to, interrupt or
-// answer for it.
+// Receiving these confers nothing on its own: authority over a session follows subscription
+// (ownSession for a plugin, childRefusesUnsubscribed for session.submit and
+// session.interrupt), and a parent's client is never subscribed to the child just because it is
+// handed the child's notifications this way. session.answer is deliberately not gated the same
+// way: a child with no asker of its own borrows its parent's (see askers), so a parent's asker
+// answering a child's standing question by the session id the question itself named is the
+// mechanism working as designed, not a leak.
 //
 // Self-locking (takes ls.parent.obsMu, never ls.obsMu, which every caller here has already
-// released - see notifyWatchers). Caller must not hold any liveSession's obsMu.
+// released - see notifyWatchers; and, briefly, each candidate conn's own cn.mu to check
+// subscribed, the same nesting broadcastObsLocked already uses for conn.notify). Caller must
+// not hold any liveSession's obsMu.
 func (ls *liveSession) watchers() []*conn {
 	if ls.parent == nil {
 		return nil
 	}
+	sid := ls.sess.ID()
 	ls.parent.obsMu.Lock()
 	defer ls.parent.obsMu.Unlock()
 	out := make([]*conn, 0, len(ls.parent.conns))
 	for _, c := range ls.parent.conns {
-		if c.plugin != "" {
+		if c.plugin != "" || c.subscribed(sid) {
 			continue
 		}
 		out = append(out, c)

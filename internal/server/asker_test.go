@@ -11,7 +11,6 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/protocol"
-	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -396,8 +395,8 @@ func TestAttachMidTurnHearsTheState(t *testing.T) {
 
 // inFlightTool is a safe tool whose Invoke blocks until release closes.
 // TestAClientAttachingMidTurnSeesCallsInFlight uses two calls of it (tu_a, tu_b) to hold the
-// turn's RunningTool state open while a third, unsafe call is awaiting permission, so a client
-// attaching mid-turn has more than one call to tell apart.
+// turn's RunningTool state open while a third call (fakePlugin's own unsafe "danger") is
+// awaiting permission, so a client attaching mid-turn has more than one call to tell apart.
 type inFlightTool struct{ release chan struct{} }
 
 func (b *inFlightTool) invoke(ctx context.Context, _ tool.Call) (tool.Result, error) {
@@ -409,76 +408,16 @@ func (b *inFlightTool) invoke(ctx context.Context, _ tool.Call) (tool.Result, er
 	return tool.Result{Content: []session.Block{session.TextBlock("ran")}}, nil
 }
 
-// inFlightProvider answers its first call with one assistant message naming four tool calls at
-// once (an instant safe one, two slow safe ones and one unsafe one) and every call after with
-// plain text, ending the turn. TestAClientAttachingMidTurnSeesCallsInFlight is the only user.
-type inFlightProvider struct {
-	mu    sync.Mutex
-	calls int
-}
+// inFlightTools registers the two tools TestAClientAttachingMidTurnSeesCallsInFlight needs
+// beyond what newHarnessWith's own fakePlugin already provides (a "danger" tool, unsafe, so
+// strict mode asks for it): quick returns immediately, slow blocks on blk.release. No provider
+// of its own; the scriptProvider newHarnessWith wraps plays every call this test needs via its
+// multi field.
+type inFlightTools struct{ blk *inFlightTool }
 
-func (p *inFlightProvider) Name() string { return "fake" }
+func (p *inFlightTools) Name() string { return "inflight" }
 
-func (p *inFlightProvider) ListModels(context.Context) ([]provider.Model, error) {
-	return []provider.Model{{
-		Ref: session.ModelRef{Provider: "fake", Model: "m1"}, DisplayName: "Fake 1",
-		ContextWindow: 100000, Capabilities: provider.Capabilities{Tools: true},
-	}}, nil
-}
-
-func (p *inFlightProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
-	p.mu.Lock()
-	p.calls++
-	n := p.calls
-	p.mu.Unlock()
-	var parts []provider.Part
-	if n == 1 {
-		parts = append(parts, provider.Part{Type: provider.PartTextDelta, Text: "go"})
-		parts = append(parts, inFlightToolCall("tu_quick", "quick")...)
-		parts = append(parts, inFlightToolCall("tu_a", "slow")...)
-		parts = append(parts, inFlightToolCall("tu_b", "slow")...)
-		parts = append(parts, inFlightToolCall("tu_danger", "danger")...)
-		parts = append(parts,
-			provider.Part{Type: provider.PartUsage, Usage: session.Usage{Input: 5, Output: 5}},
-			provider.Part{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
-		)
-	} else {
-		parts = []provider.Part{
-			{Type: provider.PartTextDelta, Text: "done"},
-			{Type: provider.PartUsage, Usage: session.Usage{Input: 5, Output: 5}},
-			{Type: provider.PartStop, StopReason: session.StopEndTurn, StopReasonRaw: "stop"},
-		}
-	}
-	for _, part := range parts {
-		if err := emit(part); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func inFlightToolCall(id, name string) []provider.Part {
-	return []provider.Part{
-		{Type: provider.PartToolUseStart, ID: id, Name: name},
-		{Type: provider.PartToolUseDelta, ID: id, Text: `{}`},
-		{Type: provider.PartToolUseEnd, ID: id},
-	}
-}
-
-// inFlightPlugin registers inFlightProvider and its three tools: quick returns immediately,
-// slow blocks on blk.release, and danger is unsafe so strict mode (testConfig's default) asks
-// for it.
-type inFlightPlugin struct {
-	prov *inFlightProvider
-	blk  *inFlightTool
-}
-
-func (p *inFlightPlugin) Name() string { return "inflight" }
-
-func (p *inFlightPlugin) Init(_ context.Context, h plugin.Host) error {
-	if err := h.RegisterProvider(p.prov); err != nil {
-		return err
-	}
+func (p *inFlightTools) Init(_ context.Context, h plugin.Host) error {
 	if err := h.RegisterTool(tool.Tool{
 		Name: "quick", Description: "returns immediately", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe,
 		Invoke: func(context.Context, tool.Call) (tool.Result, error) {
@@ -487,17 +426,9 @@ func (p *inFlightPlugin) Init(_ context.Context, h plugin.Host) error {
 	}); err != nil {
 		return err
 	}
-	if err := h.RegisterTool(tool.Tool{
+	return h.RegisterTool(tool.Tool{
 		Name: "slow", Description: "blocks until released", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe,
 		Invoke: p.blk.invoke,
-	}); err != nil {
-		return err
-	}
-	return h.RegisterTool(tool.Tool{
-		Name: "danger", Description: "an unsafe tool that asks", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Unsafe,
-		Invoke: func(context.Context, tool.Call) (tool.Result, error) {
-			return tool.Result{Content: []session.Block{session.TextBlock("danger done")}}, nil
-		},
 	})
 }
 
@@ -507,16 +438,15 @@ func (p *inFlightPlugin) Init(_ context.Context, h plugin.Host) error {
 // its own tool_result entry in the replay already delivered.
 func TestAClientAttachingMidTurnSeesCallsInFlight(t *testing.T) {
 	blk := &inFlightTool{release: make(chan struct{})}
-	prov := &inFlightProvider{}
-	// newHarnessWith is not used here: it wraps a scriptProvider into its own fakePlugin,
-	// which registers a "danger" tool of its own tied to that provider. This test needs its
-	// own plugin and provider instead, so it builds the server directly.
-	srv, _ := newServerWith(t, testConfig(), &inFlightPlugin{prov: prov, blk: blk})
-	cl := dialAs(t, srv, true)
-	var info protocol.SessionInfo
-	if err := cl.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: t.TempDir()}, &info); err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	prov := &scriptProvider{multi: []multiCall{
+		{id: "tu_quick", name: "quick", input: "{}"},
+		{id: "tu_a", name: "slow", input: "{}"},
+		{id: "tu_b", name: "slow", input: "{}"},
+		{id: "tu_danger", name: "danger", input: "{}"},
+	}}
+	h := newHarnessWith(t, prov, &inFlightTools{blk: blk})
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
 	submit(t, cl, info.SessionID, "go")
 
 	// Wait for every precondition the attach assertion below depends on: both slow calls
@@ -546,7 +476,7 @@ func TestAClientAttachingMidTurnSeesCallsInFlight(t *testing.T) {
 		return seen["a"] && seen["b"] && seen["quick"] && seen["asked"]
 	})
 
-	raw := rawDialAs(t, srv, false)
+	raw := rawDialAs(t, h.srv, false)
 	_, raws := raw.call(protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID})
 	states := map[string]string{}
 	for _, m := range sessionNotes(raws) {

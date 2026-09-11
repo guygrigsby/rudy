@@ -51,6 +51,11 @@ type scriptProvider struct {
 	toolName  string             // the tool to call; empty means danger
 	toolInput string             // that tool's input; empty means {"x":1}
 	reqs      []provider.Request // every request, in order
+	// multi, when set, makes the first call answer with every one of these tool calls in a
+	// single assistant message instead of the lone toolName/toolInput pair, and every call
+	// after that with plain text ending the turn. For a test needing several tool calls
+	// running at once (ADR 0028), rather than the one-call-per-round default above.
+	multi []multiCall
 	// A compaction's summary request (the one carrying the summary system prompt) waits on
 	// summary when it is non-nil, so a test can hold a compaction open. summaryHit is signalled
 	// once when such a request arrives, summaryDone is closed when it returns, and summaryErr
@@ -107,6 +112,7 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 	p.reqs = append(p.reqs, req)
 	textOnly := p.textOnly
 	toolName, toolInput := p.toolName, p.toolInput
+	multi := p.multi
 	p.mu.Unlock()
 	if toolName == "" {
 		toolName = "danger"
@@ -144,7 +150,21 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 		}
 	}
 	var parts []provider.Part
-	if n%2 == 1 && !textOnly {
+	switch {
+	case len(multi) > 0 && n == 1:
+		parts = append(parts, provider.Part{Type: provider.PartTextDelta, Text: "go"})
+		for _, c := range multi {
+			parts = append(parts,
+				provider.Part{Type: provider.PartToolUseStart, ID: c.id, Name: c.name},
+				provider.Part{Type: provider.PartToolUseDelta, ID: c.id, Text: c.input},
+				provider.Part{Type: provider.PartToolUseEnd, ID: c.id},
+			)
+		}
+		parts = append(parts,
+			provider.Part{Type: provider.PartUsage, Usage: session.Usage{Input: 5, Output: 5}},
+			provider.Part{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
+		)
+	case n%2 == 1 && !textOnly:
 		parts = []provider.Part{
 			{Type: provider.PartTextDelta, Text: "Looking."},
 			{Type: provider.PartToolUseStart, ID: "tu" + itoa(n), Name: toolName},
@@ -153,7 +173,7 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 			{Type: provider.PartUsage, Usage: session.Usage{Input: 10, Output: 5}},
 			{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
 		}
-	} else {
+	default:
 		parts = []provider.Part{
 			{Type: provider.PartTextDelta, Text: "done"},
 			{Type: provider.PartUsage, Usage: session.Usage{Input: 20, Output: 1}},
@@ -167,6 +187,10 @@ func (p *scriptProvider) Complete(ctx context.Context, req provider.Request, emi
 	}
 	return nil
 }
+
+// multiCall is one tool_use scriptProvider.multi answers with, all in the same assistant
+// message.
+type multiCall struct{ id, name, input string }
 
 func itoa(n int) string { return string(rune('0' + n)) }
 
@@ -3321,6 +3345,70 @@ func TestAParentsClientSeesItsChildsWork(t *testing.T) {
 	}
 }
 
+// TestAParentsClientSeesEveryChildNotificationKind is decision 6's own scope: all four kinds
+// (entry.appended, stream.delta, turn.state and tool.state) are forwarded, not only
+// entry.appended, which TestAParentsClientSeesItsChildsWork stops at the first of. It drives a
+// real turn on the child directly (a fresh connection resumes it first, satisfying the child's
+// own submit gate) so the watcher, subscribed only to the parent, has all four to observe live.
+// The child's first turn calls the shared agentProvider's "echo" tool, unregistered in this
+// harness (see openChildSession's own doc), which is what several other tests in this file
+// already rely on to reach a tool_result before the final answer; tool.state fires for it
+// regardless, since runTool reports running and done before it ever checks whether the name
+// resolves.
+func TestAParentsClientSeesEveryChildNotificationKind(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	watcher := attach(t, srv, parent)
+	child := openChildSession(t, cn, parent, "default")
+
+	childConn := dialAs(t, srv.srv, false)
+	resumeOn(t, childConn, child)
+	if err := call(t, childConn, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: child, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}); err != nil {
+		t.Fatalf("submit to child: %v", err)
+	}
+
+	seen := map[string]bool{}
+	drain(t, watcher, func(n protocol.Notification) bool {
+		switch n.Method {
+		case protocol.NotifyEntryAppended:
+			var ea protocol.EntryAppended
+			_ = json.Unmarshal(n.Params, &ea)
+			if ea.SessionID == child {
+				seen["entry.appended"] = true
+			}
+		case protocol.NotifyStreamDelta:
+			var sd protocol.StreamDelta
+			_ = json.Unmarshal(n.Params, &sd)
+			if sd.SessionID == child {
+				seen["stream.delta"] = true
+			}
+		case protocol.NotifyTurnState:
+			var ts protocol.TurnStateChanged
+			_ = json.Unmarshal(n.Params, &ts)
+			if ts.SessionID == child {
+				seen["turn.state"] = true
+				if ts.State == "completed" {
+					seen["completed"] = true
+				}
+			}
+		case protocol.NotifyToolState:
+			var ts protocol.ToolStateChanged
+			_ = json.Unmarshal(n.Params, &ts)
+			if ts.SessionID == child {
+				seen["tool.state"] = true
+			}
+		}
+		return seen["completed"]
+	})
+	for _, kind := range []string{"entry.appended", "stream.delta", "turn.state", "tool.state"} {
+		if !seen[kind] {
+			t.Fatalf("the watcher never received the child's %s: %v", kind, seen)
+		}
+	}
+}
+
 // TestAParentsClientCannotDriveTheChild is the other half of decision 6: receiving the child's
 // notifications is not the same thing as being subscribed to it, so a client that only watches
 // the parent gains no standing to submit to the child.
@@ -3339,6 +3427,64 @@ func TestAParentsClientCannotDriveTheChild(t *testing.T) {
 	}
 	if got := code(t, err); got != protocol.CodeUnauthorized {
 		t.Fatalf("submit to an unwatched child code = %d, want %d (unauthorized): %v", got, protocol.CodeUnauthorized, err)
+	}
+}
+
+// TestAParentsClientCannotInterruptTheChild is TestAParentsClientCannotDriveTheChild's
+// interrupt counterpart. This wave is what makes it reachable at all: before routing existed, a
+// client watching only the parent never learned a running child's id (it arrived in the
+// parent's own tool_result, and only once the call had already returned), so there was nothing
+// to name in a session.interrupt call it could make on its own.
+func TestAParentsClientCannotInterruptTheChild(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	watcher := attach(t, srv, parent)
+	child := openChildSession(t, cn, parent, "default")
+
+	err := call(t, watcher, protocol.MethodSessionInterrupt, protocol.SessionInterruptParams{
+		SessionID: child, How: session.InterruptCancel,
+	})
+	if err == nil {
+		t.Fatal("a client that only watches a child was allowed to interrupt it")
+	}
+	if got := code(t, err); got != protocol.CodeUnauthorized {
+		t.Fatalf("interrupt on an unwatched child code = %d, want %d (unauthorized): %v", got, protocol.CodeUnauthorized, err)
+	}
+}
+
+// TestAChildResumedColdStillRefusesAnUnsubscribedSubmit is rudy-review round 1 on task 6:
+// childRefusesUnsubscribed must key on the log (openedAsChild), not on ls.parent, the live link
+// open sets and nothing else ever does. A child reloaded cold (here, by closing every
+// connection to it and waiting for the server to actually detach it, the same waitUntilCold
+// dance TestResumedChildKeepsItsOwnList uses) has a nil ls.parent even though its log still
+// names one, and the gate must not silently fall back to the loose root rule for it.
+func TestAChildResumedColdStillRefusesAnUnsubscribedSubmit(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	child := openChildSession(t, cn, parent, "default")
+
+	srv.op.closeAll()
+	waitUntilCold(t, srv, child)
+
+	// Resuming brings it back live with ls.parent nil (open is the only writer of that field,
+	// and this path is a cold reload, not an open); the log's own parent_session_id survives.
+	resumed := attach(t, srv, child)
+	watcher := attach(t, srv, parent)
+	err := call(t, watcher, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: child, Content: []session.Block{session.TextBlock("do as I say")}, Source: session.SourceTyped,
+	})
+	if err == nil {
+		t.Fatal("a client that only watches the parent was allowed to submit to a cold-reloaded child")
+	}
+	if got := code(t, err); got != protocol.CodeUnauthorized {
+		t.Fatalf("submit to a cold-reloaded, unwatched child code = %d, want %d (unauthorized): %v", got, protocol.CodeUnauthorized, err)
+	}
+	// The connection that actually resumed it directly still may, proving the refusal above is
+	// about subscription and not about the session having gone cold once.
+	if err := call(t, resumed, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: child, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}); err != nil {
+		t.Fatalf("submit from the child's own resumed connection: %v", err)
 	}
 }
 

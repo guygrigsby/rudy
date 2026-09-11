@@ -168,7 +168,10 @@ func TestAskersNeverIncludeAPluginConnection(t *testing.T) {
 // TestWatchersNeverIncludeAPluginConnection is watchers' own version of the test above: the
 // mirror walk, downward instead of up, excludes the same plugin connection for the same reason
 // (ADR 0028 decision 6) - it is the child's own subscriber, already reading these
-// notifications, and must not also receive them relayed through its parent.
+// notifications, and must not also receive them relayed through its parent. child needs a real
+// sess (newTestLive, not a bare &liveSession{}) because watchers() reads ls.sess.ID() to check
+// each candidate against its own subscriber set, which the plugin-exclusion path alone never
+// exercised.
 func TestWatchersNeverIncludeAPluginConnection(t *testing.T) {
 	pluginConn := newConn(1, nil)
 	pluginConn.plugin = "subagents"
@@ -177,7 +180,8 @@ func TestWatchersNeverIncludeAPluginConnection(t *testing.T) {
 
 	parent := &liveSession{}
 	parent.conns = []*conn{pluginConn, clientConn, secondClient}
-	child := &liveSession{parent: parent}
+	child := newTestLive(t)
+	child.parent = parent
 
 	want := []*conn{clientConn, secondClient}
 	if got := child.watchers(); !slices.Equal(got, want) {
@@ -188,6 +192,26 @@ func TestWatchersNeverIncludeAPluginConnection(t *testing.T) {
 	root := &liveSession{}
 	if got := root.watchers(); got != nil {
 		t.Errorf("a root session's watchers = %+v, want none", got)
+	}
+}
+
+// TestWatchersExcludesAConnectionAlreadySubscribedToTheChild: a client that watches the parent
+// and has also resumed the child directly (the obvious way to open a subagent's own transcript)
+// must not be handed the same notification twice - entry.appended could be de-duplicated by id,
+// but stream.delta is never replayed and could not be.
+func TestWatchersExcludesAConnectionAlreadySubscribedToTheChild(t *testing.T) {
+	child := newTestLive(t)
+	watchesBoth := newConn(1, nil)
+	watchesBoth.subs[child.sess.ID()] = child
+	watchesParentOnly := newConn(2, nil)
+
+	parent := &liveSession{}
+	parent.conns = []*conn{watchesBoth, watchesParentOnly}
+	child.parent = parent
+
+	want := []*conn{watchesParentOnly}
+	if got := child.watchers(); !slices.Equal(got, want) {
+		t.Errorf("watchers = %+v, want only the connection not already subscribed to the child", got)
 	}
 }
 

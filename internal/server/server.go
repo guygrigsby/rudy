@@ -331,7 +331,7 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 	case protocol.MethodSessionSubmit:
 		return s.handleSubmit(cn, req.Params)
 	case protocol.MethodSessionInterrupt:
-		return s.handleInterrupt(req.Params)
+		return s.handleInterrupt(cn, req.Params)
 	case protocol.MethodSessionAnswer:
 		return s.handleAnswer(cn, req.Params)
 	case protocol.MethodSessionSetModel:
@@ -502,15 +502,27 @@ func (s *Server) handleClose(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	return struct{}{}, nil
 }
 
+// childRefusesUnsubscribed reports whether ls is a child session and cn, a plain client, has
+// not itself subscribed to it: the gate session.submit and session.interrupt share. Watching a
+// child through its parent's forwarded notifications (ADR 0028 decision 6) is deliberately not
+// the same thing as being subscribed to it, so a parent's client that never resumed the child
+// directly has no more standing to drive it than a stranger would. This uses openedAsChild on
+// the log rather than ls.parent, the live link open sets and nothing else ever does: a child
+// resumed cold, after a restart or after the session that spawned it has closed, has a nil
+// parent and is still a child (rudy-review round 1 on task 6). A plugin connection is exempted
+// here because its own submit and interrupt authority is already the stricter "only what it
+// subscribed to", enforced separately (handleSubmit's own check; ownSession for interrupt via
+// pluginOwnSession).
+func childRefusesUnsubscribed(cn *conn, ls *liveSession) bool {
+	return cn.plugin == "" && !cn.subscribed(ls.sess.ID()) && openedAsChild(ls.snapshotEntries())
+}
+
 // handleSubmit starts a turn. A plugin connection may only submit to a session it opened or
 // attached itself: driving somebody else's session is not what the plugin caller class is
-// for, and a child session is exactly a session the plugin does hold. A child session refuses
-// every other connection too, plugin or not: watching a child (its notifications reaching a
-// parent's subscribers, ADR 0028 decision 6) is deliberately not the same thing as subscribing
-// to it, so a parent's client that never resumed the child directly has no more standing to
-// submit to it than a stranger would. An ordinary session outside a parent-child relationship
-// keeps the looser rule it always had: any client that knows its id may submit to it, the same
-// as session.interrupt.
+// for, and a child session is exactly a session the plugin does hold. An ordinary session
+// outside a parent-child relationship keeps the looser rule it always had: any client that
+// knows its id may submit to it, the same as session.interrupt (the broader gap that leaves is
+// rudy-jkz, not this one).
 func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
 	var p protocol.SessionSubmitParams
 	if e := decode(raw, &p); e != nil {
@@ -523,7 +535,7 @@ func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	switch {
 	case cn.plugin != "" && !cn.subscribed(ls.sess.ID()):
 		return nil, perr(protocol.CodeUnauthorized, "plugin may only submit to sessions it opened")
-	case cn.plugin == "" && ls.parent != nil && !cn.subscribed(ls.sess.ID()):
+	case childRefusesUnsubscribed(cn, ls):
 		return nil, perr(protocol.CodeUnauthorized, "only a session's own subscriber may submit to a child session")
 	}
 	if len(p.Content) == 0 {
@@ -552,8 +564,11 @@ func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Err
 // handleInterrupt never holds ls.mu or ls.obsMu while calling into r: it reads ls.runner once
 // under mu, releases it, and only then calls State/Interrupt/TurnID directly on the runner
 // (safe and freshest, since no liveSession lock is held during those calls - see liveSession's
-// doc).
-func (s *Server) handleInterrupt(raw json.RawMessage) (any, *protocol.Error) {
+// doc). A child session refuses a plain client that has not subscribed to it, the same gate
+// session.submit applies: the routing this wave added is what makes a running child's id
+// reachable by a client that only watches the parent, and watching must not double as standing
+// to cancel it.
+func (s *Server) handleInterrupt(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
 	var p protocol.SessionInterruptParams
 	if e := decode(raw, &p); e != nil {
 		return nil, e
@@ -561,6 +576,9 @@ func (s *Server) handleInterrupt(raw json.RawMessage) (any, *protocol.Error) {
 	ls, e := s.lookup(p.SessionID)
 	if e != nil {
 		return nil, e
+	}
+	if childRefusesUnsubscribed(cn, ls) {
+		return nil, perr(protocol.CodeUnauthorized, "only a session's own subscriber may interrupt a child session")
 	}
 	if !p.How.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "how must be steer or cancel")
