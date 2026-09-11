@@ -76,19 +76,13 @@ func TestInflightIsSafeUnderConcurrentUse(t *testing.T) {
 	f := newInflight()
 	var wg sync.WaitGroup
 	for i := range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			id := string(rune('a' + i))
 			f.add(id, func() {})
 			f.len()
 			f.remove(id)
-		}()
+		})
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		f.cancelAll()
-	}()
+	wg.Go(f.cancelAll)
 	wg.Wait()
 }

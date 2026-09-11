@@ -422,11 +422,7 @@ func (r *Runner) loop(ctx context.Context) error {
 		outcomes := make([]toolOutcome, len(runnable))
 		var wg sync.WaitGroup
 		for i, tu := range runnable {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				outcomes[i] = r.runTool(ctx, tu)
-			}()
+			wg.Go(func() { outcomes[i] = r.runTool(ctx, tu) })
 		}
 		wg.Wait()
 		// One slot per call, read in call order, so the turn ends on the same outcome
