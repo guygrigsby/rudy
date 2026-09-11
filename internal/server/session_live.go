@@ -477,11 +477,7 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 		for _, q := range ls.standing {
 			at.standing = append(at.standing, q.req)
 		}
-		// Map order is not an order. Sorting by tool_use id makes what a newcomer hears
-		// the same on every attach, which is what the order test can pin.
-		slices.SortFunc(at.standing, func(a, b protocol.PermissionRequested) int {
-			return strings.Compare(a.ToolUseID, b.ToolUseID)
-		})
+		sortStanding(at.standing)
 	}
 	ls.obsMu.Unlock()
 
@@ -516,12 +512,18 @@ func (ls *liveSession) watchAttachment(asker bool) (childAttachment, bool) {
 		for _, q := range ls.standing {
 			at.standing = append(at.standing, q.req)
 		}
-		// Map order is not an order, the same reason subscribeLocked sorts its own.
-		slices.SortFunc(at.standing, func(a, b protocol.PermissionRequested) int {
-			return strings.Compare(a.ToolUseID, b.ToolUseID)
-		})
+		sortStanding(at.standing)
 	}
 	return at, true
+}
+
+// sortStanding orders a set of questions by tool_use id. A map has no order, so without this
+// what a newcomer hears would differ from attach to attach, and neither the order test nor a
+// person reading two transcripts could tell a real difference from an iteration one.
+func sortStanding(qs []protocol.PermissionRequested) {
+	slices.SortFunc(qs, func(a, b protocol.PermissionRequested) int {
+		return strings.Compare(a.ToolUseID, b.ToolUseID)
+	})
 }
 
 // mirror records an entry appended to the session by something other than a turn and sends it
