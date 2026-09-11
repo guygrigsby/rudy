@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -274,5 +275,32 @@ func TestUpdateRunsAGoModuleThroughTheFullDispatch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(s.PluginDir("hello"), "plugin.toml")); err != nil {
 		t.Fatalf("plugin.toml missing from the updated checkout: %v", err)
+	}
+}
+
+// TestAFailedGoDownloadNamesTheReason covers what every go: failure used to report: nothing.
+// `go mod download -json` writes the cause into its JSON object's Error field on stdout and
+// leaves stderr empty, so formatting stderr produced "exit status 1: " and stopped, which reads
+// the same for a typo, a tag that does not exist, a private module with no credentials and a
+// proxy that is down. The assertion is on the text after the exit status, not on the module
+// name: this package's own error prefix already names the module, so an assertion on that would
+// pass with an empty reason exactly as before.
+func TestAFailedGoDownloadNamesTheReason(t *testing.T) {
+	requireGo(t)
+	_, _, proxyURL := goModuleFixture(t)
+	s := newGoTestStore(t)
+	s.GoEnv = []string{"GOPROXY=" + proxyURL, "GONOSUMDB=*"}
+
+	_, _, err := s.Install(context.Background(), "go:example.com/rudytest/absent@v9.9.9", time.Now())
+	if err == nil {
+		t.Fatal("Install: want an error for a module the proxy does not serve")
+	}
+	if !regexp.MustCompile(`exit status \d+: \S`).MatchString(err.Error()) {
+		t.Fatalf("err = %q, want a reason after the exit status", err)
+	}
+	// From the go tool's own Error field: the proxy file it could not read. Nothing but that
+	// field carries it, so this is what proves the reason was parsed off stdout.
+	if !strings.Contains(err.Error(), "v9.9.9.info") {
+		t.Fatalf("err = %q, want the proxy path the go tool reported", err)
 	}
 }

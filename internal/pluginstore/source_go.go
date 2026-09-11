@@ -10,11 +10,15 @@ import (
 	"strings"
 )
 
-// goDownload is the subset of what `go mod download -json` reports that stageGo needs.
+// goDownload is the subset of what `go mod download -json` reports that stageGo needs. Error
+// is where the go tool puts the cause of a failed download: a typo, a tag that does not exist,
+// a private module with no credentials and a proxy that is down all report there, on stdout,
+// with stderr left empty, so a caller that only reads stderr shows the operator nothing at all.
 type goDownload struct {
 	Dir     string
 	Version string
 	Sum     string
+	Error   string
 }
 
 // stageGo fills dir with a go: source's module content the way `go install` resolves one: the
@@ -83,17 +87,41 @@ func (s *Store) goModDownload(ctx context.Context, module, ref string) (goDownlo
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return goDownload{}, fmt.Errorf("pluginstore: go mod download %s@%s: %w: %s", module, ref, err, tail(stderr.String()))
-	}
+	runErr := cmd.Run()
+	// stdout is parsed whether or not the command succeeded: a failed download still prints its
+	// JSON object, and that object's Error field is the only place the reason appears.
 	var dl goDownload
-	if err := json.Unmarshal([]byte(stdout.String()), &dl); err != nil {
-		return goDownload{}, fmt.Errorf("pluginstore: go mod download %s@%s: %w", module, ref, err)
+	jsonErr := json.Unmarshal([]byte(stdout.String()), &dl)
+	if runErr != nil {
+		return goDownload{}, fmt.Errorf("pluginstore: go mod download %s@%s: %w: %s", module, ref, runErr, downloadReason(dl, stderr.String()))
+	}
+	if dl.Error != "" {
+		// The go tool also reports some failures through Error alone, exiting zero, so an
+		// exit status is not on its own evidence that a module was downloaded.
+		return goDownload{}, fmt.Errorf("pluginstore: go mod download %s@%s: %s", module, ref, tail(dl.Error))
+	}
+	if jsonErr != nil {
+		return goDownload{}, fmt.Errorf("pluginstore: go mod download %s@%s: %w", module, ref, jsonErr)
 	}
 	if dl.Dir == "" || dl.Version == "" || dl.Sum == "" {
 		return goDownload{}, fmt.Errorf("pluginstore: go mod download %s@%s: incomplete result %+v", module, ref, dl)
 	}
 	return dl, nil
+}
+
+// downloadReason is what a failed `go mod download` gets to say for itself: the JSON object's
+// own Error field first, since that is where the go tool writes the cause, falling back to
+// stderr for a failure that produced no JSON at all (an unparseable module path, a missing go
+// binary's own complaint) and to a plain statement when the tool reported nothing anywhere,
+// rather than the empty string every go: failure used to end with.
+func downloadReason(dl goDownload, stderr string) string {
+	if reason := tail(dl.Error); reason != "" {
+		return reason
+	}
+	if reason := tail(stderr); reason != "" {
+		return reason
+	}
+	return "no reason reported"
 }
 
 // goEnv is the environment a go: source's subprocess runs with: the operator's own, with
