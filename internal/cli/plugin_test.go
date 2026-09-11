@@ -186,8 +186,8 @@ func TestPluginUninstallUnknownNameExitsWithMessage(t *testing.T) {
 
 // TestResolvedAtPrintsEachKindsRecord covers what install and update print after "at". A go: or
 // https install records no commit at all, so printing the source for anything without one threw
-// away the digest that is the entire reproducibility record of those two kinds: "at
-// go:x@v0.2.0" tells an operator only what they already typed.
+// away the digest that is the entire reproducibility record of those two kinds: an "at" line
+// echoing the module and version the operator just typed tells them nothing they did not know.
 func TestResolvedAtPrintsEachKindsRecord(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -653,3 +653,39 @@ func TestATarballWithTooManyEntriesIsRefused(t *testing.T) {
 		t.Fatalf("stage holds %d entries after the refusal, want nothing written at all", len(left))
 	}
 }
+
+// TestANestedTarballEscapingTheStageIsRefused covers the strip's interaction with the traversal
+// guard: an entry that climbs out from under the top-level directory must not be able to turn
+// that directory into a prefix worth stripping and ride the strip out of the stage. Names are
+// cleaned before any prefix is derived, so "r-1/../../../evil" is seen as "../../evil", which
+// is refused outright and rules stripping out with it. Three levels, not two: the name is
+// cleaned against its own leading "r-1/", so climbing out of a stage two directories below
+// s.Root takes one more "..", and the containment assert below would otherwise stat a path
+// nothing was ever going to be written to whether the guard worked or not.
+func TestANestedTarballEscapingTheStageIsRefused(t *testing.T) {
+	tgz := tarballWithEntries(t, []tarEntry{
+		{name: "r-1/", typeflag: tar.TypeDir},
+		{name: "r-1/plugin.toml", content: helloManifest},
+		{name: "r-1/../../../evil", content: "haha"},
+	})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(tgz)
+	}))
+	defer srv.Close()
+
+	s := newTestStore(t)
+	s.HTTPClient = srv.Client()
+
+	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
+	// The stage sits two directories below s.Root (Root/plugins/.install-*), so the cleaned
+	// "../../evil" lands exactly at Root/evil if nothing stops it.
+	if _, statErr := os.Stat(filepath.Join(s.Root, "evil")); !os.IsNotExist(statErr) {
+		t.Fatalf("the escaping entry landed at %s: stat = %v", filepath.Join(s.Root, "evil"), statErr)
+	}
+	if err == nil {
+		t.Fatal("Install of a nested archive with an escaping entry: want an error")
+	}
+	if !strings.Contains(err.Error(), "escapes the stage") {
+		t.Fatalf("err = %v, want it to name the escape", err)
+	}
+}
