@@ -298,12 +298,23 @@ func (s *Session) Agent() string {
 }
 
 // Tools is the resolved tool set session_opened recorded: nil for every tool, an empty slice
-// for none. A cold reload reads this rather than recomputing it from the agent definition and
-// the parent, which may be long gone (ADR 0028, rudy-ef4).
+// for none. Meaningful only from SchemaVersion 2 on: a version 1 log has no tools key at all,
+// and an absent key decodes to the same nil this returns for an explicit null, so a caller
+// cannot tell "every tool" from "field does not exist" through this method alone. Check
+// SchemaVersion first (ADR 0028, rudy-ef4).
 func (s *Session) Tools() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.openedLocked().Tools
+}
+
+// SchemaVersion is the log schema version session_opened recorded. It is what tells a version 1
+// log, which has no tools key, apart from a version 2 one whose tools happens to be null: both
+// decode Tools() to nil, and only SchemaVersion says which meaning that nil carries.
+func (s *Session) SchemaVersion() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openedLocked().SchemaVersion
 }
 
 func (s *Session) Model() ModelRef {

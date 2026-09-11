@@ -3358,6 +3358,74 @@ func TestForkedChildKeepsItsOwnList(t *testing.T) {
 	wantBoundedChild(t, "forked", driveTurn(t, srv, fork))
 }
 
+// v1SessionOpened is session_opened's shape before the tools field existed: no tools key at
+// all, distinct from a version 2 line's explicit null in a way only schema_version can tell
+// apart once both have decoded to a nil slice.
+type v1SessionOpened struct {
+	ID              string            `json:"id"`
+	At              string            `json:"at"`
+	Kind            string            `json:"kind"`
+	SchemaVersion   int               `json:"schema_version"`
+	RudyVersion     string            `json:"rudy_version"`
+	Workspace       session.Workspace `json:"workspace"`
+	Model           session.ModelRef  `json:"model"`
+	Thinking        string            `json:"thinking"`
+	Mode            string            `json:"mode"`
+	Agent           string            `json:"agent"`
+	ParentSessionID string            `json:"parent_session_id"`
+	ParentToolUseID string            `json:"parent_tool_use_id"`
+}
+
+// writeV1SessionOpened hand-writes a version 1 session_opened line for sid straight to disk,
+// bypassing session.Open entirely: the log a rudy from before this field existed actually left
+// behind. Written by hand rather than by mutating a version 2 line, so the test keeps meaning
+// however the writer changes. ReadLog drops a final line with no trailing newline as truncated
+// even when its JSON parses cleanly, so the line needs one.
+func writeV1SessionOpened(t *testing.T, store *session.Store, sid ulid.ULID, ws, agent string) {
+	t.Helper()
+	dir := store.Dir(sid)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(v1SessionOpened{
+		ID: sid.String(), At: time.Now().Format(time.RFC3339Nano), Kind: "session_opened",
+		SchemaVersion: 1, RudyVersion: "0.1.0",
+		Workspace: session.Workspace{Root: ws, ProjectID: "local/v1"},
+		Model:     session.ModelRef{Provider: "fake", Model: "m1"},
+		Thinking:  string(session.ThinkingOff), Mode: string(session.ModeStrict), Agent: agent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line = append(line, '\n')
+	if err := os.WriteFile(filepath.Join(dir, session.LogFile), line, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestVersionOneLogFallsBackToTheDefinition is the schema_version gate's fallback side: a log
+// written before session_opened carried a tools field has no such key at all, and an absent key
+// decodes a []string exactly like an explicit null does, both to nil. Reading that nil as
+// "every tool" would hand every log written before this field the whole registry on its next
+// resume, which is rudy-ef4 again, one field earlier. applyAgentFromLog must take the
+// definition's own list below schema_version 2 instead of reading Tools() at all.
+//
+// The gate's other side, a version 2 log replaying its recorded (and possibly narrower) set
+// rather than its own unintersected definition, is what TestResumedChildKeepsItsOwnList and
+// TestForkedChildKeepsItsOwnList already prove; this test is the one new path this round adds.
+func TestVersionOneLogFallsBackToTheDefinition(t *testing.T) {
+	srv, _ := newTestServer(t)
+	writeAgentDef(t, srv, "narrow", "reads only", []string{"read"})
+
+	sid := session.NewID()
+	writeV1SessionOpened(t, srv.store, sid, t.TempDir(), "narrow")
+
+	got := driveTurn(t, srv, sid.String())
+	if !reflect.DeepEqual(got, []string{"read"}) {
+		t.Fatalf("v1 log tools = %v, want exactly narrow's own list, never the whole registry", got)
+	}
+}
+
 // TestOrphanedSessionClosesWhenItsTurnEnds: the last connection can leave while a turn is
 // running, and detach cannot close the session then because the turn still owns it. Nothing
 // else comes back for it, so the turn closes it on its way out. The agent tool's interrupted

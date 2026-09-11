@@ -1135,10 +1135,12 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	// Resolved now, while the parent (if any) is still live, and persisted on the entry below:
 	// a resume or a fork brings this session back long after that parent may be gone, and
 	// applyAgentFromLog reads this recorded value rather than trying to recompute it (ADR
-	// 0028, rudy-ef4).
+	// 0028, rudy-ef4). SchemaVersion 2 is what tells that recorded value apart from a version 1
+	// log that has no tools key at all: both decode Tools() to nil, and reading a version 1
+	// log's absent key as "every tool" would be the same escalation one field earlier.
 	allow := resolveTools(parent, def)
 	opened := session.SessionOpened{
-		SchemaVersion: 1, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
+		SchemaVersion: 2, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
 		Thinking: thinking, Mode: mode, Agent: def.Name, Tools: allow,
 	}
 	if parent != nil {
@@ -1251,9 +1253,9 @@ func parentToolNames(parent *liveSession) []string {
 // from the log rather than the request. The definition is a file and not part of the log, so it
 // is re-read here; one that has since been deleted falls back to the default rather than
 // refusing to bring the session back, since its entries are still perfectly readable and a lost
-// file is not the user's fault. The tool set is not re-read from that file: it is whatever
-// session_opened recorded, which is what this session actually ran under and does not depend on
-// a parent that may no longer exist (ADR 0028, rudy-ef4).
+// file is not the user's fault. The tool set is not re-read from that file: from SchemaVersion 2
+// on it is whatever session_opened recorded, what this session actually ran under, and it does
+// not depend on a parent that may no longer exist (ADR 0028, rudy-ef4).
 func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 	name := ls.sess.Agent()
 	ws := deriveInfo(ls.sess.ID(), ls.entries).Workspace
@@ -1262,7 +1264,19 @@ func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "agent " + name + " is no longer defined; continuing under the default agent"})
 		def, _ = s.resolveAgent(cn, ws, "")
 	}
-	s.applyAgent(ls, def, ls.sess.Tools())
+	s.applyAgent(ls, def, loggedTools(ls.sess, def))
+}
+
+// loggedTools is the tool set applyAgentFromLog stamps: the recorded value from SchemaVersion 2
+// on, the definition's own list below that. A version 1 log has no tools key, and an absent key
+// decodes exactly like an explicit null does from version 2 on, both to a nil slice; without
+// this check that nil would read as "every tool" for every session logged before this field
+// existed, which for a child is rudy-ef4 again, one field earlier.
+func loggedTools(sess *session.Session, def agentdef.Definition) []string {
+	if sess.SchemaVersion() < 2 {
+		return def.Tools
+	}
+	return sess.Tools()
 }
 
 // parentSessionIDOf reads the parent a session was opened under off the log rather than off
