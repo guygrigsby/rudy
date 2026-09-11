@@ -1267,13 +1267,19 @@ func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 	s.applyAgent(ls, def, loggedTools(ls.sess, def))
 }
 
-// loggedTools is the tool set applyAgentFromLog stamps: the recorded value from SchemaVersion 2
-// on, the definition's own list below that. A version 1 log has no tools key, and an absent key
-// decodes exactly like an explicit null does from version 2 on, both to a nil slice; without
-// this check that nil would read as "every tool" for every session logged before this field
-// existed, which for a child is rudy-ef4 again, one field earlier.
+// loggedTools is the tool set applyAgentFromLog stamps: the recorded value whenever there is
+// one, the definition's own list only when there is not. The fallback is not a bare version
+// check: commit d2a6da8 added the tools field while still writing SchemaVersion 1, so a log
+// from that window can already carry a correct, intersected value at version 1. Falling back on
+// version alone would discard a bound that was genuinely applied, resuming wider than the
+// session ran live, which is this task's whole subject.
+//
+// A nil Tools is safe to treat as absent even inside that window: intersectTools returns nil
+// only when the parent held every tool and the definition itself named none, in which case
+// def.Tools is independently nil too, so recomputing it changes nothing. A non-nil Tools can
+// only have come from a round 2 (or later) writer and is never the one discarded here.
 func loggedTools(sess *session.Session, def agentdef.Definition) []string {
-	if sess.SchemaVersion() < 2 {
+	if sess.SchemaVersion() < 2 && sess.Tools() == nil {
 		return def.Tools
 	}
 	return sess.Tools()

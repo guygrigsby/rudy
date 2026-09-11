@@ -3358,9 +3358,12 @@ func TestForkedChildKeepsItsOwnList(t *testing.T) {
 	wantBoundedChild(t, "forked", driveTurn(t, srv, fork))
 }
 
-// v1SessionOpened is session_opened's shape before the tools field existed: no tools key at
-// all, distinct from a version 2 line's explicit null in a way only schema_version can tell
-// apart once both have decoded to a nil slice.
+// v1SessionOpened is session_opened's shape before the tools field existed, plus that field
+// with omitempty: a caller that leaves Tools nil gets the true pre-round-2 line, no tools key
+// at all, indistinguishable from a version 2 line's explicit null once decoded except by
+// schema_version; a caller that sets it gets the shape commit d2a6da8 actually wrote for a
+// window before ac16694 fixed schema_version to match, tools recorded correctly but the version
+// still 1.
 type v1SessionOpened struct {
 	ID              string            `json:"id"`
 	At              string            `json:"at"`
@@ -3374,14 +3377,18 @@ type v1SessionOpened struct {
 	Agent           string            `json:"agent"`
 	ParentSessionID string            `json:"parent_session_id"`
 	ParentToolUseID string            `json:"parent_tool_use_id"`
+	Tools           []string          `json:"tools,omitempty"`
 }
 
 // writeV1SessionOpened hand-writes a version 1 session_opened line for sid straight to disk,
-// bypassing session.Open entirely: the log a rudy from before this field existed actually left
-// behind. Written by hand rather than by mutating a version 2 line, so the test keeps meaning
-// however the writer changes. ReadLog drops a final line with no trailing newline as truncated
-// even when its JSON parses cleanly, so the line needs one.
-func writeV1SessionOpened(t *testing.T, store *session.Store, sid ulid.ULID, ws, agent string) {
+// bypassing session.Open entirely: the log a rudy from before this field existed, or from the
+// window commit d2a6da8 opened and ac16694 closed, actually left behind. Written by hand rather
+// than by mutating a version 2 line, so the test keeps meaning however the writer changes.
+// parentSID and parentToolUseID empty write a root, set write a child; tools nil omits the
+// tools key entirely, non-nil writes it, recorded as that window's writer would have. ReadLog
+// drops a final line with no trailing newline as truncated even when its JSON parses cleanly,
+// so the line needs one.
+func writeV1SessionOpened(t *testing.T, store *session.Store, sid ulid.ULID, ws, agent, parentSID, parentToolUseID string, tools []string) {
 	t.Helper()
 	dir := store.Dir(sid)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -3393,6 +3400,7 @@ func writeV1SessionOpened(t *testing.T, store *session.Store, sid ulid.ULID, ws,
 		Workspace: session.Workspace{Root: ws, ProjectID: "local/v1"},
 		Model:     session.ModelRef{Provider: "fake", Model: "m1"},
 		Thinking:  string(session.ThinkingOff), Mode: string(session.ModeStrict), Agent: agent,
+		ParentSessionID: parentSID, ParentToolUseID: parentToolUseID, Tools: tools,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3408,21 +3416,64 @@ func writeV1SessionOpened(t *testing.T, store *session.Store, sid ulid.ULID, ws,
 // decodes a []string exactly like an explicit null does, both to nil. Reading that nil as
 // "every tool" would hand every log written before this field the whole registry on its next
 // resume, which is rudy-ef4 again, one field earlier. applyAgentFromLog must take the
-// definition's own list below schema_version 2 instead of reading Tools() at all.
+// definition's own list when there is no recorded value instead of reading Tools() regardless.
 //
 // The gate's other side, a version 2 log replaying its recorded (and possibly narrower) set
 // rather than its own unintersected definition, is what TestResumedChildKeepsItsOwnList and
-// TestForkedChildKeepsItsOwnList already prove; this test is the one new path this round adds.
+// TestForkedChildKeepsItsOwnList already prove. This is a root; TestVersionOneChildLogFallsBackToItsDefinition
+// is the child case, which is the one rudy-ef4 is actually about.
 func TestVersionOneLogFallsBackToTheDefinition(t *testing.T) {
 	srv, _ := newTestServer(t)
 	writeAgentDef(t, srv, "narrow", "reads only", []string{"read"})
 
 	sid := session.NewID()
-	writeV1SessionOpened(t, srv.store, sid, t.TempDir(), "narrow")
+	writeV1SessionOpened(t, srv.store, sid, t.TempDir(), "narrow", "", "", nil)
 
 	got := driveTurn(t, srv, sid.String())
 	if !reflect.DeepEqual(got, []string{"read"}) {
 		t.Fatalf("v1 log tools = %v, want exactly narrow's own list, never the whole registry", got)
+	}
+}
+
+// TestVersionOneChildLogFallsBackToItsDefinition is TestVersionOneLogFallsBackToTheDefinition's
+// child case: a version 1 child log with no tools key falls back to its own definition's list
+// like any version 1 log, wide's here, and the agent tool stays denied regardless of
+// schema_version, since that deny is derived fresh from parent_session_id and never read off
+// the tools field.
+func TestVersionOneChildLogFallsBackToItsDefinition(t *testing.T) {
+	srv, _ := newTestServer(t)
+	writeAgentDef(t, srv, "wide", "everything", nil)
+
+	sid := session.NewID()
+	writeV1SessionOpened(t, srv.store, sid, t.TempDir(), "wide", session.NewID().String(), "tu_fake", nil)
+
+	got := driveTurn(t, srv, sid.String())
+	for _, want := range []string{"read", "bash", "edit", "write"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("v1 child tools = %v, missing %q from its own definition", got, want)
+		}
+	}
+	if slices.Contains(got, "agent") {
+		t.Fatalf("a v1 child still sees the agent tool: %v", got)
+	}
+}
+
+// TestVersionOneChildLogWithRecordedToolsKeepsThem is the window commit d2a6da8 opened and
+// ac16694 closed: a log written between those two commits carries a correct, intersected tools
+// value while still recording schema_version 1, because d2a6da8 added the field before ac16694
+// made the version say so. loggedTools must not discard that value just because the version is
+// 1: a child log with tools recorded narrower than its own definition must resume with the
+// recorded value, not the definition's wider one.
+func TestVersionOneChildLogWithRecordedToolsKeepsThem(t *testing.T) {
+	srv, _ := newTestServer(t)
+	writeAgentDef(t, srv, "wide", "everything", nil)
+
+	sid := session.NewID()
+	writeV1SessionOpened(t, srv.store, sid, t.TempDir(), "wide", session.NewID().String(), "tu_fake", []string{"read"})
+
+	got := driveTurn(t, srv, sid.String())
+	if !reflect.DeepEqual(got, []string{"read"}) {
+		t.Fatalf("v1 child with recorded tools = %v, want exactly the recorded set, not wide's own list", got)
 	}
 }
 
