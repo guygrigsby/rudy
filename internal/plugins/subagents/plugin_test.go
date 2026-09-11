@@ -12,21 +12,156 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/plugin/plugintest"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
 )
 
-func TestRegistersTheAgentToolNamingTheDefinitions(t *testing.T) {
+// writeDef writes a minimal agents/<name>.md under dir, creating it if needed.
+func writeDef(t *testing.T, dir, name, description string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\ndescription: " + description + "\n---\nYou do the thing.\n"
+	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTheRosterComesFromTheSessionNotTheProcess is ADR 0028 decision 8: the description built
+// once in Init from configDir/agents alone can never see a workspace's own .rudy/agents nor a
+// plugin's RegisterAgent call, since plugins after subagents in wire.go commit after this
+// plugin's Init already ran. The roster has to come from a session_opened hook instead, fired
+// once the workspace is known and every plugin has registered.
+func TestTheRosterComesFromTheSessionNotTheProcess(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "agents"), 0o700); err != nil {
+	writeDef(t, filepath.Join(dir, "agents"), "explorer", "reads the codebase")
+	ws := t.TempDir()
+	writeDef(t, filepath.Join(ws, ".rudy", "agents"), "reviewer", "reviews a diff")
+
+	h := &plugintest.Host{Name: "subagents", Agents: []agentdef.Definition{
+		{Name: "migrator", Description: "writes migrations"},
+	}}
+	if err := New(dir).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	def := "---\ndescription: reads only\n---\nYou explore.\n"
-	if err := os.WriteFile(filepath.Join(dir, "agents", "explorer.md"), []byte(def), 0o600); err != nil {
+	if len(h.Hooks) != 1 || h.Hooks[0].Point != plugin.HookSessionOpened {
+		t.Fatalf("hooks %+v", h.Hooks)
+	}
+
+	res, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
+		Point:   plugin.HookSessionOpened,
+		Payload: &plugin.SessionOpenedPayload{Workspace: session.Workspace{Root: ws}},
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	sor, ok := res.(*plugin.SessionOpenedResult)
+	if !ok {
+		t.Fatalf("result type %T", res)
+	}
+	for _, want := range []string{"explorer", "reviewer", "migrator"} {
+		if !strings.Contains(sor.Context, want) {
+			t.Fatalf("the roster omits %q: %q", want, sor.Context)
+		}
+	}
+
+	if strings.Contains(h.RegisteredTools[0].Description, "explorer") {
+		t.Fatal("the description still enumerates agents, so it is stale the moment a workspace differs")
+	}
+}
+
+// TestARootDefinitionBeatsAWorkspaceOneAndAWorkspaceOneBeatsAPlugin checks the precedence
+// resolveAgent uses (server.go's resolveAgent): the user's config directory first, then the
+// workspace's .rudy/agents, then whatever plugins registered, first name winning.
+func TestARootDefinitionBeatsAWorkspaceOneAndAWorkspaceOneBeatsAPlugin(t *testing.T) {
+	dir := t.TempDir()
+	writeDef(t, filepath.Join(dir, "agents"), "shared", "the operator's own")
+	ws := t.TempDir()
+	writeDef(t, filepath.Join(ws, ".rudy", "agents"), "shared", "the workspace's own")
+
+	h := &plugintest.Host{Name: "subagents", Agents: []agentdef.Definition{
+		{Name: "shared", Description: "the plugin's own"},
+	}}
+	if err := New(dir).Init(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	res, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
+		Point:   plugin.HookSessionOpened,
+		Payload: &plugin.SessionOpenedPayload{Workspace: session.Workspace{Root: ws}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sor := res.(*plugin.SessionOpenedResult)
+	if !strings.Contains(sor.Context, "the operator's own") {
+		t.Fatalf("the operator's config definition did not win: %q", sor.Context)
+	}
+	if strings.Contains(sor.Context, "the workspace's own") || strings.Contains(sor.Context, "the plugin's own") {
+		t.Fatalf("a lower-precedence definition of the same name leaked through: %q", sor.Context)
+	}
+}
+
+// TestRosterNoticesAFileThatFailsToParse: a definition that does not parse must surface as a
+// notice, not silence. A shipped example that failed to parse went unnoticed earlier in this
+// wave because nothing reported agentdef.Load's errs (rudy-review round 1 on task 5).
+func TestRosterNoticesAFileThatFailsToParse(t *testing.T) {
+	dir := t.TempDir()
+	agentsDir := filepath.Join(dir, "agents")
+	if err := os.MkdirAll(agentsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// No opening fence at all: frontmatter.Split refuses it, so Load reports it in errs and
+	// skips the file rather than resolving a definition from it.
+	if err := os.WriteFile(filepath.Join(agentsDir, "broken.md"), []byte("description: x\nbody"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &plugintest.Host{Name: "subagents"}
+	if err := New(dir).Init(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
+		Point:   plugin.HookSessionOpened,
+		Payload: &plugin.SessionOpenedPayload{Workspace: session.Workspace{Root: t.TempDir()}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.Notices) != 1 {
+		t.Fatalf("notices %v", h.Notices)
+	}
+}
+
+// TestRosterEmptyReturnsNoResult mirrors the skills plugin: no definitions at all means the
+// hook has nothing to add, so the runner should drop it rather than injecting an empty line.
+func TestRosterEmptyReturnsNoResult(t *testing.T) {
+	h := &plugintest.Host{Name: "subagents"}
+	if err := New(t.TempDir()).Init(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	res, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
+		Point:   plugin.HookSessionOpened,
+		Payload: &plugin.SessionOpenedPayload{Workspace: session.Workspace{Root: t.TempDir()}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != nil {
+		t.Fatalf("result = %+v, want nil", res)
+	}
+}
+
+// TestRegistersTheAgentToolWithAStaticDescription is ADR 0028 decision 8: the description
+// cannot enumerate agents, since a registration cannot be revised once a workspace or a later
+// plugin adds one, so it must not name any and must instead point at the system prompt, where
+// the session_opened hook puts the roster. It also has to describe tools truthfully: the field
+// narrows, never grants.
+func TestRegistersTheAgentToolWithAStaticDescription(t *testing.T) {
+	dir := t.TempDir()
+	writeDef(t, filepath.Join(dir, "agents"), "explorer", "reads only")
 	h := &plugintest.Host{Name: "subagents"}
 	if err := New(dir).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
@@ -38,8 +173,14 @@ func TestRegistersTheAgentToolNamingTheDefinitions(t *testing.T) {
 	if got.Name != "agent" || got.Safety != tool.Safe {
 		t.Errorf("tool = %s %s", got.Name, got.Safety)
 	}
-	if !strings.Contains(got.Description, "explorer (reads only)") {
-		t.Errorf("description does not name the definitions: %q", got.Description)
+	if strings.Contains(got.Description, "explorer") {
+		t.Errorf("description enumerates a definition, so it is stale the moment a workspace or plugin differs: %q", got.Description)
+	}
+	if !strings.Contains(got.Description, "system prompt") {
+		t.Errorf("description does not say where the roster is: %q", got.Description)
+	}
+	if !strings.Contains(got.Description, "removes") {
+		t.Errorf("description does not say tools can only narrow: %q", got.Description)
 	}
 	if !json.Valid(got.Schema) {
 		t.Errorf("schema is not valid JSON: %s", got.Schema)

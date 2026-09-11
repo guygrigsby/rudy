@@ -32,17 +32,60 @@ type agentPlugin struct {
 }
 
 // New returns the plugin. configDir is the user's rudy config directory, whose agents/
-// subdirectory names the definitions the tool's description advertises; a workspace's own
-// .rudy/agents/ is read by the server when the child session opens.
+// subdirectory is the first root the roster hook and the server both read; a workspace's own
+// .rudy/agents/ is the second, read fresh per session so an edit between sessions takes effect
+// without a restart.
 func New(configDir string) plugin.Plugin { return &agentPlugin{configDir: configDir} }
 
 func (p *agentPlugin) Name() string { return "subagents" }
 
 func (p *agentPlugin) Init(_ context.Context, h plugin.Host) error {
 	p.host = h
-	defs, _ := agentdef.Load([]string{filepath.Join(p.configDir, "agents")})
-	desc := "Delegate a task to a subagent running in its own session and return its final answer. Agents defined for this machine: " + describe(defs) + ". A workspace may add more under .rudy/agents/."
-	return h.RegisterTool(tool.Tool{Name: "agent", Description: desc, Schema: json.RawMessage(schema), Safety: tool.Safe, Invoke: p.invoke})
+	desc := "Delegate a task to a subagent running in its own session and return its final answer. " +
+		"The agents available to this session, and what each is for, are listed in the system prompt. " +
+		"Pass tools to narrow what the subagent may use; it only ever removes."
+	if err := h.RegisterTool(tool.Tool{
+		Name: "agent", Description: desc, Schema: json.RawMessage(schema),
+		Safety: tool.Safe, Invoke: p.invoke,
+	}); err != nil {
+		return err
+	}
+	// The roster is a session fact, not a process fact: it depends on the workspace and on
+	// plugins that may register after this one. A description is written once and cannot be
+	// revised, so it says where to look rather than trying to hold the answer (ADR 0028).
+	return h.RegisterHook(plugin.HookHandler{
+		Point:  plugin.HookSessionOpened,
+		Handle: p.roster,
+	})
+}
+
+// roster lists the definitions visible to one session: the operator's config directory, then
+// the workspace's own .rudy/agents, then whatever plugins registered, first name winning. That
+// is the same precedence resolveAgent uses to pick a definition, so what the roster advertises
+// is what a call actually gets.
+func (p *agentPlugin) roster(_ context.Context, call plugin.HookCall) (any, error) {
+	payload, ok := call.Payload.(*plugin.SessionOpenedPayload)
+	if !ok || payload == nil {
+		return nil, nil
+	}
+	defs, errs := agentdef.Load([]string{
+		filepath.Join(p.configDir, "agents"),
+		filepath.Join(payload.Workspace.Root, ".rudy", "agents"),
+	})
+	for _, e := range errs {
+		p.host.Notice(e.Error())
+	}
+	for n, d := range p.host.AgentDefs() {
+		if _, seen := defs[n]; !seen {
+			defs[n] = d
+		}
+	}
+	if len(defs) == 0 {
+		return nil, nil
+	}
+	return &plugin.SessionOpenedResult{
+		Context: "Agents you can delegate to with the agent tool: " + describe(defs) + ".",
+	}, nil
 }
 
 // describe lists the definitions by name and description, in name order so the tool's
