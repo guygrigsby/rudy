@@ -580,29 +580,22 @@ func (s *Server) handleAnswer(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	if !p.Decision.Valid() || !p.Scope.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "invalid decision or scope")
 	}
-	// The first answer decides. Claiming the pending channel and marking the id answered in
-	// one critical section is what makes that race-free between two askers holding the same
-	// question: exactly one of them finds the channel, and the loser is told which of the two
-	// refusals applies. obsMu nests inside the mu this already holds, the order the
-	// liveSession doc fixes.
-	ls.mu.Lock()
-	ch, ok := ls.pending[p.ToolUseID]
-	delete(ls.pending, p.ToolUseID)
-	ls.obsMu.Lock()
-	already := ls.answered[p.ToolUseID]
-	if ok {
-		ls.answered[p.ToolUseID] = true
-		delete(ls.standing, p.ToolUseID)
-	}
-	ls.obsMu.Unlock()
-	ls.mu.Unlock()
+	// The first answer decides. resolveAnswer claims the pending channel and marks the id
+	// answered in one critical section, which is what makes that race-free between two askers
+	// holding the same question: exactly one of them finds the channel, and the loser is told
+	// which of the two refusals applies.
+	ans := turn.Answer{Decision: p.Decision, Scope: p.Scope, Reason: p.Reason}
+	ch, settle, ok, already := ls.resolveAnswer(p.ToolUseID, ans)
 	if !ok {
 		if already {
 			return nil, perr(protocol.CodeConflict, "another asker already answered "+p.ToolUseID)
 		}
 		return nil, perr(protocol.CodeNotFound, "no pending question for "+p.ToolUseID)
 	}
-	ch <- turn.Answer{Decision: p.Decision, Scope: p.Scope, Reason: p.Reason}
+	ch <- ans
+	for _, sch := range settle {
+		sch <- ans
+	}
 	return struct{}{}, nil
 }
 

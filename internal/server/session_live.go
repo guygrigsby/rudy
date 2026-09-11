@@ -64,7 +64,7 @@ type liveSession struct {
 	sess        *session.Session
 	model       provider.Model
 	runner      *turn.Runner
-	pending     map[string]chan turn.Answer
+	pending     map[string]pendingAsk
 	closed      bool     // sess has been closed and removed from Server.live; never touch sess again
 	hookContext []string // what session_opened handlers added to this session's system prompt
 
@@ -128,7 +128,7 @@ func newLive(sess *session.Session, m provider.Model) *liveSession {
 		sess:      sess,
 		model:     m,
 		entries:   append([]session.Entry(nil), sess.Entries()...),
-		pending:   map[string]chan turn.Answer{},
+		pending:   map[string]pendingAsk{},
 		asking:    map[askKey]*standingAsk{},
 		overrides: map[string][]session.Block{},
 		children:  map[string]bool{},
@@ -569,19 +569,44 @@ func (o *firstAppendSignal) StateChanged(turnID string, s turn.State) {
 	o.Observer.StateChanged(turnID, s)
 }
 
-// askKey is the question a call would put to the operator. Two calls with the same matcher ask
-// the same thing, whatever their tool_use ids are.
-type askKey struct{ tool, prefix string }
+// askKey is the question a call would put to the operator: its matcher together with its exact
+// input bytes. The matcher alone is too coarse to key on: MatcherFor collapses every tool but
+// bash to its own name and bash to its first two words, so two calls with different arguments
+// (two writes to different paths, both matcher {Tool: "write"}) would share a key. Coalescing
+// them would show the operator one call's input and bind the other to the same answer, which is
+// consent for arguments it never saw (ADR 0028 decision 4). json.RawMessage is not comparable,
+// so the input travels as a string.
+type askKey struct {
+	matcher session.Matcher
+	input   string
+}
 
-// standingAsk is one outstanding question and the answer the calls waiting on it will take.
-// done is closed once ans and err are final; nothing reads them before that. waiting is how many
-// calls are currently parked on it, the raiser included: it is what lets a caller tell that every
-// concurrent call asking the same thing has arrived, before any of them has been answered.
+// keyFor is the key q's call would ask under.
+func keyFor(q turn.Question) askKey { return askKey{matcher: q.Matcher, input: string(q.Input)} }
+
+// standingAsk is one outstanding question and the answer the calls sharing it will take. done is
+// closed once ans and err are final; nothing reads them before that. waiting is how many calls
+// are currently parked on it, the raiser included: it is what lets a caller tell that every
+// concurrent call asking the same thing has arrived, before any of them has been answered. queue
+// holds every parked call that could be promoted to raise the question itself, in arrival order,
+// if whoever currently holds it leaves without an answer (see liveAsker.leave): a raiser's own
+// cancellation is not an answer for the calls waiting behind it.
 type standingAsk struct {
 	done    chan struct{}
 	ans     turn.Answer
 	err     error
 	waiting int
+	queue   []chan struct{}
+}
+
+// pendingAsk is one raised question's answer channel and the key its standingAsk is filed under.
+// Filing the key alongside the channel is what lets session.answer retire the standing entry in
+// the same critical section that claims the channel (see liveSession.resolveAnswer): otherwise a
+// call could join the standing entry in the window between the answer being sent and the raiser
+// getting back around to deleting it, and take an answer given before it ever asked.
+type pendingAsk struct {
+	ch  chan turn.Answer
+	key askKey
 }
 
 // liveAsker puts one turn's permission questions to every asker connection the session has
@@ -594,46 +619,165 @@ type liveAsker struct {
 }
 
 // Ask is called from every goroutine running a tool call in the turn, so it may be re-entered
-// while an earlier question stands. Calls that ask the same thing share one question: the
-// operator sees one prompt and every call waiting on it when it is answered takes that answer.
-// A call that arrives after a question resolves asks again, unless the answer was session
-// scope, in which case the allowance exists and the Gate never asks.
+// while an earlier question stands. Calls that ask the same thing (same matcher, same input
+// bytes) share one question: the operator sees one prompt and every call waiting on it takes the
+// answer when it lands. A call that arrives after a question resolves asks again, unless the
+// answer was session scope, in which case resolveAnswer has already settled every other question
+// the new allowance covers, and a call arriving later still finds the allowance through the Gate
+// and never asks at all.
 func (a *liveAsker) Ask(ctx context.Context, q turn.Question) (turn.Answer, error) {
-	key := askKey{tool: q.Matcher.Tool, prefix: q.Matcher.Prefix}
+	key := keyFor(q)
 	a.ls.mu.Lock()
-	if st, ok := a.ls.asking[key]; ok {
-		st.waiting++
+	st, ok := a.ls.asking[key]
+	if !ok {
+		st = &standingAsk{done: make(chan struct{}), waiting: 1}
+		a.ls.asking[key] = st
 		a.ls.mu.Unlock()
-		select {
-		case <-st.done:
-			return st.ans, st.err
-		case <-ctx.Done():
-			// This call is going away; the question stands for whoever else is waiting.
-			a.ls.mu.Lock()
-			st.waiting--
-			a.ls.mu.Unlock()
-			return turn.Answer{}, ctx.Err()
-		}
+		return a.raise(ctx, key, q, st)
 	}
-	st := &standingAsk{done: make(chan struct{}), waiting: 1}
-	a.ls.asking[key] = st
+	st.waiting++
+	promote := make(chan struct{})
+	st.queue = append(st.queue, promote)
 	a.ls.mu.Unlock()
+	select {
+	case <-st.done:
+		return st.ans, st.err
+	case <-promote:
+		// Whoever was raising this question left without an answer, and this call was next
+		// in line: it raises the same question itself rather than taking a denial that was
+		// never really about its own arguments.
+		return a.raise(ctx, key, q, st)
+	case <-ctx.Done():
+		a.ls.mu.Lock()
+		removed := removeChan(&st.queue, promote)
+		if removed {
+			st.waiting--
+		}
+		a.ls.mu.Unlock()
+		if !removed {
+			// Popped for promotion in the same instant this call decided to leave: it now
+			// holds the question, so leaving silently would strand whoever is queued behind
+			// it. Hand off exactly as a raiser leaving without an answer would.
+			return a.leave(key, st, ctx.Err())
+		}
+		return turn.Answer{}, ctx.Err()
+	}
+}
 
+// raise is what the call currently holding a question does: put it to the operator and wait for
+// an answer. If its own context ends first, the departure is only this call's (see leave); a
+// real answer, including no_asker, retires the question for everyone waiting on it.
+func (a *liveAsker) raise(ctx context.Context, key askKey, q turn.Question, st *standingAsk) (turn.Answer, error) {
 	ans, err := a.ask(ctx, q)
-
+	if err != nil && err == ctx.Err() {
+		return a.leave(key, st, err)
+	}
 	a.ls.mu.Lock()
 	delete(a.ls.asking, key)
 	a.ls.mu.Unlock()
+	defer close(st.done)
 	st.ans, st.err = ans, err
-	close(st.done)
 	return ans, err
 }
 
+// leave is what a call currently holding a question does when it departs without an answer of
+// its own: its own context ended before session.answer, or the last asker leaving, gave one. A
+// cancellation is only this call's, so if another call is still waiting on the same question the
+// question passes to it instead of denying it for a cancellation that is not its own. Only once
+// nobody is left waiting does it retire the standing entry with this call's own error.
+func (a *liveAsker) leave(key askKey, st *standingAsk, err error) (turn.Answer, error) {
+	a.ls.mu.Lock()
+	st.waiting--
+	if len(st.queue) > 0 {
+		next := st.queue[0]
+		st.queue = st.queue[1:]
+		a.ls.mu.Unlock()
+		close(next)
+		return turn.Answer{}, err
+	}
+	delete(a.ls.asking, key)
+	a.ls.mu.Unlock()
+	defer close(st.done)
+	st.ans, st.err = turn.Answer{}, err
+	return turn.Answer{}, err
+}
+
+// removeChan deletes the first occurrence of ch from *queue and reports whether it found one.
+// Caller holds mu.
+func removeChan(queue *[]chan struct{}, ch chan struct{}) bool {
+	for i, c := range *queue {
+		if c == ch {
+			*queue = append((*queue)[:i], (*queue)[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// resolveAnswer claims the pending question for toolUseID, retires its standing entry, and, when
+// ans is a session-scope allow, settles every other parked question the new allowance now covers
+// (ADR 0028 decision 4): two calls can read the session's allowances before either has recorded
+// one, both park, and answering the first for the session leaves the second asking for something
+// that is now already granted. ok is false when there is no pending question for toolUseID;
+// already then says whether that is because it was already decided (a conflict) rather than
+// never asked (not_found). The caller sends ans on ch, and on every channel in settle, itself,
+// outside any lock: this only prepares the delivery.
+func (ls *liveSession) resolveAnswer(toolUseID string, ans turn.Answer) (ch chan turn.Answer, settle []chan turn.Answer, ok, already bool) {
+	ls.mu.Lock()
+	pend, found := ls.pending[toolUseID]
+	delete(ls.pending, toolUseID)
+	ls.obsMu.Lock()
+	already = ls.answered[toolUseID]
+	if found {
+		ls.answered[toolUseID] = true
+		delete(ls.standing, toolUseID)
+	}
+	ls.obsMu.Unlock()
+	if found {
+		delete(ls.asking, pend.key)
+		if ans.Decision == session.Allow && ans.Scope == session.ScopeSession {
+			settle = ls.settleLocked(pend.key.matcher)
+		}
+	}
+	ls.mu.Unlock()
+	return pend.ch, settle, found, already
+}
+
+// settleLocked retires every other tool_use currently asking under matcher m: a session-scope
+// allow just granted for m covers them too, by the same rule Gate.Evaluate applies to a call
+// that has not asked yet (ADR 0028 decision 4), so a question raised before that allowance
+// existed does not stay open asking for something already granted. Caller holds mu; it takes and
+// releases obsMu itself, once, for the standing and answered bookkeeping each retirement needs.
+func (ls *liveSession) settleLocked(m session.Matcher) []chan turn.Answer {
+	var chans []chan turn.Answer
+	var ids []string
+	for id, pend := range ls.pending {
+		if pend.key.matcher != m {
+			continue
+		}
+		chans = append(chans, pend.ch)
+		ids = append(ids, id)
+		delete(ls.pending, id)
+		delete(ls.asking, pend.key)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	ls.obsMu.Lock()
+	for _, id := range ids {
+		ls.answered[id] = true
+		delete(ls.standing, id)
+	}
+	ls.obsMu.Unlock()
+	return chans
+}
+
 // ask puts one question to the operator and waits for its answer: the whole of what Ask did
-// before calls could coalesce, unchanged, and now the path only the call that raises a question
-// takes. It runs on the caller's own goroutine, with no turn.Runner or liveSession lock held
-// (see turn.Runner.runTool): calling a.runner.TurnID() here is safe and gives the freshest
-// value, unlike a handler that already holds mu or obsMu, which must use the mirror instead.
+// before calls could coalesce, unchanged, and now the path only the call currently raising a
+// question takes (directly, or a promoted call from leave). It runs on the caller's own
+// goroutine, with no turn.Runner or liveSession lock held (see turn.Runner.runTool): calling
+// a.runner.TurnID() here is safe and gives the freshest value, unlike a handler that already
+// holds mu or obsMu, which must use the mirror instead.
 func (a *liveAsker) ask(ctx context.Context, q turn.Question) (turn.Answer, error) {
 	// TurnID before any lock is taken: calling a Runner method under one is what the
 	// liveSession doc rules out, and here no lock is held, so it is also the freshest value.
@@ -643,7 +787,7 @@ func (a *liveAsker) ask(ctx context.Context, q turn.Question) (turn.Answer, erro
 	ch := make(chan turn.Answer, 1)
 	abandon := make(chan struct{})
 	a.ls.mu.Lock()
-	a.ls.pending[q.ToolUseID] = ch
+	a.ls.pending[q.ToolUseID] = pendingAsk{ch: ch, key: keyFor(q)}
 	a.ls.mu.Unlock()
 	askers := a.ls.stand(standingQuestion{req: req, abandon: abandon})
 	if len(askers) == 0 {

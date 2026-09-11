@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -225,7 +226,7 @@ func TestAnAnswerRacingTheQuestionLeavesNothingStanding(t *testing.T) {
 		runtime.Gosched()
 	}
 	ls.mu.Lock()
-	ch, ok := ls.pending["tu1"]
+	pend, ok := ls.pending["tu1"]
 	delete(ls.pending, "tu1")
 	ls.mu.Unlock()
 	if !ok {
@@ -233,7 +234,7 @@ func TestAnAnswerRacingTheQuestionLeavesNothingStanding(t *testing.T) {
 	}
 	// The handler's other half ran while standing was still empty, so nothing is deleted
 	// here. Only the answer arrives.
-	ch <- turn.Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "yes"}
+	pend.ch <- turn.Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "yes"}
 	got := <-done
 	if got.err != nil || got.ans.Decision != session.Allow {
 		t.Fatalf("ask = %+v, %v, want the allow it was sent", got.ans, got.err)
@@ -333,28 +334,23 @@ func (ls *liveSession) subscribeAsker(t *testing.T, fn func(protocol.PermissionR
 	}()
 }
 
-// answer plays session.answer's own claim-then-send against ls directly (see
-// Server.handleAnswer), without a live connection or dispatcher to send it through. It is
-// called from subscribeAsker's watcher goroutine, never the test's own, so a missing question
-// is reported with Errorf rather than Fatalf: FailNow is only safe from the goroutine running
-// the test.
+// answer calls the exact same resolveAnswer Server.handleAnswer calls, so a test exercises the
+// real claim-then-settle logic rather than a hand-rolled copy of it that could drift from what
+// the RPC path actually does. It is called from subscribeAsker's watcher goroutine, never the
+// test's own, so a missing question is reported with Errorf rather than Fatalf: FailNow is only
+// safe from the goroutine running the test.
 func (ls *liveSession) answer(t *testing.T, toolUseID string, d session.Decision, scope session.Scope) {
 	t.Helper()
-	ls.mu.Lock()
-	ch, ok := ls.pending[toolUseID]
-	delete(ls.pending, toolUseID)
-	ls.obsMu.Lock()
-	if ok {
-		ls.answered[toolUseID] = true
-		delete(ls.standing, toolUseID)
-	}
-	ls.obsMu.Unlock()
-	ls.mu.Unlock()
+	ans := turn.Answer{Decision: d, Scope: scope, Reason: "test"}
+	ch, settle, ok, _ := ls.resolveAnswer(toolUseID, ans)
 	if !ok {
 		t.Errorf("answer: no pending question for %s", toolUseID)
 		return
 	}
-	ch <- turn.Answer{Decision: d, Scope: scope, Reason: "test"}
+	ch <- ans
+	for _, sch := range settle {
+		sch <- ans
+	}
 }
 
 // waitingAsks is how many calls are currently parked at the coalescing layer across every
@@ -368,6 +364,15 @@ func (ls *liveSession) waitingAsks() int {
 		n += st.waiting
 	}
 	return n
+}
+
+// pendingCount is how many calls are currently registered as the active raiser of some
+// question: at most one per distinct askKey, since a joiner never registers into pending (only
+// the call that raises a question does). Self-locking (takes ls.mu).
+func (ls *liveSession) pendingCount() int {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return len(ls.pending)
 }
 
 // waitFor polls pred until it holds or five seconds pass, failing the test if it never does.
@@ -412,8 +417,10 @@ func TestConcurrentAsksOnOneMatcherAskOnce(t *testing.T) {
 			answers[i], errs[i] = asker.Ask(context.Background(), one)
 		}()
 	}
-	// Let all three reach the asker before any answer lands.
-	waitFor(t, func() bool { return ls.waitingAsks() == 3 })
+	// Let all three reach the asker before any answer lands. Only the raiser ever registers
+	// into pending, so pendingCount staying at 1 alongside waitingAsks reaching 3 is the
+	// raiser-only invariant holding: two calls sharing a question, not two more questions.
+	waitFor(t, func() bool { return ls.waitingAsks() == 3 && ls.pendingCount() == 1 })
 	close(release)
 	wg.Wait()
 
@@ -431,12 +438,18 @@ func TestConcurrentAsksOnOneMatcherAskOnce(t *testing.T) {
 }
 
 // TestDifferentMatchersAskSeparately: two calls whose matcher differs are two different
-// questions, each asked and answered on its own.
+// questions, each asked and answered on its own. Both calls must actually be parked before
+// either is answered: the watcher answers as soon as a prompt arrives, so without release
+// holding the first open until the second has also registered, the two calls could run one
+// after the other and this would pass even against a key that ignores Prefix entirely, which is
+// the bug it exists to catch.
 func TestDifferentMatchersAskSeparately(t *testing.T) {
 	ls, asker := newAskTestSession(t)
 	var prompts atomic.Int32
+	release := make(chan struct{})
 	ls.subscribeAsker(t, func(req protocol.PermissionRequested) {
 		prompts.Add(1)
+		<-release
 		ls.answer(t, req.ToolUseID, session.Allow, session.ScopeOnce)
 	})
 
@@ -451,8 +464,204 @@ func TestDifferentMatchersAskSeparately(t *testing.T) {
 			})
 		}()
 	}
+	waitFor(t, func() bool { return ls.waitingAsks() == 2 })
+	close(release)
 	wg.Wait()
 	if got := prompts.Load(); got != 2 {
 		t.Fatalf("prompts = %d, want 2: different matchers are different questions", got)
+	}
+}
+
+// TestSessionScopeAnswerSettlesOtherParkedQuestions is ADR 0028 decision 4's second mechanism:
+// two calls with different inputs under the same matcher raise two separate questions (fix (a)
+// stops them coalescing on the matcher alone), but both read the session's allowances before
+// either has recorded one and so both park. Since they are genuinely different questions, both
+// do reach the operator as their own permission.requested (there is nothing to coalesce them on
+// yet) - the fix is that only one of them needs deciding: answering it for the session scope
+// grants an allowance that covers the other too, which must take it directly rather than sit
+// asking for something now already granted.
+func TestSessionScopeAnswerSettlesOtherParkedQuestions(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+	var prompts atomic.Int32
+	ls.subscribeAsker(t, func(protocol.PermissionRequested) { prompts.Add(1) })
+
+	m := session.Matcher{Tool: "write"}
+	inputs := []string{`{"path":"a"}`, `{"path":"b"}`}
+	toolUseIDs := []string{"tu0", "tu1"}
+	var wg sync.WaitGroup
+	answers := make([]turn.Answer, 2)
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			answers[i], errs[i] = asker.Ask(context.Background(), turn.Question{
+				ToolUseID: toolUseIDs[i], Tool: "write",
+				Input: json.RawMessage(inputs[i]), Matcher: m,
+			})
+		}()
+	}
+	// Both calls must be genuinely parked, not just registered as waiting on their own
+	// question: pendingCount reaching 2 is each one's own raiser having actually asked, which
+	// is what makes this the case decision 4 is about rather than one call beating the other
+	// to the answer. Only the first is ever explicitly answered.
+	waitFor(t, func() bool { return ls.pendingCount() == 2 })
+	ls.answer(t, toolUseIDs[0], session.Allow, session.ScopeSession)
+	wg.Wait()
+
+	if got := prompts.Load(); got != 2 {
+		t.Fatalf("prompts = %d, want 2: both calls genuinely parked before either was decided, so both raised their own question", got)
+	}
+	for i := range 2 {
+		if errs[i] != nil {
+			t.Fatalf("call %d: %v", i, errs[i])
+		}
+		if answers[i].Decision != session.Allow || answers[i].Scope != session.ScopeSession {
+			t.Fatalf("call %d = %+v, want a session-scope allow", i, answers[i])
+		}
+	}
+}
+
+// TestRaiserCancelledPromotesAJoiner: the call raising a question can be cancelled (its own tool
+// call was killed, or its own context otherwise ended) while another call is still waiting on
+// the same question. That cancellation is not an answer, and it must not deny the healthy call
+// waiting behind it: the question passes to it instead, and it raises the same question itself.
+func TestRaiserCancelledPromotesAJoiner(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+	var prompts atomic.Int32
+	release := make(chan struct{})
+	ls.subscribeAsker(t, func(req protocol.PermissionRequested) {
+		prompts.Add(1)
+		if req.ToolUseID == "raiser" {
+			return // never answered: this call is about to be cancelled instead
+		}
+		<-release
+		ls.answer(t, req.ToolUseID, session.Allow, session.ScopeOnce)
+	})
+
+	q := turn.Question{Tool: "bash", Matcher: session.Matcher{Tool: "bash", Prefix: "git status"}}
+	raiserCtx, cancel := context.WithCancel(context.Background())
+	raiserDone := make(chan struct{})
+	go func() {
+		one := q
+		one.ToolUseID = "raiser"
+		_, _ = asker.Ask(raiserCtx, one)
+		close(raiserDone)
+	}()
+	waitFor(t, func() bool { return ls.pendingCount() == 1 })
+
+	var joinAns turn.Answer
+	var joinErr error
+	joinDone := make(chan struct{})
+	go func() {
+		one := q
+		one.ToolUseID = "joiner"
+		joinAns, joinErr = asker.Ask(context.Background(), one)
+		close(joinDone)
+	}()
+	waitFor(t, func() bool { return ls.waitingAsks() == 2 })
+
+	cancel()
+	<-raiserDone
+	// The joiner is promoted and raises the question itself in the raiser's place.
+	waitFor(t, func() bool { return prompts.Load() == 2 })
+	close(release)
+	<-joinDone
+
+	if joinErr != nil {
+		t.Fatalf("joiner: %v", joinErr)
+	}
+	if joinAns.Decision != session.Allow {
+		t.Fatalf("joiner decision = %q, want allow: a cancelled raiser must not deny a healthy joiner", joinAns.Decision)
+	}
+}
+
+// TestJoinerCancelledLeavesTheRaiserUnaffected: a call that leaves a shared question before it
+// is answered (its own context ended while it was only ever a joiner, never the raiser) takes
+// its own cancellation and nothing else. The raiser, and the question it put to the operator,
+// are unaffected.
+func TestJoinerCancelledLeavesTheRaiserUnaffected(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+	var prompts atomic.Int32
+	release := make(chan struct{})
+	ls.subscribeAsker(t, func(req protocol.PermissionRequested) {
+		prompts.Add(1)
+		<-release
+		ls.answer(t, req.ToolUseID, session.Allow, session.ScopeOnce)
+	})
+
+	q := turn.Question{Tool: "bash", Matcher: session.Matcher{Tool: "bash", Prefix: "git status"}}
+	var raiserAns turn.Answer
+	var raiserErr error
+	raiserDone := make(chan struct{})
+	go func() {
+		one := q
+		one.ToolUseID = "raiser"
+		raiserAns, raiserErr = asker.Ask(context.Background(), one)
+		close(raiserDone)
+	}()
+	waitFor(t, func() bool { return ls.pendingCount() == 1 })
+
+	joinCtx, cancelJoin := context.WithCancel(context.Background())
+	var joinErr error
+	joinDone := make(chan struct{})
+	go func() {
+		one := q
+		one.ToolUseID = "joiner"
+		_, joinErr = asker.Ask(joinCtx, one)
+		close(joinDone)
+	}()
+	waitFor(t, func() bool { return ls.waitingAsks() == 2 })
+
+	cancelJoin()
+	<-joinDone
+	if !errors.Is(joinErr, context.Canceled) {
+		t.Fatalf("joiner err = %v, want context.Canceled", joinErr)
+	}
+
+	// The raiser's own question is unaffected: it still gets a real answer.
+	waitFor(t, func() bool { return ls.waitingAsks() == 1 })
+	close(release)
+	<-raiserDone
+	if raiserErr != nil {
+		t.Fatalf("raiser: %v", raiserErr)
+	}
+	if raiserAns.Decision != session.Allow {
+		t.Fatalf("raiser decision = %q, want allow", raiserAns.Decision)
+	}
+	if got := prompts.Load(); got != 1 {
+		t.Fatalf("prompts = %d, want 1: the joiner leaving must not raise a question of its own", got)
+	}
+}
+
+// TestArrivingAfterResolutionAsksAgain: a call sharing a matcher and input with a question that
+// has already been answered once does not take that old answer. resolveAnswer retires the
+// standing entry in the same critical section that claims the answer, so by the time a call's
+// own Ask returns, the key is free for the next call to raise fresh.
+func TestArrivingAfterResolutionAsksAgain(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+	var prompts atomic.Int32
+	ls.subscribeAsker(t, func(req protocol.PermissionRequested) {
+		prompts.Add(1)
+		ls.answer(t, req.ToolUseID, session.Allow, session.ScopeOnce)
+	})
+
+	q := turn.Question{Tool: "bash", Matcher: session.Matcher{Tool: "bash", Prefix: "git status"}}
+	first := q
+	first.ToolUseID = "tu-first"
+	if ans, err := asker.Ask(context.Background(), first); err != nil || ans.Decision != session.Allow {
+		t.Fatalf("first ask = %+v, %v", ans, err)
+	}
+	if n := len(ls.asking); n != 0 {
+		t.Fatalf("asking has %d entries once the first call resolved, want 0", n)
+	}
+
+	second := q
+	second.ToolUseID = "tu-second"
+	if ans, err := asker.Ask(context.Background(), second); err != nil || ans.Decision != session.Allow {
+		t.Fatalf("second ask = %+v, %v", ans, err)
+	}
+	if got := prompts.Load(); got != 2 {
+		t.Fatalf("prompts = %d, want 2: a call arriving after the question resolved must ask again, not take the old answer", got)
 	}
 }
