@@ -1,6 +1,9 @@
 package pluginstore
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseSource(t *testing.T) {
 	for _, tc := range []struct {
@@ -15,7 +18,9 @@ func TestParseSource(t *testing.T) {
 		// so anything but the tarball extensions below reads as git.
 		{"https://github.com/a/b.git", Source{Kind: KindGit, Location: "https://github.com/a/b.git"}, false},
 		{"go:example.com/m/plugin@v0.3.1", Source{Kind: KindGo, Location: "example.com/m/plugin", Ref: "v0.3.1"}, false},
-		{"go:example.com/m/plugin", Source{Kind: KindGo, Location: "example.com/m/plugin", Ref: "latest"}, false},
+		// A missing version leaves Ref empty: the contracts row says empty means latest for
+		// go, resolved by whatever reads it, not rewritten to a literal "latest" here.
+		{"go:example.com/m/plugin", Source{Kind: KindGo, Location: "example.com/m/plugin", Ref: ""}, false},
 		{"https://example.com/p.tar.gz", Source{Kind: KindHTTPS, Location: "https://example.com/p.tar.gz"}, false},
 		{"https://example.com/p.tgz", Source{Kind: KindHTTPS, Location: "https://example.com/p.tgz"}, false},
 		{"./local", Source{Kind: KindPath}, false}, // Location is the absolute path; assert kind only
@@ -65,6 +70,23 @@ func TestParseSourceLocalPathAfterGitPrefixIsNotRewrittenToHTTPS(t *testing.T) {
 		}
 		if got.Ref != "v1" {
 			t.Fatalf("ParseSource(%q).Ref = %q, want v1", in, got.Ref)
+		}
+	}
+}
+
+// TestParseSourceRefusesGitPrefixedSCPForm covers fix round 1's minor on the parser: "git:"
+// followed by git's own scp shorthand (user@host:path) is not a bare host/path shorthand, and
+// rewriting it would mangle it into "https://user@host:path", a URL that fails at clone with
+// no clue why. ParseSource refuses it instead: the scp form already works with no prefix at
+// all.
+func TestParseSourceRefusesGitPrefixedSCPForm(t *testing.T) {
+	for _, in := range []string{"git:git@host:a/b.git@v1", "git:host.example:a/b.git"} {
+		_, err := ParseSource(in)
+		if err == nil {
+			t.Fatalf("ParseSource(%q): want an error", in)
+		}
+		if !strings.Contains(err.Error(), "scp") {
+			t.Fatalf("ParseSource(%q) err = %v, want it to name the scp shape", in, err)
 		}
 	}
 }

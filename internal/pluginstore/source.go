@@ -22,11 +22,12 @@ const (
 // Source is one rudy install argument, classified. Location is what a stager actually
 // clones, fetches or copies: an https:// URL, git's scp-like shorthand, a Go module path, or
 // an absolute filesystem path. Ref is the part after "@", exactly as typed, empty when the
-// operator gave none; a stager resolves it to a commit or a digest but never rewrites Ref
-// itself. AsTyped is what the lock's source column records: the original argument verbatim
-// for every kind except path, which has always been stored as an absolute path (never the
-// relative string typed) since Update has no reason to run from the working directory
-// Install did.
+// operator gave none, per the plugins.lock.toml contracts row: empty means the default
+// branch for git and latest for go, a later reader's job to interpret, not ParseSource's to
+// fill in. A stager resolves Ref to a commit or a digest but never rewrites Ref itself.
+// AsTyped is what the lock's source column records: the original argument verbatim for every
+// kind except path, which has always been stored as an absolute path (never the relative
+// string typed) since Update has no reason to run from the working directory Install did.
 type Source struct {
 	Kind     Kind
 	Location string
@@ -86,16 +87,15 @@ func classifyScheme(s string) Kind {
 	return KindGit
 }
 
-// parseGoSource handles "go:module/path@version". A missing version resolves to "latest",
-// mirroring go install's own default.
+// parseGoSource handles "go:module/path@version". A missing version leaves Ref empty, per
+// the contracts row: empty means latest for go, resolved by whatever reads it (task 4), not
+// rewritten here to a literal "latest" that would then need distinguishing from an operator
+// who actually typed "@latest".
 func parseGoSource(s string) (Source, error) {
 	rest := strings.TrimPrefix(s, "go:")
 	loc, ref := splitRef(rest)
 	if loc == "" {
 		return Source{}, fmt.Errorf("pluginstore: %s: empty go module path", s)
-	}
-	if ref == "" {
-		ref = "latest"
 	}
 	return Source{Kind: KindGo, Location: loc, Ref: ref, AsTyped: s}, nil
 }
@@ -108,11 +108,18 @@ func parseGitPrefixed(s string) (Source, error) {
 	if loc == "" {
 		return Source{}, fmt.Errorf("pluginstore: %s: empty git source", s)
 	}
-	if !strings.Contains(loc, "://") &&
-		!strings.HasPrefix(loc, "/") && !strings.HasPrefix(loc, ".") && !strings.HasPrefix(loc, "~") {
-		loc = "https://" + loc
+	if strings.Contains(loc, "://") ||
+		strings.HasPrefix(loc, "/") || strings.HasPrefix(loc, ".") || strings.HasPrefix(loc, "~") {
+		return Source{Kind: KindGit, Location: loc, Ref: ref, AsTyped: s}, nil
 	}
-	return Source{Kind: KindGit, Location: loc, Ref: ref, AsTyped: s}, nil
+	if strings.ContainsRune(loc, ':') {
+		// git's own scp-like shorthand (user@host:path) already names a full remote; git:
+		// prepending "https://" on top of it would mangle it into an unreachable URL rather
+		// than refuse cleanly, so this is the one shape git: does not rewrite: type it
+		// directly, with no prefix, the way ParseSource's default branch already accepts it.
+		return Source{}, fmt.Errorf("pluginstore: %s: %q looks like git's scp shorthand (user@host:path); use it directly, without the git: prefix", s, loc)
+	}
+	return Source{Kind: KindGit, Location: "https://" + loc, Ref: ref, AsTyped: s}, nil
 }
 
 // splitRef splits "location@ref" on the last "@", the one a version, tag or commit follows.

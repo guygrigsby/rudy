@@ -139,14 +139,14 @@ func renderPlugins(w io.Writer, s *pluginstore.Store, locked map[string]pluginst
 	}
 	sort.Strings(names)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "NAME\tVERSION\tENABLED\tCOMMIT\tSOURCE")
+	_, _ = fmt.Fprintln(tw, "NAME\tVERSION\tENABLED\tKIND\tREF\tCOMMIT\tSOURCE")
 	for _, name := range names {
 		inst := locked[name]
 		version := "-"
 		if m, err := plugin.ReadManifest(filepath.Join(s.Root, "plugins", name)); err == nil {
 			version = m.Version
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%t\t%s\t%s\n", name, version, inst.Enabled, inst.Commit, inst.Source)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%t\t%s\t%s\t%s\t%s\n", name, version, inst.Enabled, inst.Kind, inst.Ref, inst.Commit, inst.Source)
 	}
 	return tw.Flush()
 }

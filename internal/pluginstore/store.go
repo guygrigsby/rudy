@@ -77,21 +77,28 @@ func (s *Store) lockPath() string               { return filepath.Join(s.Root, L
 func (s *Store) pluginsDir() string             { return filepath.Join(s.Root, "plugins") }
 func (s *Store) checkoutDir(name string) string { return filepath.Join(s.pluginsDir(), name) }
 
-// staleStageAge is how old an .install-* or .update-* directory under Root/plugins has to be
-// before Install or Update will remove it as abandoned rather than leave it alone as
+// staleStageAge is how old an .install-*, .update-* or *.old directory under Root/plugins has
+// to be before Install or Update will remove it as abandoned rather than leave it alone as
 // possibly still in use. An hour is generous next to how long even a large --depth 1 clone
 // takes, and every write inside an active stage (git writing objects, os.CopyFS writing
 // files) bumps the stage directory's own mtime, so a clone that is still actually making
-// progress never ages past this no matter how long it runs.
+// progress never ages past this no matter how long it runs. A *.old backup's mtime only
+// changes when swapCheckout creates or removes it, so one left behind by a crash between
+// those two renames ages normally and gets swept the same way a stage does.
 const staleStageAge = time.Hour
 
-// sweepStaleStages removes every .install-* and .update-* directory under Root/plugins whose
-// modification time is older than staleStageAge. Called from Install and Update, never from
-// New or DisabledFromLock: those run on every session boot and every rudy plugin list, and
-// neither is the moment to go deleting another process's in-progress work. A missing plugins
-// directory means nothing has ever been installed, not something to sweep; any other read
-// failure is left for the caller's real operation to report, since sweeping is best-effort
-// clean-up, not the thing being asked for.
+// sweepStaleStages removes every .install-*, .update-* and *.old directory under Root/plugins
+// whose modification time is older than staleStageAge. Called from Install and Update, never
+// from New or DisabledFromLock: those run on every session boot and every rudy plugin list,
+// and neither is the moment to go deleting another process's in-progress work. A missing
+// plugins directory means nothing has ever been installed, not something to sweep; any other
+// read failure is left for the caller's real operation to report, since sweeping is
+// best-effort clean-up, not the thing being asked for.
+//
+// *.old only exists because swapCheckout's own best-effort cleanup did not run (the process
+// died between the two renames and its final RemoveAll): plugin.Discover otherwise walks it
+// as a plugin directory, finds its manifest's name does not match the directory name, and
+// reports that as an error notice on every boot forever.
 func (s *Store) sweepStaleStages() {
 	ents, err := os.ReadDir(s.pluginsDir())
 	if err != nil {
@@ -102,14 +109,15 @@ func (s *Store) sweepStaleStages() {
 		if !e.IsDir() {
 			continue
 		}
-		if !strings.HasPrefix(e.Name(), ".install-") && !strings.HasPrefix(e.Name(), ".update-") {
+		name := e.Name()
+		if !strings.HasPrefix(name, ".install-") && !strings.HasPrefix(name, ".update-") && !strings.HasSuffix(name, ".old") {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil || info.ModTime().After(cutoff) {
 			continue
 		}
-		_ = os.RemoveAll(filepath.Join(s.pluginsDir(), e.Name()))
+		_ = os.RemoveAll(filepath.Join(s.pluginsDir(), name))
 	}
 }
 
@@ -336,6 +344,11 @@ func (s *Store) Uninstall(name string) error {
 	if err := os.RemoveAll(s.checkoutDir(name)); err != nil {
 		return fmt.Errorf("pluginstore: %w", err)
 	}
+	// A crash between swapCheckout's two renames can leave name+".old" beside the checkout
+	// just removed; sweepStaleStages only reaches it after an hour, and manifestNameRe
+	// excludes ".", so no plugin can ever be named to collide with it: it is always safe to
+	// remove here too rather than leave it for plugin.Discover to trip over.
+	_ = os.RemoveAll(s.checkoutDir(name) + ".old")
 	delete(locked, name)
 	return s.Write(locked)
 }
@@ -434,18 +447,29 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 	return inst, nil
 }
 
-// swapCheckout replaces dir's live contents with stage's. It renames dir aside before
-// renaming stage into its place, rather than os.RemoveAll(dir) then os.Rename(stage, dir):
-// that older two-step version could lose the checkout entirely if either half failed, since
-// the deferred stage cleanup then removed the only remaining copy too (rudy-xpe). Here, the
-// worst a failure between the two renames leaves behind is dir+".old" orphaned next to a
-// missing dir, not a destroyed plugin.
+// swapCheckout replaces dir's live contents with stage's. When dir exists, it is renamed
+// aside before stage is renamed into its place, rather than os.RemoveAll(dir) then
+// os.Rename(stage, dir): that older two-step version could lose the checkout entirely if
+// either half failed, since the deferred stage cleanup then removed the only remaining copy
+// too (rudy-xpe). The worst a failure between the two renames leaves behind is dir+".old"
+// orphaned next to a missing dir, not a destroyed plugin.
+//
+// When dir does not already exist (a prior update failed between those same two renames and
+// left only dir+".old", or an operator rm -rf'd the live checkout to force a repair), stage
+// renames straight in without touching old first: fix round 1 found that removing old before
+// checking whether dir exists could delete the one surviving copy and then fail the rename
+// with ENOENT, leaving neither. old, if present, is only ever removed once dir already holds
+// the new checkout, so it is known redundant rather than merely assumed so.
 func swapCheckout(dir, stage string) error {
 	old := dir + ".old"
-	if err := os.RemoveAll(old); err != nil {
-		return fmt.Errorf("pluginstore: %w", err)
-	}
-	if err := os.Rename(dir, old); err != nil {
+	if _, err := os.Lstat(dir); err == nil {
+		if err := os.RemoveAll(old); err != nil {
+			return fmt.Errorf("pluginstore: %w", err)
+		}
+		if err := os.Rename(dir, old); err != nil {
+			return fmt.Errorf("pluginstore: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("pluginstore: %w", err)
 	}
 	if err := os.Rename(stage, dir); err != nil {
@@ -581,7 +605,8 @@ func stageGitInstall(ctx context.Context, src Source, stage string) (string, err
 		}
 		return headCommit(ctx, stage)
 	}
-	if _, err := runGit(ctx, "clone", "--depth", "1", "--branch", src.Ref, "--", src.Location, stage); err != nil {
+	_, shallowErr := runGit(ctx, "clone", "--depth", "1", "--branch", src.Ref, "--", src.Location, stage)
+	if shallowErr != nil {
 		// git refuses to clone into a non-empty directory, and a failed --branch attempt can
 		// still have created .git before failing; clear it before the full-clone fallback.
 		if rmErr := os.RemoveAll(stage); rmErr != nil {
@@ -591,7 +616,10 @@ func stageGitInstall(ctx context.Context, src Source, stage string) (string, err
 			return "", fmt.Errorf("pluginstore: %w", mkErr)
 		}
 		if _, err := runGit(ctx, "clone", "--", src.Location, stage); err != nil {
-			return "", err
+			// The shallow --branch attempt may have failed for a more informative reason (an
+			// unreachable host, say) than the full clone's own failure; report both rather
+			// than only the second, which can just be the same problem restated.
+			return "", fmt.Errorf("shallow clone at %s: %w; full clone: %s", src.Ref, shallowErr, err)
 		}
 		if _, err := runGit(ctx, "-C", stage, "checkout", src.Ref); err != nil {
 			return "", err
@@ -605,18 +633,35 @@ func stageGitInstall(ctx context.Context, src Source, stage string) (string, err
 // default branch tip is now. With a ref, the clone establishes the repository and its origin
 // remote, then a shallow fetch of exactly that ref plus a hard reset onto it re-resolves the
 // pin, rather than drifting to the tip of whatever branch the clone's default happened to
-// track.
+// track. Some git servers refuse to fetch a commit that is not itself a ref tip
+// (upload-pack's allowReachableSHA1InWant/allowAnySHA1InWant default off), which the shallow
+// default-branch clone above cannot see either; a full clone can still reach it through
+// history, the same fallback stageGitInstall uses for a bare-commit ref.
 func stageGitUpdate(ctx context.Context, src Source, stage string) (string, error) {
 	if _, err := runGit(ctx, "clone", "--depth", "1", "--", src.Location, stage); err != nil {
 		return "", err
 	}
-	if src.Ref != "" {
-		if _, err := runGit(ctx, "-C", stage, "fetch", "--depth", "1", "--", "origin", src.Ref); err != nil {
-			return "", err
-		}
+	if src.Ref == "" {
+		return headCommit(ctx, stage)
+	}
+	_, fetchErr := runGit(ctx, "-C", stage, "fetch", "--depth", "1", "--", "origin", src.Ref)
+	if fetchErr == nil {
 		if _, err := runGit(ctx, "-C", stage, "reset", "--hard", "FETCH_HEAD"); err != nil {
 			return "", err
 		}
+		return headCommit(ctx, stage)
+	}
+	if err := os.RemoveAll(stage); err != nil {
+		return "", fmt.Errorf("pluginstore: %w", err)
+	}
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		return "", fmt.Errorf("pluginstore: %w", err)
+	}
+	if _, err := runGit(ctx, "clone", "--", src.Location, stage); err != nil {
+		return "", fmt.Errorf("fetch %s: %w; full clone: %s", src.Ref, fetchErr, err)
+	}
+	if _, err := runGit(ctx, "-C", stage, "checkout", src.Ref); err != nil {
+		return "", err
 	}
 	return headCommit(ctx, stage)
 }

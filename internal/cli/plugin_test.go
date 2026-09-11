@@ -112,12 +112,16 @@ func TestPluginListPrintsHeaderAndRow(t *testing.T) {
 		t.Fatalf("output = %q", out)
 	}
 	if !strings.HasPrefix(lines[0], "NAME") || !strings.Contains(lines[0], "VERSION") ||
-		!strings.Contains(lines[0], "ENABLED") || !strings.Contains(lines[0], "COMMIT") ||
+		!strings.Contains(lines[0], "ENABLED") || !strings.Contains(lines[0], "KIND") ||
+		!strings.Contains(lines[0], "REF") || !strings.Contains(lines[0], "COMMIT") ||
 		!strings.Contains(lines[0], "SOURCE") {
 		t.Fatalf("header = %q", lines[0])
 	}
+	// A bare local argument installs as the path kind (ADR 0025): no ref, a pin would be
+	// invisible in this listing if kind and ref were not their own columns.
 	if !strings.Contains(lines[1], "hello") || !strings.Contains(lines[1], "0.1.0") ||
-		!strings.Contains(lines[1], "true") || !strings.Contains(lines[1], src) {
+		!strings.Contains(lines[1], "true") || !strings.Contains(lines[1], "path") ||
+		!strings.Contains(lines[1], src) {
 		t.Fatalf("row = %q", lines[1])
 	}
 }

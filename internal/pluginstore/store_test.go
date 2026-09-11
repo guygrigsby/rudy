@@ -1102,3 +1102,186 @@ func TestUpdateLeavesNoBackupDirectoryOnSuccess(t *testing.T) {
 		t.Fatalf("stat .old = %v, want not exist after a successful update", err)
 	}
 }
+
+// TestSwapCheckoutRecoversWhenDirIsMissingButOldHoldsABackup covers fix round 1's Important 1,
+// first way in: a prior swapCheckout call failed between its two renames, leaving dir gone
+// and dir+".old" holding the only copy. The old swapCheckout unconditionally removed old
+// before checking whether dir existed, so retrying here would delete that surviving backup
+// and then fail the rename with ENOENT, leaving neither. The fixed version must reach straight
+// for the rename-in when dir is already absent, leaving old untouched until the new checkout
+// is confirmed in place.
+func TestSwapCheckoutRecoversWhenDirIsMissingButOldHoldsABackup(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "hello")
+	old := dir + ".old"
+	if err := os.MkdirAll(old, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "marker"), []byte("backup"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(root, "stage")
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "marker"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := swapCheckout(dir, stage); err != nil {
+		t.Fatalf("swapCheckout: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "marker"))
+	if err != nil {
+		t.Fatalf("dir missing the new checkout: %v", err)
+	}
+	if string(b) != "new" {
+		t.Fatalf("dir contents = %q, want the new checkout", b)
+	}
+}
+
+// TestSwapCheckoutRepairsAMissingDirWithNoBackup covers fix round 1's Important 1, second way
+// in: no prior fault at all, an operator ran rm -rf on the live checkout directly (the repair
+// the old remove-then-rename code supported) and there is no dir+".old" either. swapCheckout
+// must still land the new checkout rather than fail on a rename whose source it wrongly
+// assumed would exist.
+func TestSwapCheckoutRepairsAMissingDirWithNoBackup(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "hello") // never created; nothing at dir+".old" either
+	stage := filepath.Join(root, "stage")
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "marker"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := swapCheckout(dir, stage); err != nil {
+		t.Fatalf("swapCheckout: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "marker")); err != nil {
+		t.Fatalf("dir missing after repair: %v", err)
+	}
+}
+
+// TestInstallRefusesGoSources and TestInstallRefusesHTTPSSources cover fix round 1's minor:
+// nothing previously asserted that the dispatch itself refuses go and https, only that
+// ParseSource classifies them; a refactor that routed either into the git stager by mistake
+// would have passed every other test in this file.
+func TestInstallRefusesGoSources(t *testing.T) {
+	s := newTestStore(t)
+	_, _, err := s.Install(context.Background(), "go:example.com/m/plugin@v1", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
+		t.Fatalf("err = %v, want a not-yet-supported error", err)
+	}
+}
+
+func TestInstallRefusesHTTPSSources(t *testing.T) {
+	s := newTestStore(t)
+	_, _, err := s.Install(context.Background(), "https://example.com/p.tar.gz", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
+		t.Fatalf("err = %v, want a not-yet-supported error", err)
+	}
+}
+
+// TestUpdateAtABareCommitPinStaysThere covers fix round 1's minor: Update had no coverage at
+// all for a bare-commit pin, only Install did. Installs pinned at a commit that is not the
+// tip of any branch or tag, advances the source further, and asserts Update's fetch-and-reset
+// re-resolves to the same pinned commit rather than the new tip.
+func TestUpdateAtABareCommitPinStaysThere(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, helloManifest)
+	first := wantHeadCommit(t, src)
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(helloManifest+"# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, src, "add", "-A")
+	runGitT(t, src, "commit", "-q", "-m", "second")
+
+	s := newTestStore(t)
+	inst, _, err := s.Install(context.Background(), "git:"+src+"@"+first, time.Now())
+	if err != nil {
+		t.Fatalf("Install at a bare commit: %v", err)
+	}
+	if inst.Commit != first {
+		t.Fatalf("Commit = %s, want %s", inst.Commit, first)
+	}
+
+	// The source moves on again after the install.
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(helloManifest+"# v3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, src, "add", "-A")
+	runGitT(t, src, "commit", "-q", "-m", "third")
+
+	updated, err := s.Update(context.Background(), "hello", time.Now())
+	if err != nil {
+		t.Fatalf("Update at a bare commit: %v", err)
+	}
+	if updated.Commit != first {
+		t.Fatalf("Commit after Update = %s, want it to stay at the pinned commit %s", updated.Commit, first)
+	}
+	b, err := os.ReadFile(filepath.Join(s.Root, "plugins", "hello", "plugin.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "# v2") || strings.Contains(string(b), "# v3") {
+		t.Fatal("checkout moved past the pinned commit")
+	}
+}
+
+// TestUninstallRemovesAnOrphanedOldBackup covers fix round 1's Important 2: a crash between
+// swapCheckout's two renames can leave name+".old" beside the checkout, which plugin.Discover
+// then walks as a plugin directory whose manifest name does not match, reporting an error
+// notice on every boot. Uninstall must remove it too, not just the live checkout.
+func TestUninstallRemovesAnOrphanedOldBackup(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, helloManifest)
+	s := newTestStore(t)
+	if _, _, err := s.Install(context.Background(), "git:"+src, time.Now()); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	old := s.PluginDir("hello") + ".old"
+	if err := os.MkdirAll(old, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Uninstall("hello"); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("orphaned .old backup stat = %v, want removed by Uninstall", err)
+	}
+}
+
+// TestInstallSweepsAStaleOldBackup covers the other half of fix round 1's Important 2: the
+// sweep that clears abandoned .install-*/.update-* stages must clear a stale *.old backup the
+// same way, age-gated identically, so one left behind by a crash does not sit forever for
+// plugin.Discover to trip over.
+func TestInstallSweepsAStaleOldBackup(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, helloManifest)
+	root := t.TempDir()
+	pluginsDir := filepath.Join(root, "plugins")
+	staleOld := filepath.Join(pluginsDir, "orphan.old")
+	freshOld := filepath.Join(pluginsDir, "fresh.old")
+	for _, d := range []string{staleOld, freshOld} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-staleStageAge - time.Minute)
+	if err := os.Chtimes(staleOld, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(root)
+	if _, _, err := s.Install(context.Background(), src, time.Now()); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if _, err := os.Stat(staleOld); !os.IsNotExist(err) {
+		t.Fatalf("stale .old stat = %v, want swept", err)
+	}
+	if _, err := os.Stat(freshOld); err != nil {
+		t.Fatalf("fresh .old was swept: %v", err)
+	}
+}
