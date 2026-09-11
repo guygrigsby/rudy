@@ -79,7 +79,7 @@ func newInstallCmd() *cobra.Command {
 			}
 			out := cmd.OutOrStdout()
 			s.Out = out
-			_, _ = fmt.Fprintf(out, "installing %s: its manifest may run a build command\n", args[0])
+			_, _ = fmt.Fprintf(out, "installing %s: downloads the source and its manifest may run a build command\n", args[0])
 			inst, m, err := s.Install(cmd.Context(), args[0], time.Now())
 			if err != nil {
 				return err

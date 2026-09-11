@@ -1164,19 +1164,6 @@ func TestSwapCheckoutRepairsAMissingDirWithNoBackup(t *testing.T) {
 	}
 }
 
-// TestInstallRefusesHTTPSSources covers fix round 1's minor: nothing previously asserted that
-// the dispatch itself refuses https, only that ParseSource classifies it; a refactor that
-// routed it into the git stager by mistake would have passed every other test in this file. Go
-// had the same test until task 4 gave go: sources a real stager; source_go_test.go's
-// TestInstallsAGoModuleFromTheProxy is the dispatch coverage for go now.
-func TestInstallRefusesHTTPSSources(t *testing.T) {
-	s := newTestStore(t)
-	_, _, err := s.Install(context.Background(), "https://example.com/p.tar.gz", time.Now())
-	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
-		t.Fatalf("err = %v, want a not-yet-supported error", err)
-	}
-}
-
 // TestUpdateAtABareCommitPinStaysThere covers fix round 1's minor: Update had no coverage at
 // all for a bare-commit pin, only Install did. Installs pinned at a commit that is not the
 // tip of any branch or tag, advances the source further, and asserts Update's fetch-and-reset

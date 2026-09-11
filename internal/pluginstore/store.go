@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,6 +65,11 @@ type Store struct {
 	// instead of t.Setenv, which would mutate the whole test binary's environment for as long
 	// as the test runs and race any other test in this package that shells out to go too.
 	GoEnv []string
+	// HTTPClient, when set, is what an https: source's stager uses instead of
+	// http.DefaultClient. Nil everywhere but tests: production always gets the real default
+	// transport, and a test hands in an httptest server's own client (its TLS cert pinned)
+	// rather than reaching for a package-global client no two tests could safely share.
+	HTTPClient *http.Client
 }
 
 // buildOut is where a manifest's build command output goes: Out when the caller set one,
@@ -424,6 +430,12 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 	}()
 
 	resolved, err := s.stageForUpdate(ctx, src, stage, inst.Digest)
+	if errors.Is(err, errDigestUnchanged) {
+		// The re-download matched what is already recorded: leave the live checkout and the
+		// lock exactly as they are, with no build or swap attempted, rather than stage, build
+		// and swap in a byte-identical copy.
+		return inst, nil
+	}
 	if err != nil {
 		return Installed{}, err
 	}
@@ -545,8 +557,8 @@ func isRemoteSource(source string) bool {
 
 // stageForInstall fills stage (already created, empty) with src's contents for a fresh
 // install, and reports what it resolved to: the checked-out commit for git, the module version
-// and proxy sum for go, empty for path (there is no version concept to record), and an error
-// for https, not yet implemented (task 5 adds a stager behind this same dispatch).
+// and proxy sum for go, the sha256 of the downloaded bytes for https, and empty for path (there
+// is no version concept to record).
 func (s *Store) stageForInstall(ctx context.Context, src Source, stage string) (resolved string, err error) {
 	switch src.Kind {
 	case KindGit:
@@ -556,7 +568,7 @@ func (s *Store) stageForInstall(ctx context.Context, src Source, stage string) (
 	case KindGo:
 		return s.stageGo(ctx, src, stage)
 	case KindHTTPS:
-		return "", fmt.Errorf("pluginstore: https sources are not yet supported")
+		return stageHTTPS(ctx, src, stage, s.httpClient())
 	default:
 		return "", fmt.Errorf("pluginstore: unknown source kind %q", src.Kind)
 	}
@@ -564,9 +576,10 @@ func (s *Store) stageForInstall(ctx context.Context, src Source, stage string) (
 
 // stageForUpdate is stageForInstall's counterpart for rudy plugins update: the same dispatch,
 // but git re-resolves a pinned ref instead of taking whatever a fresh clone's default branch
-// happens to be at (see stageGitUpdate), and go refuses a pinned ref whose digest no longer
-// matches priorDigest, the lock's own recorded value, rather than silently replacing it (see
-// stageGoUpdate).
+// happens to be at (see stageGitUpdate), go refuses a pinned ref whose digest no longer matches
+// priorDigest, the lock's own recorded value, rather than silently replacing it (see
+// stageGoUpdate), and https returns errDigestUnchanged, which Update treats as nothing to do,
+// when a re-download's digest matches priorDigest (see stageHTTPSUpdate).
 func (s *Store) stageForUpdate(ctx context.Context, src Source, stage string, priorDigest string) (resolved string, err error) {
 	switch src.Kind {
 	case KindGit:
@@ -576,7 +589,7 @@ func (s *Store) stageForUpdate(ctx context.Context, src Source, stage string, pr
 	case KindGo:
 		return s.stageGoUpdate(ctx, src, stage, priorDigest)
 	case KindHTTPS:
-		return "", fmt.Errorf("pluginstore: https sources are not yet supported")
+		return stageHTTPSUpdate(ctx, src, stage, s.httpClient(), priorDigest)
 	default:
 		return "", fmt.Errorf("pluginstore: unknown source kind %q", src.Kind)
 	}
