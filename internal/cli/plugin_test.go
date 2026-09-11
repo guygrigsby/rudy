@@ -74,7 +74,10 @@ func TestPluginInstallPrintsNameVersionAndCommit(t *testing.T) {
 	tempXDG(t)
 	src := newPluginSourceRepo(t)
 
-	out, err := runPlugin(t, "plugin", "install", src)
+	// The "git:" prefix, rather than the bare path: a bare local argument is the path kind
+	// (ADR 0025), which never records a commit even when it happens to be a checkout, so
+	// this printed line would otherwise show the full source path instead of a short sha.
+	out, err := runPlugin(t, "plugin", "install", "git:"+src)
 	if err != nil {
 		t.Fatalf("install: %v\n%s", err, out)
 	}

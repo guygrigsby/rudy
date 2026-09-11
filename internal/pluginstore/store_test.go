@@ -113,6 +113,17 @@ func wantHeadCommit(t *testing.T, dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// newTaggedSourceRepo is newSourceRepo plus a lightweight tag on its one commit, for tests
+// pinning an install to a ref. It returns the repo path and the commit tag names, so a test
+// can later advance the repo's default branch and assert the tag still names the same
+// commit.
+func newTaggedSourceRepo(t *testing.T, tag string) (dir, commit string) {
+	t.Helper()
+	dir = newSourceRepo(t, helloManifest)
+	runGitT(t, dir, "tag", tag)
+	return dir, wantHeadCommit(t, dir)
+}
+
 // TestInstallRunsTheManifestsBuild covers rudy-kab: a manifest's build command has to
 // actually run in the staged checkout, not merely be parsed and carried around.
 func TestInstallRunsTheManifestsBuild(t *testing.T) {
@@ -221,7 +232,7 @@ command = "./stable"
 build = "echo v1 > marker"
 `)
 	s := newTestStore(t)
-	inst, _, err := s.Install(context.Background(), src, time.Now())
+	inst, _, err := s.Install(context.Background(), "git:"+src, time.Now())
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -281,18 +292,22 @@ build = "exit 3"
 func TestInstallClonesGitSourceAndRecordsLock(t *testing.T) {
 	requireGit(t)
 	src := newSourceRepo(t, helloManifest)
+	source := "git:" + src
 	s := New(t.TempDir())
 
 	before := time.Now().Add(-time.Second)
-	inst, m, err := s.Install(context.Background(), src, time.Now())
+	inst, m, err := s.Install(context.Background(), source, time.Now())
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
 	if m.Name != "hello" || m.Version != "0.1.0" {
 		t.Fatalf("manifest = %+v", m)
 	}
-	if inst.Source != src {
-		t.Fatalf("Source = %q, want %q", inst.Source, src)
+	if inst.Source != source {
+		t.Fatalf("Source = %q, want %q", inst.Source, source)
+	}
+	if inst.Kind != KindGit {
+		t.Fatalf("Kind = %q, want git", inst.Kind)
 	}
 	if !commitRe.MatchString(inst.Commit) {
 		t.Fatalf("Commit = %q, want a 40 character hex sha", inst.Commit)
@@ -318,8 +333,33 @@ func TestInstallClonesGitSourceAndRecordsLock(t *testing.T) {
 	if !ok {
 		t.Fatal("lock has no hello entry")
 	}
-	if got.Source != src || got.Commit != inst.Commit || !got.Enabled {
+	if got.Source != source || got.Kind != KindGit || got.Commit != inst.Commit || !got.Enabled {
 		t.Fatalf("lock entry = %+v", got)
+	}
+}
+
+// TestInstallCopiesAPathThatIsItselfARepository covers the "path" kind's other half: a bare
+// local filesystem argument, with no "git:" prefix, is the path kind even when it happens to
+// be a git checkout, so it never records a commit even though staging still clones it to get
+// a clean copy free of uncommitted or ignored files. TestInstallClonesGitSourceAndRecordsLock
+// covers the same checkout reached through "git:", where a commit is recorded.
+func TestInstallCopiesAPathThatIsItselfARepository(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, helloManifest)
+	s := New(t.TempDir())
+
+	inst, _, err := s.Install(context.Background(), src, time.Now())
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if inst.Kind != KindPath {
+		t.Fatalf("Kind = %q, want path for a bare local argument", inst.Kind)
+	}
+	if inst.Commit != "" {
+		t.Fatalf("Commit = %q, want empty for the path kind", inst.Commit)
+	}
+	if _, err := os.Stat(filepath.Join(s.Root, "plugins", "hello", "plugin.toml")); err != nil {
+		t.Fatalf("checkout not written: %v", err)
 	}
 }
 
@@ -402,7 +442,7 @@ func TestUpdateMovesCommitForwardForAClone(t *testing.T) {
 	requireGit(t)
 	src := newSourceRepo(t, helloManifest)
 	s := New(t.TempDir())
-	first, _, err := s.Install(context.Background(), src, time.Now())
+	first, _, err := s.Install(context.Background(), "git:"+src, time.Now())
 	if err != nil {
 		t.Fatalf("Install: %v", err)
 	}
@@ -816,23 +856,23 @@ func TestIsRemoteSourceHostOnlySCPForm(t *testing.T) {
 	}
 }
 
-// TestResolveSourcePassesHostOnlySCPFormThrough is the same finding at the level Install
+// TestParseSourcePassesHostOnlySCPFormThrough is the same finding at the level Install
 // actually calls: a host-only scp source must reach the lock untouched, not mangled through
 // filepath.Abs as if it were a relative filesystem path.
-func TestResolveSourcePassesHostOnlySCPFormThrough(t *testing.T) {
+func TestParseSourcePassesHostOnlySCPFormThrough(t *testing.T) {
 	const source = "build.example.com:team/plugin.git"
-	got, err := resolveSource(source)
+	got, err := ParseSource(source)
 	if err != nil {
-		t.Fatalf("resolveSource: %v", err)
+		t.Fatalf("ParseSource: %v", err)
 	}
-	if got != source {
-		t.Fatalf("resolveSource(%q) = %q, want it untouched", source, got)
+	if got.Kind != KindGit || got.Location != source {
+		t.Fatalf("ParseSource(%q) = %+v, want Kind git and Location untouched", source, got)
 	}
 }
 
-// TestResolveSourceStillResolvesALocalRelativePath guards against isRemoteSource's new
+// TestParseSourceStillResolvesALocalRelativePath guards against isRemoteSource's new
 // colon-before-slash rule swallowing an ordinary local path.
-func TestResolveSourceStillResolvesALocalRelativePath(t *testing.T) {
+func TestParseSourceStillResolvesALocalRelativePath(t *testing.T) {
 	dir := t.TempDir()
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -847,12 +887,12 @@ func TestResolveSourceStillResolvesALocalRelativePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := resolveSource(rel)
+	got, err := ParseSource(rel)
 	if err != nil {
-		t.Fatalf("resolveSource: %v", err)
+		t.Fatalf("ParseSource: %v", err)
 	}
-	if got != want {
-		t.Fatalf("resolveSource(%q) = %q, want %q", rel, got, want)
+	if got.Kind != KindPath || got.Location != want {
+		t.Fatalf("ParseSource(%q) = %+v, want Kind path and Location %q", rel, got, want)
 	}
 }
 
@@ -865,5 +905,200 @@ func TestUninstallRefusesAnUnsafeName(t *testing.T) {
 	err := s.Uninstall("../x")
 	if err == nil || !strings.Contains(err.Error(), "must match") {
 		t.Fatalf("err = %v, want the manifest name rule's error", err)
+	}
+}
+
+// TestInstallAtARefStaysThereOnUpdate is the pin test the contracts row promises: an install
+// at a tag must stay at that tag's commit across an update even after the source's default
+// branch has moved past it. Before stageGitUpdate re-resolved ref through a fetch and reset,
+// Update always landed wherever a fresh shallow clone's default branch tip was, so this test
+// fails the moment Update stops honouring Ref.
+func TestInstallAtARefStaysThereOnUpdate(t *testing.T) {
+	requireGit(t)
+	src, tagged := newTaggedSourceRepo(t, "v1")
+	s := newTestStore(t)
+	inst, _, err := s.Install(context.Background(), "git:"+src+"@v1", time.Now())
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if inst.Commit != tagged {
+		t.Fatalf("Commit = %s, want the tagged commit %s", inst.Commit, tagged)
+	}
+	if inst.Ref != "v1" {
+		t.Fatalf("Ref = %q, want v1", inst.Ref)
+	}
+
+	// The source's default branch moves on past the tag.
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(helloManifest+"# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, src, "add", "-A")
+	runGitT(t, src, "commit", "-q", "-m", "past the tag")
+	tip := wantHeadCommit(t, src)
+	if tip == tagged {
+		t.Fatal("test setup: the new commit did not move the source's tip")
+	}
+
+	updated, err := s.Update(context.Background(), "hello", time.Now())
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.Commit != tagged {
+		t.Fatalf("Commit after Update = %s, want it to stay at the tag %s rather than drift to the tip %s", updated.Commit, tagged, tip)
+	}
+	if updated.Ref != "v1" {
+		t.Fatalf("Ref after Update = %q, want v1 unchanged", updated.Ref)
+	}
+	locked, err := s.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locked["hello"].Commit != tagged || locked["hello"].Ref != "v1" {
+		t.Fatalf("lock entry after Update = %+v, want commit %s and ref v1", locked["hello"], tagged)
+	}
+}
+
+// TestInstallAtABareCommitFallsBackToAFullClone covers the other half of stageGitInstall's
+// pin: a ref that names a commit rather than a branch or tag is not something git's --branch
+// flag understands, so the shallow attempt has to fail over to a full clone plus checkout.
+func TestInstallAtABareCommitFallsBackToAFullClone(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, helloManifest)
+	first := wantHeadCommit(t, src)
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(helloManifest+"# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, src, "add", "-A")
+	runGitT(t, src, "commit", "-q", "-m", "second")
+
+	s := newTestStore(t)
+	inst, _, err := s.Install(context.Background(), "git:"+src+"@"+first, time.Now())
+	if err != nil {
+		t.Fatalf("Install at a bare commit: %v", err)
+	}
+	if inst.Commit != first {
+		t.Fatalf("Commit = %s, want the pinned commit %s", inst.Commit, first)
+	}
+	if inst.Ref != first {
+		t.Fatalf("Ref = %q, want %q", inst.Ref, first)
+	}
+	b, err := os.ReadFile(filepath.Join(s.Root, "plugins", "hello", "plugin.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "# v2") {
+		t.Fatal("checkout has the second commit's content, want the first commit's")
+	}
+}
+
+// TestLockRecordsKindAndRef asserts the lock's own bytes carry kind and ref, not just that
+// Read reports them: rudy plugins update and a future rudy plugins list read the file
+// directly, and either field silently missing from the TOML would still let this pass if the
+// assertion only went through Installed.
+func TestLockRecordsKindAndRef(t *testing.T) {
+	requireGit(t)
+	src, _ := newTaggedSourceRepo(t, "v1")
+	s := newTestStore(t)
+	if _, _, err := s.Install(context.Background(), "git:"+src+"@v1", time.Now()); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(s.Root, LockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `kind = 'git'`) && !strings.Contains(string(b), `kind = "git"`) {
+		t.Fatalf("lock does not record kind = git:\n%s", b)
+	}
+	if !strings.Contains(string(b), `ref = 'v1'`) && !strings.Contains(string(b), `ref = "v1"`) {
+		t.Fatalf("lock does not record ref = v1:\n%s", b)
+	}
+}
+
+// TestReadDerivesKindForAnOldFormatLock covers the contracts row's compatibility clause: a
+// lock written before kind existed has only source, commit, installed_at and enabled, and
+// Read must derive kind from commit being set rather than leave it the zero value. The
+// fixture is hand-written, not produced by Write, so this fails if the derivation in Read is
+// ever removed rather than passing by construction from the current writer.
+func TestReadDerivesKindForAnOldFormatLock(t *testing.T) {
+	root := t.TempDir()
+	body := `[plugins.fromgit]
+source = "git:example.com/a/b"
+commit = "` + strings.Repeat("a", 40) + `"
+installed_at = 2024-01-01T00:00:00Z
+enabled = true
+
+[plugins.frompath]
+source = "/some/local/plugin"
+installed_at = 2024-01-01T00:00:00Z
+enabled = true
+`
+	if err := os.WriteFile(filepath.Join(root, LockFile), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := New(root).Read()
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got := locked["fromgit"].Kind; got != KindGit {
+		t.Fatalf("fromgit Kind = %q, want git derived from a non-empty commit", got)
+	}
+	if got := locked["frompath"].Kind; got != KindPath {
+		t.Fatalf("frompath Kind = %q, want path derived from an empty commit", got)
+	}
+}
+
+// TestSwapCheckoutOrphansABackupRatherThanDestroyingOnFailure covers rudy-xpe: the old
+// os.RemoveAll(dir) then os.Rename(stage, dir) swap could lose a checkout entirely if the
+// rename half failed after the removal had already succeeded. swapCheckout's three-step
+// version renames dir aside first, so the same failure leaves the pre-update checkout intact
+// at dir+".old" instead. A missing stage forces the second rename to fail deterministically,
+// after the first rename has already moved the live checkout aside.
+func TestSwapCheckoutOrphansABackupRatherThanDestroyingOnFailure(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "hello")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "marker")
+	if err := os.WriteFile(marker, []byte("live"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	missingStage := filepath.Join(root, "does-not-exist")
+
+	if err := swapCheckout(dir, missingStage); err == nil {
+		t.Fatal("swapCheckout with a missing stage: want an error")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("dir stat = %v, want not exist: the failed rename should have moved it aside", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir+".old", "marker"))
+	if err != nil {
+		t.Fatalf("backup missing after a failed swap: %v", err)
+	}
+	if string(b) != "live" {
+		t.Fatalf("backup contents = %q, want %q", b, "live")
+	}
+}
+
+// TestUpdateLeavesNoBackupDirectoryOnSuccess is swapCheckout's happy path from Update: the
+// .old directory it swaps through is a step, not a permanent artefact, so a successful
+// update must not leave one behind next to the live checkout.
+func TestUpdateLeavesNoBackupDirectoryOnSuccess(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, helloManifest)
+	s := newTestStore(t)
+	if _, _, err := s.Install(context.Background(), "git:"+src, time.Now()); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(helloManifest+"# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, src, "add", "-A")
+	runGitT(t, src, "commit", "-q", "-m", "second")
+	if _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if _, err := os.Stat(s.PluginDir("hello") + ".old"); !os.IsNotExist(err) {
+		t.Fatalf("stat .old = %v, want not exist after a successful update", err)
 	}
 }

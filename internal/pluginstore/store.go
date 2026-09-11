@@ -27,9 +27,18 @@ const LockFile = "plugins.lock.toml"
 
 // Installed is one [plugins.<name>] table.
 type Installed struct {
-	Name        string    `toml:"-"`
-	Source      string    `toml:"source"`
+	Name   string `toml:"-"`
+	Source string `toml:"source"`
+	// Kind is what Source resolved as: git, path, go or https. A lock written before this
+	// field existed has none on disk; Read derives it (see the loop below) rather than
+	// leaving it the zero value, so an old lock keeps meaning instead of failing dispatch.
+	Kind Kind `toml:"kind"`
+	// Ref is what the operator typed after "@", exactly as typed. rudy plugins update
+	// re-resolves it every time; it is never rewritten to the tip of whatever the checkout
+	// happens to track.
+	Ref         string    `toml:"ref"`
 	Commit      string    `toml:"commit"`
+	Digest      string    `toml:"digest"`
 	InstalledAt time.Time `toml:"installed_at"`
 	Enabled     bool      `toml:"enabled"`
 }
@@ -121,6 +130,16 @@ func (s *Store) Read() (map[string]Installed, error) {
 	out := make(map[string]Installed, len(lf.Plugins))
 	for name, inst := range lf.Plugins {
 		inst.Name = name
+		if inst.Kind == "" {
+			// Predates the kind column: derive it from fields every lock has always
+			// carried, exactly as the plugins.lock.toml contracts row says, so an old lock
+			// keeps meaning rather than failing the per-kind dispatch on a zero value.
+			if inst.Commit != "" {
+				inst.Kind = KindGit
+			} else {
+				inst.Kind = KindPath
+			}
+		}
 		out[name] = inst
 	}
 	return out, nil
@@ -226,7 +245,7 @@ func validateName(name string) error {
 // the stage's random one. Every error path removes the stage: a failed install leaves no
 // checkout and no lock entry behind.
 func (s *Store) Install(ctx context.Context, source string, now time.Time) (Installed, plugin.Manifest, error) {
-	recorded, err := resolveSource(source)
+	src, err := ParseSource(source)
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
 	}
@@ -245,13 +264,13 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 		}
 	}()
 
-	isClone, err := stageSource(ctx, recorded, stage)
+	resolved, err := stageForInstall(ctx, src, stage)
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, err
 	}
 	m, err := plugin.ReadManifest(stage)
 	if err != nil {
-		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %s: %w", recorded, err)
+		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %s: %w", src.AsTyped, err)
 	}
 	locked, err := s.Read()
 	if err != nil {
@@ -278,19 +297,19 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
 	}
 
-	var commit string
-	if isClone {
-		if commit, err = headCommit(ctx, stage); err != nil {
-			return Installed{}, plugin.Manifest{}, err
-		}
-	}
 	if err := os.Rename(stage, dest); err != nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
 	}
 	keep = true
 	m.Dir = dest
 
-	inst := Installed{Name: m.Name, Source: recorded, Commit: commit, InstalledAt: now, Enabled: true}
+	inst := Installed{Name: m.Name, Source: src.AsTyped, Kind: src.Kind, Ref: src.Ref, InstalledAt: now, Enabled: true}
+	switch src.Kind {
+	case KindGit:
+		inst.Commit = resolved
+	case KindGo, KindHTTPS:
+		inst.Digest = resolved
+	}
 	locked[m.Name] = inst
 	if err := s.Write(locked); err != nil {
 		// The checkout landed but the lock did not record it: leaving it behind would be a
@@ -361,6 +380,16 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 	if !ok {
 		return Installed{}, notInstalled(name)
 	}
+	src, err := ParseSource(inst.Source)
+	if err != nil {
+		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+	}
+	// kind and ref are the lock's own columns, not re-derived from source: a checkout
+	// installed before the kind column existed can have a source string that alone reads
+	// ambiguously (a local git checkout given as a bare path parses as path, not git), and
+	// ref is re-resolved every update, never rewritten from whatever the checkout tracks.
+	src.Kind = inst.Kind
+	src.Ref = inst.Ref
 
 	stage, err := os.MkdirTemp(s.pluginsDir(), ".update-*")
 	if err != nil {
@@ -373,42 +402,59 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 		}
 	}()
 
-	isClone, err := stageSource(ctx, inst.Source, stage)
+	resolved, err := stageForUpdate(ctx, src, stage)
 	if err != nil {
 		return Installed{}, err
 	}
 	m, err := plugin.ReadManifest(stage)
 	if err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %s: %w", inst.Source, err)
+		return Installed{}, fmt.Errorf("pluginstore: %s: %w", src.AsTyped, err)
 	}
 	announceBuild(s.buildOut(), name, m.Build)
 	if err := runBuild(ctx, stage, m.Build, s.buildOut()); err != nil {
 		return Installed{}, fmt.Errorf("pluginstore: %w", err)
 	}
 
-	var commit string
-	if isClone {
-		if commit, err = headCommit(ctx, stage); err != nil {
-			return Installed{}, err
-		}
-	}
-
-	dir := s.checkoutDir(name)
-	if err := os.RemoveAll(dir); err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %w", err)
-	}
-	if err := os.Rename(stage, dir); err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+	if err := swapCheckout(s.checkoutDir(name), stage); err != nil {
+		return Installed{}, err
 	}
 	keep = true
 
-	inst.Commit = commit
+	switch src.Kind {
+	case KindGit:
+		inst.Commit = resolved
+	case KindGo, KindHTTPS:
+		inst.Digest = resolved
+	}
 	inst.InstalledAt = now
 	locked[name] = inst
 	if err := s.Write(locked); err != nil {
 		return Installed{}, err
 	}
 	return inst, nil
+}
+
+// swapCheckout replaces dir's live contents with stage's. It renames dir aside before
+// renaming stage into its place, rather than os.RemoveAll(dir) then os.Rename(stage, dir):
+// that older two-step version could lose the checkout entirely if either half failed, since
+// the deferred stage cleanup then removed the only remaining copy too (rudy-xpe). Here, the
+// worst a failure between the two renames leaves behind is dir+".old" orphaned next to a
+// missing dir, not a destroyed plugin.
+func swapCheckout(dir, stage string) error {
+	old := dir + ".old"
+	if err := os.RemoveAll(old); err != nil {
+		return fmt.Errorf("pluginstore: %w", err)
+	}
+	if err := os.Rename(dir, old); err != nil {
+		return fmt.Errorf("pluginstore: %w", err)
+	}
+	if err := os.Rename(stage, dir); err != nil {
+		return fmt.Errorf("pluginstore: %w", err)
+	}
+	// Best effort: the swap itself already succeeded, and a leftover .old backup is a
+	// nuisance to clean up next time, not a reason to fail an update that otherwise worked.
+	_ = os.RemoveAll(old)
+	return nil
 }
 
 // runBuild runs a manifest's build command once in the staged checkout, with the checkout as
@@ -465,38 +511,114 @@ func isRemoteSource(source string) bool {
 	return true
 }
 
-// resolveSource is what Install records as Installed.Source. A remote endpoint is recorded
-// verbatim: there is no filesystem path in it to resolve. Anything else is a local path, and
-// is made absolute before it is written to the lock, since a relative path is read back by
-// Update, which has no reason to run from the same working directory Install did.
-func resolveSource(source string) (string, error) {
-	if isRemoteSource(source) {
-		return source, nil
+// stageForInstall fills stage (already created, empty) with src's contents for a fresh
+// install, and reports what it resolved to: the checked-out commit for git, empty for path
+// (there is no version concept to record), and an error for go and https, not yet
+// implemented (tasks 4 and 5 add a stager for each behind this same dispatch).
+func stageForInstall(ctx context.Context, src Source, stage string) (resolved string, err error) {
+	switch src.Kind {
+	case KindGit:
+		return stageGitInstall(ctx, src, stage)
+	case KindPath:
+		return "", stagePath(ctx, src, stage)
+	case KindGo:
+		return "", fmt.Errorf("pluginstore: go: sources are not yet supported")
+	case KindHTTPS:
+		return "", fmt.Errorf("pluginstore: https sources are not yet supported")
+	default:
+		return "", fmt.Errorf("pluginstore: unknown source kind %q", src.Kind)
 	}
-	return filepath.Abs(source)
 }
 
-// stageSource fills stage (already created, empty) with source's contents: a directory with
-// no .git is copied as plain files, everything else (a URL, or a local path that is itself a
-// git checkout) is cloned. isClone tells the caller whether stage is a git checkout it can
-// read a commit out of.
-func stageSource(ctx context.Context, source, stage string) (isClone bool, err error) {
-	if fi, statErr := os.Stat(source); statErr == nil && fi.IsDir() {
-		if _, gitErr := os.Stat(filepath.Join(source, ".git")); gitErr != nil {
-			if err := os.CopyFS(stage, os.DirFS(source)); err != nil {
-				return false, fmt.Errorf("pluginstore: copy %s: %w", source, err)
+// stageForUpdate is stageForInstall's counterpart for rudy plugins update: the same dispatch,
+// but git re-resolves a pinned ref instead of taking whatever a fresh clone's default branch
+// happens to be at (see stageGitUpdate).
+func stageForUpdate(ctx context.Context, src Source, stage string) (resolved string, err error) {
+	switch src.Kind {
+	case KindGit:
+		return stageGitUpdate(ctx, src, stage)
+	case KindPath:
+		return "", stagePath(ctx, src, stage)
+	case KindGo:
+		return "", fmt.Errorf("pluginstore: go: sources are not yet supported")
+	case KindHTTPS:
+		return "", fmt.Errorf("pluginstore: https sources are not yet supported")
+	default:
+		return "", fmt.Errorf("pluginstore: unknown source kind %q", src.Kind)
+	}
+}
+
+// stagePath fills stage with a path source's contents: a directory with no .git is copied as
+// plain files, one that is itself a git checkout is cloned instead, so an install or update
+// never picks up uncommitted changes or ignored files sitting in a developer's working copy.
+// Either way this is the path kind: no ref, no commit recorded, per the contracts row.
+func stagePath(ctx context.Context, src Source, stage string) error {
+	if fi, statErr := os.Stat(src.Location); statErr == nil && fi.IsDir() {
+		if _, gitErr := os.Stat(filepath.Join(src.Location, ".git")); gitErr != nil {
+			if err := os.CopyFS(stage, os.DirFS(src.Location)); err != nil {
+				return fmt.Errorf("pluginstore: copy %s: %w", src.Location, err)
 			}
-			return false, nil
+			return nil
 		}
 	}
-	// -- before the source: it is whatever the operator typed, and a value starting with a
-	// dash would otherwise be read as an option to git rather than as a repository. The other
-	// git calls here take no operator-supplied positional (fetch names the constant origin,
-	// reset and rev-parse take a revision, where -- would mean a pathspec instead).
-	if _, err := runGit(ctx, "clone", "--depth", "1", "--", source, stage); err != nil {
-		return false, err
+	// -- before the location: it is whatever the operator typed, and a value starting with a
+	// dash would otherwise be read as an option to git rather than as a repository.
+	if _, err := runGit(ctx, "clone", "--depth", "1", "--", src.Location, stage); err != nil {
+		return err
 	}
-	return true, nil
+	return nil
+}
+
+// stageGitInstall lands a git source into stage for a fresh install and returns the commit
+// it landed on. With no ref this is the plain shallow clone stageSource always did. With a
+// ref, a shallow clone can name it directly only when it is a branch or a tag; a bare commit
+// is not something --branch understands, so that shallow attempt is retried as a full clone
+// plus checkout.
+func stageGitInstall(ctx context.Context, src Source, stage string) (string, error) {
+	if src.Ref == "" {
+		if _, err := runGit(ctx, "clone", "--depth", "1", "--", src.Location, stage); err != nil {
+			return "", err
+		}
+		return headCommit(ctx, stage)
+	}
+	if _, err := runGit(ctx, "clone", "--depth", "1", "--branch", src.Ref, "--", src.Location, stage); err != nil {
+		// git refuses to clone into a non-empty directory, and a failed --branch attempt can
+		// still have created .git before failing; clear it before the full-clone fallback.
+		if rmErr := os.RemoveAll(stage); rmErr != nil {
+			return "", fmt.Errorf("pluginstore: %w", rmErr)
+		}
+		if mkErr := os.MkdirAll(stage, 0o700); mkErr != nil {
+			return "", fmt.Errorf("pluginstore: %w", mkErr)
+		}
+		if _, err := runGit(ctx, "clone", "--", src.Location, stage); err != nil {
+			return "", err
+		}
+		if _, err := runGit(ctx, "-C", stage, "checkout", src.Ref); err != nil {
+			return "", err
+		}
+	}
+	return headCommit(ctx, stage)
+}
+
+// stageGitUpdate lands a git source into stage for rudy plugins update. With no ref this is
+// the existing default-branch behaviour: a fresh shallow clone lands wherever origin's
+// default branch tip is now. With a ref, the clone establishes the repository and its origin
+// remote, then a shallow fetch of exactly that ref plus a hard reset onto it re-resolves the
+// pin, rather than drifting to the tip of whatever branch the clone's default happened to
+// track.
+func stageGitUpdate(ctx context.Context, src Source, stage string) (string, error) {
+	if _, err := runGit(ctx, "clone", "--depth", "1", "--", src.Location, stage); err != nil {
+		return "", err
+	}
+	if src.Ref != "" {
+		if _, err := runGit(ctx, "-C", stage, "fetch", "--depth", "1", "--", "origin", src.Ref); err != nil {
+			return "", err
+		}
+		if _, err := runGit(ctx, "-C", stage, "reset", "--hard", "FETCH_HEAD"); err != nil {
+			return "", err
+		}
+	}
+	return headCommit(ctx, stage)
 }
 
 // headCommit is the checked-out commit of a git directory.
