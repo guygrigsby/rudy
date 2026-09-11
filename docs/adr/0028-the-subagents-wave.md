@@ -43,7 +43,14 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    cancelling whichever call registered last. An interrupt is observed
    independently by every in-flight call instead of being consumed by the first
    one to look, so an interrupted turn cannot record its other calls as clean
-   successes. `Observer.StateChanged` carries the `tool_use` id.
+   successes. A call's progress is reported per call.
+
+   That last part was first written here as `Observer.StateChanged` carrying the
+   `tool_use` id. It shipped as a second notification, `tool.state`, beside the
+   turn-level one, because a turn state and a call state answer different
+   questions and overloading one to mean both would have made `RunningTool`
+   ambiguous the moment two calls ran. The contracts row is the normative
+   description; this sentence is corrected to match what exists.
 
    This is one change serving two features, and it is the reason they are one
    wave rather than two.
