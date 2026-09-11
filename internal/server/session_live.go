@@ -114,6 +114,17 @@ type liveSession struct {
 	// asking, which is not_found.
 	standing map[string]standingQuestion
 	answered map[string]bool
+
+	// inFlight is the last tool.state this session has broadcast for each call still running
+	// or awaiting permission, by tool_use id: what a connection attaching mid-turn is owed so
+	// it renders the calls already in progress instead of a turn with no visible tool
+	// activity until the next one finishes (the tool.state contracts row). fanout.ToolStateChanged
+	// is the only writer: it records running and awaiting_permission, and deletes on done. A
+	// finished call is never replayed from here; it is its own tool_result entry, and every
+	// call recorded here is guaranteed to reach done eventually (runner.runTool's defer fires
+	// it unconditionally, interrupt and cancellation included), so this can never wedge a
+	// finished call's state open past the turn that ran it.
+	inFlight map[string]protocol.ToolStateChanged
 }
 
 // standingQuestion is one question currently put to the askers: the payload to re-send to an
@@ -139,6 +150,7 @@ func newLive(sess *session.Session, m provider.Model) *liveSession {
 		children:  map[string]bool{},
 		standing:  map[string]standingQuestion{},
 		answered:  map[string]bool{},
+		inFlight:  map[string]protocol.ToolStateChanged{},
 	}
 }
 
@@ -231,6 +243,60 @@ func (ls *liveSession) askersObsLocked() []*conn {
 		}
 	}
 	return out
+}
+
+// watchers is the parent's subscribers, which also see this session's work so a client can
+// watch the subagents it dispatched (ADR 0028 decision 6). It is the mirror of askers, which
+// walks the same link upward when a child has no asker of its own; this one always walks down,
+// unconditionally, since a live client with no interest in a child's work simply never resumed
+// it and drops the notification client-side the way it already does for anything session-id
+// keyed. Depth is one, so unlike askers this never recurses: a child can never itself have a
+// child (open refuses a parent that is already one), so ls.parent.parent is always nil.
+//
+// The plugin connection that opened this session is excluded: it is the one waiting on the
+// tool call this session answers and is already reading these notifications as this session's
+// own subscriber, so routing them to it a second time here would echo every one of them back.
+//
+// Receiving these confers nothing: authority over a session follows subscription (ownSession,
+// handleSubmit), and a parent's client is never subscribed to the child just because it is
+// handed the child's notifications this way, so it gains no new way to submit to, interrupt or
+// answer for it.
+//
+// Self-locking (takes ls.parent.obsMu, never ls.obsMu, which every caller here has already
+// released - see notifyWatchers). Caller must not hold any liveSession's obsMu.
+func (ls *liveSession) watchers() []*conn {
+	if ls.parent == nil {
+		return nil
+	}
+	ls.parent.obsMu.Lock()
+	defer ls.parent.obsMu.Unlock()
+	out := make([]*conn, 0, len(ls.parent.conns))
+	for _, c := range ls.parent.conns {
+		if c.plugin != "" {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// notifyWatchers forwards one notification already sent to this session's own subscribers to
+// its parent's, unchanged (the session id inside params is always this session's own, which is
+// what lets a client tell a forwarded notification from one about the session it actually
+// resumed). Called after the broadcastObsLocked section that sent it to ls.conns has released
+// ls.obsMu: watchers() takes the parent's obsMu, and the two sessions' locks must never be held
+// at once (see the ordering note at the top of this file), so this cannot run any earlier than
+// that release without holding both. The gap that leaves between a session's own broadcast and
+// its forwarded copy is accepted rather than closed: two of this session's own tool calls
+// already race their entries into the log in whatever order they finish (ADR 0028's own
+// consequence), and every notification forwarded here is either scoped to one tool_use id
+// (tool.state, contract: "ordered per tool_use_id") or read by id rather than by arrival order
+// (entry.appended) on the reading end, so a forwarded copy landing out of step with a sibling
+// call's forwarded copy changes nothing a client can observe incorrectly.
+func (ls *liveSession) notifyWatchers(method string, params any) {
+	for _, c := range ls.watchers() {
+		c.notify(method, params)
+	}
 }
 
 // stand publishes q as one of this session's standing questions and returns the askers to put
@@ -333,13 +399,14 @@ func (ls *liveSession) broadcastObsLocked(method string, params any) {
 
 // attachment is everything a newly subscribed connection is owed, in the order the contract
 // hands it over: every entry as entry.appended, then the current turn.state when a turn is
-// active, then each standing permission.requested when the newcomer is an asker, and last the
-// response carrying info.
+// active, then a tool.state for every call still in flight, then each standing
+// permission.requested when the newcomer is an asker, and last the response carrying info.
 type attachment struct {
-	entries  []session.Entry
-	state    *protocol.TurnStateChanged
-	standing []protocol.PermissionRequested
-	info     protocol.SessionInfo
+	entries    []session.Entry
+	state      *protocol.TurnStateChanged
+	toolStates []protocol.ToolStateChanged
+	standing   []protocol.PermissionRequested
+	info       protocol.SessionInfo
 }
 
 // subscribeLocked registers cn as a subscriber and returns what it is owed: the entries to
@@ -363,6 +430,16 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 	// live notification a moment later instead.
 	if isActive(ls.state) && ls.turnID != "" {
 		at.state = &protocol.TurnStateChanged{SessionID: sid.String(), TurnID: ls.turnID, State: string(ls.state)}
+	}
+	if len(ls.inFlight) > 0 {
+		at.toolStates = make([]protocol.ToolStateChanged, 0, len(ls.inFlight))
+		for _, ts := range ls.inFlight {
+			at.toolStates = append(at.toolStates, ts)
+		}
+		// Map order is not an order, the same reason at.standing sorts below.
+		slices.SortFunc(at.toolStates, func(a, b protocol.ToolStateChanged) int {
+			return strings.Compare(a.ToolUseID, b.ToolUseID)
+		})
 	}
 	if cn.isAsker() {
 		for _, q := range ls.standing {
@@ -389,10 +466,12 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 // it. Every server-side append ends here, so the mirror and the broadcast can never disagree
 // about what landed.
 func (ls *liveSession) mirror(e session.Entry) {
+	p := protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e}
 	ls.obsMu.Lock()
 	ls.entries = append(ls.entries, e)
-	ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: ls.sess.ID().String(), Entry: e})
+	ls.broadcastObsLocked(protocol.NotifyEntryAppended, p)
 	ls.obsMu.Unlock()
+	ls.notifyWatchers(protocol.NotifyEntryAppended, p)
 }
 
 // appendAndBroadcastLocked appends an entry the server produces directly. The caller must
@@ -515,19 +594,24 @@ type fanout struct {
 }
 
 func (f *fanout) EntryAppended(e session.Entry) {
+	p := protocol.EntryAppended{SessionID: f.sid, Entry: e}
 	f.ls.obsMu.Lock()
 	f.ls.entries = append(f.ls.entries, e)
-	f.ls.broadcastObsLocked(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: f.sid, Entry: e})
+	f.ls.broadcastObsLocked(protocol.NotifyEntryAppended, p)
 	f.ls.obsMu.Unlock()
+	f.ls.notifyWatchers(protocol.NotifyEntryAppended, p)
 }
 
-func (f *fanout) Delta(turnID string, p provider.Part) {
+func (f *fanout) Delta(turnID string, part provider.Part) {
+	p := protocol.StreamDelta{SessionID: f.sid, TurnID: turnID, Part: part}
 	f.ls.obsMu.Lock()
-	f.ls.broadcastObsLocked(protocol.NotifyStreamDelta, protocol.StreamDelta{SessionID: f.sid, TurnID: turnID, Part: p})
+	f.ls.broadcastObsLocked(protocol.NotifyStreamDelta, p)
 	f.ls.obsMu.Unlock()
+	f.ls.notifyWatchers(protocol.NotifyStreamDelta, p)
 }
 
 func (f *fanout) StateChanged(turnID string, s turn.State) {
+	p := protocol.TurnStateChanged{SessionID: f.sid, TurnID: turnID, State: string(s)}
 	f.ls.obsMu.Lock()
 	f.ls.state = s
 	f.ls.turnID = turnID
@@ -537,19 +621,28 @@ func (f *fanout) StateChanged(turnID string, s turn.State) {
 		// question nobody is asking, which is not_found rather than conflict.
 		clear(f.ls.answered)
 	}
-	f.ls.broadcastObsLocked(protocol.NotifyTurnState, protocol.TurnStateChanged{SessionID: f.sid, TurnID: turnID, State: string(s)})
+	f.ls.broadcastObsLocked(protocol.NotifyTurnState, p)
 	f.ls.obsMu.Unlock()
+	f.ls.notifyWatchers(protocol.NotifyTurnState, p)
 }
 
 // ToolStateChanged forwards one call's progress. turn.state cannot carry it: the calls of an
 // assistant message run at once (ADR 0028), so the turn's own state cannot say which of them
-// is running and which is the one waiting on the operator.
+// is running and which is the one waiting on the operator. It also keeps ls.inFlight current:
+// running and awaiting_permission record this call's latest state, done retires it, which is
+// what lets a connection attaching mid-turn be told about every call still going (see
+// subscribeLocked) without replaying one that has already finished.
 func (f *fanout) ToolStateChanged(turnID, toolUseID, name string, state turn.ToolState) {
+	p := protocol.ToolStateChanged{SessionID: f.sid, TurnID: turnID, ToolUseID: toolUseID, Name: name, State: string(state)}
 	f.ls.obsMu.Lock()
-	f.ls.broadcastObsLocked(protocol.NotifyToolState, protocol.ToolStateChanged{
-		SessionID: f.sid, TurnID: turnID, ToolUseID: toolUseID, Name: name, State: string(state),
-	})
+	if state == turn.ToolDone {
+		delete(f.ls.inFlight, toolUseID)
+	} else {
+		f.ls.inFlight[toolUseID] = p
+	}
+	f.ls.broadcastObsLocked(protocol.NotifyToolState, p)
 	f.ls.obsMu.Unlock()
+	f.ls.notifyWatchers(protocol.NotifyToolState, p)
 }
 
 // firstAppendSignal wraps an Observer so the first EntryAppended call also sends the entry,

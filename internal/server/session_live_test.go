@@ -165,6 +165,32 @@ func TestAskersNeverIncludeAPluginConnection(t *testing.T) {
 	}
 }
 
+// TestWatchersNeverIncludeAPluginConnection is watchers' own version of the test above: the
+// mirror walk, downward instead of up, excludes the same plugin connection for the same reason
+// (ADR 0028 decision 6) - it is the child's own subscriber, already reading these
+// notifications, and must not also receive them relayed through its parent.
+func TestWatchersNeverIncludeAPluginConnection(t *testing.T) {
+	pluginConn := newConn(1, nil)
+	pluginConn.plugin = "subagents"
+	clientConn := newConn(2, nil)
+	secondClient := newConn(3, nil)
+
+	parent := &liveSession{}
+	parent.conns = []*conn{pluginConn, clientConn, secondClient}
+	child := &liveSession{parent: parent}
+
+	want := []*conn{clientConn, secondClient}
+	if got := child.watchers(); !slices.Equal(got, want) {
+		t.Errorf("watchers = %+v, want the parent's non-plugin connections", got)
+	}
+
+	// A root session has no parent to walk to, so nobody is watching it this way.
+	root := &liveSession{}
+	if got := root.watchers(); got != nil {
+		t.Errorf("a root session's watchers = %+v, want none", got)
+	}
+}
+
 // newTestLive opens a real session on disk and wraps it, the setup every liveSession unit test
 // below needs before it can call anything that reads sess.ID().
 func newTestLive(t *testing.T) *liveSession {

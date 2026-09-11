@@ -504,7 +504,13 @@ func (s *Server) handleClose(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 
 // handleSubmit starts a turn. A plugin connection may only submit to a session it opened or
 // attached itself: driving somebody else's session is not what the plugin caller class is
-// for, and a child session is exactly a session the plugin does hold.
+// for, and a child session is exactly a session the plugin does hold. A child session refuses
+// every other connection too, plugin or not: watching a child (its notifications reaching a
+// parent's subscribers, ADR 0028 decision 6) is deliberately not the same thing as subscribing
+// to it, so a parent's client that never resumed the child directly has no more standing to
+// submit to it than a stranger would. An ordinary session outside a parent-child relationship
+// keeps the looser rule it always had: any client that knows its id may submit to it, the same
+// as session.interrupt.
 func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
 	var p protocol.SessionSubmitParams
 	if e := decode(raw, &p); e != nil {
@@ -514,8 +520,11 @@ func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	if e != nil {
 		return nil, e
 	}
-	if cn.plugin != "" && !cn.subscribed(ls.sess.ID()) {
+	switch {
+	case cn.plugin != "" && !cn.subscribed(ls.sess.ID()):
 		return nil, perr(protocol.CodeUnauthorized, "plugin may only submit to sessions it opened")
+	case cn.plugin == "" && ls.parent != nil && !cn.subscribed(ls.sess.ID()):
+		return nil, perr(protocol.CodeUnauthorized, "only a session's own subscriber may submit to a child session")
 	}
 	if len(p.Content) == 0 {
 		return nil, perr(protocol.CodeInvalidArgument, "empty content")
@@ -1637,13 +1646,17 @@ func replay(cn *conn, sid ulid.ULID, entries []session.Entry) {
 }
 
 // deliverAttach sends a new subscriber everything it is owed, in the contract's order: the
-// replay, then the turn's current state when one is running, then each question standing for
-// an asker. The response the caller returns leaves after all of them, on the same ordered
-// outbox (see conn.pump), which is what "then this response" in the session.resume row means.
+// replay, then the turn's current state when one is running, then a tool.state for every call
+// still in flight, then each question standing for an asker. The response the caller returns
+// leaves after all of them, on the same ordered outbox (see conn.pump), which is what "then
+// this response" in the session.resume row means.
 func deliverAttach(cn *conn, sid ulid.ULID, at attachment) {
 	replay(cn, sid, at.entries)
 	if at.state != nil {
 		cn.notify(protocol.NotifyTurnState, *at.state)
+	}
+	for _, ts := range at.toolStates {
+		cn.notify(protocol.NotifyToolState, ts)
 	}
 	for _, q := range at.standing {
 		cn.notify(protocol.NotifyPermissionRequested, q)

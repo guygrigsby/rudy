@@ -3244,6 +3244,180 @@ func openChildSession(t *testing.T, cn *testConn, parent, childAgent string, too
 	return ""
 }
 
+// attach opens a second, non-plugin connection and resumes it onto sid: a subscriber to sid
+// that neither opened nor drives it, the shape a client watching a session it did not start
+// takes.
+func attach(t *testing.T, srv *testServer, sid string) *protocol.Client {
+	t.Helper()
+	cl := dialAs(t, srv.srv, false)
+	resumeOn(t, cl, sid)
+	return cl
+}
+
+// call issues one request on cl with the background context, ignoring any result: a test that
+// only cares whether the caller was entitled to make the call.
+func call(t *testing.T, cl *protocol.Client, method string, params any) error {
+	t.Helper()
+	return cl.Call(context.Background(), method, params, &struct{}{})
+}
+
+// waitForNotification drains cl until a notification of method decodes into a T that match
+// accepts, and returns that payload. Unlike drain, which hands back every notification seen up
+// to the stop, this hands back only the one the caller asked for.
+func waitForNotification[T any](t *testing.T, cl *protocol.Client, method string, match func(T) bool) T {
+	t.Helper()
+	var out T
+	drain(t, cl, func(n protocol.Notification) bool {
+		if n.Method != method {
+			return false
+		}
+		var v T
+		if err := json.Unmarshal(n.Params, &v); err != nil {
+			t.Fatalf("%s params: %v", method, err)
+		}
+		if !match(v) {
+			return false
+		}
+		out = v
+		return true
+	})
+	return out
+}
+
+// appendAssistantText puts one entry on sid via the opener plugin's own Note API: a note is
+// display-only and needs no active turn (unlike an assistant message, which only a running turn
+// may append), so this is the simplest way to land an entry.appended on a session's mirror for
+// a test that only cares that the routing carries an entry, not what kind it is.
+func appendAssistantText(t *testing.T, srv *testServer, sid, text string) {
+	t.Helper()
+	id, err := ulid.Parse(sid)
+	if err != nil {
+		t.Fatalf("bad session id %q: %v", sid, err)
+	}
+	if err := srv.op.host.Note(id, text, session.NoteInfo); err != nil {
+		t.Fatalf("note on %s: %v", sid, err)
+	}
+}
+
+// TestAParentsClientSeesItsChildsWork is ADR 0028 decision 6: a client subscribed to a parent
+// also receives its child's own notifications, tagged with the child's session id, so a client
+// watching a session sees the work it delegated without ever resuming the child itself.
+func TestAParentsClientSeesItsChildsWork(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	watcher := attach(t, srv, parent) // a second, non-plugin connection on the parent
+
+	child := openChildSession(t, cn, parent, "default")
+	appendAssistantText(t, srv, child, "what the subagent found")
+
+	n := waitForNotification(t, watcher, protocol.NotifyEntryAppended, func(p protocol.EntryAppended) bool {
+		return p.SessionID == child
+	})
+	if n.SessionID != child {
+		t.Fatalf("session id = %q, want the child's %q", n.SessionID, child)
+	}
+	if n.SessionID == parent {
+		t.Fatal("the child's entry arrived tagged as the parent's own")
+	}
+}
+
+// TestAParentsClientCannotDriveTheChild is the other half of decision 6: receiving the child's
+// notifications is not the same thing as being subscribed to it, so a client that only watches
+// the parent gains no standing to submit to the child.
+func TestAParentsClientCannotDriveTheChild(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	watcher := attach(t, srv, parent)
+	child := openChildSession(t, cn, parent, "default")
+
+	// Seeing a session is not owning it: the watcher is not subscribed to the child.
+	err := call(t, watcher, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: child, Content: []session.Block{session.TextBlock("do as I say")}, Source: session.SourceTyped,
+	})
+	if err == nil {
+		t.Fatal("a client that only watches a child was allowed to submit to it")
+	}
+	if got := code(t, err); got != protocol.CodeUnauthorized {
+		t.Fatalf("submit to an unwatched child code = %d, want %d (unauthorized): %v", got, protocol.CodeUnauthorized, err)
+	}
+}
+
+// TestThePluginDoesNotReceiveItsOwnChildsEcho: a plugin connection subscribed to a session that
+// delegates further must not also receive its child's notifications the way a plain client
+// would. The subagents plugin's own per-call connection never actually ends up subscribed to
+// the session it delegated from (a fresh Host.Connect per call, used only for the child, closed
+// once that call returns - see agentPlugin.invoke), so that specific pairing can never
+// double-deliver in practice; what this proves is the general rule watchers() enforces
+// regardless of how a plugin connection came to be a session's subscriber: a plugin managing a
+// session end to end (opening it itself, then delegating from inside it, the shape a
+// self-driving automation plugin would take) never gets a subagent's echo either.
+func TestThePluginDoesNotReceiveItsOwnChildsEcho(t *testing.T) {
+	srv, cn := newTestServer(t)
+
+	pluginConn, err := srv.op.host.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("connect as plugin: %v", err)
+	}
+	defer func() { _ = pluginConn.Close() }()
+	var info protocol.SessionInfo
+	if err := pluginConn.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: t.TempDir()}, &info); err != nil {
+		t.Fatalf("plugin open: %v", err)
+	}
+	// cn never opened or resumed this session, but session.submit's loose rule for a root
+	// session (unlike a child's) lets any client drive it; resuming it here is only so cn can
+	// also read its notifications, which openChildSession's own drain needs.
+	resumeOn(t, cn.Client, info.SessionID)
+
+	child := openChildSession(t, cn, info.SessionID, "default")
+	appendAssistantText(t, srv, child, "seen once")
+
+	deadline := time.After(300 * time.Millisecond)
+	for {
+		select {
+		case n := <-pluginConn.Notifications():
+			if n.Method != protocol.NotifyEntryAppended {
+				continue
+			}
+			var ea protocol.EntryAppended
+			if err := json.Unmarshal(n.Params, &ea); err != nil {
+				t.Fatal(err)
+			}
+			if ea.SessionID == child {
+				t.Fatalf("a plugin connection subscribed to the parent received the child's entry: %+v", ea)
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// TestAttachToParentDoesNotReplayAFinishedChildsEntries confirms the attach path does not walk
+// down: watchers() only ever forwards a live broadcast, so it has nothing to do with what a
+// resume replays, and a child's own entries live only in its own log. A parent's tool_result for
+// the agent call is what carries the child's answer, and a finished child is read by resuming
+// it directly (rudy-contracts.md's notifications section).
+func TestAttachToParentDoesNotReplayAFinishedChildsEntries(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	child := openChildSession(t, cn, parent, "default")
+	driveTurn(t, srv, child) // a genuinely finished child, not merely an opened one
+
+	raw := rawDialAs(t, srv.srv, false)
+	_, raws := raw.call(protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: parent})
+	for _, m := range raws {
+		if m.Method != protocol.NotifyEntryAppended {
+			continue
+		}
+		var ea protocol.EntryAppended
+		if err := json.Unmarshal(m.Params, &ea); err != nil {
+			t.Fatal(err)
+		}
+		if ea.SessionID == child {
+			t.Fatalf("attaching to the parent replayed the child's own entry: %+v", ea)
+		}
+	}
+}
+
 // toolNames drives one bare turn on sess and returns the tool names the server offered it in
 // that request: the observable proxy for a live session's effective tool view, which is
 // otherwise unexported. It refuses a session that is not already live rather than silently
@@ -3276,8 +3450,10 @@ func toolNames(t *testing.T, srv *testServer, sess string) []string {
 // test that closes a connection and immediately resumes can silently keep measuring the live
 // view instead of the reloaded one. Polling the store directly, outside the server's own
 // bookkeeping, is what turns "cold" from a timing assumption into an observed fact: by the time
-// this Load succeeds, closeIfUnusedLocked has already removed sess from s.live (the delete and
-// the flock's release happen in that order, under the same lock), so the very next resume is
+// this Load succeeds, closeIfUnusedLocked has already removed sess from s.live: the delete runs
+// under Server.mu, and the flock's release follows it afterward, once Server.mu has been
+// released and claimCloseIfIdle's claim has made this session's close exclusive, two different
+// locks taken one after the other, not one lock covering both, so the very next resume is
 // guaranteed to take the true cold path.
 func waitUntilCold(t *testing.T, srv *testServer, sess string) {
 	t.Helper()
