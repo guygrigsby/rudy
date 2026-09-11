@@ -216,7 +216,7 @@ func TestSpawnedPluginServesToolHookAndCommand(t *testing.T) {
 	// The tool the child registered was offered, and its before_turn hook reached the prompt.
 	req := h.prov.request(0)
 	if !hasTool(req.Tools, "hello_upper") {
-		t.Fatalf("tools = %v", toolNames(req.Tools))
+		t.Fatalf("tools = %v", defNames(req.Tools))
 	}
 	if !strings.Contains(req.System, "hello plugin was here") {
 		t.Fatalf("system prompt = %q", req.System)
@@ -247,7 +247,7 @@ func TestSpawnedPluginThatDiesIsWithdrawn(t *testing.T) {
 	info := h.openSession(t)
 	h.runTurn(t, info)
 	if req := h.prov.request(0); hasTool(req.Tools, "hello_upper") {
-		t.Fatalf("a dead plugin's tool is still offered: %v", toolNames(req.Tools))
+		t.Fatalf("a dead plugin's tool is still offered: %v", defNames(req.Tools))
 	}
 	// Its command went with it.
 	err := h.cl.Call(context.Background(), protocol.MethodCommandRun, protocol.CommandRunParams{

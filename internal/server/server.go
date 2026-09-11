@@ -12,6 +12,7 @@ import (
 	"log"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1179,20 +1180,57 @@ func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agen
 
 // applyAgent stamps a definition onto a session that is not yet shared: its tool view, its
 // system prompt and its step limit. A child never sees the agent tool, even when its
-// definition lists it, and this deny is the only place that removal happens: it is what keeps
-// subagent depth at one, and with no tool to call a child cannot open a grandchild, so no
-// further check is needed anywhere else. A root session under the same definition keeps the
-// tool; dispatching subagents is what such a definition is for.
+// definition lists it, which is what keeps subagent depth at one: with no tool to call, a child
+// cannot open a grandchild.
+//
+// A child's list is also intersected with its parent's. Restricting an agent is done by
+// removing tools from its list, so delegation must not hand out what the parent does not hold,
+// or the restriction means nothing (ADR 0028, rudy-ef4).
 func (s *Server) applyAgent(ls *liveSession, def agentdef.Definition) {
 	var deny []string
+	allow := def.Tools
 	if ls.parent != nil || openedAsChild(ls.entries) {
 		deny = []string{"agent"}
+		allow = intersectTools(allow, parentToolNames(ls))
 	}
-	if def.Tools != nil || deny != nil {
-		ls.tools = plugin.NewToolView(s.d.Plugins, def.Tools, deny)
+	if allow != nil || deny != nil {
+		ls.tools = plugin.NewToolView(s.d.Plugins, allow, deny)
 	}
 	ls.system = def.Prompt
 	ls.maxSteps = def.MaxTurns
+}
+
+// intersectTools narrows want by have. A nil want means every tool, so the result is have; a
+// nil have means the parent is unrestricted, so the result is want. Only ever removes.
+func intersectTools(want, have []string) []string {
+	switch {
+	case have == nil:
+		return want
+	case want == nil:
+		return slices.Clone(have)
+	}
+	out := make([]string, 0, min(len(want), len(have)))
+	for _, n := range want {
+		if slices.Contains(have, n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// parentToolNames is the parent's effective list, or nil when the parent holds every tool. It
+// reads the live parent rather than the log: a child is opened while its parent is live, and
+// the parent's own view is already the intersection of everything above it.
+func parentToolNames(ls *liveSession) []string {
+	if ls.parent == nil || ls.parent.tools == nil {
+		return nil
+	}
+	all := ls.parent.tools.Tools()
+	out := make([]string, 0, len(all))
+	for _, t := range all {
+		out = append(out, t.Name)
+	}
+	return out
 }
 
 // applyAgentFromLog stamps the agent definition a session already carries in its log onto a

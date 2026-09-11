@@ -28,6 +28,10 @@ import (
 	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/subagents"
+	"github.com/guygrigsby/rudy/internal/plugins/tools/bash"
+	"github.com/guygrigsby/rudy/internal/plugins/tools/edit"
+	"github.com/guygrigsby/rudy/internal/plugins/tools/read"
+	"github.com/guygrigsby/rudy/internal/plugins/tools/write"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/server"
@@ -2638,7 +2642,10 @@ func completedOn(sid string) func(protocol.Notification) bool {
 	}
 }
 
-func toolNames(defs []provider.ToolDef) []string {
+// defNames is the tool names inside one provider request's Tools: what a model was actually
+// offered, distinct from toolNames below, which drives a whole turn on a live session to find
+// out the same thing from outside the server package.
+func defNames(defs []provider.ToolDef) []string {
 	out := make([]string, 0, len(defs))
 	for _, d := range defs {
 		out = append(out, d.Name)
@@ -2755,7 +2762,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if len(creqs) != 2 {
 		t.Fatalf("child made %d requests", len(creqs))
 	}
-	if names := toolNames(creqs[0].Tools); !reflect.DeepEqual(names, []string{"echo"}) {
+	if names := defNames(creqs[0].Tools); !reflect.DeepEqual(names, []string{"echo"}) {
 		t.Errorf("child tools = %v", names)
 	}
 	if !strings.HasPrefix(creqs[0].System, "You explore the repository and report.") {
@@ -2789,7 +2796,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if len(hreqs) != 2 {
 		t.Fatalf("helper made %d requests", len(hreqs))
 	}
-	if names := toolNames(hreqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
+	if names := defNames(hreqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
 		t.Errorf("helper tools = %v", names)
 	}
 
@@ -2824,7 +2831,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if len(hreqs) != 3 {
 		t.Fatalf("helper made %d requests after the resume", len(hreqs))
 	}
-	if names := toolNames(hreqs[2].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
+	if names := defNames(hreqs[2].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
 		t.Errorf("resumed child tools = %v", names)
 	}
 	if !strings.HasPrefix(hreqs[2].System, "You help.") {
@@ -2847,7 +2854,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if len(freqs) == 0 {
 		t.Fatal("the fork of the child ran no request")
 	}
-	if names := toolNames(freqs[0].Tools); slices.Contains(names, "agent") {
+	if names := defNames(freqs[0].Tools); slices.Contains(names, "agent") {
 		t.Errorf("fork of a child tools = %v, want no agent tool", names)
 	}
 
@@ -2879,7 +2886,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	}
 	drain(t, cl, completedOn(info.SessionID))
 	rreqs := prov.requestsFor(info.SessionID)
-	if names := toolNames(rreqs[len(rreqs)-1].Tools); !slices.Contains(names, "agent") {
+	if names := defNames(rreqs[len(rreqs)-1].Tools); !slices.Contains(names, "agent") {
 		t.Errorf("resumed root tools = %v, want the agent tool among them", names)
 	}
 
@@ -2961,7 +2968,7 @@ func TestForkKeepsTheAgentDefinition(t *testing.T) {
 	}
 	drain(t, cl, completedOn(forkInfo.SessionID))
 	req := prov.lastRequest()
-	if names := toolNames(req.Tools); !reflect.DeepEqual(names, []string{"danger"}) {
+	if names := defNames(req.Tools); !reflect.DeepEqual(names, []string{"danger"}) {
 		t.Errorf("fork tools = %v, want the definition's", names)
 	}
 	if !strings.HasPrefix(req.System, "You explore and report.") {
@@ -2990,9 +2997,345 @@ func TestRootSessionKeepsTheAgentToolItsDefinitionLists(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	runTurn(t, cl, info.SessionID, "go")
-	names := toolNames(prov.lastRequest().Tools)
+	names := defNames(prov.lastRequest().Tools)
 	if !slices.Contains(names, "agent") || !slices.Contains(names, "danger") {
 		t.Errorf("root tools = %v, want the definition's list, agent included", names)
+	}
+}
+
+// testProvider is the fake model newTestServer wires in. It scripts one round trip: armDelegate
+// makes the very next call it answers open a child under the named agent, through the harness's
+// own "agent" tool; every other call, on any session, answers with plain text. Arming is
+// explicit rather than tied to call order or session identity, because toolNames below drives
+// its own bare turns on whatever session it is pointed at, including ones armDelegate never
+// touched, and those must never trigger a spurious child open.
+type testProvider struct {
+	mu    sync.Mutex
+	armed bool
+	agent string
+	reqs  map[ulid.ULID][]provider.Request
+}
+
+func (p *testProvider) armDelegate(agent string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.armed, p.agent = true, agent
+}
+
+func (p *testProvider) requestsFor(sid ulid.ULID) []provider.Request {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]provider.Request(nil), p.reqs[sid]...)
+}
+
+func (p *testProvider) Name() string { return "fake" }
+
+func (p *testProvider) ListModels(context.Context) ([]provider.Model, error) {
+	return []provider.Model{{
+		Ref:           session.ModelRef{Provider: "fake", Model: "m1"},
+		DisplayName:   "Fake 1",
+		ContextWindow: 100000,
+		Capabilities:  provider.Capabilities{Tools: true},
+	}}, nil
+}
+
+func (p *testProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
+	p.mu.Lock()
+	if p.reqs == nil {
+		p.reqs = map[ulid.ULID][]provider.Request{}
+	}
+	p.reqs[req.SessionID] = append(p.reqs[req.SessionID], req)
+	fire, agent := p.armed, p.agent
+	p.armed = false
+	p.mu.Unlock()
+
+	var parts []provider.Part
+	if fire {
+		parts = []provider.Part{
+			{Type: provider.PartToolUseStart, ID: "tu_agent", Name: "agent"},
+			{Type: provider.PartToolUseDelta, ID: "tu_agent", Text: `{"agent":"` + agent + `"}`},
+			{Type: provider.PartToolUseEnd, ID: "tu_agent"},
+			{Type: provider.PartUsage, Usage: session.Usage{Input: 10, Output: 5}},
+			{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
+		}
+	} else {
+		parts = []provider.Part{
+			{Type: provider.PartTextDelta, Text: "done"},
+			{Type: provider.PartUsage, Usage: session.Usage{Input: 20, Output: 1}},
+			{Type: provider.PartStop, StopReason: session.StopEndTurn, StopReasonRaw: "stop"},
+		}
+	}
+	for _, part := range parts {
+		if err := emit(part); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// openerPlugin is every subagents-wave test's stand-in for the real subagents plugin: it owns
+// the "agent" tool that opens a child session from inside its own pending tool_use, the same
+// authority path the real plugin's invoke uses (parentOf, server.go). Unlike the real plugin it
+// never submits anything to the child and never closes the connection that opened it, since a
+// test needs the child to stay live (and its tool view inspectable through toolNames) after
+// this call returns rather than being detached and closed the moment it has nothing running.
+// closeAll, run from newTestServer's t.Cleanup, closes what it opened at the end of each test.
+type openerPlugin struct {
+	prov *testProvider
+	host plugin.Host
+
+	mu    sync.Mutex
+	conns []*protocol.Client
+}
+
+func (o *openerPlugin) Name() string { return "opener" }
+
+func (o *openerPlugin) Init(_ context.Context, h plugin.Host) error {
+	o.host = h
+	if err := h.RegisterProvider(o.prov); err != nil {
+		return err
+	}
+	return h.RegisterTool(tool.Tool{
+		Name:        "agent",
+		Description: "test stand-in: opens a child session naming an agent definition",
+		Schema:      json.RawMessage(`{"type":"object","properties":{"agent":{"type":"string"}},"required":["agent"]}`),
+		Safety:      tool.Safe,
+		Invoke:      o.invoke,
+	})
+}
+
+func (o *openerPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
+	var in struct {
+		Agent string `json:"agent"`
+	}
+	if err := json.Unmarshal(call.Input, &in); err != nil || in.Agent == "" {
+		return tool.Result{IsError: true, Content: []session.Block{session.TextBlock("agent: bad input")}}, nil
+	}
+	client, err := o.host.Connect(ctx)
+	if err != nil {
+		return tool.Result{IsError: true, Content: []session.Block{session.TextBlock("agent: connect: " + err.Error())}}, nil
+	}
+	var info protocol.SessionInfo
+	err = client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
+		Cwd: call.Workspace.Root, Agent: in.Agent,
+		Parent: &protocol.ParentRef{SessionID: call.SessionID.String(), ToolUseID: call.ID},
+	}, &info)
+	if err != nil {
+		_ = client.Close()
+		return tool.Result{IsError: true, Content: []session.Block{session.TextBlock("agent: open: " + err.Error())}}, nil
+	}
+	o.mu.Lock()
+	o.conns = append(o.conns, client)
+	o.mu.Unlock()
+	return tool.Result{Content: []session.Block{session.TextBlock(info.SessionID)}}, nil
+}
+
+func (o *openerPlugin) closeAll() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, c := range o.conns {
+		_ = c.Close()
+	}
+	o.conns = nil
+}
+
+// testServer bundles what the subagents-wave test helpers need beyond a connection: the server
+// itself (for toolNames' own dial), the user config directory writeAgentDef writes agent
+// definitions into (every session resolves it regardless of its own cwd, so callers never need
+// to thread a workspace through), and the provider and opener plugin openChildSession and
+// toolNames drive.
+type testServer struct {
+	srv       *server.Server
+	store     *session.Store
+	configDir string
+	prov      *testProvider
+	op        *openerPlugin
+}
+
+// testConn is the connection session.open and session.submit run over in these tests, plus the
+// testServer it belongs to: openChildSession needs the latter to arm the harness's provider
+// before it drives the turn that opens a child.
+type testConn struct {
+	*protocol.Client
+	ts *testServer
+}
+
+// newTestServer is newTestServerWithPlugins with no extra plugins.
+func newTestServer(t *testing.T) (*testServer, *testConn) {
+	t.Helper()
+	return newTestServerWithPlugins(t)
+}
+
+// newTestServerWithPlugins is the harness every task in the subagents-wave plan shares: real
+// read, bash, edit and write tools, so a definition's tools list names tools a test can
+// actually check for, plus the opener stand-in and its provider. extra is for a test that needs
+// its own plugin on top of that roster (a fake agent-contributing plugin, say).
+func newTestServerWithPlugins(t *testing.T, extra ...plugin.Plugin) (*testServer, *testConn) {
+	t.Helper()
+	cfg := testConfig()
+	cfg.ConfigDir = t.TempDir()
+	prov := &testProvider{}
+	op := &openerPlugin{prov: prov}
+	plugins := append([]plugin.Plugin{op, read.New(), bash.New(), edit.New(), write.New()}, extra...)
+	srv, store := newServerWith(t, cfg, plugins...)
+	t.Cleanup(op.closeAll)
+	ts := &testServer{srv: srv, store: store, configDir: cfg.ConfigDir, prov: prov, op: op}
+	cl := dialAs(t, srv, false)
+	return ts, &testConn{Client: cl, ts: ts}
+}
+
+// sessionOpenParams is the test-facing subset of protocol.SessionOpenParams these helpers need:
+// an agent name, with the cwd and everything else defaulted.
+type sessionOpenParams struct {
+	Agent string
+}
+
+// openSession opens a root session and returns its id.
+func openSession(t *testing.T, cn *testConn, p sessionOpenParams) string {
+	t.Helper()
+	var info protocol.SessionInfo
+	if err := cn.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{
+		Cwd: t.TempDir(), Agent: p.Agent,
+	}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return info.SessionID
+}
+
+// writeAgentDef writes name.md under srv's agents directory. tools nil omits the frontmatter's
+// tools key entirely (every tool); a non-nil tools, including an empty one, writes an explicit
+// tools: [...] list (no tool for an empty one). agentdef.Definition.Tools depends on telling
+// those two apart, so this must not collapse one into the other.
+func writeAgentDef(t *testing.T, srv *testServer, name, description string, tools []string) {
+	t.Helper()
+	dir := filepath.Join(srv.configDir, "agents")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	b.WriteString("---\ndescription: " + description + "\n")
+	if tools != nil {
+		b.WriteString("tools: [" + strings.Join(tools, ", ") + "]\n")
+	}
+	b.WriteString("---\nTest agent.\n")
+	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// openChildSession opens a child session under parent naming childAgent, the way the subagents
+// plugin's own agent tool does: from inside a Safe tool's own pending tool_use, over that
+// plugin's own connection. It arms cn's provider and drives one turn on parent through it, then
+// reads the child's session id back off the tool result the opener tool returned.
+func openChildSession(t *testing.T, cn *testConn, parent, childAgent string) string {
+	t.Helper()
+	cn.ts.prov.armDelegate(childAgent)
+	ctx := context.Background()
+	var sub protocol.SessionSubmitResult
+	if err := cn.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: parent, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit to open a child under %s: %v", parent, err)
+	}
+	ns := drain(t, cn.Client, completedOn(parent))
+	for _, e := range entries(t, ns) {
+		if tr, ok := e.Payload.(session.ToolResult); ok {
+			if id := session.TextOf(tr.Content); id != "" {
+				return id
+			}
+		}
+	}
+	t.Fatalf("no child session id in %s's tool result: %v", parent, methods(ns))
+	return ""
+}
+
+// toolNames drives one bare turn on sess and returns the tool names the server offered it in
+// that request. It is the only way outside the server package to read a live session's
+// effective tool view: ToolView is unexported, so what a model was actually sent is the
+// observable proxy for it. Resuming first rather than dialing straight into session.submit
+// matters for a session this helper did not open itself: a live session just gains a
+// subscriber, but one that has fallen out of the live map cold-loads it, which is deliberate
+// when a test wants to exercise that path (see TestResumedChildKeepsItsOwnList) and harmless
+// otherwise.
+func toolNames(t *testing.T, srv *testServer, sess string) []string {
+	t.Helper()
+	sid, err := ulid.Parse(sess)
+	if err != nil {
+		t.Fatalf("bad session id %q: %v", sess, err)
+	}
+	cl := dialAs(t, srv.srv, false)
+	var info protocol.SessionInfo
+	if err := cl.Call(context.Background(), protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: sess}, &info); err != nil {
+		t.Fatalf("resume %s: %v", sess, err)
+	}
+	var sub protocol.SessionSubmitResult
+	if err := cl.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: sess, Content: []session.Block{session.TextBlock("status")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit to %s: %v", sess, err)
+	}
+	drain(t, cl, completedOn(sess))
+	reqs := srv.prov.requestsFor(sid)
+	if len(reqs) == 0 {
+		t.Fatalf("no request recorded for %s", sess)
+	}
+	return defNames(reqs[len(reqs)-1].Tools)
+}
+
+// TestChildToolsCannotExceedItsParent is rudy-ef4: a parent restricted to [read, agent] could
+// open a child under a permissive definition and the child would come back with every tool,
+// because applyAgent never intersected the child's list with the parent's. bash, edit and write
+// are registered but not in the parent's own list, so the child holding any of them is the bug
+// observed directly rather than inferred.
+func TestChildToolsCannotExceedItsParent(t *testing.T) {
+	srv, cn := newTestServer(t)
+	writeAgentDef(t, srv, "narrow", "reads only", []string{"read", "agent"})
+	writeAgentDef(t, srv, "wide", "everything", nil) // absent tools means every tool
+
+	parent := openSession(t, cn, sessionOpenParams{Agent: "narrow"})
+	child := openChildSession(t, cn, parent, "wide")
+
+	got := toolNames(t, srv, child)
+	for _, banned := range []string{"bash", "edit", "write"} {
+		if slices.Contains(got, banned) {
+			t.Fatalf("the child holds %q, which its parent does not: %v", banned, got)
+		}
+	}
+	if !slices.Contains(got, "read") {
+		t.Fatalf("the child lost read, which both it and its parent hold: %v", got)
+	}
+	if slices.Contains(got, "agent") {
+		t.Fatalf("a child still sees the agent tool: %v", got)
+	}
+}
+
+// TestResumedChildKeepsItsOwnList documents a deliberate gap rather than closing one. A child
+// resumed long after its parent is gone has no live parent to intersect with, so it keeps its
+// own definition's list as it was when it was opened. That is safe: the definition is the same
+// file the child ran under from the start, and resuming it cannot hand it a tool it did not
+// already have the run of. Only the agent tool stays denied, since that deny does not depend on
+// the parent at all.
+func TestResumedChildKeepsItsOwnList(t *testing.T) {
+	srv, cn := newTestServer(t)
+	writeAgentDef(t, srv, "narrow", "reads only", []string{"read", "agent"})
+	writeAgentDef(t, srv, "wide", "everything", nil)
+
+	parent := openSession(t, cn, sessionOpenParams{Agent: "narrow"})
+	child := openChildSession(t, cn, parent, "wide")
+
+	// Force a cold reload: close the only connection the child has (the opener's, kept open
+	// so the live case above can inspect it) so the next resume finds it gone from s.live and
+	// reloads it from disk through applyAgentFromLog, which is where the parent link is lost.
+	srv.op.closeAll()
+
+	got := toolNames(t, srv, child)
+	for _, want := range []string{"read", "bash", "edit", "write"} {
+		if !slices.Contains(got, want) {
+			t.Fatalf("resumed child lost %q from its own definition: %v", want, got)
+		}
+	}
+	if slices.Contains(got, "agent") {
+		t.Fatalf("a resumed child still sees the agent tool: %v", got)
 	}
 }
 
