@@ -16,20 +16,24 @@ func bashArgs(cmd string) json.RawMessage {
 func TestEvaluateTable(t *testing.T) {
 	g := New([]string{"rm -rf", "sudo", "git push --force"})
 	cases := []struct {
-		name       string
-		tool       string
-		safety     tool.Safety
-		mode       session.Mode
-		asker      bool
-		allowances []session.Matcher
-		args       json.RawMessage
-		wantDec    session.Decision
-		wantBy     session.DecidedBy
-		wantAsk    bool
-		wantReason string
+		name          string
+		tool          string
+		safety        tool.Safety
+		mode          session.Mode
+		asker         bool
+		allowances    []session.Matcher
+		args          json.RawMessage
+		wantDec       session.Decision
+		wantBy        session.DecidedBy
+		wantAsk       bool
+		wantReason    string
+		wantDangerous bool
 	}{
 		{name: "safe tool always runs", tool: "read", safety: tool.Safe, mode: session.ModeStrict, args: json.RawMessage(`{}`),
 			wantDec: session.Allow, wantBy: session.ByClass, wantReason: "safe tool"},
+		// Mode off never reaches the dangerous check at all (it returns first), so Dangerous
+		// stays false even for a command that would otherwise match the dangerous set: the one
+		// mode that gates nothing gates nothing, including the bit settlement reads.
 		{name: "mode off runs unsafe", tool: "bash", safety: tool.Unsafe, mode: session.ModeOff, args: bashArgs("rm -rf /"),
 			wantDec: session.Allow, wantBy: session.ByMode, wantReason: "mode off"},
 		{name: "strict asks", tool: "bash", safety: tool.Unsafe, mode: session.ModeStrict, asker: true, args: bashArgs("go test ./..."),
@@ -39,15 +43,15 @@ func TestEvaluateTable(t *testing.T) {
 		{name: "permissive runs the ordinary", tool: "bash", safety: tool.Unsafe, mode: session.ModePermissive, args: bashArgs("go test ./..."),
 			wantDec: session.Allow, wantBy: session.ByMode, wantReason: "mode permissive"},
 		{name: "permissive asks on dangerous", tool: "bash", safety: tool.Unsafe, mode: session.ModePermissive, asker: true, args: bashArgs("rm -rf build"),
-			wantAsk: true, wantReason: "dangerous rm -rf"},
+			wantAsk: true, wantReason: "dangerous rm -rf", wantDangerous: true},
 		{name: "permissive dangerous no asker denies", tool: "bash", safety: tool.Unsafe, mode: session.ModePermissive, args: bashArgs("sudo make install"),
-			wantDec: session.Deny, wantBy: session.ByNoAsker, wantReason: "no asker attached"},
+			wantDec: session.Deny, wantBy: session.ByNoAsker, wantReason: "no asker attached", wantDangerous: true},
 		{name: "allowance beats strict", tool: "bash", safety: tool.Unsafe, mode: session.ModeStrict, args: bashArgs("go test ./internal/..."),
 			allowances: []session.Matcher{{Tool: "bash", Prefix: "go test"}},
 			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowance bash go test"},
 		{name: "dangerous beats an allowance", tool: "bash", safety: tool.Unsafe, mode: session.ModePermissive, asker: true, args: bashArgs("rm -rf build"),
 			allowances: []session.Matcher{{Tool: "bash", Prefix: "rm -rf"}},
-			wantAsk:    true, wantReason: "dangerous rm -rf"},
+			wantAsk:    true, wantReason: "dangerous rm -rf", wantDangerous: true},
 		{name: "allowance for a non-bash tool", tool: "write", safety: tool.Unsafe, mode: session.ModeStrict, args: json.RawMessage(`{"path":"x"}`),
 			allowances: []session.Matcher{{Tool: "write"}},
 			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowance write "},
@@ -74,6 +78,9 @@ func TestEvaluateTable(t *testing.T) {
 			}
 			if v.Matcher.Tool != tc.tool {
 				t.Fatalf("matcher tool = %q", v.Matcher.Tool)
+			}
+			if v.Dangerous != tc.wantDangerous {
+				t.Fatalf("dangerous = %v, want %v: %+v", v.Dangerous, tc.wantDangerous, v)
 			}
 		})
 	}

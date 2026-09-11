@@ -410,8 +410,10 @@ func TestRunPermissiveAsksForDangerous(t *testing.T) {
 		{text("gone"), stop(session.StopEndTurn, "stop")},
 	}}
 	asked := false
-	asker := askerFunc(func(context.Context, Question) (Answer, error) {
+	var gotQ Question
+	asker := askerFunc(func(_ context.Context, q Question) (Answer, error) {
 		asked = true
+		gotQ = q
 		return Answer{Decision: session.Allow, Scope: session.ScopeSession, Reason: "yes for this session"}, nil
 	})
 	rec := &recorder{}
@@ -421,6 +423,12 @@ func TestRunPermissiveAsksForDangerous(t *testing.T) {
 	}
 	if !asked {
 		t.Fatal("dangerous command in permissive mode must ask")
+	}
+	// The asker has to see the Gate's own dangerous verdict on the Question, not re-derive it:
+	// settleLocked reads this bit to keep a session allow from resolving a dangerous question
+	// it never actually decided (ADR 0011, ADR 0028 decision 4).
+	if !gotQ.Dangerous {
+		t.Fatalf("question = %+v, want Dangerous true for a call the Gate marked dangerous", gotQ)
 	}
 	pd := rec.entries[2].Payload.(session.PermissionDecision)
 	if pd.Scope != session.ScopeSession || pd.DecidedBy != session.ByAsker {
