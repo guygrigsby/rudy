@@ -458,7 +458,19 @@ func (r *Runner) endTurn(ctx context.Context, outcomes []toolOutcome) (ended boo
 			_ = r.finishInterrupt(ctx, session.InterruptCancel)
 			return true, o.ctxErr
 		case o.interrupt != "":
-			return true, r.finishInterrupt(ctx, o.interrupt)
+			// The interrupt standing now, not the one this call happened to see. Calls
+			// observe whenever they finish, which can be a whole tool call apart, and
+			// Interrupt lets a cancel overtake a pending steer in between. Taking the first
+			// call's steer would leave the runner parked in Steering, with no
+			// turn_interrupted, waiting for a steer the operator who just cancelled is never
+			// going to send. Empty is not reachable, since only rest and fail clear it and
+			// neither has run; the fallback is there so the turn can never finish on the
+			// empty interrupt the log refuses.
+			how := r.observeInterrupt()
+			if how == "" {
+				how = o.interrupt
+			}
+			return true, r.finishInterrupt(ctx, how)
 		}
 	}
 	return false, nil

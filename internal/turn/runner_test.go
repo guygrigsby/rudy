@@ -1012,6 +1012,75 @@ func waitForDelta(t *testing.T, rec *recorder, n int) {
 	t.Fatalf("waited for %d deltas", n)
 }
 
+// waitForEntries blocks until n entries of kind k have been appended. It is how a test with
+// two calls in flight pins the point one of them has reached: a call appends its tool_result
+// straight after reading the interrupt, so the entry landing says the read has happened.
+func waitForEntries(t *testing.T, rec *recorder, k session.Kind, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if rec.count(k) >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("waited for %d %s entries, saw %d", n, k, rec.count(k))
+}
+
+// TestTheStrongestInterruptEndsTheTurn covers a cancel arriving after another call has already
+// observed a steer. Interrupt lets a cancel overtake a pending steer, and with calls running
+// concurrently their observations can be a whole tool call apart, so the turn must end on the
+// interrupt standing when it ends rather than on whichever one the first call happened to see.
+// Taking the steer would rest the runner in Steering with no turn_interrupted, waiting for a
+// steer the operator who just hit cancel is never going to send.
+func TestTheStrongestInterruptEndsTheTurn(t *testing.T) {
+	s := openTestSession(t, session.ModePermissive)
+	started := make(chan struct{}, 2)
+	release := map[string]chan struct{}{"tu1": make(chan struct{}), "tu2": make(chan struct{})}
+	held := tool.Tool{
+		Name: "held", Description: "returns when the test says so", Schema: json.RawMessage(`{"type":"object"}`), Safety: tool.Safe,
+		Invoke: func(_ context.Context, c tool.Call) (tool.Result, error) {
+			started <- struct{}{}
+			<-release[c.ID]
+			return tool.Result{Content: []session.Block{session.TextBlock("partial " + c.ID)}}, nil
+		},
+	}
+	p := &scripted{scripts: [][]provider.Part{twoCalls("held", "tu1", "tu2")}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"held": held}, nil, rec)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+	<-started
+	<-started
+
+	r.Interrupt(session.InterruptSteer)
+	close(release["tu1"])
+	// tu1's killed result is on the log, so tu1 has already read the steer.
+	waitForEntries(t, rec, session.KindToolResult, 1)
+	r.Interrupt(session.InterruptCancel)
+	close(release["tu2"])
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	if r.State() != Idle {
+		t.Fatalf("state = %s, want idle: the cancel that overtook the steer is what ended the turn", r.State())
+	}
+	ti := rec.payloads(session.KindTurnInterrupted)
+	if len(ti) != 1 {
+		t.Fatalf("turn_interrupted entries = %d, want 1", len(ti))
+	}
+	if how := ti[0].(session.TurnInterrupted).How; how != session.InterruptCancel {
+		t.Fatalf("turn_interrupted how = %q, want cancel", how)
+	}
+	for _, pl := range rec.payloads(session.KindToolResult) {
+		if tr := pl.(session.ToolResult); tr.Outcome != session.OutcomeKilled {
+			t.Fatalf("call %s outcome = %q, want killed", tr.ToolUseID, tr.Outcome)
+		}
+	}
+}
+
 // TestSteerWhileAwaitingPermission and TestCancelWhileAwaitingPermission cover the
 // interrupt that lands while the asker still holds the question. Every tool_result needs a
 // permission_decision for its tool_use before it, so the killed result the interrupt
