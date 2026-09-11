@@ -295,6 +295,8 @@ A pass 1 log lacks the two parent fields; `Load` reads their absence as empty.
 
 This field is why `schema_version` is 2. A version 1 log has no `tools` key, and an absent key is indistinguishable from an explicit `null` once decoded into a slice, so reading one as `null` would hand every pre-existing session the whole registry on its next resume: for a child that is the escalation this field exists to close. `Load` takes the definition's list for a version 1 log and the recorded value from version 2 on.
 
+That leaves one residual, stated rather than left to be discovered: a version 1 child log whose own definition named no tools resumes holding every tool, because there is nothing recorded to bound it and its parent is long gone. It is not a new escalation, since that session held exactly that set while it was live and nothing bounded it then either, but it is looser than anything opened from now on. Refusing to resume such a log was considered and rejected: it would break sessions that predate the field, to retroactively enforce a rule they never ran under.
+
 **`fork_point`**
 
 | field | type | null | meaning |
