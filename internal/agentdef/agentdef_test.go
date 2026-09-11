@@ -94,17 +94,18 @@ func TestLoadDistinguishesMissingFromUnterminatedFence(t *testing.T) {
 // this context"; the file meant to remove the memory tools from a subagent instead vanished
 // and left every session that named it holding the whole registry (rudy-review round 1 on
 // task 5). This guard fails the moment a shipped example does that again.
+//
+// It asserts on what Load actually resolved, not on the directory listing: Load only looks at
+// top-level *.md files, so a definition dropped into a subdirectory or given another extension
+// is invisible to it, and a directory-non-empty check would pass right alongside that (rudy-
+// review round 2 on task 5).
 func TestShippedExamplesParse(t *testing.T) {
 	dir := filepath.Join("..", "..", "examples", "agents")
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read %s: %v", dir, err)
-	}
-	if len(ents) == 0 {
-		t.Fatal("examples/agents ships no definitions to check")
-	}
-	_, errs := Load([]string{dir})
+	defs, errs := Load([]string{dir})
 	if len(errs) != 0 {
 		t.Fatalf("a shipped example under examples/agents does not parse: %v", errs)
+	}
+	if len(defs) == 0 {
+		t.Fatal("examples/agents resolved no definitions at all")
 	}
 }

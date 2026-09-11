@@ -3266,6 +3266,42 @@ func toolNames(t *testing.T, srv *testServer, sess string) []string {
 	return driveTurn(t, srv, sess)
 }
 
+// waitUntilCold is toolNames' ErrLocked probe run in reverse: it proves sess is NOT live by
+// taking the store's own flock itself, rather than by observing that someone else holds it.
+// Closing every connection to a session only starts the server's detach; detachAll runs on the
+// server's own serve goroutine once it observes the connection's EOF, and closing a client here
+// does not wait for that. A resume issued before detach begins finds s.live still populated and
+// returns the still-live session with no wait at all, since loadCold's own s.closing wait only
+// covers the window after detach has already started (rudy-review round 2 on task 5) — so a
+// test that closes a connection and immediately resumes can silently keep measuring the live
+// view instead of the reloaded one. Polling the store directly, outside the server's own
+// bookkeeping, is what turns "cold" from a timing assumption into an observed fact: by the time
+// this Load succeeds, closeIfUnusedLocked has already removed sess from s.live (the delete and
+// the flock's release happen in that order, under the same lock), so the very next resume is
+// guaranteed to take the true cold path.
+func waitUntilCold(t *testing.T, srv *testServer, sess string) {
+	t.Helper()
+	sid, err := ulid.Parse(sess)
+	if err != nil {
+		t.Fatalf("bad session id %q: %v", sess, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s, err := session.Load(srv.store, sid)
+		if err == nil {
+			_ = s.Close()
+			return
+		}
+		if !errors.Is(err, session.ErrLocked) {
+			t.Fatalf("load %s: %v", sess, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never went cold", sess)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // driveTurn resumes sess, live or cold, drives one bare turn on it and returns the tool names
 // the server offered it in that request.
 func driveTurn(t *testing.T, srv *testServer, sess string) []string {
@@ -3419,8 +3455,11 @@ func TestResumedChildKeepsItsOwnList(t *testing.T) {
 
 	// Force a cold reload: close the only connection the child has (the opener's, kept open
 	// so the live case above can inspect it) so the next resume finds it gone from s.live and
-	// reloads it from disk through applyAgentFromLog.
+	// reloads it from disk through applyAgentFromLog. Closing is not enough by itself: detach
+	// runs on the server's own goroutine once it sees the EOF, so wait for it to actually
+	// finish before resuming (waitUntilCold).
 	srv.op.closeAll()
+	waitUntilCold(t, srv, child)
 
 	wantBoundedChild(t, "resumed", driveTurn(t, srv, child))
 }
@@ -3446,8 +3485,10 @@ func TestResumedChildKeepsItsCallerNarrowing(t *testing.T) {
 		t.Fatalf("read was dropped though the caller named it: %v", live)
 	}
 
-	// Force a cold reload the same way TestResumedChildKeepsItsOwnList does.
+	// Force a cold reload the same way TestResumedChildKeepsItsOwnList does, waiting for the
+	// server's own detach to actually finish rather than assuming closeAll was enough.
 	srv.op.closeAll()
+	waitUntilCold(t, srv, child)
 
 	got := driveTurn(t, srv, child)
 	if slices.Contains(got, "bash") {
@@ -3469,6 +3510,7 @@ func TestForkedChildKeepsItsOwnList(t *testing.T) {
 	parent := openSession(t, cn, sessionOpenParams{Agent: "narrow"})
 	child := openChildSession(t, cn, parent, "wide")
 	srv.op.closeAll()
+	waitUntilCold(t, srv, child)
 
 	fork := forkSession(t, srv, child)
 	wantBoundedChild(t, "forked", driveTurn(t, srv, fork))
