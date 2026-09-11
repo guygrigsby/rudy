@@ -1179,6 +1179,19 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	}
 	ls := newLive(sess, m)
 	ls.parent = parent
+	if parent != nil {
+		// session.Open appends session_opened inside itself, before this liveSession
+		// exists, so the ordinary mirror/fanout broadcast (session_live.go) never runs for
+		// it: the caller who opened it only ever sees it by direct replay, in
+		// installAndAttach below, and the parent's own watchers see nothing at all. Without
+		// this, AgentCallFor and its equivalents never learn the mapping a child's own
+		// notifications are routed under, and a subagent never renders (rudy-contracts.md,
+		// entry.appended: a child's entries go to its parent's subscribers too). Sent now,
+		// after ls.parent is set, since watchers() has nowhere to look before that.
+		ls.notifyWatchers(protocol.NotifyEntryAppended, protocol.EntryAppended{
+			SessionID: sess.ID().String(), Entry: ls.entries[0],
+		})
+	}
 	s.applyAgent(ls, def, allow)
 	s.fireSessionOpened(s.ctx, ls, false)
 	return s.installAndAttach(cn, ls), nil

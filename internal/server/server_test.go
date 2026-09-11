@@ -3345,6 +3345,67 @@ func TestAParentsClientSeesItsChildsWork(t *testing.T) {
 	}
 }
 
+// TestAParentsWatcherSeesTheChildsSessionOpened is the regression test for a real bug: session.Open
+// appends session_opened before its liveSession even exists (session.go's Open, then newLive),
+// so the ordinary mirror/fanout broadcast (session_live.go) never runs for that one entry. Before
+// this was fixed, the only place it reached anyone at all was the direct replay to the connection
+// that opened it, in installAndAttach; a parent's watchers saw nothing, and since the client
+// learns which agent call a child answers from exactly this entry (ADR 0028 decision 6), a
+// subagent never rendered no matter how correct the rendering code was.
+//
+// Neither TestAParentsClientSeesItsChildsWork nor TestAParentsClientSeesEveryChildNotificationKind
+// catches this: both stop at the first entry.appended (or any notification kind) tagged with the
+// child's session id, and every entry the child appends after session_opened (its own
+// user_message, an assistant_message, a tool_result) already goes through the normal per-append
+// broadcast this wave added and satisfies "some entry.appended arrived" on its own.
+func TestAParentsWatcherSeesTheChildsSessionOpened(t *testing.T) {
+	srv, cn := newTestServer(t)
+	parent := openSession(t, cn, sessionOpenParams{})
+	watcher := attach(t, srv, parent) // subscribed before the child ever opens
+
+	openChildSession(t, cn, parent, "default")
+
+	// The scripted root session in this file chains more than one agent call in the same
+	// turn (agentProvider's own switch, root && n==2 and beyond), so this collects every
+	// "agent" tool_use id the parent made rather than assuming there is exactly one.
+	ns := drain(t, watcher, completedOn(parent))
+	es := entries(t, ns)
+
+	agentCalls := map[string]bool{}
+	for _, e := range es {
+		am, ok := e.Payload.(session.AssistantMessage)
+		if !ok {
+			continue
+		}
+		for _, b := range am.Content {
+			if b.Type == session.BlockToolUse && b.Name == "agent" {
+				agentCalls[b.ID] = true
+			}
+		}
+	}
+	if len(agentCalls) == 0 {
+		t.Fatalf("no agent tool_use among what the watcher saw: %v", methods(ns))
+	}
+
+	var found bool
+	for _, e := range es {
+		o, ok := e.Payload.(session.SessionOpened)
+		if !ok || o.ParentToolUseID == "" {
+			continue
+		}
+		found = true
+		if o.ParentSessionID != parent {
+			t.Errorf("child's session_opened parent_session_id = %q, want %q", o.ParentSessionID, parent)
+		}
+		if !agentCalls[o.ParentToolUseID] {
+			t.Errorf("child's session_opened names tool_use %q, which is not one of the parent's own agent calls %v", o.ParentToolUseID, agentCalls)
+		}
+	}
+	if !found {
+		t.Fatalf("the watcher never received a child's session_opened: %v", methods(ns))
+	}
+}
+
 // TestAParentsClientSeesEveryChildNotificationKind is decision 6's own scope: all four kinds
 // (entry.appended, stream.delta, turn.state and tool.state) are forwarded, not only
 // entry.appended, which TestAParentsClientSeesItsChildsWork stops at the first of. It drives a
