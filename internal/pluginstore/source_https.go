@@ -258,9 +258,110 @@ func userAgent() string {
 	return "rudy/" + v
 }
 
+// tarballReader is one open gzip tarball: the file, the decompressor over it and the tar
+// reader over that, closed together. unpackTarball opens the archive twice, once to survey it
+// and once to write it out (see soleTopLevelDir), so this exists to keep the three-step open
+// and the two closes in one place rather than twice over.
+type tarballReader struct {
+	f  *os.File
+	gz *gzip.Reader
+	tr *tar.Reader
+}
+
+func openTarball(path string) (*tarballReader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("pluginstore: %w", err)
+	}
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("pluginstore: %s: %w", path, err)
+	}
+	return &tarballReader{f: f, gz: gz, tr: tar.NewReader(gz)}, nil
+}
+
+func (t *tarballReader) Close() {
+	_ = t.gz.Close()
+	_ = t.f.Close()
+}
+
+// soleTopLevelDir reports the one top-level directory every entry of the tarball at path sits
+// under, or "" when the entries already sit at the root, sit under more than one directory, or
+// include a name the unpacking pass is going to refuse anyway. `git archive` and every GitHub
+// release tarball wrap their contents in exactly one such directory, so stripping it is what
+// makes the likeliest https: URL there is installable at all; any other nesting is still
+// refused, by checkManifestAtRoot, naming what it found (contracts, plugins.lock.toml).
+//
+// This is a whole extra pass over the archive, decompression included, before a byte is
+// written. Deciding while writing instead would mean either buffering entries until the answer
+// is known or moving files up a level afterwards, and the rule is that nothing is written under
+// the extra directory in the first place.
+func soleTopLevelDir(path string) (string, error) {
+	tb, err := openTarball(path)
+	if err != nil {
+		return "", err
+	}
+	defer tb.Close()
+
+	prefix, nested := "", false
+	for {
+		hdr, err := tb.tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("pluginstore: %s: %w", path, err)
+		}
+		if hdr.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
+		clean, err := cleanTarName(hdr.Name)
+		if err != nil {
+			// An entry no name check will accept: say nothing about a prefix and let the
+			// unpacking pass refuse it, so a refusal is worded in exactly one place.
+			return "", nil
+		}
+		if clean == "." {
+			continue
+		}
+		first, rest, _ := strings.Cut(clean, string(filepath.Separator))
+		switch {
+		case prefix == "":
+			prefix = first
+		case first != prefix:
+			return "", nil
+		}
+		switch {
+		case rest != "":
+			nested = true
+		case hdr.Typeflag != tar.TypeDir:
+			// The one top-level entry is a file: there is nothing to strip, and stripping its
+			// own name would drop the file itself.
+			return "", nil
+		}
+	}
+	if !nested {
+		return "", nil
+	}
+	return prefix, nil
+}
+
+// stripTopLevel removes prefix, the archive's sole top-level directory, from one cleaned entry
+// name. The prefix's own directory entry becomes ".", the stage itself, which the caller skips.
+func stripTopLevel(rel, prefix string) string {
+	if prefix == "" {
+		return rel
+	}
+	if rel == prefix {
+		return "."
+	}
+	return strings.TrimPrefix(rel, prefix+string(filepath.Separator))
+}
+
 // unpackTarball unpacks the gzip tarball at path into stage, which the caller has already
 // created empty. Every entry is refused, and the whole install refused with it, unless its
-// cleaned name resolves inside stage (safeTarPath: no "..", no absolute path, no backslash) and
+// cleaned name resolves inside stage (cleanTarName: no "..", no absolute path, no backslash) and
 // it is a regular file or a directory. Anything else — a symlink or a hard link most of all,
 // since either one's target can point anywhere on disk the process can reach, escaping or not —
 // is refused outright rather than validated case by case: a plugin bundle has no legitimate
@@ -283,22 +384,19 @@ func userAgent() string {
 // zero-fill synthesizes, and remaining is decremented by what writeTarFile reports was actually
 // copied, not by hdr.Size.
 func unpackTarball(path, stage string) error {
-	f, err := os.Open(path)
+	prefix, err := soleTopLevelDir(path)
 	if err != nil {
-		return fmt.Errorf("pluginstore: %w", err)
+		return err
 	}
-	defer func() { _ = f.Close() }()
-
-	gz, err := gzip.NewReader(f)
+	tb, err := openTarball(path)
 	if err != nil {
-		return fmt.Errorf("pluginstore: %s: %w", path, err)
+		return err
 	}
-	defer func() { _ = gz.Close() }()
+	defer tb.Close()
 
-	tr := tar.NewReader(gz)
 	remaining := int64(maxUnpackedBytes)
 	for {
-		hdr, err := tr.Next()
+		hdr, err := tb.tr.Next()
 		if err == io.EOF {
 			break
 		}
@@ -311,7 +409,15 @@ func unpackTarball(path, stage string) error {
 		if hdr.Size < 0 || hdr.Size > remaining {
 			return fmt.Errorf("pluginstore: %s: entry %q would exceed the %d byte unpacked cap", path, hdr.Name, maxUnpackedBytes)
 		}
-		target, err := safeTarPath(stage, hdr.Name)
+		rel, err := cleanTarName(hdr.Name)
+		if err != nil {
+			return fmt.Errorf("pluginstore: %s: %w", path, err)
+		}
+		rel = stripTopLevel(rel, prefix)
+		if rel == "." {
+			continue
+		}
+		target, err := stageTarget(stage, rel)
 		if err != nil {
 			return fmt.Errorf("pluginstore: %s: %w", path, err)
 		}
@@ -321,7 +427,7 @@ func unpackTarball(path, stage string) error {
 				return fmt.Errorf("pluginstore: %w", err)
 			}
 		case tar.TypeReg:
-			n, err := writeTarFile(target, io.LimitReader(tr, remaining), hdr)
+			n, err := writeTarFile(target, io.LimitReader(tb.tr, remaining), hdr)
 			remaining -= n
 			if err != nil {
 				return fmt.Errorf("pluginstore: %s: %w", path, err)
@@ -358,12 +464,13 @@ func writeTarFile(target string, r io.Reader, hdr *tar.Header) (int64, error) {
 	return n, closeErr
 }
 
-// safeTarPath resolves a tar entry's name to a path inside stage, refusing anything that could
-// land outside it. This is the security property of installing from an https: tarball: the
-// bytes come from wherever the operator's URL happened to serve them from, and a hostile or
-// merely careless archive can name an entry "../../evil" or "/etc/cron.d/whatever" to write
-// outside the extraction directory.
-func safeTarPath(stage, name string) (string, error) {
+// cleanTarName resolves a tar entry's name to a stage-relative path, refusing anything that
+// could land outside the stage. This is the security property of installing from an https:
+// tarball: the bytes come from wherever the operator's URL happened to serve them from, and a
+// hostile or merely careless archive can name an entry "../../evil" or "/etc/cron.d/whatever"
+// to write outside the extraction directory. It runs before any top-level prefix is stripped,
+// so a prefix can never be derived from a name that would have been refused.
+func cleanTarName(name string) (string, error) {
 	// "..\..\x" is one legal, backslash-containing filename to filepath.Clean on a unix build
 	// (backslash is not a separator there), so it survives every check below unchanged; refuse
 	// it outright rather than rely on this running only on unix, since this package's path
@@ -375,21 +482,27 @@ func safeTarPath(stage, name string) (string, error) {
 	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("entry %q escapes the stage", name)
 	}
-	target := filepath.Join(stage, clean)
-	// Defense in depth: the checks above should already make this impossible, but a stager
-	// touching arbitrary paths on disk on attacker-controlled input is exactly the place to
-	// double-check rather than trust one code path to have gotten it right.
+	return clean, nil
+}
+
+// stageTarget joins a cleaned, stage-relative entry name onto stage.
+func stageTarget(stage, rel string) (string, error) {
+	target := filepath.Join(stage, rel)
+	// Defense in depth: cleanTarName should already make this impossible, but a stager touching
+	// arbitrary paths on disk on attacker-controlled input is exactly the place to double-check
+	// rather than trust one code path to have gotten it right.
 	if target != stage && !strings.HasPrefix(target, stage+string(filepath.Separator)) {
-		return "", fmt.Errorf("entry %q escapes the stage", name)
+		return "", fmt.Errorf("entry %q escapes the stage", rel)
 	}
 	return target, nil
 }
 
-// checkManifestAtRoot refuses a tarball whose plugin.toml is not directly at its root, naming
-// what was found instead of letting the generic plugin.ReadManifest fail later with a bare "no
-// such file" that does not say why. The likely cause is `tar czf plugin.tar.gz plugin-dir/`,
-// whose every entry sits under one top-level directory: an easy mistake for a plugin author to
-// make, and one worth naming rather than leaving them to guess at.
+// checkManifestAtRoot refuses a tarball whose plugin.toml is not at the root of what was
+// unpacked, naming what was found instead of letting the generic plugin.ReadManifest fail later
+// with a bare "no such file" that does not say why. An archive whose every entry sits under one
+// top-level directory has already had it stripped by then (soleTopLevelDir), so what reaches
+// here is real nesting: two levels deep, or a bundle of several directories with no manifest
+// among them.
 func checkManifestAtRoot(stage string) error {
 	if _, err := os.Stat(filepath.Join(stage, "plugin.toml")); err == nil {
 		return nil
@@ -404,5 +517,27 @@ func checkManifestAtRoot(stage string) error {
 			return fmt.Errorf("pluginstore: found plugin.toml under top-level directory %q, want it at the tarball root", ents[0].Name())
 		}
 	}
-	return fmt.Errorf("pluginstore: plugin.toml not found at the tarball root")
+	return fmt.Errorf("pluginstore: plugin.toml not found at the tarball root; found %s", entryList(ents))
+}
+
+// entryList names a stage's top-level entries for that error, directories marked with a
+// trailing separator, capped so a large archive does not empty its whole root into one string.
+func entryList(ents []os.DirEntry) string {
+	if len(ents) == 0 {
+		return "an empty archive"
+	}
+	const maxNamed = 8
+	names := make([]string, 0, maxNamed)
+	for _, e := range ents[:min(len(ents), maxNamed)] {
+		name := e.Name()
+		if e.IsDir() {
+			name += string(filepath.Separator)
+		}
+		names = append(names, strconv.Quote(name))
+	}
+	out := strings.Join(names, ", ")
+	if len(ents) > maxNamed {
+		out += fmt.Sprintf(" and %d more", len(ents)-maxNamed)
+	}
+	return out
 }

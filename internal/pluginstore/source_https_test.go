@@ -307,15 +307,15 @@ func TestASparseEntryClaimingAHugeSizeIsRefused(t *testing.T) {
 	}
 }
 
-// TestAGitArchiveGlobalHeaderStillFindsANestedManifest covers Important 1: `git archive
-// --format=tar` and GitHub's own release tarballs (the shape behind the single most likely URL
-// an operator types, https://github.com/o/r/archive/refs/tags/v1.tar.gz) emit a
-// pax_global_header entry, typeflag 'g', ahead of the real content. Before the fix that entry
-// fell into the refusal for entry types this store does not extract, failing with a message
-// about tar internals instead of ever reaching checkManifestAtRoot's actually useful "under
-// top-level directory" error for the (also present, and equally real for a github.com archive
-// URL) nested-manifest mistake.
-func TestAGitArchiveGlobalHeaderStillFindsANestedManifest(t *testing.T) {
+// TestAGitArchiveInstallsWithItsTopLevelDirectoryStripped covers the shape behind the single
+// most likely https: URL an operator types,
+// https://github.com/o/r/archive/refs/tags/v1.tar.gz: a pax_global_header entry, typeflag 'g',
+// ahead of content that all sits under one directory named for the repository and its ref.
+// That directory is stripped, per the contracts row, so the manifest lands at the root of the
+// checkout and nothing is written under the extra level. The global header must still be
+// skipped rather than refused as an entry type this store does not extract, which the install
+// succeeding at all proves.
+func TestAGitArchiveInstallsWithItsTopLevelDirectoryStripped(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
@@ -326,17 +326,28 @@ func TestAGitArchiveGlobalHeaderStillFindsANestedManifest(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("WriteHeader(global): %v", err)
 	}
-	content := []byte(helloManifest)
 	if err := tw.WriteHeader(&tar.Header{
-		Name:     "myrepo-abc1234/plugin.toml",
-		Size:     int64(len(content)),
-		Mode:     0o644,
-		Typeflag: tar.TypeReg,
+		Name:     "myrepo-abc1234/",
+		Mode:     0o755,
+		Typeflag: tar.TypeDir,
 	}); err != nil {
-		t.Fatalf("WriteHeader(manifest): %v", err)
+		t.Fatalf("WriteHeader(dir): %v", err)
 	}
-	if _, err := tw.Write(content); err != nil {
-		t.Fatalf("Write(manifest): %v", err)
+	for _, e := range []struct{ name, content string }{
+		{"myrepo-abc1234/plugin.toml", helloManifest},
+		{"myrepo-abc1234/lib/run.sh", "#!/bin/sh\n"},
+	} {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     e.name,
+			Size:     int64(len(e.content)),
+			Mode:     0o644,
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatalf("WriteHeader(%s): %v", e.name, err)
+		}
+		if _, err := tw.Write([]byte(e.content)); err != nil {
+			t.Fatalf("Write(%s): %v", e.name, err)
+		}
 	}
 	if err := tw.Close(); err != nil {
 		t.Fatalf("tar Close: %v", err)
@@ -354,15 +365,21 @@ func TestAGitArchiveGlobalHeaderStillFindsANestedManifest(t *testing.T) {
 	s := newTestStore(t)
 	s.HTTPClient = srv.Client()
 
-	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
-	if err == nil {
-		t.Fatal("Install with plugin.toml nested under a top-level directory: want an error")
+	if _, m, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now()); err != nil {
+		t.Fatalf("Install of a GitHub-shaped archive: %v", err)
+	} else if m.Name != "hello" {
+		t.Fatalf("Name = %s, want hello", m.Name)
 	}
-	if strings.Contains(err.Error(), "not a regular file or a directory") {
-		t.Fatalf("err = %v, the global header entry should have been skipped rather than refused", err)
+	dir := s.PluginDir("hello")
+	if _, err := os.Stat(filepath.Join(dir, "plugin.toml")); err != nil {
+		t.Fatalf("plugin.toml is not at the checkout root: %v", err)
 	}
-	if !strings.Contains(err.Error(), "myrepo-abc1234") || !strings.Contains(err.Error(), "tarball root") {
-		t.Fatalf("err = %v, want the helpful not-rooted error naming the found directory", err)
+	if _, err := os.Stat(filepath.Join(dir, "lib", "run.sh")); err != nil {
+		t.Fatalf("lib/run.sh missing from the checkout: %v", err)
+	}
+	// The stripping happens while unpacking, so the extra level is never written at all.
+	if _, err := os.Stat(filepath.Join(dir, "myrepo-abc1234")); !os.IsNotExist(err) {
+		t.Fatalf("stat myrepo-abc1234 = %v, want the top-level directory never written", err)
 	}
 }
 
@@ -409,11 +426,16 @@ func TestATarballWithASymlinkEscapeIsRefused(t *testing.T) {
 	}
 }
 
-// TestATarballNotRootedRefusesWithAHelpfulError covers the shape `tar czf plugin.tar.gz dir/`
-// produces: every entry sits under one top-level directory, a likely operator mistake refused
-// with an error naming what was found, rather than a bare "no such file" from ReadManifest.
-func TestATarballNotRootedRefusesWithAHelpfulError(t *testing.T) {
-	tgz := tarballOf(t, map[string]string{"myplugin/plugin.toml": helloManifest})
+// TestATarballNestedUnderTwoDirectoriesIsRefused covers the other half of the contracts row:
+// one sole top-level directory is stripped, and any other nesting is refused naming what was
+// found. Two top-level directories is that "any other": there is no single prefix to strip, so
+// the manifest is genuinely not at the root and the operator is told which entries were there
+// instead of being left with a bare "no such file" from ReadManifest.
+func TestATarballNestedUnderTwoDirectoriesIsRefused(t *testing.T) {
+	tgz := tarballOf(t, map[string]string{
+		"myplugin/plugin.toml": helloManifest,
+		"docs/README.md":       "# docs\n",
+	})
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(tgz)
 	}))
@@ -424,10 +446,37 @@ func TestATarballNotRootedRefusesWithAHelpfulError(t *testing.T) {
 
 	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
 	if err == nil {
-		t.Fatal("Install with plugin.toml under a top-level directory: want an error")
+		t.Fatal("Install with two top-level directories: want an error")
+	}
+	if !strings.Contains(err.Error(), "tarball root") ||
+		!strings.Contains(err.Error(), "myplugin") || !strings.Contains(err.Error(), "docs") {
+		t.Fatalf("err = %v, want it to name both top-level directories and the expected root", err)
+	}
+}
+
+// TestATarballNestedTwoLevelsDeepIsRefused covers what survives the strip: an archive wrapping
+// a wrapper. The sole top-level directory goes, and what is left still has no manifest at its
+// root, so the refusal names the directory the manifest actually sits in rather than claiming
+// the archive was empty of one.
+func TestATarballNestedTwoLevelsDeepIsRefused(t *testing.T) {
+	tgz := tarballOf(t, map[string]string{"r-1/myplugin/plugin.toml": helloManifest})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(tgz)
+	}))
+	defer srv.Close()
+
+	s := newTestStore(t)
+	s.HTTPClient = srv.Client()
+
+	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
+	if err == nil {
+		t.Fatal("Install with plugin.toml two directories deep: want an error")
 	}
 	if !strings.Contains(err.Error(), "myplugin") || !strings.Contains(err.Error(), "tarball root") {
-		t.Fatalf("err = %v, want it to name the found directory and the expected root", err)
+		t.Fatalf("err = %v, want it to name the directory the manifest was found under", err)
+	}
+	if strings.Contains(err.Error(), "r-1") {
+		t.Fatalf("err = %v, the sole top-level directory should have been stripped before this check", err)
 	}
 }
 
