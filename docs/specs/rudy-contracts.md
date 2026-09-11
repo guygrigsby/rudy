@@ -649,7 +649,7 @@ Invariants and where they are enforced:
 | one process writes a session | lock file | `flock` on `lock` |
 | tool names unique | `PluginRegistry.RegisterTool` | none; runtime |
 | a session's tool set never exceeds its parent's | `Session.Open` intersects definition, `tools` and parent before stamping the view | none; runtime, rebuilt on resume from the agent name in the log and the parent link |
-| a call never runs on consent given for another call's arguments | the asker coalesces only calls whose matcher and input bytes are both equal; a `session` answer resolves parked questions its allowance covers, which is the same rule `Evaluate` applies | one `permission_decision` per `tool_use`, so each call records its own decision row citing the answer that bound it |
+| a call never runs on consent given for another call's arguments | the asker coalesces only calls whose matcher and input bytes are both equal; a `session` answer resolves parked questions its allowance covers, never one the Gate marked dangerous, which keeps ADR 0011's ordering that puts the dangerous set ahead of allowances | one `permission_decision` per `tool_use`, so each call records its own decision row citing the answer that bound it |
 | an interrupted turn records no call as succeeding | every in-flight call observes the interrupt rather than one consuming it | `tool_result` outcome `killed` for each call that was running |
 
 ## Completeness gate

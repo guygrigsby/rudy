@@ -91,13 +91,25 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    Identical inputs cannot have that problem, and a coarse key is not worth the
    consent it forges.
 
-   A session-scope allow resolves every parked question it covers. This is the
-   case the wave itself creates: two calls read the allowances before either has
-   recorded one, both park, and the operator answering "allow for the session"
-   on the first leaves the second still asking for something that is now
-   allowed. The new allowance settles it by the same matcher rule the Gate
-   applies everywhere else, which is what the operator was told they were
-   granting.
+   A session-scope allow resolves every parked question it covers, except a
+   dangerous one. This is the case the wave itself creates: two calls read the
+   allowances before either has recorded one, both park, and the operator
+   answering "allow for the session" on the first leaves the second still asking
+   for something that is now allowed.
+
+   The exception is not a detail. ADR 0011 puts the dangerous set ahead of
+   session allowances in every mode but off, so a dangerous command asks again
+   even when a matching allow already stands. Settlement has to honour that
+   ordering or it becomes a way to launder consent past it: two `rm -rf` calls
+   on different paths park under different questions but one matcher, and
+   settling the second from the first's allow grants exactly what ADR 0011
+   exists to refuse. A question the Gate marked dangerous is never settled by an
+   allowance; it waits for its own answer.
+
+   The Gate decides what is dangerous, and the asker only reads the bit. The
+   asker must not re-derive that judgement, because a second implementation of a
+   precedence rule is a second chance to get it wrong, and this one is on the
+   fail-open side.
 
    Both are enforced at the asker rather than in the verdict. `Gate.Evaluate` is
    a pure function of the input it is handed and holds no session, so it has
