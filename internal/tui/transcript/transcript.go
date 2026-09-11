@@ -45,6 +45,36 @@ type Transcript struct {
 	// md is the glamour renderer for the current width, built on first use and dropped
 	// by SetWidth.
 	md mdCache
+	// calls maps a subagent's session id to the tool_use id of the agent call that opened
+	// it (ADR 0028 decision 6). Set from the child's own session_opened, the first
+	// notification that names it, and read by a client deciding whether a notification for
+	// a session that is not this one belongs to a subagent it is already showing.
+	calls map[string]string
+}
+
+// origin is where a row came from when it is not the session this transcript renders: a
+// subagent's session id and the tool_use that opened it (ADR 0028 decision 6). The zero
+// value is this transcript's own session, which is why every row built without one keeps
+// behaving exactly as it did before origin existed.
+type origin struct {
+	sessionID       string
+	parentToolUseID string
+}
+
+// key prefixes k with the origin's session, so a subagent's row can never collide with the
+// parent's or with a sibling subagent's, even when the id underneath (an entry id, a
+// tool_use id) happens to repeat across sessions.
+func (o origin) key(k string) string {
+	if o.sessionID == "" {
+		return k
+	}
+	return o.sessionID + "/" + k
+}
+
+// stamp marks r with the origin, which is what layout indents by and Commit sweeps by.
+func (o origin) stamp(r *Row) *Row {
+	r.SessionID, r.ParentToolUseID = o.sessionID, o.parentToolUseID
+	return r
 }
 
 // New opens an empty transcript.
@@ -55,6 +85,26 @@ func New(o Options, th theme.Theme) *Transcript {
 // Rows are the transcript's rows, in order. The Row pointers are the transcript's own:
 // a caller may read them and set Expanded, and must not reorder the slice.
 func (t *Transcript) Rows() []*Row { return slices.Clone(t.rows) }
+
+// RecordAgentCall remembers that sessionID is the subagent toolUseID's agent call opened, so
+// a later notification tagged with sessionID can be routed to that call's own rows
+// (ADR 0028 decision 6). A session already recorded keeps its first mapping: the call that
+// opened a session cannot change once it has.
+func (t *Transcript) RecordAgentCall(sessionID, toolUseID string) {
+	if _, ok := t.calls[sessionID]; ok {
+		return
+	}
+	if t.calls == nil {
+		t.calls = make(map[string]string)
+	}
+	t.calls[sessionID] = toolUseID
+}
+
+// AgentCallFor is the tool_use id sessionID's rows render under, and whether one is known.
+func (t *Transcript) AgentCallFor(sessionID string) (string, bool) {
+	id, ok := t.calls[sessionID]
+	return id, ok
+}
 
 // Turn is the turn rows are being added to: the nearest preceding user_message, or ""
 // before the first one. A steer message continues the turn it was sent into, so this is
@@ -160,11 +210,117 @@ func (t *Transcript) orphan(e session.Entry, what string) *Row {
 }
 
 // toolRow is the tool row keyed by a tool_use id, or nil.
-func (t *Transcript) toolRow(toolUseID string) *Row {
-	if r := t.byKey[toolUseID]; r != nil && r.Kind == RowTool {
+func (t *Transcript) toolRow(toolUseID string) *Row { return t.rowIfTool(toolUseID) }
+
+// rowIfTool is the row keyed key, if it is a tool row.
+func (t *Transcript) rowIfTool(key string) *Row {
+	if r := t.byKey[key]; r != nil && r.Kind == RowTool {
 		return r
 	}
 	return nil
+}
+
+// ApplyFrom is Apply for an entry that arrived tagged with a subagent's session id
+// (ADR 0028 decision 6): every row it makes is stamped with that origin and inserted
+// immediately after the last row already carrying the same parentToolUseID, so a child's
+// work stays grouped under the call that opened it in the order it arrived rather than at
+// the end of the transcript.
+//
+// A child's own turn is never this transcript's turn: every row here is stamped with the
+// agent call's own TurnID, read off the call's own row, rather than anything the child's
+// log carries, which is what lets Commit sweep a subagent's rows off screen together with
+// the call that opened it. Nothing here reads or writes t.turn or t.liveTurn: those track
+// this transcript's own turn, and a child's is not it.
+func (t *Transcript) ApplyFrom(sessionID, parentToolUseID string, e session.Entry) []string {
+	o := origin{sessionID: sessionID, parentToolUseID: parentToolUseID}
+	turn := t.callTurn(parentToolUseID)
+	switch p := e.Payload.(type) {
+	case session.UserMessage:
+		kind := RowUser
+		if p.Source == session.SourceShell {
+			kind = RowShell
+		}
+		return t.addChild(o, o.stamp(&Row{
+			Key: o.key(e.ID.String()), Kind: kind, TurnID: turn,
+			Entry: e, Text: session.TextOf(p.Content),
+		}))
+	case session.AssistantMessage:
+		return t.applyAssistantFrom(o, turn, e, p)
+	case session.PermissionDecision:
+		r := t.childToolRow(o, p.ToolUseID)
+		if r == nil {
+			return t.addChild(o, t.orphanFrom(o, turn, e, "decision"))
+		}
+		if r.Decision != nil {
+			return nil
+		}
+		r.Decision = &p
+		return []string{r.Key}
+	case session.ToolResult:
+		r := t.childToolRow(o, p.ToolUseID)
+		if r == nil {
+			return t.addChild(o, t.orphanFrom(o, turn, e, "result"))
+		}
+		if r.Result != nil {
+			return nil
+		}
+		r.Result = &p
+		return []string{r.Key}
+	case session.Note, session.Compaction, session.TurnInterrupted, session.TurnFailed:
+		return t.addChild(o, o.stamp(&Row{Key: o.key(e.ID.String()), Kind: RowMarker, TurnID: turn, Entry: e}))
+	}
+	// session_opened, fork_point and the model, mode, thinking and title changes are state
+	// the model reads off the entry directly (a session_opened is what records the call a
+	// child answers in the first place); none of them is a row.
+	return nil
+}
+
+// orphanFrom is orphan for a subagent's decision or result whose own tool_use this
+// transcript never saw.
+func (t *Transcript) orphanFrom(o origin, turn string, e session.Entry, what string) *Row {
+	return o.stamp(&Row{Key: o.key(e.ID.String()), Kind: RowMarker, TurnID: turn, Entry: e, Text: what})
+}
+
+// childToolRow is the tool row a subagent's own tool_use id names, or nil.
+func (t *Transcript) childToolRow(o origin, toolUseID string) *Row {
+	return t.rowIfTool(o.key(toolUseID))
+}
+
+// callTurn is the TurnID a subagent's rows are stamped with: the agent call's own row's, not
+// the child's. "", for a call whose own row has already gone to scrollback, still renders
+// fine and is swept by the next CommitLate the same as any other late row.
+func (t *Transcript) callTurn(parentToolUseID string) string {
+	if r := t.byKey[parentToolUseID]; r != nil {
+		return r.TurnID
+	}
+	return ""
+}
+
+// addChild inserts r under its own origin unless its key is already on screen, a replayed
+// entry, and reports the key it changed.
+func (t *Transcript) addChild(o origin, r *Row) []string {
+	if t.byKey[r.Key] != nil {
+		return nil
+	}
+	t.insertAfterGroup(o.parentToolUseID, r)
+	return []string{r.Key}
+}
+
+// insertAfterGroup adds r to the transcript immediately after the last row already carrying
+// parentToolUseID: the call's own row, or the last row it has already gained. Appending at
+// the end instead would scatter a subagent's rows behind whatever the parent said in
+// between. A call whose own row has already gone to scrollback (a straggler entry for a
+// turn that already committed) falls back to the end, which CommitLate then walks the same
+// as any other late row.
+func (t *Transcript) insertAfterGroup(parentToolUseID string, r *Row) {
+	t.byKey[r.Key] = r
+	end := len(t.rows)
+	for i, row := range t.rows {
+		if row.Key == parentToolUseID || row.ParentToolUseID == parentToolUseID {
+			end = i + 1
+		}
+	}
+	t.rows = slices.Insert(t.rows, end, r)
 }
 
 // applyAssistant turns one assistant_message into rows: one per text block, one per
@@ -219,6 +375,50 @@ func (t *Transcript) applyAssistant(e session.Entry, m session.AssistantMessage)
 	return changed
 }
 
+// applyAssistantFrom is applyAssistant for a subagent's own assistant_message: the same
+// per-block row shapes and the same live-tool-row replacement through its pointer, but
+// grouped under parentToolUseID (placeChild) rather than anchored on this transcript's own
+// turn (placeCommitted). Filtering by turn alone would not do: a sibling agent call
+// dispatched in the very same parent turn stamps its own rows with that same TurnID, and a
+// turn-only sweep would take its live rows along with this call's.
+func (t *Transcript) applyAssistantFrom(o origin, turn string, e session.Entry, m session.AssistantMessage) []string {
+	built := make([]*Row, 0, len(m.Content))
+	for i, b := range m.Content {
+		key := o.key(fmt.Sprintf("%s/%d", e.ID, i))
+		switch b.Type {
+		case session.BlockText:
+			built = append(built, o.stamp(&Row{Key: key, Kind: RowAssistant, TurnID: turn, Entry: e, Text: b.Text}))
+		case session.BlockThinking:
+			if t.opts.ShowThinking {
+				built = append(built, o.stamp(&Row{Key: key, Kind: RowAssistant, TurnID: turn, Entry: e, Text: b.Text, Thinking: true}))
+			}
+		case session.BlockToolUse:
+			built = append(built, o.stamp(&Row{Key: o.key(b.ID), Kind: RowTool, TurnID: turn, Entry: e, ToolUse: b}))
+		}
+	}
+	if len(built) == 0 {
+		t.rows = t.placeChild(o.parentToolUseID, nil)
+		return nil
+	}
+	if t.settled(built) {
+		return nil
+	}
+	changed := make([]string, 0, len(built))
+	for i, r := range built {
+		changed = append(changed, r.Key)
+		old := t.byKey[r.Key]
+		if old == nil {
+			t.byKey[r.Key] = r
+			continue
+		}
+		r.Expanded, r.Decision, r.Result = old.Expanded, old.Decision, old.Result
+		*old = *r
+		built[i] = old
+	}
+	t.rows = t.placeChild(o.parentToolUseID, built)
+	return changed
+}
+
 // settled reports whether every row this message makes is already on screen, committed.
 // Replaying a log entry a second time must not move anything.
 func (t *Transcript) settled(built []*Row) bool {
@@ -240,6 +440,39 @@ func (t *Transcript) settled(built []*Row) bool {
 // built may be empty, which is the sweep on its own: an assistant message that draws
 // nothing still ends the turn's live rows.
 func (t *Transcript) placeCommitted(turn string, built []*Row) []*Row {
+	return t.placeGroup(built,
+		func(r *Row) bool { return r.Live && r.Kind != RowTool && r.TurnID == turn },
+		func(out []*Row) int { return len(out) },
+	)
+}
+
+// placeChild is placeCommitted for a subagent's rows: built goes in immediately after the
+// last row of parentToolUseID's own group instead of at the end, and only that group's own
+// live placeholder is swept, by ParentToolUseID rather than by turn (see applyAssistantFrom
+// for why turn alone is not enough).
+func (t *Transcript) placeChild(parentToolUseID string, built []*Row) []*Row {
+	return t.placeGroup(built,
+		func(r *Row) bool { return r.Live && r.Kind != RowTool && r.ParentToolUseID == parentToolUseID },
+		func(out []*Row) int {
+			end := len(out)
+			for i, r := range out {
+				if r.Key == parentToolUseID || r.ParentToolUseID == parentToolUseID {
+					end = i + 1
+				}
+			}
+			return end
+		},
+	)
+}
+
+// placeGroup puts built on screen in block order: one message's rows are one contiguous
+// group, so any row sweep marks as this group's own live placeholder is lifted out and the
+// whole of built goes in at the first position such a row held, placed one at a time so
+// [text, tool_use, text] keeps that order rather than being anchored and appended. Nothing
+// swept means the transcript had no live placeholder for this group yet, so fallback decides
+// where the group lands instead: at the end for the transcript's own turn, right after the
+// call's own row for a subagent (see placeCommitted and placeChild).
+func (t *Transcript) placeGroup(built []*Row, sweep func(*Row) bool, fallback func(out []*Row) int) []*Row {
 	member := make(map[string]bool, len(built))
 	for _, r := range built {
 		member[r.Key] = true
@@ -247,7 +480,7 @@ func (t *Transcript) placeCommitted(turn string, built []*Row) []*Row {
 	out := make([]*Row, 0, len(t.rows)+len(built))
 	anchor := -1
 	for _, r := range t.rows {
-		live := r.Live && r.Kind != RowTool && r.TurnID == turn
+		live := sweep(r)
 		if !member[r.Key] && !live {
 			out = append(out, r)
 			continue
@@ -260,7 +493,7 @@ func (t *Transcript) placeCommitted(turn string, built []*Row) []*Row {
 		}
 	}
 	if anchor < 0 {
-		anchor = len(out)
+		anchor = fallback(out)
 	}
 	return slices.Insert(out, anchor, built...)
 }
@@ -297,6 +530,40 @@ func (t *Transcript) Delta(turnID string, p provider.Part) {
 	}
 }
 
+// DeltaFrom is Delta for a part streamed by a subagent. The live placeholder it builds is
+// keyed by the call it belongs to rather than by a turn id: one agent call has at most one
+// turn in flight at a time, since the agent tool submits its prompt once and waits, so the
+// call's own tool_use id is a stable key for the whole of it. It is inserted under the call
+// the same way ApplyFrom's committed rows are (insertAfterGroup), so a subagent's answer
+// shows up where it will land as it streams rather than only once it is whole.
+func (t *Transcript) DeltaFrom(sessionID, parentToolUseID string, p provider.Part) {
+	o := origin{sessionID: sessionID, parentToolUseID: parentToolUseID}
+	turn := t.callTurn(parentToolUseID)
+	switch p.Type {
+	case provider.PartTextDelta:
+		t.liveChild(o, turn, o.key(liveKey(parentToolUseID)), false).Text += p.Text
+	case provider.PartThinkingDelta:
+		r := t.liveChild(o, turn, o.key(thinkingKey(parentToolUseID)), true)
+		if t.opts.ShowThinking {
+			r.Text += p.Text
+		}
+	case provider.PartToolUseStart:
+		key := o.key(p.ID)
+		if t.byKey[key] != nil {
+			return
+		}
+		t.insertAfterGroup(o.parentToolUseID, o.stamp(&Row{
+			Key: key, Kind: RowTool, TurnID: turn, Live: true,
+			ToolUse: session.Block{Type: session.BlockToolUse, ID: p.ID, Name: p.Name},
+		}))
+	case provider.PartToolUseDelta:
+		if r := t.byKey[o.key(p.ID)]; r != nil && r.Live {
+			r.ToolUse.Input = append(r.ToolUse.Input, p.Text...)
+		}
+	case provider.PartToolUseEnd, provider.PartThinkingSignature, provider.PartUsage, provider.PartStop:
+	}
+}
+
 // live is the turn's live assistant row of one flavour, created on first use.
 func (t *Transcript) live(key, turnID string, thinking bool) *Row {
 	if r := t.byKey[key]; r != nil {
@@ -304,6 +571,17 @@ func (t *Transcript) live(key, turnID string, thinking bool) *Row {
 	}
 	r := &Row{Key: key, Kind: RowAssistant, TurnID: turnID, Live: true, Thinking: thinking}
 	t.add(r)
+	return r
+}
+
+// liveChild is live for a subagent: the row goes in under its call (insertAfterGroup)
+// instead of at the end.
+func (t *Transcript) liveChild(o origin, turn, key string, thinking bool) *Row {
+	if r := t.byKey[key]; r != nil {
+		return r
+	}
+	r := o.stamp(&Row{Key: key, Kind: RowAssistant, TurnID: turn, Live: true, Thinking: thinking})
+	t.insertAfterGroup(o.parentToolUseID, r)
 	return r
 }
 

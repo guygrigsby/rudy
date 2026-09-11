@@ -428,12 +428,31 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 			m.switching.buffer = append(m.switching.buffer, n)
 			return nil
 		case sid != "" && sid != m.session.SessionID:
-			// Another session's, which is not the one on screen: a client that has just
+			// Another session's, which is not the one on screen. A client that has just
 			// switched stays attached to the session it left until its close lands, and
 			// the answer that switched it overtakes what was sent before it (a
-			// notification arrives one per update, an answer in a single message), so
-			// the two cross. One that names no session is nobody else's and is folded.
-			return nil
+			// notification arrives one per update, an answer in a single message), so the
+			// two cross: that case is handled above, before this one is even reached.
+			//
+			// What is left is a subagent this session dispatched: its notifications reach
+			// this connection tagged with its own session id because they are routed to
+			// the parent's subscribers, not because this client ever resumed it (ADR 0028
+			// decision 6). session_opened is the entry that names the call a child
+			// answers, and it is also the first notification a child ever sends, so the
+			// mapping is recorded here, ahead of the lookup that would otherwise drop this
+			// very notification for not yet knowing it.
+			if ea, ok := entryAppendedOf(n); ok {
+				if opened, ok := ea.Entry.Payload.(session.SessionOpened); ok && opened.ParentToolUseID != "" {
+					m.tr.RecordAgentCall(sid, opened.ParentToolUseID)
+				}
+			}
+			call, ok := m.tr.AgentCallFor(sid)
+			if !ok {
+				// Genuinely not ours: a stray notification for a session this client has
+				// no relationship to.
+				return nil
+			}
+			return m.childNotification(sid, call, n)
 		}
 	}
 	switch n.Method {
@@ -484,6 +503,50 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 			// (docs/specs/2026-09-07-rudy-design.md); loading and ready say nothing.
 			m.note(levelError, "plugin "+p.Name+" failed: "+p.Reason)
 		}
+	}
+	return nil
+}
+
+// entryAppendedOf decodes n as entry.appended, or reports false for any other method or a
+// malformed payload. It is used ahead of the session-scope gate, to read a subagent's
+// session_opened for the call it names before that gate has anywhere to look the mapping
+// up: silent rather than noting a decode failure, since every other method fails this and
+// is expected to.
+func entryAppendedOf(n protocol.Notification) (protocol.EntryAppended, bool) {
+	if n.Method != protocol.NotifyEntryAppended {
+		return protocol.EntryAppended{}, false
+	}
+	var p protocol.EntryAppended
+	if err := json.Unmarshal(n.Params, &p); err != nil {
+		return protocol.EntryAppended{}, false
+	}
+	return p, true
+}
+
+// childNotification folds one of a subagent's notifications into the transcript, under
+// callToolUseID, the agent call that opened sid. entry.appended and stream.delta render the
+// same way they would for this session's own entries, just tagged and indented
+// (Transcript.ApplyFrom, Transcript.DeltaFrom).
+//
+// turn.state and tool.state do not: a child's turn is not this session's turn, and letting
+// a child's completed reach turnChanged would rest this session's spinner and offer the
+// composer while the parent is still mid-turn (ADR 0028 decision 6). The agent row already
+// says "running" for as long as its own tool_result has not arrived (transcript.tool), which
+// is every moment covered by these two notifications, so there is nothing further to fold:
+// what matters is that neither one reaches m.turn.
+func (m *Model) childNotification(sid, callToolUseID string, n protocol.Notification) tea.Cmd {
+	switch n.Method {
+	case protocol.NotifyEntryAppended:
+		var p protocol.EntryAppended
+		if m.decode(n, &p) {
+			return m.lateRows(m.tr.ApplyFrom(sid, callToolUseID, p.Entry))
+		}
+	case protocol.NotifyStreamDelta:
+		var p protocol.StreamDelta
+		if m.decode(n, &p) {
+			m.tr.DeltaFrom(sid, callToolUseID, p.Part)
+		}
+	case protocol.NotifyTurnState, protocol.NotifyToolState:
 	}
 	return nil
 }
@@ -722,7 +785,7 @@ func switchMethod(method string) bool {
 func sessionScoped(method string) bool {
 	switch method {
 	case protocol.NotifyEntryAppended, protocol.NotifyStreamDelta,
-		protocol.NotifyTurnState, protocol.NotifyPermissionRequested:
+		protocol.NotifyTurnState, protocol.NotifyPermissionRequested, protocol.NotifyToolState:
 		return true
 	}
 	return false

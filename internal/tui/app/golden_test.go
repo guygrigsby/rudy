@@ -336,3 +336,34 @@ func TestGoldenWidgetsAndStatus(t *testing.T) {
 		}}))
 	}))
 }
+
+// TestGoldenSubagentRunning pins a subagent's work rendering under the agent call that
+// dispatched it (ADR 0028 decision 6): the child's session_opened names the call by its
+// parent_tool_use_id, and its own answer, arriving tagged with the child's session id,
+// shows indented under that call rather than being dropped as another session's.
+func TestGoldenSubagentRunning(t *testing.T) {
+	golden(t, "subagent_running", screen(t, nil, func(tm *teatest.TestModel, sid string) {
+		child := session.NewID().String()
+		turn := session.NewID().String()
+		tm.Send(appendedMsg(t, sid, session.AssistantMessage{
+			Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+			Content: []session.Block{session.ToolUseBlock("t9", "agent",
+				json.RawMessage(`{"agent":"explorer","prompt":"find the caller"}`))},
+			Usage: goldenUsage,
+		}))
+		tm.Send(notify(t, protocol.NotifyToolState, protocol.ToolStateChanged{
+			SessionID: sid, TurnID: turn, ToolUseID: "t9", Name: "agent", State: protocol.ToolStateRunning,
+		}))
+		tm.Send(appendedMsg(t, child, session.SessionOpened{
+			SchemaVersion: 1, RudyVersion: "test",
+			Workspace: testWorkspace, Model: testRef, Mode: session.ModeStrict,
+			Thinking: session.ThinkingHigh, Agent: "explorer",
+			ParentSessionID: sid, ParentToolUseID: "t9",
+		}))
+		tm.Send(appendedMsg(t, child, session.AssistantMessage{
+			Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn,
+			Content: []session.Block{session.TextBlock("Found it in internal/cli/wire.go")},
+			Usage:   goldenUsage,
+		}))
+	}))
+}

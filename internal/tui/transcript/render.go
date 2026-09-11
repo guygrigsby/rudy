@@ -53,54 +53,66 @@ const (
 )
 
 // Render is the lines of one row under the current options and theme, styled: the
-// caller writes them out as they are.
+// caller writes them out as they are. A row a subagent's session produced (ParentToolUseID
+// set) renders indented under the agent call that opened it, by rowIndent.
 func (t *Transcript) Render(r *Row) []string {
 	if r == nil {
 		return nil
 	}
+	indent := rowIndent(r)
 	switch r.Kind {
 	case RowUser:
 		text := r.Text
 		if t.opts.UserPrefix != "" {
 			text = t.opts.UserPrefix + " " + text
 		}
-		return t.wrap(theme.RoleUser, 0, text)
+		return t.wrap(theme.RoleUser, indent, text)
 	case RowShell:
 		// The command already carries its own "$ " from the log, and its output follows it
 		// verbatim: what the operator saw in their terminal is what the row shows.
-		return t.wrap(theme.RoleShell, 0, r.Text)
+		return t.wrap(theme.RoleShell, indent, r.Text)
 	case RowAssistant:
-		return t.assistant(r)
+		return t.assistant(r, indent)
 	case RowTool:
-		return t.tool(r)
+		return t.tool(r, indent)
 	case RowPrompt:
-		return t.prompt(r)
+		return t.prompt(r, indent)
 	case RowMarker:
-		return t.marker(r)
+		return t.marker(r, indent)
 	}
 	return nil
 }
 
+// rowIndent is how far under its own left margin a row draws: previewIndent, the same a
+// tool row's own preview sits at, for a subagent's row (ADR 0028), nothing for the session
+// this transcript renders.
+func rowIndent(r *Row) int {
+	if r.ParentToolUseID != "" {
+		return previewIndent
+	}
+	return 0
+}
+
 // assistant renders an answer block: markdown once the entry has arrived, wrapped plain
 // text while it streams, and muted plain text for thinking either way.
-func (t *Transcript) assistant(r *Row) []string {
+func (t *Transcript) assistant(r *Row, indent int) []string {
 	if r.Text == "" {
 		return nil
 	}
 	if r.Thinking {
-		return t.wrap(theme.RoleMuted, mdMargin, r.Text)
+		return t.wrap(theme.RoleMuted, mdMargin+indent, r.Text)
 	}
 	if r.Live {
-		return t.wrap(theme.RoleAssistant, mdMargin, r.Text)
+		return t.wrap(theme.RoleAssistant, mdMargin+indent, r.Text)
 	}
 	// Sanitized before glamour rather than after. glamour's escape replacer covers
 	// markdown syntax and leaves an ANSI sequence and a C0 byte in the text exactly as the
 	// model wrote them, and the styling it adds on top is what a sanitize of its output
 	// would strip; a committed row is written into the terminal's own scrollback by
 	// tea.Println, where a \x1b[2J the client never owned would clear the screen.
-	out, err := t.markdown(sanitize(r.Text))
+	out, err := t.markdown(sanitize(r.Text), indent)
 	if err != nil {
-		return t.wrap(theme.RoleAssistant, mdMargin, r.Text)
+		return t.wrap(theme.RoleAssistant, mdMargin+indent, r.Text)
 	}
 	return out
 }
@@ -108,7 +120,7 @@ func (t *Transcript) assistant(r *Row) []string {
 // tool renders a tool row: one summary line, then what the row knows. A denied call and
 // one still running say so instead of a preview; a killed or lost result says so and
 // then shows what came back.
-func (t *Transcript) tool(r *Row) []string {
+func (t *Transcript) tool(r *Row, indent int) []string {
 	// A permission question renders inline where the tool row would be (the design's
 	// Client section), so while one is open the tool row it stands in front of draws
 	// nothing rather than repeating its summary a line below the question.
@@ -124,21 +136,21 @@ func (t *Transcript) tool(r *Row) []string {
 	name := r.ToolUse.Name
 	// The row opens with a marker saying which way it is: a click or ctrl+o toggles it, and
 	// without the marker nothing on screen says the click did anything (ADR 0025).
-	out := []string{t.summaryLine(name, input, t.disclosure(r))}
+	out := []string{t.summaryLine(name, input, t.disclosure(r), indent)}
 	if r.Decision != nil && r.Decision.Decision == session.Deny {
-		return append(out, t.line(theme.RoleError, previewIndent, "denied: "+r.Decision.Reason, false))
+		return append(out, t.line(theme.RoleError, previewIndent+indent, "denied: "+r.Decision.Reason, false))
 	}
 	if r.Result == nil {
-		return append(out, t.line(theme.RoleMuted, previewIndent, "running", false))
+		return append(out, t.line(theme.RoleMuted, previewIndent+indent, "running", false))
 	}
 	if s := outcomes[r.Result.Outcome]; s != "" {
-		out = append(out, t.line(theme.RoleWarning, previewIndent, s, false))
+		out = append(out, t.line(theme.RoleWarning, previewIndent+indent, s, false))
 	}
 	// ToolCollapsed is the default; Expanded is what the user opened on top of it.
 	if r.Expanded || !t.opts.ToolCollapsed {
-		return append(out, t.expansion(input, r.Result)...)
+		return append(out, t.expansion(input, r.Result, indent)...)
 	}
-	return append(out, t.segments(t.preview(name, input, r.Result))...)
+	return append(out, t.segments(t.preview(name, input, r.Result), indent)...)
 }
 
 // outcomes name the two outcomes a preview cannot show for itself: the tool never
@@ -150,13 +162,13 @@ var outcomes = map[session.Outcome]string{
 
 // expansion is the whole call: the input pretty-printed and the whole result. Printing
 // is display only; the row's bytes are never rewritten.
-func (t *Transcript) expansion(input json.RawMessage, res *session.ToolResult) []string {
+func (t *Transcript) expansion(input json.RawMessage, res *session.ToolResult, indent int) []string {
 	var out []string
 	for _, l := range prettyJSON(input) {
-		out = append(out, t.line(theme.RoleMuted, previewIndent, l, false))
+		out = append(out, t.line(theme.RoleMuted, previewIndent+indent, l, false))
 	}
 	for _, l := range splitLines(session.TextOf(res.Content)) {
-		out = append(out, t.line(theme.RoleText, previewIndent, l, false))
+		out = append(out, t.line(theme.RoleText, previewIndent+indent, l, false))
 	}
 	return out
 }
@@ -215,10 +227,10 @@ func paint(role theme.Role, texts ...string) []segment {
 	return out
 }
 
-func (t *Transcript) segments(segs []segment) []string {
+func (t *Transcript) segments(segs []segment, indent int) []string {
 	out := make([]string, 0, len(segs))
 	for _, s := range segs {
-		out = append(out, t.line(s.role, previewIndent, s.text, s.fill))
+		out = append(out, t.line(s.role, previewIndent+indent, s.text, s.fill))
 	}
 	return out
 }
@@ -269,14 +281,14 @@ func firstHunk(u string) []string {
 }
 
 // prompt renders a permission question in the place of its tool row.
-func (t *Transcript) prompt(r *Row) []string {
+func (t *Transcript) prompt(r *Row, indent int) []string {
 	p := r.Prompt
 	if p == nil {
 		return nil
 	}
 	return []string{
-		t.summaryLine(p.Tool, p.Input, ""),
-		t.line(theme.RoleWarning, previewIndent, promptChoices, false),
+		t.summaryLine(p.Tool, p.Input, "", indent),
+		t.line(theme.RoleWarning, previewIndent+indent, promptChoices, false),
 	}
 }
 
@@ -290,7 +302,7 @@ var noteRoles = map[session.NoteRole]theme.Role{
 
 // marker renders the entries that are not a message: a plugin's note, a compaction and
 // the two ways a turn can end badly.
-func (t *Transcript) marker(r *Row) []string {
+func (t *Transcript) marker(r *Row, indent int) []string {
 	switch p := r.Entry.Payload.(type) {
 	case session.Note:
 		role, ok := noteRoles[p.Role]
@@ -299,17 +311,17 @@ func (t *Transcript) marker(r *Row) []string {
 			// where StyleFor falls back to text.
 			role = theme.Role(p.Role)
 		}
-		return t.wrap(role, 0, p.Text)
+		return t.wrap(role, indent, p.Text)
 	case session.Compaction:
 		// How many entries a compaction covered is a server-side count; the client has
 		// the summary, so the first line of it stands for the range.
-		return []string{t.line(theme.RoleMuted, 0, "compaction: "+firstLine(p.Summary), false)}
+		return []string{t.line(theme.RoleMuted, indent, "compaction: "+firstLine(p.Summary), false)}
 	case session.TurnInterrupted:
-		return []string{t.line(theme.RoleMuted, 0, "interrupted ("+string(p.How)+")", false)}
+		return []string{t.line(theme.RoleMuted, indent, "interrupted ("+string(p.How)+")", false)}
 	case session.TurnFailed:
-		return t.wrap(theme.RoleError, 0, "turn failed ("+string(p.Class)+"): "+p.Message)
+		return t.wrap(theme.RoleError, indent, "turn failed ("+string(p.Class)+"): "+p.Message)
 	case session.PermissionDecision, session.ToolResult:
-		return []string{t.line(theme.RoleWarning, 0, r.Text+" for unknown tool_use", false)}
+		return []string{t.line(theme.RoleWarning, indent, r.Text+" for unknown tool_use", false)}
 	}
 	return nil
 }
@@ -327,8 +339,8 @@ var summaryField = map[string]string{
 // summaryLine opens a tool row and a permission question alike: the marker, the glyph, the
 // tool and what the call does. A permission question passes no marker: there is nothing to
 // expand until the call has run.
-func (t *Transcript) summaryLine(name string, input json.RawMessage, marker string) string {
-	return t.line(theme.RoleTool, 0, marker+t.toolIcon(name)+" "+name+"  "+summary(name, input), false)
+func (t *Transcript) summaryLine(name string, input json.RawMessage, marker string, indent int) string {
+	return t.line(theme.RoleTool, indent, marker+t.toolIcon(name)+" "+name+"  "+summary(name, input), false)
 }
 
 // disclosure is the marker a tool row opens with: pointing right while its result is
@@ -423,8 +435,13 @@ func isControl(r rune) bool {
 	return (r < 0x20 && r != '\n' && r != '\t') || (r >= 0x7f && r <= 0x9f)
 }
 
-// markdown renders one answer block through glamour, with chroma on fences.
-func (t *Transcript) markdown(s string) ([]string, error) {
+// markdown renders one answer block through glamour, with chroma on fences. indent adds to
+// the left margin every line is given, for a subagent's answer; the renderer itself is
+// cached at the transcript's own width regardless (mdCache), so a wide indented block wraps
+// to the same column count an unindented one would rather than rebuilding glamour's styles
+// per indent level. previewIndent is small next to the width this is built for, so the rare
+// overflow that leaves possible reads as a soft edge case, not a design gap.
+func (t *Transcript) markdown(s string, indent int) ([]string, error) {
 	if t.md.r == nil && t.md.err == nil {
 		t.md.r, t.md.err = glamour.NewTermRenderer(
 			glamour.WithStyles(glamourStyle(t.th)),
@@ -448,7 +465,7 @@ func (t *Transcript) markdown(s string) ([]string, error) {
 		if l != "" {
 			// The gutter line adds for every other row kind. A blank line stays blank
 			// rather than carrying a column of trailing space nothing draws.
-			l = strings.Repeat(" ", Gutter) + l
+			l = strings.Repeat(" ", Gutter+indent) + l
 		}
 		lines[i] = l
 	}

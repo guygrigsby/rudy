@@ -49,6 +49,9 @@ const testTimeout = 5 * time.Second
 var (
 	testRef  = session.ModelRef{Provider: "fake", Model: "m1"}
 	testRef2 = session.ModelRef{Provider: "fake", Model: "m2"}
+	// testWorkspace is the harness's own workspace: a subagent opens on the same one, so a
+	// test's session_opened for a child uses it too.
+	testWorkspace = session.Workspace{Root: "/w", GitRoot: "/w", ProjectID: "local/w"}
 )
 
 // testModels is the registry the app is handed: one model, priced, with a round context

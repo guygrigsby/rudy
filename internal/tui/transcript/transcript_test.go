@@ -38,6 +38,67 @@ func entry(t *testing.T, p session.Payload) session.Entry {
 	return session.Entry{ID: session.NewID(), At: time.Unix(0, 0).UTC(), Kind: p.Kind(), Payload: p}
 }
 
+// newTestTranscript is a transcript at a plain width, for a test that only checks
+// structure (row order, keys, indentation) rather than a specific rendering.
+func newTestTranscript(t *testing.T) *Transcript {
+	t.Helper()
+	return New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2, BlockGap: 1}, theme.Default())
+}
+
+// assistantEntry is one assistant_message entry carrying blocks, for a test that only cares
+// about the rows the blocks make rather than a realistic turn around them.
+func assistantEntry(t *testing.T, blocks ...session.Block) session.Entry {
+	t.Helper()
+	return entry(t, session.AssistantMessage{Model: ref, Thinking: session.ThinkingHigh, StopReason: session.StopEndTurn, Content: blocks})
+}
+
+// rowByKey is the row keyed key, or a fatal failure: a test asserting about a specific row
+// should never silently compare against nil.
+func rowByKey(t *testing.T, rows []*Row, key string) *Row {
+	t.Helper()
+	for _, r := range rows {
+		if r.Key == key {
+			return r
+		}
+	}
+	t.Fatalf("no row keyed %q among %d rows", key, len(rows))
+	return nil
+}
+
+// rowAfter is the row immediately following r in rows.
+func rowAfter(t *testing.T, rows []*Row, r *Row) *Row {
+	t.Helper()
+	for i, row := range rows {
+		if row == r {
+			if i+1 >= len(rows) {
+				t.Fatalf("row %q has nothing after it", r.Key)
+			}
+			return rows[i+1]
+		}
+	}
+	t.Fatalf("row %q not found", r.Key)
+	return nil
+}
+
+// lineForRow is the rendered line r drew, out of a Layout call.
+func lineForRow(t *testing.T, lines []Line, r *Row) Line {
+	t.Helper()
+	for _, l := range lines {
+		if l.Row == r {
+			return l
+		}
+	}
+	t.Fatalf("no line for row %q", r.Key)
+	return Line{}
+}
+
+// indentOf is how many leading columns a rendered line opens with: the gutter plus
+// whatever the row asked layout to indent it by. The indent is plain spaces ahead of any
+// style, so counting them needs no ansi stripping.
+func indentOf(l Line) int {
+	return len(l.Text) - len(strings.TrimLeft(l.Text, " "))
+}
+
 func TestApplyFoldsToolRows(t *testing.T) {
 	tr := New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2, UserPrefix: "›", BlockGap: 1}, theme.Default())
 	u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("fix the flaky fork test")}})
@@ -105,6 +166,67 @@ func TestThinkingRowsOnlyWhenShown(t *testing.T) {
 	}
 	if rows[0].Key != a.ID.String()+"/0" || rows[1].Key != a.ID.String()+"/1" {
 		t.Errorf("keys %q %q", rows[0].Key, rows[1].Key)
+	}
+}
+
+// TestChildRowsNestUnderTheAgentCall is ADR 0028 decision 6 on the client side: a
+// subagent's rows arrive tagged with the child's own session id and render under the
+// agent call that dispatched it.
+func TestChildRowsNestUnderTheAgentCall(t *testing.T) {
+	tr := newTestTranscript(t)
+	// The parent's agent call.
+	tr.Apply(assistantEntry(t, session.ToolUseBlock("tu1", "agent", json.RawMessage(`{"agent":"explorer","prompt":"look"}`))))
+	// The child's own work, arriving tagged with the child's session id.
+	tr.ApplyFrom("child-session-id", "tu1", assistantEntry(t, session.TextBlock("I looked")))
+
+	rows := tr.Rows()
+	agentRow := rowByKey(t, rows, "tu1")
+	childRow := rowAfter(t, rows, agentRow)
+	if childRow.ParentToolUseID != "tu1" {
+		t.Fatalf("child row parent = %q, want tu1", childRow.ParentToolUseID)
+	}
+	if childRow.SessionID != "child-session-id" {
+		t.Fatalf("child row session = %q", childRow.SessionID)
+	}
+
+	lines := tr.Layout()
+	childLine := lineForRow(t, lines, childRow)
+	parentLine := lineForRow(t, lines, agentRow)
+	if indentOf(childLine) <= indentOf(parentLine) {
+		t.Fatalf("the child is not indented under its call: parent=%d child=%d",
+			indentOf(parentLine), indentOf(childLine))
+	}
+	// The comparison above holds even with no subagent-specific indent at all: an
+	// assistant row's own markdown margin already sits deeper than a tool row's bare
+	// summary line. What isolates the indent this task adds is the same text rendered
+	// with no origin at all, in a transcript of its own: the child must sit exactly
+	// previewIndent past wherever that plain row would have landed.
+	plain := newTestTranscript(t)
+	plain.Apply(assistantEntry(t, session.TextBlock("I looked")))
+	plainLine := lineForRow(t, plain.Layout(), plain.Rows()[0])
+	if got, want := indentOf(childLine), indentOf(plainLine)+previewIndent; got != want {
+		t.Fatalf("child indent = %d, want the same text's plain indent %d plus previewIndent %d = %d",
+			got, indentOf(plainLine), previewIndent, want)
+	}
+}
+
+// TestChildRowsInsertRightAfterTheirGroupNotAtTheEnd is the ordering half of ApplyFrom: a
+// child's rows go in immediately after the last row of their own group, not appended after
+// whatever the parent said afterward. Two rows alone (the call and its one child row)
+// cannot tell "after the call" from "at the end" apart, since they are the same place; a
+// third, later parent row is what forces them apart.
+func TestChildRowsInsertRightAfterTheirGroupNotAtTheEnd(t *testing.T) {
+	tr := newTestTranscript(t)
+	tr.Apply(assistantEntry(t, session.ToolUseBlock("tu1", "agent", json.RawMessage(`{"agent":"explorer","prompt":"look"}`))))
+	tr.Apply(assistantEntry(t, session.TextBlock("meanwhile, back at the parent")))
+
+	tr.ApplyFrom("child-session-id", "tu1", assistantEntry(t, session.TextBlock("I looked")))
+
+	rows := tr.Rows()
+	agentRow := rowByKey(t, rows, "tu1")
+	childRow := rowAfter(t, rows, agentRow)
+	if childRow.SessionID != "child-session-id" {
+		t.Fatalf("child row did not land right after its call, got %+v", *rowAfter(t, rows, agentRow))
 	}
 }
 

@@ -63,6 +63,14 @@ type Row struct {
 	Decision *session.PermissionDecision
 	Result   *session.ToolResult
 	Prompt   *protocol.PermissionRequested
+	// SessionID is the session the row's entry came from, empty for the session being
+	// rendered. A subagent's rows arrive tagged with the child's id (ADR 0028) and render
+	// under the agent call that opened it.
+	SessionID string
+	// ParentToolUseID is the agent call this row's session was opened by, empty unless
+	// SessionID is set. It is what layout indents under, and what Commit removes with the
+	// call when the turn is dropped.
+	ParentToolUseID string
 }
 
 // Options are the [ui.transcript] and [ui.diff] render choices, one field per config key
