@@ -344,6 +344,15 @@ type SessionOpened struct {
 	// empty is a root session; a pass 1 line without the keys loads as one.
 	ParentSessionID string `json:"parent_session_id"`
 	ParentToolUseID string `json:"parent_tool_use_id"`
+	// Tools is the session's resolved tool set: the agent definition's list intersected with
+	// the parent's effective set, before the agent tool's own deny (ADR 0028, rudy-ef4). nil
+	// means every tool, an empty slice means none, the same distinction the definition file
+	// carries. It is recorded rather than recomputed on resume or fork because a child is cold
+	// by the time anyone comes back to it and its parent may be gone by then; recomputing from
+	// the definition alone would hand back exactly what the intersection removed. A line
+	// written before this field existed decodes it as nil, the pre-existing behaviour for
+	// those sessions.
+	Tools []string `json:"tools"`
 }
 
 type ForkPoint struct {

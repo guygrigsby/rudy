@@ -2429,11 +2429,28 @@ func TestDetachDuringCompactionClosesTheSession(t *testing.T) {
 // agentProvider scripts two sessions at once, by session id: the first session it sees (the
 // root) calls the agent tool and then answers with text; every other session (the child the
 // agent tool opened) calls the unsafe echo tool and then answers "child done".
+//
+// armDelegate is a second, independent script bolted onto the same type rather than a
+// duplicate provider: it makes the very next call, on any session, answer with a tool_use for
+// the agent tool naming the given agent, overriding the switch below; every other call answers
+// with plain text. Tests that only need one bare delegation (the subagents-wave helpers'
+// resumed and forked child cases) use it instead of teaching the switch another hardcoded case.
 type agentProvider struct {
 	mu    sync.Mutex
 	root  ulid.ULID
 	calls map[ulid.ULID]int
 	reqs  map[ulid.ULID][]provider.Request
+
+	armed         bool
+	delegateAgent string
+}
+
+// armDelegate makes agentProvider's very next Complete call, whatever session it is for, open a
+// child under agent through the agent tool, instead of running the root/child switch.
+func (p *agentProvider) armDelegate(agent string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.armed, p.delegateAgent = true, agent
 }
 
 func (p *agentProvider) Name() string { return "fake" }
@@ -2469,6 +2486,8 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 	n := p.calls[req.SessionID]
 	p.reqs[req.SessionID] = append(p.reqs[req.SessionID], req)
 	root := req.SessionID == p.root
+	fire, delegateAgent := p.armed, p.delegateAgent
+	p.armed = false
 	p.mu.Unlock()
 
 	call := func(id, name, input string) []provider.Part {
@@ -2489,6 +2508,8 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 	}
 	var parts []provider.Part
 	switch {
+	case fire:
+		parts = call("tu_agent", "agent", `{"agent":"`+delegateAgent+`"}`)
 	case root && n == 1:
 		parts = call("tu_agent", "agent", `{"agent":"explorer","prompt":"look"}`)
 	case root && n == 2:
@@ -2662,10 +2683,19 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ws, ".rudy", "agents", "explorer.md"), []byte(def), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// The helper names no tools, so its child gets every registered tool except the agent
-	// tool itself: that exception is what keeps subagent depth at one.
+	// The helper names no tools, so its child's own definition would hand it every registered
+	// tool; what it actually gets is bounded by the root's own list below, minus agent (that
+	// exception is what keeps subagent depth at one). bash is registered but left out of the
+	// root's list deliberately: the helper child holding it is rudy-ef4 observed directly.
 	helper := "---\ndescription: A general helper\n---\nYou help.\n"
 	if err := os.WriteFile(filepath.Join(ws, ".rudy", "agents", "helper.md"), []byte(helper), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The root itself is restricted, not the implicit unrestricted default: echo and probe are
+	// what it calls directly, agent is what it delegates with, and bash is left out on purpose
+	// so a child that exceeds this list is observable.
+	lead := "---\ndescription: Delegates to subagents\ntools: [echo, agent, probe]\n---\nYou delegate.\n"
+	if err := os.WriteFile(filepath.Join(ws, ".rudy", "agents", "lead.md"), []byte(lead), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	prov := &agentProvider{}
@@ -2680,7 +2710,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	ctx := context.Background()
 	cl := dialAs(t, srv, true)
 	var info protocol.SessionInfo
-	if err := cl.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: ws}, &info); err != nil {
+	if err := cl.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: ws, Agent: "lead"}, &info); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	var sub protocol.SessionSubmitResult
@@ -2790,14 +2820,16 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 		t.Errorf("one tool_use opened two children: %v", errSecond)
 	}
 
-	// The helper child named no tools, so it was offered every registered tool and never
-	// the agent tool: a child cannot open a grandchild.
+	// The helper child named no tools, so its own definition would hand it every registered
+	// tool; what it actually got is bounded by the root's own restricted list (rudy-ef4), minus
+	// agent, which a child never sees regardless: echo and probe, the root's own, but never
+	// bash, which the root does not hold.
 	hreqs := prov.requestsFor(helperSID)
 	if len(hreqs) != 2 {
 		t.Fatalf("helper made %d requests", len(hreqs))
 	}
-	if names := defNames(hreqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
-		t.Errorf("helper tools = %v", names)
+	if names := defNames(hreqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "probe"}) {
+		t.Errorf("helper tools = %v, want bounded by the root's own list", names)
 	}
 
 	// The root's tool_result for the agent call carries the child's answer.
@@ -2814,9 +2846,11 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 		t.Errorf("agent result = %+v", result)
 	}
 
-	// A resumed child keeps its agent definition, re-resolved from the workspace on cold
-	// load since the definition is a file rather than part of the log, and it is still a
-	// child: no agent tool, whatever became of the session that spawned it.
+	// A resumed child keeps the tool set session_opened recorded for it, not its own
+	// definition's list recomputed: applyAgentFromLog has no live parent to intersect against
+	// by the time anything resumes this session, and recomputing from the definition alone
+	// would hand back exactly what the live intersection removed (rudy-ef4 round 2). Its
+	// prompt still comes from the definition file, which is not part of that record.
 	var back protocol.SessionInfo
 	if err := cl.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: helperSID}, &back); err != nil {
 		t.Fatalf("resume child: %v", err)
@@ -2831,15 +2865,17 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if len(hreqs) != 3 {
 		t.Fatalf("helper made %d requests after the resume", len(hreqs))
 	}
-	if names := defNames(hreqs[2].Tools); !reflect.DeepEqual(names, []string{"echo", "bash", "probe"}) {
-		t.Errorf("resumed child tools = %v", names)
+	if names := defNames(hreqs[2].Tools); !reflect.DeepEqual(names, []string{"echo", "probe"}) {
+		t.Errorf("resumed child tools = %v, want the recorded set, not the definition's own", names)
 	}
 	if !strings.HasPrefix(hreqs[2].System, "You help.") {
 		t.Errorf("resumed child system = %q", hreqs[2].System)
 	}
 
-	// A fork of a child is still a child. Its inherited entries carry the session_opened that
-	// names its parent, so the agent tool stays denied: a fork is not a way around depth one.
+	// A fork of a child is still a child, and inherits the same recorded set: its entries carry
+	// the original session_opened by reference, tools field included, rather than a new one of
+	// its own. A fork is not a way around depth one or around the bound the root's own list
+	// puts on it.
 	var forkInfo protocol.SessionInfo
 	if err := cl.Call(ctx, protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: helperSID}, &forkInfo); err != nil {
 		t.Fatalf("fork the child: %v", err)
@@ -2854,8 +2890,8 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	if len(freqs) == 0 {
 		t.Fatal("the fork of the child ran no request")
 	}
-	if names := defNames(freqs[0].Tools); slices.Contains(names, "agent") {
-		t.Errorf("fork of a child tools = %v, want no agent tool", names)
+	if names := defNames(freqs[0].Tools); !reflect.DeepEqual(names, []string{"echo", "probe"}) {
+		t.Errorf("fork of a child tools = %v, want the recorded set, not the definition's own", names)
 	}
 
 	// session_opened told the hooks which session has a parent: the memory plugin folds a
@@ -2872,7 +2908,8 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 		t.Errorf("session_opened for the root = %+v, want no parent_session_id", p)
 	}
 
-	// A resumed root session is no child: it runs the default agent and the whole tool set.
+	// A resumed root session is no child: it keeps running its own "lead" definition's list,
+	// agent included, from the record session_opened made when it was opened.
 	if err := cl.Call(ctx, protocol.MethodSessionClose, protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{}); err != nil {
 		t.Fatalf("close root: %v", err)
 	}
@@ -2886,8 +2923,8 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	}
 	drain(t, cl, completedOn(info.SessionID))
 	rreqs := prov.requestsFor(info.SessionID)
-	if names := defNames(rreqs[len(rreqs)-1].Tools); !slices.Contains(names, "agent") {
-		t.Errorf("resumed root tools = %v, want the agent tool among them", names)
+	if names := defNames(rreqs[len(rreqs)-1].Tools); !reflect.DeepEqual(names, []string{"echo", "probe", "agent"}) {
+		t.Errorf("resumed root tools = %v, want lead's own list", names)
 	}
 
 	// A parent naming a tool_use that is not pending is not_found, and a parent from a
@@ -3003,76 +3040,6 @@ func TestRootSessionKeepsTheAgentToolItsDefinitionLists(t *testing.T) {
 	}
 }
 
-// testProvider is the fake model newTestServer wires in. It scripts one round trip: armDelegate
-// makes the very next call it answers open a child under the named agent, through the harness's
-// own "agent" tool; every other call, on any session, answers with plain text. Arming is
-// explicit rather than tied to call order or session identity, because toolNames below drives
-// its own bare turns on whatever session it is pointed at, including ones armDelegate never
-// touched, and those must never trigger a spurious child open.
-type testProvider struct {
-	mu    sync.Mutex
-	armed bool
-	agent string
-	reqs  map[ulid.ULID][]provider.Request
-}
-
-func (p *testProvider) armDelegate(agent string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.armed, p.agent = true, agent
-}
-
-func (p *testProvider) requestsFor(sid ulid.ULID) []provider.Request {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return append([]provider.Request(nil), p.reqs[sid]...)
-}
-
-func (p *testProvider) Name() string { return "fake" }
-
-func (p *testProvider) ListModels(context.Context) ([]provider.Model, error) {
-	return []provider.Model{{
-		Ref:           session.ModelRef{Provider: "fake", Model: "m1"},
-		DisplayName:   "Fake 1",
-		ContextWindow: 100000,
-		Capabilities:  provider.Capabilities{Tools: true},
-	}}, nil
-}
-
-func (p *testProvider) Complete(ctx context.Context, req provider.Request, emit func(provider.Part) error) error {
-	p.mu.Lock()
-	if p.reqs == nil {
-		p.reqs = map[ulid.ULID][]provider.Request{}
-	}
-	p.reqs[req.SessionID] = append(p.reqs[req.SessionID], req)
-	fire, agent := p.armed, p.agent
-	p.armed = false
-	p.mu.Unlock()
-
-	var parts []provider.Part
-	if fire {
-		parts = []provider.Part{
-			{Type: provider.PartToolUseStart, ID: "tu_agent", Name: "agent"},
-			{Type: provider.PartToolUseDelta, ID: "tu_agent", Text: `{"agent":"` + agent + `"}`},
-			{Type: provider.PartToolUseEnd, ID: "tu_agent"},
-			{Type: provider.PartUsage, Usage: session.Usage{Input: 10, Output: 5}},
-			{Type: provider.PartStop, StopReason: session.StopToolUse, StopReasonRaw: "tool_calls"},
-		}
-	} else {
-		parts = []provider.Part{
-			{Type: provider.PartTextDelta, Text: "done"},
-			{Type: provider.PartUsage, Usage: session.Usage{Input: 20, Output: 1}},
-			{Type: provider.PartStop, StopReason: session.StopEndTurn, StopReasonRaw: "stop"},
-		}
-	}
-	for _, part := range parts {
-		if err := emit(part); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // openerPlugin is every subagents-wave test's stand-in for the real subagents plugin: it owns
 // the "agent" tool that opens a child session from inside its own pending tool_use, the same
 // authority path the real plugin's invoke uses (parentOf, server.go). Unlike the real plugin it
@@ -3080,8 +3047,13 @@ func (p *testProvider) Complete(ctx context.Context, req provider.Request, emit 
 // test needs the child to stay live (and its tool view inspectable through toolNames) after
 // this call returns rather than being detached and closed the moment it has nothing running.
 // closeAll, run from newTestServer's t.Cleanup, closes what it opened at the end of each test.
+//
+// It is kept alongside the real subagents plugin (which TestChildSessionThroughThePluginClass
+// drives) rather than replacing it: this stand-in is faithful to the one thing under test here,
+// parentOf's authority check and applyAgent's intersection, but proving the escalation itself
+// belongs on the shipping path, through the real plugin, not through this one (rudy-ef4).
 type openerPlugin struct {
-	prov *testProvider
+	prov *agentProvider
 	host plugin.Host
 
 	mu    sync.Mutex
@@ -3148,7 +3120,7 @@ type testServer struct {
 	srv       *server.Server
 	store     *session.Store
 	configDir string
-	prov      *testProvider
+	prov      *agentProvider
 	op        *openerPlugin
 }
 
@@ -3174,7 +3146,7 @@ func newTestServerWithPlugins(t *testing.T, extra ...plugin.Plugin) (*testServer
 	t.Helper()
 	cfg := testConfig()
 	cfg.ConfigDir = t.TempDir()
-	prov := &testProvider{}
+	prov := &agentProvider{}
 	op := &openerPlugin{prov: prov}
 	plugins := append([]plugin.Plugin{op, read.New(), bash.New(), edit.New(), write.New()}, extra...)
 	srv, store := newServerWith(t, cfg, plugins...)
@@ -3250,19 +3222,31 @@ func openChildSession(t *testing.T, cn *testConn, parent, childAgent string) str
 }
 
 // toolNames drives one bare turn on sess and returns the tool names the server offered it in
-// that request. It is the only way outside the server package to read a live session's
-// effective tool view: ToolView is unexported, so what a model was actually sent is the
-// observable proxy for it. Resuming first rather than dialing straight into session.submit
-// matters for a session this helper did not open itself: a live session just gains a
-// subscriber, but one that has fallen out of the live map cold-loads it, which is deliberate
-// when a test wants to exercise that path (see TestResumedChildKeepsItsOwnList) and harmless
-// otherwise.
+// that request: the observable proxy for a live session's effective tool view, which is
+// otherwise unexported. It refuses a session that is not already live rather than silently
+// cold-loading it: a narrowing test whose child has already closed would otherwise measure
+// whatever a reload produces instead of the live view, and could pass while proving nothing
+// (rudy-ef4 round 2). driveTurn is the shared "resume, submit, drain" body for a test that wants
+// the cold path deliberately.
 func toolNames(t *testing.T, srv *testServer, sess string) []string {
 	t.Helper()
 	sid, err := ulid.Parse(sess)
 	if err != nil {
 		t.Fatalf("bad session id %q: %v", sess, err)
 	}
+	if s, err := session.Load(srv.store, sid); !errors.Is(err, session.ErrLocked) {
+		if err == nil {
+			_ = s.Close()
+		}
+		t.Fatalf("toolNames needs a live session; %s is not: %v", sess, err)
+	}
+	return driveTurn(t, srv, sess)
+}
+
+// driveTurn resumes sess, live or cold, drives one bare turn on it and returns the tool names
+// the server offered it in that request.
+func driveTurn(t *testing.T, srv *testServer, sess string) []string {
+	t.Helper()
 	cl := dialAs(t, srv.srv, false)
 	var info protocol.SessionInfo
 	if err := cl.Call(context.Background(), protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: sess}, &info); err != nil {
@@ -3275,18 +3259,30 @@ func toolNames(t *testing.T, srv *testServer, sess string) []string {
 		t.Fatalf("submit to %s: %v", sess, err)
 	}
 	drain(t, cl, completedOn(sess))
-	reqs := srv.prov.requestsFor(sid)
+	reqs := srv.prov.requestsFor(sess)
 	if len(reqs) == 0 {
 		t.Fatalf("no request recorded for %s", sess)
 	}
 	return defNames(reqs[len(reqs)-1].Tools)
 }
 
+// forkSession forks sess at its newest entry and returns the fork's id.
+func forkSession(t *testing.T, srv *testServer, sess string) string {
+	t.Helper()
+	cl := dialAs(t, srv.srv, false)
+	var info protocol.SessionInfo
+	if err := cl.Call(context.Background(), protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: sess}, &info); err != nil {
+		t.Fatalf("fork %s: %v", sess, err)
+	}
+	return info.SessionID
+}
+
 // TestChildToolsCannotExceedItsParent is rudy-ef4: a parent restricted to [read, agent] could
 // open a child under a permissive definition and the child would come back with every tool,
 // because applyAgent never intersected the child's list with the parent's. bash, edit and write
 // are registered but not in the parent's own list, so the child holding any of them is the bug
-// observed directly rather than inferred.
+// observed directly rather than inferred. This is the live-open path; the round 2 reopening
+// below is the same escalation reached one resume or fork later.
 func TestChildToolsCannotExceedItsParent(t *testing.T) {
 	srv, cn := newTestServer(t)
 	writeAgentDef(t, srv, "narrow", "reads only", []string{"read", "agent"})
@@ -3309,12 +3305,27 @@ func TestChildToolsCannotExceedItsParent(t *testing.T) {
 	}
 }
 
-// TestResumedChildKeepsItsOwnList documents a deliberate gap rather than closing one. A child
-// resumed long after its parent is gone has no live parent to intersect with, so it keeps its
-// own definition's list as it was when it was opened. That is safe: the definition is the same
-// file the child ran under from the start, and resuming it cannot hand it a tool it did not
-// already have the run of. Only the agent tool stays denied, since that deny does not depend on
-// the parent at all.
+// wantBoundedChild is the assertion both TestResumedChildKeepsItsOwnList and
+// TestForkedChildKeepsItsOwnList make on got: exactly what the child held live (read), never
+// what its own "wide" definition would have handed it unintersected (bash, edit, write), and
+// never the agent tool regardless.
+func wantBoundedChild(t *testing.T, how string, got []string) {
+	t.Helper()
+	if !slices.Contains(got, "read") {
+		t.Fatalf("%s child lost read, which it held live: %v", how, got)
+	}
+	for _, banned := range []string{"bash", "edit", "write", "agent"} {
+		if slices.Contains(got, banned) {
+			t.Fatalf("a %s child holds %q, which its parent never gave it: %v", how, banned, got)
+		}
+	}
+}
+
+// TestResumedChildKeepsItsOwnList is rudy-ef4 round 2: applyAgentFromLog used to recompute the
+// child's tools from its own definition because it has no live parent to intersect against,
+// which handed a resumed child back exactly what the live intersection had removed. The
+// resolved set is now recorded on session_opened at open time and replayed here instead of
+// recomputed, so a resumed child holds exactly what it held live.
 func TestResumedChildKeepsItsOwnList(t *testing.T) {
 	srv, cn := newTestServer(t)
 	writeAgentDef(t, srv, "narrow", "reads only", []string{"read", "agent"})
@@ -3325,18 +3336,26 @@ func TestResumedChildKeepsItsOwnList(t *testing.T) {
 
 	// Force a cold reload: close the only connection the child has (the opener's, kept open
 	// so the live case above can inspect it) so the next resume finds it gone from s.live and
-	// reloads it from disk through applyAgentFromLog, which is where the parent link is lost.
+	// reloads it from disk through applyAgentFromLog.
 	srv.op.closeAll()
 
-	got := toolNames(t, srv, child)
-	for _, want := range []string{"read", "bash", "edit", "write"} {
-		if !slices.Contains(got, want) {
-			t.Fatalf("resumed child lost %q from its own definition: %v", want, got)
-		}
-	}
-	if slices.Contains(got, "agent") {
-		t.Fatalf("a resumed child still sees the agent tool: %v", got)
-	}
+	wantBoundedChild(t, "resumed", driveTurn(t, srv, child))
+}
+
+// TestForkedChildKeepsItsOwnList is TestResumedChildKeepsItsOwnList's fork counterpart: forkAt
+// reaches the session through the very same applyAgentFromLog, and a fork inherits the
+// original's session_opened entry, tools field included, rather than writing its own.
+func TestForkedChildKeepsItsOwnList(t *testing.T) {
+	srv, cn := newTestServer(t)
+	writeAgentDef(t, srv, "narrow", "reads only", []string{"read", "agent"})
+	writeAgentDef(t, srv, "wide", "everything", nil)
+
+	parent := openSession(t, cn, sessionOpenParams{Agent: "narrow"})
+	child := openChildSession(t, cn, parent, "wide")
+	srv.op.closeAll()
+
+	fork := forkSession(t, srv, child)
+	wantBoundedChild(t, "forked", driveTurn(t, srv, fork))
 }
 
 // TestOrphanedSessionClosesWhenItsTurnEnds: the last connection can leave while a turn is

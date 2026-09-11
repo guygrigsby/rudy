@@ -1132,9 +1132,14 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	if !mode.Valid() || !thinking.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "invalid mode or thinking level")
 	}
+	// Resolved now, while the parent (if any) is still live, and persisted on the entry below:
+	// a resume or a fork brings this session back long after that parent may be gone, and
+	// applyAgentFromLog reads this recorded value rather than trying to recompute it (ADR
+	// 0028, rudy-ef4).
+	allow := resolveTools(parent, def)
 	opened := session.SessionOpened{
 		SchemaVersion: 1, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
-		Thinking: thinking, Mode: mode, Agent: def.Name,
+		Thinking: thinking, Mode: mode, Agent: def.Name, Tools: allow,
 	}
 	if parent != nil {
 		opened.ParentSessionID, opened.ParentToolUseID = parent.sess.ID().String(), p.Parent.ToolUseID
@@ -1145,7 +1150,7 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	}
 	ls := newLive(sess, m)
 	ls.parent = parent
-	s.applyAgent(ls, def)
+	s.applyAgent(ls, def, allow)
 	s.fireSessionOpened(s.ctx, ls, false)
 	return s.installAndAttach(cn, ls), nil
 }
@@ -1178,26 +1183,36 @@ func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agen
 	return agentdef.Resolve(defs, name)
 }
 
-// applyAgent stamps a definition onto a session that is not yet shared: its tool view, its
-// system prompt and its step limit. A child never sees the agent tool, even when its
-// definition lists it, which is what keeps subagent depth at one: with no tool to call, a child
-// cannot open a grandchild.
+// applyAgent stamps a definition and an already-resolved tool list onto a session that is not
+// yet shared: its tool view, its system prompt and its step limit. A child never sees the agent
+// tool, even when allow lists it, which is what keeps subagent depth at one: with no tool to
+// call, a child cannot open a grandchild.
 //
-// A child's list is also intersected with its parent's. Restricting an agent is done by
-// removing tools from its list, so delegation must not hand out what the parent does not hold,
-// or the restriction means nothing (ADR 0028, rudy-ef4).
-func (s *Server) applyAgent(ls *liveSession, def agentdef.Definition) {
+// allow is never computed here. At open time it is resolveTools's intersection against the
+// live parent; on a reload it is whatever session_opened recorded. applyAgent only stamps, so
+// it needs nothing about the parent's liveness (ADR 0028, rudy-ef4).
+func (s *Server) applyAgent(ls *liveSession, def agentdef.Definition, allow []string) {
 	var deny []string
-	allow := def.Tools
 	if ls.parent != nil || openedAsChild(ls.entries) {
 		deny = []string{"agent"}
-		allow = intersectTools(allow, parentToolNames(ls))
 	}
 	if allow != nil || deny != nil {
 		ls.tools = plugin.NewToolView(s.d.Plugins, allow, deny)
 	}
 	ls.system = def.Prompt
 	ls.maxSteps = def.MaxTurns
+}
+
+// resolveTools is the intersection a fresh session.open needs: the definition's list narrowed
+// by the live parent's own effective set, when there is one. It runs once, at open time, and
+// its result is persisted on session_opened rather than recomputed on a later resume or fork,
+// since the parent may be gone by then and recomputing from the definition alone would hand
+// back exactly what the intersection removed (ADR 0028, rudy-ef4).
+func resolveTools(parent *liveSession, def agentdef.Definition) []string {
+	if parent == nil {
+		return def.Tools
+	}
+	return intersectTools(def.Tools, parentToolNames(parent))
 }
 
 // intersectTools narrows want by have. A nil want means every tool, so the result is have; a
@@ -1218,14 +1233,12 @@ func intersectTools(want, have []string) []string {
 	return out
 }
 
-// parentToolNames is the parent's effective list, or nil when the parent holds every tool. It
-// reads the live parent rather than the log: a child is opened while its parent is live, and
-// the parent's own view is already the intersection of everything above it.
-func parentToolNames(ls *liveSession) []string {
-	if ls.parent == nil || ls.parent.tools == nil {
+// parentToolNames is parent's effective list, or nil when it holds every tool.
+func parentToolNames(parent *liveSession) []string {
+	if parent.tools == nil {
 		return nil
 	}
-	all := ls.parent.tools.Tools()
+	all := parent.tools.Tools()
 	out := make([]string, 0, len(all))
 	for _, t := range all {
 		out = append(out, t.Name)
@@ -1233,12 +1246,14 @@ func parentToolNames(ls *liveSession) []string {
 	return out
 }
 
-// applyAgentFromLog stamps the agent definition a session already carries in its log onto a
-// liveSession that is not yet shared: the cold-load and fork paths, where the name comes from
-// the log rather than the request. The definition is a file and not part of the log, so it is
-// re-read here; one that has since been deleted falls back to the default rather than
-// refusing to bring the session back, since its entries are still perfectly readable and a
-// lost file is not the user's fault.
+// applyAgentFromLog stamps the agent definition and tool set a session already carries in its
+// log onto a liveSession that is not yet shared: the cold-load and fork paths, where both come
+// from the log rather than the request. The definition is a file and not part of the log, so it
+// is re-read here; one that has since been deleted falls back to the default rather than
+// refusing to bring the session back, since its entries are still perfectly readable and a lost
+// file is not the user's fault. The tool set is not re-read from that file: it is whatever
+// session_opened recorded, which is what this session actually ran under and does not depend on
+// a parent that may no longer exist (ADR 0028, rudy-ef4).
 func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 	name := ls.sess.Agent()
 	ws := deriveInfo(ls.sess.ID(), ls.entries).Workspace
@@ -1247,7 +1262,7 @@ func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "agent " + name + " is no longer defined; continuing under the default agent"})
 		def, _ = s.resolveAgent(cn, ws, "")
 	}
-	s.applyAgent(ls, def)
+	s.applyAgent(ls, def, ls.sess.Tools())
 }
 
 // parentSessionIDOf reads the parent a session was opened under off the log rather than off

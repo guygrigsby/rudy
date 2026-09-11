@@ -297,6 +297,15 @@ func (s *Session) Agent() string {
 	return s.openedLocked().Agent
 }
 
+// Tools is the resolved tool set session_opened recorded: nil for every tool, an empty slice
+// for none. A cold reload reads this rather than recomputing it from the agent definition and
+// the parent, which may be long gone (ADR 0028, rudy-ef4).
+func (s *Session) Tools() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openedLocked().Tools
+}
+
 func (s *Session) Model() ModelRef {
 	s.mu.Lock()
 	defer s.mu.Unlock()

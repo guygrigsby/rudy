@@ -130,6 +130,7 @@ Value object, payload of a `session_opened` entry.
 | `agent` | string | The agent definition name this session runs under; `default` when none |
 | `parentSessionID` | ULID or empty | The session whose `tool_use` opened this one; empty means a root session |
 | `parentToolUseID` | string | The `tool_use` id in the parent that opened this one; empty exactly when `parentSessionID` is empty |
+| `tools` | `[string]` or null | The session's resolved tool set: the agent definition's list intersected with the parent's effective set, before the agent tool's own deny. Null means every tool, an empty list means none. Recorded at open time rather than recomputed on resume or fork, since the parent may be gone by then |
 
 ## ForkPoint
 
