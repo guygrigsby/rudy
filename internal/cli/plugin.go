@@ -73,11 +73,14 @@ func newPluginInstallCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			out := cmd.OutOrStdout()
+			s.Out = out
+			_, _ = fmt.Fprintf(out, "installing %s: its manifest may run a build command\n", args[0])
 			inst, m, err := s.Install(cmd.Context(), args[0], time.Now())
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "installed %s %s at %s\n", m.Name, m.Version, commitOrSource(inst))
+			_, err = fmt.Fprintf(out, "installed %s %s at %s\n", m.Name, m.Version, commitOrSource(inst))
 			return err
 		},
 	}
@@ -188,6 +191,7 @@ func newPluginUpdateCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			s.Out = cmd.OutOrStdout()
 			inst, err := s.Update(cmd.Context(), args[0], time.Now())
 			if err != nil {
 				return err

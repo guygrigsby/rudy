@@ -78,10 +78,15 @@ func TestPluginInstallPrintsNameVersionAndCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("install: %v\n%s", err, out)
 	}
-	if !strings.HasPrefix(out, "installed hello 0.1.0 at ") {
+	if !strings.Contains(out, "build command") {
+		t.Fatalf("output missing the pre-install build warning: %q", out)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.HasPrefix(last, "installed hello 0.1.0 at ") {
 		t.Fatalf("output = %q", out)
 	}
-	commitPart := strings.TrimSuffix(strings.TrimPrefix(out, "installed hello 0.1.0 at "), "\n")
+	commitPart := strings.TrimPrefix(last, "installed hello 0.1.0 at ")
 	if len(commitPart) != 8 {
 		t.Fatalf("commit part = %q, want 8 characters", commitPart)
 	}

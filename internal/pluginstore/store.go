@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,7 +41,22 @@ type lockFile struct {
 
 // Store is the plugin checkouts and their lock file under one XDG data root: checkouts live
 // at Root/plugins/<name>, the lock at Root/plugins.lock.toml.
-type Store struct{ Root string }
+type Store struct {
+	Root string
+	// Out receives a manifest's build command output as Install and Update run it. Left nil
+	// everywhere but the CLI, which wires in its own stdout so the operator watching the
+	// command sees what the build does.
+	Out io.Writer
+}
+
+// buildOut is where a manifest's build command output goes: Out when the caller set one,
+// discarded otherwise, so Install and Update never need to nil-check it themselves.
+func (s *Store) buildOut() io.Writer {
+	if s.Out != nil {
+		return s.Out
+	}
+	return io.Discard
+}
 
 // New is a Store over root, normally $XDG_DATA_HOME/rudy. New does no filesystem clean-up
 // itself: it runs on every session boot, through DisabledFromLock, and a session starting
@@ -237,6 +253,10 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %s: %w", recorded, err)
 	}
+	announceBuild(s.buildOut(), m.Name, m.Build)
+	if err := runBuild(ctx, stage, m.Build, s.buildOut()); err != nil {
+		return Installed{}, plugin.Manifest{}, fmt.Errorf("pluginstore: %w", err)
+	}
 
 	locked, err := s.Read()
 	if err != nil {
@@ -355,12 +375,49 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 		}
 		inst.Commit = ""
 	}
+
+	m, err := plugin.ReadManifest(dir)
+	if err != nil {
+		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+	}
+	announceBuild(s.buildOut(), name, m.Build)
+	if err := runBuild(ctx, dir, m.Build, s.buildOut()); err != nil {
+		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+	}
+
 	inst.InstalledAt = now
 	locked[name] = inst
 	if err := s.Write(locked); err != nil {
 		return Installed{}, err
 	}
 	return inst, nil
+}
+
+// runBuild runs a manifest's build command once in the staged checkout, with the checkout as
+// its working directory and the operator's environment. It executes arbitrary code by
+// construction: that is what installing from a source means, and the install command says so
+// before it happens rather than implying otherwise (ADR 0025).
+func runBuild(ctx context.Context, dir, command string, out io.Writer) error {
+	if strings.TrimSpace(command) == "" {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	cmd.Dir = dir
+	cmd.Stdout = out
+	cmd.Stderr = out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("build %q: %w", command, err)
+	}
+	return nil
+}
+
+// announceBuild tells the operator a manifest's build is about to run, before runBuild
+// actually executes it. A manifest with no build command says nothing.
+func announceBuild(out io.Writer, name, command string) {
+	if strings.TrimSpace(command) == "" {
+		return
+	}
+	_, _ = fmt.Fprintf(out, "building %s: %s\n", name, command)
 }
 
 // recopy replaces dir with a fresh copy of source, staged beside dir first so a failed copy

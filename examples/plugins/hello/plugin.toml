@@ -1,5 +1,6 @@
 name = "hello"
 version = "0.1.0"
 protocol_version = 1
-command = "hello"
+command = "./hello"
+build = "go build -o hello ."
 description = "Example spawned plugin"

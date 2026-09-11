@@ -2,6 +2,7 @@ package pluginstore
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,14 +12,37 @@ import (
 	"time"
 )
 
-// helloManifest is a valid plugin.toml matching examples/plugins/hello, kept as a literal
-// here so these tests do not depend on the working directory a test binary happens to run
-// from.
+// helloManifest is a valid plugin.toml for a plugin named hello, kept as a literal here so
+// these tests do not depend on the working directory a test binary happens to run from. It
+// carries no build command, unlike the real examples/plugins/hello/plugin.toml: newSourceRepo
+// commits only plugin.toml, not the example's main.go, so a real go build here would have
+// nothing to build.
 const helloManifest = "name = \"hello\"\n" +
 	"version = \"0.1.0\"\n" +
 	"protocol_version = 1\n" +
 	"command = \"hello\"\n" +
 	"description = \"Example spawned plugin\"\n"
+
+// newTestStore is New over a fresh temp root, the construction every Install/Update test in
+// this file wants.
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	return New(t.TempDir())
+}
+
+// PluginDir exposes checkoutDir to tests that need to look inside a checkout after Install or
+// Update, without duplicating its join.
+func (s *Store) PluginDir(name string) string { return s.checkoutDir(name) }
+
+// Lock is the lock file read straight from disk, for tests asserting on a raw entry's
+// presence rather than going through Read's per-entry copy.
+func (s *Store) Lock() lockFile {
+	locked, err := s.Read()
+	if err != nil {
+		return lockFile{}
+	}
+	return lockFile{Plugins: locked}
+}
 
 var commitRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -87,6 +111,100 @@ func wantHeadCommit(t *testing.T, dir string) string {
 		t.Fatal(err)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// TestInstallRunsTheManifestsBuild covers rudy-kab: a manifest's build command has to
+// actually run in the staged checkout, not merely be parsed and carried around.
+func TestInstallRunsTheManifestsBuild(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, `name = "built"
+version = "0.1.0"
+protocol_version = 1
+command = "./built"
+build = "printf '#!/bin/sh\necho hi\n' > built && chmod +x built"
+`)
+	s := newTestStore(t)
+	inst, _, err := s.Install(context.Background(), src, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.PluginDir(inst.Name), "built")); err != nil {
+		t.Fatalf("build did not produce the binary: %v", err)
+	}
+}
+
+// TestAFailingBuildRefusesTheInstall covers the other half: a build that fails must refuse
+// the install outright, naming the step and the exit code, and leave neither a checkout nor
+// a lock entry behind.
+func TestAFailingBuildRefusesTheInstall(t *testing.T) {
+	requireGit(t)
+	src := newSourceRepo(t, `name = "broken"
+version = "0.1.0"
+protocol_version = 1
+command = "./nothing"
+build = "exit 3"
+`)
+	s := newTestStore(t)
+	_, _, err := s.Install(context.Background(), src, time.Now())
+	if err == nil {
+		t.Fatal("a failing build was accepted")
+	}
+	if !strings.Contains(err.Error(), "build") || !strings.Contains(err.Error(), "3") {
+		t.Fatalf("error names neither the step nor the exit code: %v", err)
+	}
+	if _, ok := s.Lock().Plugins["broken"]; ok {
+		t.Fatal("a plugin whose build failed was written to the lock")
+	}
+	if _, err := os.Stat(s.PluginDir("broken")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a failed install left its checkout behind")
+	}
+}
+
+// TestUpdateRunsTheBuildAgain installs a plugin whose build writes a marker, moves the
+// source's build command to write a different marker, updates, and asserts the new marker
+// replaced the old one. A git reset leaves an untracked file (the built marker) alone, so
+// this only passes if Update actually reran the build rather than keeping install's stale
+// artefact.
+func TestUpdateRunsTheBuildAgain(t *testing.T) {
+	requireGit(t)
+	const name = "versioned"
+	manifest := func(echo string) string {
+		return "name = \"" + name + "\"\n" +
+			"version = \"0.1.0\"\n" +
+			"protocol_version = 1\n" +
+			"command = \"./versioned\"\n" +
+			"build = \"echo " + echo + " > marker\"\n"
+	}
+	src := newSourceRepo(t, manifest("v1"))
+	s := newTestStore(t)
+	if _, _, err := s.Install(context.Background(), src, time.Now()); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	marker := filepath.Join(s.PluginDir(name), "marker")
+	b, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("marker not written by install's build: %v", err)
+	}
+	if strings.TrimSpace(string(b)) != "v1" {
+		t.Fatalf("marker = %q, want v1", b)
+	}
+
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(manifest("v2")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, src, "add", "-A")
+	runGitT(t, src, "commit", "-q", "-m", "bump build")
+
+	if _, err := s.Update(context.Background(), name, time.Now()); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	b, err = os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("marker missing after update: %v", err)
+	}
+	if strings.TrimSpace(string(b)) != "v2" {
+		t.Fatalf("marker = %q, want v2: update did not rerun the build", b)
+	}
 }
 
 func TestInstallClonesGitSourceAndRecordsLock(t *testing.T) {
