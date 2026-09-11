@@ -50,17 +50,31 @@ func pluginStore() (*pluginstore.Store, error) {
 	return pluginstore.New(config.XDG(os.Getenv, home).Data), nil
 }
 
-// commitOrSource is what rudy plugin install and update print after "at": the first eight
-// characters of the checked-out commit for a git source, or the source itself when inst has
-// no commit because it was copied from a plain directory rather than cloned.
-func commitOrSource(inst pluginstore.Installed) string {
-	if inst.Commit == "" {
-		return inst.Source
+// resolvedAt is what rudy install and rudy plugins update print after "at": the reproducibility
+// record of the kind that was installed, since that is the whole point of recording one. git
+// resolves to a commit, shortened to the first eight characters; go and https resolve to a
+// digest, printed whole, because a truncated sum is not a sum. A path has neither, and a lock
+// written before a column existed can be missing one, so both fall back to the source itself.
+func resolvedAt(inst pluginstore.Installed) string {
+	switch inst.Kind {
+	case pluginstore.KindGit:
+		if inst.Commit != "" {
+			return shortCommit(inst.Commit)
+		}
+	case pluginstore.KindGo, pluginstore.KindHTTPS:
+		if inst.Digest != "" {
+			return inst.Digest
+		}
 	}
-	if len(inst.Commit) > 8 {
-		return inst.Commit[:8]
+	return inst.Source
+}
+
+// shortCommit is a commit sha at the length git itself abbreviates to.
+func shortCommit(commit string) string {
+	if len(commit) > 8 {
+		return commit[:8]
 	}
-	return inst.Commit
+	return commit
 }
 
 // newInstallCmd is install, mounted twice: as the top-level `rudy install` (ADR 0025
@@ -70,7 +84,7 @@ func commitOrSource(inst pluginstore.Installed) string {
 func newInstallCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "install <source>",
-		Short: "install a plugin from a git URL or a local path",
+		Short: "install a plugin from a Go module, a git repository, a tarball URL or a local path",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			s, err := pluginStore()
@@ -84,7 +98,7 @@ func newInstallCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(out, "installed %s %s at %s\n", m.Name, m.Version, commitOrSource(inst))
+			_, err = fmt.Fprintf(out, "installed %s %s at %s\n", m.Name, m.Version, resolvedAt(inst))
 			return err
 		},
 	}
@@ -139,14 +153,17 @@ func renderPlugins(w io.Writer, s *pluginstore.Store, locked map[string]pluginst
 	}
 	sort.Strings(names)
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "NAME\tVERSION\tENABLED\tKIND\tREF\tCOMMIT\tSOURCE")
+	// DIGEST is a column of its own rather than sharing one with COMMIT: they are what makes a
+	// go or https install reproducible, and a listing that shows neither leaves an operator with
+	// no way to see what their plugins actually resolved to.
+	_, _ = fmt.Fprintln(tw, "NAME\tVERSION\tENABLED\tKIND\tREF\tCOMMIT\tDIGEST\tSOURCE")
 	for _, name := range names {
 		inst := locked[name]
 		version := "-"
 		if m, err := plugin.ReadManifest(filepath.Join(s.Root, "plugins", name)); err == nil {
 			version = m.Version
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%t\t%s\t%s\t%s\t%s\n", name, version, inst.Enabled, inst.Kind, inst.Ref, inst.Commit, inst.Source)
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%t\t%s\t%s\t%s\t%s\t%s\n", name, version, inst.Enabled, inst.Kind, inst.Ref, inst.Commit, inst.Digest, inst.Source)
 	}
 	return tw.Flush()
 }
@@ -188,7 +205,7 @@ func pluginSetEnabledRunE(on bool, verb string) func(cmd *cobra.Command, args []
 func newPluginUpdateCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "update <name>",
-		Short: "pull the latest commit, or re-copy the source, for an installed plugin",
+		Short: "re-resolve an installed plugin's source and rebuild it",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			s, err := pluginStore()
@@ -196,11 +213,17 @@ func newPluginUpdateCommand() *cobra.Command {
 				return err
 			}
 			s.Out = cmd.OutOrStdout()
-			inst, err := s.Update(cmd.Context(), args[0], time.Now())
+			inst, changed, err := s.Update(cmd.Context(), args[0], time.Now())
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "updated %s at %s\n", args[0], commitOrSource(inst))
+			// "updated" for an https digest that never moved, or a pinned ref that re-resolved
+			// to the same commit, claims something happened that did not.
+			verb := "unchanged"
+			if changed {
+				verb = "updated"
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s %s at %s\n", verb, args[0], resolvedAt(inst))
 			return err
 		},
 	}

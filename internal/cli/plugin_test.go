@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/guygrigsby/rudy/internal/pluginstore"
 )
 
 const cliHelloManifest = "name = \"hello\"\n" +
@@ -179,5 +181,94 @@ func TestPluginUninstallUnknownNameExitsWithMessage(t *testing.T) {
 	_, err := runPlugin(t, "plugin", "uninstall", "nope")
 	if err == nil || err.Error() != "no plugin named nope" {
 		t.Fatalf("err = %v, want %q", err, "no plugin named nope")
+	}
+}
+
+// TestResolvedAtPrintsEachKindsRecord covers what install and update print after "at". A go: or
+// https install records no commit at all, so printing the source for anything without one threw
+// away the digest that is the entire reproducibility record of those two kinds: "at
+// go:x@v0.2.0" tells an operator only what they already typed.
+func TestResolvedAtPrintsEachKindsRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		inst pluginstore.Installed
+		want string
+	}{
+		{"git shortens the commit", pluginstore.Installed{Kind: pluginstore.KindGit, Commit: "0123456789abcdef0123", Source: "git:example.com/o/r"}, "01234567"},
+		{"go prints the whole digest", pluginstore.Installed{Kind: pluginstore.KindGo, Digest: "v0.2.0 h1:Zm9vYmFy=", Source: "go:example.com/m@v0.2.0"}, "v0.2.0 h1:Zm9vYmFy="},
+		{"https prints the whole digest", pluginstore.Installed{Kind: pluginstore.KindHTTPS, Digest: "sha256:d0be", Source: "https://example.com/p.tar.gz"}, "sha256:d0be"},
+		{"a path has neither", pluginstore.Installed{Kind: pluginstore.KindPath, Source: "/src/hello"}, "/src/hello"},
+		{"a git entry with no commit falls back", pluginstore.Installed{Kind: pluginstore.KindGit, Source: "git:example.com/o/r"}, "git:example.com/o/r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolvedAt(tc.inst); got != tc.want {
+				t.Fatalf("resolvedAt = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPluginListPrintsTheDigestColumn covers the same gap in the listing: without a DIGEST
+// column there is nowhere for a go: or https entry's resolved sum to appear at all.
+// renderPlugins is called directly, with a lock holding one entry per kind, since installing a
+// real go module or tarball needs a module proxy or a TLS server this command has no way to be
+// handed. The store is an empty root, so every version reads "-": the manifest lookup is not
+// what is under test here.
+func TestPluginListPrintsTheDigestColumn(t *testing.T) {
+	locked := map[string]pluginstore.Installed{
+		"agit":   {Name: "agit", Kind: pluginstore.KindGit, Ref: "v1", Commit: "0123456789abcdef", Source: "git:example.com/o/r@v1", Enabled: true},
+		"bgo":    {Name: "bgo", Kind: pluginstore.KindGo, Ref: "v0.2.0", Digest: "v0.2.0 h1:Zm9vYmFy=", Source: "go:example.com/m@v0.2.0", Enabled: true},
+		"chttps": {Name: "chttps", Kind: pluginstore.KindHTTPS, Digest: "sha256:d0be", Source: "https://example.com/p.tar.gz", Enabled: true},
+	}
+	var out bytes.Buffer
+	if err := renderPlugins(&out, pluginstore.New(t.TempDir()), locked); err != nil {
+		t.Fatalf("renderPlugins: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("output = %q", out.String())
+	}
+	if !strings.Contains(lines[0], "DIGEST") {
+		t.Fatalf("header = %q, want a DIGEST column", lines[0])
+	}
+	for i, want := range []string{"0123456789abcdef", "v0.2.0 h1:Zm9vYmFy=", "sha256:d0be"} {
+		if !strings.Contains(lines[i+1], want) {
+			t.Fatalf("row = %q, want it to carry %q", lines[i+1], want)
+		}
+	}
+}
+
+// TestPluginUpdateSaysUnchangedWhenNothingMoved covers the update line itself, through the real
+// command: "updated" printed for a re-resolve that landed on the commit already installed
+// claims something happened that did not, and the operator has no other signal that it didn't.
+func TestPluginUpdateSaysUnchangedWhenNothingMoved(t *testing.T) {
+	requireGitCLI(t)
+	tempXDG(t)
+	src := newPluginSourceRepo(t)
+	if _, err := runPlugin(t, "install", "git:"+src); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	out, err := runPlugin(t, "plugin", "update", "hello")
+	if err != nil {
+		t.Fatalf("update: %v\n%s", err, out)
+	}
+	if !strings.HasPrefix(out, "unchanged hello at ") {
+		t.Fatalf("update with nothing new upstream printed %q, want it to say unchanged", out)
+	}
+
+	// The source moves on, and the same command says so.
+	if err := os.WriteFile(filepath.Join(src, "plugin.toml"), []byte(cliHelloManifest+"# v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitCLI(t, src, "add", "-A")
+	runGitCLI(t, src, "commit", "-q", "-m", "second")
+
+	out, err = runPlugin(t, "plugin", "update", "hello")
+	if err != nil {
+		t.Fatalf("update: %v\n%s", err, out)
+	}
+	if !strings.HasPrefix(out, "updated hello at ") {
+		t.Fatalf("update across a new commit printed %q, want it to say updated", out)
 	}
 }

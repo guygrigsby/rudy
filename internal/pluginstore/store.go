@@ -391,25 +391,30 @@ func (s *Store) SetEnabled(name string, on bool) error {
 // the lock. A build that fails leaves the live checkout, and the lock, exactly as they were:
 // Update either advances both together or advances neither. Every error path removes the
 // stage.
-func (s *Store) Update(ctx context.Context, name string, now time.Time) (Installed, error) {
+//
+// changed reports whether anything actually moved: false when an https digest, a git commit or
+// a go module's digest re-resolved to exactly what the lock already recorded. That is what lets
+// the CLI say "unchanged" rather than claim an update that did nothing. A path source has no
+// resolved value to compare, so it always reports changed.
+func (s *Store) Update(ctx context.Context, name string, now time.Time) (inst Installed, changed bool, err error) {
 	if err := validateName(name); err != nil {
-		return Installed{}, err
+		return Installed{}, false, err
 	}
 	if err := os.MkdirAll(s.pluginsDir(), 0o700); err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+		return Installed{}, false, fmt.Errorf("pluginstore: %w", err)
 	}
 	s.sweepStaleStages()
 	locked, err := s.Read()
 	if err != nil {
-		return Installed{}, err
+		return Installed{}, false, err
 	}
 	inst, ok := locked[name]
 	if !ok {
-		return Installed{}, notInstalled(name)
+		return Installed{}, false, notInstalled(name)
 	}
 	src, err := ParseSource(inst.Source)
 	if err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+		return Installed{}, false, fmt.Errorf("pluginstore: %w", err)
 	}
 	// kind and ref are the lock's own columns, not re-derived from source: a checkout
 	// installed before the kind column existed can have a source string that alone reads
@@ -420,7 +425,7 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 
 	stage, err := os.MkdirTemp(s.pluginsDir(), ".update-*")
 	if err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+		return Installed{}, false, fmt.Errorf("pluginstore: %w", err)
 	}
 	keep := false
 	defer func() {
@@ -434,37 +439,40 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 		// The re-download matched what is already recorded: leave the live checkout and the
 		// lock exactly as they are, with no build or swap attempted, rather than stage, build
 		// and swap in a byte-identical copy.
-		return inst, nil
+		return inst, false, nil
 	}
 	if err != nil {
-		return Installed{}, err
+		return Installed{}, false, err
 	}
 	m, err := plugin.ReadManifest(stage)
 	if err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %s: %w", src.AsTyped, err)
+		return Installed{}, false, fmt.Errorf("pluginstore: %s: %w", src.AsTyped, err)
 	}
 	announceBuild(s.buildOut(), name, m.Build)
 	if err := runBuild(ctx, stage, m.Build, s.buildOut()); err != nil {
-		return Installed{}, fmt.Errorf("pluginstore: %w", err)
+		return Installed{}, false, fmt.Errorf("pluginstore: %w", err)
 	}
 
 	if err := swapCheckout(s.checkoutDir(name), stage); err != nil {
-		return Installed{}, err
+		return Installed{}, false, err
 	}
 	keep = true
 
+	changed = true
 	switch src.Kind {
 	case KindGit:
+		changed = resolved != inst.Commit
 		inst.Commit = resolved
 	case KindGo, KindHTTPS:
+		changed = resolved != inst.Digest
 		inst.Digest = resolved
 	}
 	inst.InstalledAt = now
 	locked[name] = inst
 	if err := s.Write(locked); err != nil {
-		return Installed{}, err
+		return Installed{}, false, err
 	}
-	return inst, nil
+	return inst, changed, nil
 }
 
 // swapCheckout replaces dir's live contents with stage's. When dir exists, it is renamed

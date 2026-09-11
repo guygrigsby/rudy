@@ -521,12 +521,15 @@ build = "printf x >> %s"
 	mu.Lock()
 	current = tgzB
 	mu.Unlock()
-	updated, err := s.Update(context.Background(), "hello", time.Now())
+	updated, changed, err := s.Update(context.Background(), "hello", time.Now())
 	if err != nil {
 		t.Fatalf("Update to a changed tarball: %v", err)
 	}
 	if updated.Digest == firstDigest {
 		t.Fatal("Digest did not change after the upstream tarball changed")
+	}
+	if !changed {
+		t.Fatal("changed = false after the upstream tarball changed")
 	}
 	assertFileContent(t, buildLog, "xx")
 	if _, err := os.Stat(filepath.Join(s.PluginDir("hello"), "extra")); err != nil {
@@ -535,12 +538,16 @@ build = "printf x >> %s"
 
 	// Nothing new upstream: the same bytes are re-downloaded, the digest matches what's already
 	// recorded, and neither the build nor the swap runs again.
-	again, err := s.Update(context.Background(), "hello", time.Now())
+	again, changedAgain, err := s.Update(context.Background(), "hello", time.Now())
 	if err != nil {
 		t.Fatalf("Update with an unchanged tarball: %v", err)
 	}
 	if again.Digest != updated.Digest {
 		t.Fatalf("Digest = %q, want it unchanged at %q", again.Digest, updated.Digest)
+	}
+	// What the CLI prints "unchanged" from: nothing was rebuilt and nothing was swapped.
+	if changedAgain {
+		t.Fatal("changed = true for a re-download whose digest matched the lock")
 	}
 	assertFileContent(t, buildLog, "xx")
 }

@@ -233,7 +233,7 @@ func TestUpdateAtLatestAdvancesAcrossANewRelease(t *testing.T) {
 	second := "v0.2.0"
 	writeProxyVersion(t, proxyDir, module, second)
 
-	if _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
+	if _, _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
 		t.Fatalf("Update at latest across a new release: %v", err)
 	}
 	after := s.Lock().Plugins["hello"]
@@ -263,7 +263,7 @@ func TestUpdateRunsAGoModuleThroughTheFullDispatch(t *testing.T) {
 	}
 	before := s.Lock().Plugins["hello"]
 
-	if _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
+	if _, _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	after := s.Lock().Plugins["hello"]

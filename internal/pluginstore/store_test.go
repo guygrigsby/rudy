@@ -206,7 +206,7 @@ func TestUpdateRunsTheBuildAgain(t *testing.T) {
 	runGitT(t, src, "add", "-A")
 	runGitT(t, src, "commit", "-q", "-m", "bump build")
 
-	if _, err := s.Update(context.Background(), name, time.Now()); err != nil {
+	if _, _, err := s.Update(context.Background(), name, time.Now()); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	b, err = os.ReadFile(marker)
@@ -253,7 +253,7 @@ build = "exit 3"
 	runGitT(t, src, "add", "-A")
 	runGitT(t, src, "commit", "-q", "-m", "break the build")
 
-	if _, err := s.Update(context.Background(), name, time.Now()); err == nil {
+	if _, _, err := s.Update(context.Background(), name, time.Now()); err == nil {
 		t.Fatal("an update whose build fails was accepted")
 	} else if !strings.Contains(err.Error(), "build") || !strings.Contains(err.Error(), "3") {
 		t.Fatalf("error names neither the step nor the exit code: %v", err)
@@ -458,12 +458,15 @@ func TestUpdateMovesCommitForwardForAClone(t *testing.T) {
 		t.Fatal("test setup: second commit did not change HEAD")
 	}
 
-	updated, err := s.Update(context.Background(), "hello", time.Now())
+	updated, changed, err := s.Update(context.Background(), "hello", time.Now())
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if updated.Commit != want {
 		t.Fatalf("Commit after Update = %s, want %s", updated.Commit, want)
+	}
+	if !changed {
+		t.Fatal("changed = false for an update that moved to a new commit")
 	}
 	b, err := os.ReadFile(filepath.Join(s.Root, "plugins", "hello", "plugin.toml"))
 	if err != nil {
@@ -483,7 +486,7 @@ func TestUpdateMovesCommitForwardForAClone(t *testing.T) {
 
 func TestUpdateUnknownName(t *testing.T) {
 	s := New(t.TempDir())
-	_, err := s.Update(context.Background(), "nope", time.Now())
+	_, _, err := s.Update(context.Background(), "nope", time.Now())
 	if err == nil || err.Error() != "no plugin named nope" {
 		t.Fatalf("err = %v, want %q", err, "no plugin named nope")
 	}
@@ -561,7 +564,7 @@ func TestUpdateRecopiesAPathSource(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "plugin.toml"), []byte(helloManifest+"# v2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	updated, err := s.Update(context.Background(), "hello", time.Now())
+	updated, _, err := s.Update(context.Background(), "hello", time.Now())
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -747,7 +750,7 @@ func TestInstallRecordsARelativePathSourceAsAbsolute(t *testing.T) {
 	if err := os.Chdir(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	updated, err := s.Update(context.Background(), "hello", time.Now())
+	updated, _, err := s.Update(context.Background(), "hello", time.Now())
 	if err != nil {
 		t.Fatalf("Update from a different cwd: %v", err)
 	}
@@ -939,7 +942,7 @@ func TestInstallAtARefStaysThereOnUpdate(t *testing.T) {
 		t.Fatal("test setup: the new commit did not move the source's tip")
 	}
 
-	updated, err := s.Update(context.Background(), "hello", time.Now())
+	updated, _, err := s.Update(context.Background(), "hello", time.Now())
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -1095,7 +1098,7 @@ func TestUpdateLeavesNoBackupDirectoryOnSuccess(t *testing.T) {
 	}
 	runGitT(t, src, "add", "-A")
 	runGitT(t, src, "commit", "-q", "-m", "second")
-	if _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
+	if _, _, err := s.Update(context.Background(), "hello", time.Now()); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if _, err := os.Stat(s.PluginDir("hello") + ".old"); !os.IsNotExist(err) {
@@ -1194,12 +1197,16 @@ func TestUpdateAtABareCommitPinStaysThere(t *testing.T) {
 	runGitT(t, src, "add", "-A")
 	runGitT(t, src, "commit", "-q", "-m", "third")
 
-	updated, err := s.Update(context.Background(), "hello", time.Now())
+	updated, changed, err := s.Update(context.Background(), "hello", time.Now())
 	if err != nil {
 		t.Fatalf("Update at a bare commit: %v", err)
 	}
 	if updated.Commit != first {
 		t.Fatalf("Commit after Update = %s, want it to stay at the pinned commit %s", updated.Commit, first)
+	}
+	// A pinned ref that re-resolves to the same commit moved nothing, whatever the source did.
+	if changed {
+		t.Fatal("changed = true for a pinned ref that re-resolved to the same commit")
 	}
 	b, err := os.ReadFile(filepath.Join(s.Root, "plugins", "hello", "plugin.toml"))
 	if err != nil {
