@@ -651,8 +651,9 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 	}
 	switch r.Method {
 	case protocol.MethodSessionAnswer:
-		// The server has the decision; nothing is left to put back.
-		m.turn.asked = nil
+		// The server has this one's decision; nothing is left to put back for it. Named by
+		// r.Name (rudy-9nc), not blanket-cleared: another question can still be in flight.
+		m.turn.clearAsked(parsePromptName(r.Name))
 	case protocol.MethodRegistryList, protocol.MethodRegistryRefresh:
 		var res protocol.RegistryListResult
 		if !m.result(r, &res) {
@@ -738,8 +739,10 @@ func (m *Model) callFailed(r CallResultMsg) tea.Cmd {
 	case r.Method == protocol.MethodSessionAnswer:
 		// The question came down when the answer went out and the server never got it:
 		// put it back rather than leave the turn waiting on a decision with nothing on
-		// screen to make it with.
-		m.reask()
+		// screen to make it with. Named by r.Name (rudy-9nc): only this one question goes
+		// back, whichever others are still standing or in flight.
+		sid, toolUseID := parsePromptName(r.Name)
+		m.reaskOne(sid, toolUseID)
 	case switchMethod(r.Method):
 		// The session that was being left is still here and still attached: nothing was
 		// closed, and what arrived while the switch was in flight was its own.

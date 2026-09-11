@@ -717,14 +717,14 @@ func TestAPickerTakesTheKeysAQuestionWants(t *testing.T) {
 	if h.m.pick == nil || h.m.pick.filter != "y" {
 		t.Fatalf("the picker takes the key the question wanted: picker %+v", h.m.pick)
 	}
-	if h.m.turn.prompt == nil {
+	if h.m.turn.focused() == nil {
 		t.Error("the question was not answered by a key the picker took")
 	}
 	h.press("escape")
 	if h.m.pick != nil {
 		t.Fatal("escape closes the picker")
 	}
-	if h.m.turn.prompt == nil {
+	if h.m.turn.focused() == nil {
 		t.Fatal("the question the picker hid is still standing")
 	}
 	h.press("y")

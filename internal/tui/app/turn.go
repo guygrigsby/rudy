@@ -1,6 +1,7 @@
 package app
 
 import (
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -33,21 +34,95 @@ const (
 const answerReason = "asker"
 
 // turnControl is what the client knows about the turn: the state the server last
-// reported and the turn it belongs to, when the last Esc the table acted on landed, the
-// permission question standing on screen and the one this client has answered but not yet
+// reported and the turn it belongs to, when the last Esc the table acted on landed, every
+// permission question standing on screen and the ones this client has answered but not yet
 // heard back about.
 type turnControl struct {
 	state   string
 	turnID  string
 	lastEsc time.Time
-	prompt  *protocol.PermissionRequested
-	// asked is the question whose answer is in flight, kept so a call that never reached
-	// the server can put the question back.
-	asked *protocol.PermissionRequested
+	// prompts are every standing question this client knows about, keyed the same way the
+	// server keys its own standing set (session_live.go): session id and tool_use id. One
+	// slot stopped being enough once tool calls in an assistant message started running
+	// concurrently (ADR 0028 wired the runner for it; task 7 is what makes a subagent's own
+	// questions reach this client too), since more than one can be outstanding on this
+	// session alone, before a subagent adds its own on top (rudy-9nc).
+	prompts map[promptKey]*protocol.PermissionRequested
+	// order is prompts' keys in arrival order. A map has none of its own, and the composer
+	// answers whichever one arrived last (focused), the one nearest the input on screen.
+	order []promptKey
+	// asked is the same shape as prompts, for a question whose answer is in flight, kept so
+	// a call that never reached the server can put it back.
+	asked map[promptKey]*protocol.PermissionRequested
 	// streamed is set once text has streamed in this turn. The server reports one
 	// streaming state for both halves of it, and what the turn status item says while it
 	// runs is thinking until an answer begins and streaming after (ADR 0013 decision 3).
 	streamed bool
+}
+
+// promptKey names one standing question exactly the way the server's own standing set does:
+// which session asked, and which tool_use it is for. Two sessions can mint the same
+// tool_use id shape (ADR 0028), so the session id is part of the key, not an afterthought.
+type promptKey struct {
+	sessionID string
+	toolUseID string
+}
+
+func keyOf(p *protocol.PermissionRequested) promptKey {
+	return promptKey{sessionID: p.SessionID, toolUseID: p.ToolUseID}
+}
+
+// promptName encodes a key into CallResultMsg.Name, so callResult and callFailed know which
+// of possibly several outstanding session.answer calls a given response is for. sid is a
+// ULID and so never contains "/", which is what makes splitting on the first one exact.
+func promptName(sid, toolUseID string) string { return sid + "/" + toolUseID }
+
+func parsePromptName(name string) (sid, toolUseID string) {
+	sid, toolUseID, _ = strings.Cut(name, "/")
+	return sid, toolUseID
+}
+
+// focused is the question the composer answers: the most recently arrived one still
+// standing, the one nearest the input on screen. nil when none stands.
+func (t turnControl) focused() *protocol.PermissionRequested {
+	if len(t.order) == 0 {
+		return nil
+	}
+	return t.prompts[t.order[len(t.order)-1]]
+}
+
+// addPrompt records p as standing, appending its key to order the first time it is seen so
+// a replay or a resend of the same question does not move it out of arrival order.
+func (t *turnControl) addPrompt(p *protocol.PermissionRequested) {
+	k := keyOf(p)
+	if t.prompts == nil {
+		t.prompts = map[promptKey]*protocol.PermissionRequested{}
+	}
+	if _, seen := t.prompts[k]; !seen {
+		t.order = append(t.order, k)
+	}
+	t.prompts[k] = p
+}
+
+// removePrompt takes k down, wherever it stood in arrival order.
+func (t *turnControl) removePrompt(k promptKey) {
+	if _, ok := t.prompts[k]; !ok {
+		return
+	}
+	delete(t.prompts, k)
+	t.order = slices.DeleteFunc(t.order, func(x promptKey) bool { return x == k })
+}
+
+// clearAsked drops the in-flight answer for sid/toolUseID, if there is one.
+func (t *turnControl) clearAsked(sid, toolUseID string) {
+	delete(t.asked, promptKey{sessionID: sid, toolUseID: toolUseID})
+}
+
+// clearPrompts drops every standing and in-flight question: what a turn coming to rest does
+// (turnChanged), since an interrupt denies whatever it was waiting on and the decision is
+// already in the log, so every question the turn was carrying goes with it.
+func (t *turnControl) clearPrompts() {
+	t.prompts, t.order, t.asked = nil, nil, nil
 }
 
 // turnWords name what the turn item says for each state the server reports that is not
@@ -113,7 +188,7 @@ func (m *Model) turnChanged(p protocol.TurnStateChanged) tea.Cmd {
 	}
 	// A turn that ended answers no question: an interrupt denies what it was waiting on
 	// and the decision is already in the log, so the question goes with the turn.
-	m.turn.prompt, m.turn.asked = nil, nil
+	m.turn.clearPrompts()
 	var commit tea.Cmd
 	// The same guard commitTurns keeps: a turn.state buffered during a session switch is
 	// folded while the switch replays, and the one ordered print at the end of that replay
@@ -182,10 +257,11 @@ func (m *Model) lateRows(added []string) tea.Cmd {
 	return nil
 }
 
-// requested puts a permission question on screen and makes it the one the keyboard
-// answers.
+// requested puts a permission question on screen and adds it to the standing set (rudy-9nc):
+// concurrent tool calls mean it may not be the only one, so this never assumes it replaces
+// whatever was there before.
 func (m *Model) requested(p protocol.PermissionRequested) {
-	m.turn.prompt = &p
+	m.turn.addPrompt(&p)
 	m.tr.Prompt(p)
 }
 
@@ -195,22 +271,17 @@ func (m *Model) requested(p protocol.PermissionRequested) {
 // subscription). Rendered under the agent call that opened the child (Transcript.PromptFrom)
 // rather than in place of a tool row this session's own turn owns.
 func (m *Model) requestedFrom(sid, callToolUseID string, p protocol.PermissionRequested) {
-	m.turn.prompt = &p
+	m.turn.addPrompt(&p)
 	m.tr.PromptFrom(sid, callToolUseID, p)
 }
 
 // clearPrompt takes down the standing or in-flight question sid asked for toolUseID,
 // whichever of the two it is, wherever the decision came from: this client's own answer, a
-// hook, the gate, or another asker. The session id guard is what keeps a subagent's
-// tool_use id, or another subagent's, from being read as an answer to a different session's
-// question of the same id (ADR 0028: two sessions can mint the same shape of id).
+// hook, the gate, or another asker.
 func (m *Model) clearPrompt(sid, toolUseID string) {
-	if m.turn.prompt != nil && m.turn.prompt.ToolUseID == toolUseID && m.turn.prompt.SessionID == sid {
-		m.turn.prompt = nil
-	}
-	if m.turn.asked != nil && m.turn.asked.ToolUseID == toolUseID && m.turn.asked.SessionID == sid {
-		m.turn.asked = nil
-	}
+	k := promptKey{sessionID: sid, toolUseID: toolUseID}
+	m.turn.removePrompt(k)
+	m.turn.clearAsked(sid, toolUseID)
 }
 
 // answered takes this session's own question for toolUseID down.
@@ -241,20 +312,25 @@ func (m *Model) takeDownPrompt(p *protocol.PermissionRequested) {
 	m.clearPrompt(p.SessionID, p.ToolUseID)
 }
 
-// reask puts back the question this client answered when the answer never reached the
+// reaskOne puts back the question sid/toolUseID named when its answer never reached the
 // server. Without it the turn waits on a decision that will never come, with nothing on
 // screen to answer it with.
-func (m *Model) reask() {
-	// A question standing now is a later one the server is waiting on, and it keeps the
-	// keyboard: the failed answer's own question is moot, since nothing asks twice.
-	if m.turn.asked == nil || m.turn.prompt != nil {
+func (m *Model) reaskOne(sid, toolUseID string) {
+	k := promptKey{sessionID: sid, toolUseID: toolUseID}
+	p, ok := m.turn.asked[k]
+	if !ok {
 		return
 	}
-	p := m.turn.asked
-	m.turn.prompt = p
-	if p.SessionID != m.session.SessionID {
-		if call, ok := m.tr.AgentCallFor(p.SessionID); ok {
-			m.tr.PromptFrom(p.SessionID, call, *p)
+	delete(m.turn.asked, k)
+	if _, exists := m.turn.prompts[k]; exists {
+		// A later question already stands in this same slot; the failed answer's own
+		// question is moot, since nothing asks twice for the same call.
+		return
+	}
+	m.turn.addPrompt(p)
+	if sid != m.session.SessionID {
+		if call, ok := m.tr.AgentCallFor(sid); ok {
+			m.tr.PromptFrom(sid, call, *p)
 			return
 		}
 	}
@@ -264,9 +340,12 @@ func (m *Model) reask() {
 // answer is the standing question's own key handling, and it runs before anything else:
 // the turn is waiting on it, so nothing may take y, a, n or Esc from it. Any other key
 // falls through to the rest of the keyboard, which is what keeps ctrl+c and ctrl+d
-// working while a question stands.
+// working while a question stands. It answers the focused question: the most recently
+// arrived one still standing, the one nearest the input (rudy-9nc) — concurrent tool calls
+// mean more than one can be waiting, and the keyboard has no way to name one but the
+// nearest until a picker gives it one.
 func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {
-	p := m.turn.prompt
+	p := m.turn.focused()
 	if p == nil {
 		return nil, false
 	}
@@ -279,8 +358,11 @@ func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {
 	// that was not. It is kept in hand until the call comes back, since an answer that
 	// never arrived has to go back up.
 	m.takeDownPrompt(p)
-	m.turn.asked = p
-	return m.call(protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
+	if m.turn.asked == nil {
+		m.turn.asked = map[promptKey]*protocol.PermissionRequested{}
+	}
+	m.turn.asked[keyOf(p)] = p
+	return m.callNamed(protocol.MethodSessionAnswer, promptName(p.SessionID, p.ToolUseID), protocol.SessionAnswerParams{
 		// The session the prompt actually named, not this client's own: a subagent's
 		// question carries the child's session id, and session.answer is deliberately not
 		// subscription gated (contracts), so this is the mechanism working as designed

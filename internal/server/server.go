@@ -1179,7 +1179,7 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	}
 	ls := newLive(sess, m)
 	ls.parent = parent
-	if parent != nil {
+	if parent != nil && len(ls.entries) > 0 {
 		// session.Open appends session_opened inside itself, before this liveSession
 		// exists, so the ordinary mirror/fanout broadcast (session_live.go) never runs for
 		// it: the caller who opened it only ever sees it by direct replay, in
@@ -1188,6 +1188,11 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 		// notifications are routed under, and a subagent never renders (rudy-contracts.md,
 		// entry.appended: a child's entries go to its parent's subscribers too). Sent now,
 		// after ls.parent is set, since watchers() has nowhere to look before that.
+		//
+		// The length guard is defensive: session.Open guarantees session_opened is the
+		// log's first entry, so ls.entries is never empty here in practice, but indexing
+		// it bare is a panic waiting for whatever future path seeds a liveSession
+		// differently.
 		ls.notifyWatchers(protocol.NotifyEntryAppended, protocol.EntryAppended{
 			SessionID: sess.ID().String(), Entry: ls.entries[0],
 		})

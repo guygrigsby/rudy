@@ -163,11 +163,15 @@ func TestAFailedAnswerPutsTheQuestionBack(t *testing.T) {
 	if strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
 		t.Fatalf("the question comes down when the answer goes out:\n%s", h.view())
 	}
-	h.update(CallResultMsg{Method: protocol.MethodSessionAnswer, Err: errors.New("boom")})
+	// Name is what tells callFailed which of possibly several outstanding answers this is
+	// for (rudy-9nc); a hand-built message needs it the same way the real call would carry
+	// it (turn.go's answer, via callNamed).
+	name := promptName(h.m.session.SessionID, "t1")
+	h.update(CallResultMsg{Method: protocol.MethodSessionAnswer, Name: name, Err: errors.New("boom")})
 	if !strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
 		t.Errorf("an answer that never reached the server puts the question back:\n%s", h.view())
 	}
-	if h.m.turn.prompt == nil {
+	if h.m.turn.focused() == nil {
 		t.Error("and the keyboard answers it again")
 	}
 	if !strings.Contains(ansi.Strip(h.view()), "session.answer: boom") {
@@ -179,9 +183,70 @@ func TestAFailedAnswerPutsTheQuestionBack(t *testing.T) {
 		Matcher:  session.Matcher{Tool: "bash", Prefix: "go test"},
 		Decision: session.Allow, DecidedBy: session.ByAsker, Scope: session.ScopeOnce, Reason: "asker",
 	})
-	h.update(CallResultMsg{Method: protocol.MethodSessionAnswer, Err: errors.New("late")})
+	h.update(CallResultMsg{Method: protocol.MethodSessionAnswer, Name: name, Err: errors.New("late")})
 	if strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
 		t.Errorf("a decided question does not come back:\n%s", h.view())
+	}
+}
+
+// TestTwoConcurrentQuestionsBothResolve is rudy-9nc: task 3 of this wave made the tool
+// calls of one assistant message run concurrently, so more than one permission question can
+// stand on a session at once (the server already models this as a set, keyed by tool_use
+// id). The TUI's own turnControl held only one slot, so a second question overwrote the
+// first on the keyboard while the first's row was still on screen: the operator could
+// answer the second, but the first could never be answered and its call hung out
+// tool_timeout_ms. Answering in the reverse of arrival order is the case that a single
+// "the newest one" slot gets right by accident and a LIFO map gets right on purpose, so it
+// is what this drives.
+func TestTwoConcurrentQuestionsBothResolve(t *testing.T) {
+	h := newHarness(t, nil)
+	sid := h.m.session.SessionID
+	turn := session.NewID().String()
+
+	h.notify(protocol.NotifyPermissionRequested, protocol.PermissionRequested{
+		SessionID: sid, TurnID: turn, ToolUseID: "t1", Tool: "bash",
+		Input: json.RawMessage(`{"command":"go test ./..."}`), Matcher: session.Matcher{Tool: "bash", Prefix: "go test"},
+	})
+	h.notify(protocol.NotifyPermissionRequested, protocol.PermissionRequested{
+		SessionID: sid, TurnID: turn, ToolUseID: "t2", Tool: "write",
+		Input: json.RawMessage(`{"path":"x","content":"y"}`), Matcher: session.Matcher{Tool: "write"},
+	})
+
+	if got := strings.Count(ansi.Strip(h.view()), "allow once [y]"); got != 2 {
+		t.Fatalf("setup: %d questions on screen, want 2:\n%s", got, h.view())
+	}
+	if focused := h.m.turn.focused(); focused == nil || focused.ToolUseID != "t2" {
+		t.Fatalf("setup: focused = %+v, want t2 (the one nearest the input)", focused)
+	}
+
+	// Answer t2 first, the reverse of arrival order.
+	runCmd(t, h.press("y"))
+	got := answerRequests(t, h)
+	if len(got) != 1 || got[0].ToolUseID != "t2" {
+		t.Fatalf("first answer = %+v, want exactly one naming t2", got)
+	}
+	if got := strings.Count(ansi.Strip(h.view()), "allow once [y]"); got != 1 {
+		t.Fatalf("t1's row must still stand after t2 is answered: %d questions on screen:\n%s", got, h.view())
+	}
+	if focused := h.m.turn.focused(); focused == nil || focused.ToolUseID != "t1" {
+		t.Fatalf("focused after t2 = %+v, want t1", focused)
+	}
+
+	// Then t1: without the fix, this key press answers t2 a second time (or nothing), and
+	// t1's call is left to hang out tool_timeout_ms with no way for the operator to reach it.
+	runCmd(t, h.press("y"))
+	got = answerRequests(t, h)
+	if len(got) != 2 {
+		t.Fatalf("session.answer calls = %d, want 2 (both t1 and t2 resolved): %+v", len(got), got)
+	}
+	if got[1].ToolUseID != "t1" {
+		t.Fatalf("second answer = %+v, want t1", got[1])
+	}
+	if h.m.turn.focused() != nil {
+		t.Fatalf("a question is still standing after both were answered: %+v", h.m.turn.focused())
+	}
+	if strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
+		t.Fatalf("a question row is still on screen after both were answered:\n%s", h.view())
 	}
 }
 
@@ -325,7 +390,7 @@ func TestPermissionPromptInline(t *testing.T) {
 	if dec.Reason != "asker" {
 		t.Errorf("reason %q", dec.Reason)
 	}
-	if h.m.turn.prompt != nil {
+	if h.m.turn.focused() != nil {
 		t.Error("the answered question is cleared")
 	}
 	h.waitPrinted("ran go test ./...")

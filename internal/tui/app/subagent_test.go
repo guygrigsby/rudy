@@ -89,8 +89,8 @@ func TestAChildsPermissionPromptRendersAndAnswers(t *testing.T) {
 		Input: json.RawMessage(`{"command":"rm -rf /tmp/x"}`),
 	})
 
-	if h.m.turn.prompt == nil || h.m.turn.prompt.SessionID != child {
-		t.Fatalf("the child's prompt did not become the standing question: %+v", h.m.turn.prompt)
+	if h.m.turn.focused() == nil || h.m.turn.focused().SessionID != child {
+		t.Fatalf("the child's prompt did not become the standing question: %+v", h.m.turn.focused())
 	}
 	var promptRow *transcript.Row
 	for _, r := range h.m.tr.Rows() {
@@ -131,8 +131,8 @@ func TestAChildsPermissionPromptRendersAndAnswers(t *testing.T) {
 		Matcher: session.Matcher{Tool: "bash", Prefix: "rm -rf"}, Decision: session.Allow,
 		DecidedBy: session.ByAsker, Scope: session.ScopeOnce, Reason: answerReason,
 	})})
-	if h.m.turn.prompt != nil {
-		t.Fatalf("the standing question survived its own decision: %+v", h.m.turn.prompt)
+	if h.m.turn.focused() != nil {
+		t.Fatalf("the standing question survived its own decision: %+v", h.m.turn.focused())
 	}
 	for _, r := range h.m.tr.Rows() {
 		if r.Kind == transcript.RowPrompt {
@@ -165,7 +165,7 @@ func TestADecisionFromElsewhereTakesDownAChildsPrompt(t *testing.T) {
 		SessionID: child, ToolUseID: "tu_bash", Tool: "bash",
 		Input: json.RawMessage(`{"command":"rm -rf /tmp/x"}`),
 	})
-	if h.m.turn.prompt == nil {
+	if h.m.turn.focused() == nil {
 		t.Fatal("setup: the child's prompt never became the standing question")
 	}
 
@@ -175,8 +175,8 @@ func TestADecisionFromElsewhereTakesDownAChildsPrompt(t *testing.T) {
 		DecidedBy: session.ByHook, Scope: session.ScopeOnce, Reason: "before_tool hook",
 	})})
 
-	if h.m.turn.prompt != nil {
-		t.Fatalf("a decision from elsewhere left the standing question up: %+v", h.m.turn.prompt)
+	if h.m.turn.focused() != nil {
+		t.Fatalf("a decision from elsewhere left the standing question up: %+v", h.m.turn.focused())
 	}
 	for _, r := range h.m.tr.Rows() {
 		if r.Kind == transcript.RowPrompt {
