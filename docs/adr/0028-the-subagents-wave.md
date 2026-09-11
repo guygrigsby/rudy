@@ -149,12 +149,18 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    Removal is the only way to restrict an agent, so delegation must not be a way
    around removal, or restricting an agent means nothing.
 
-   The shipped default definition drops the memory writes, which is the
-   mechanism above being used rather than a special case in it. A subagent
-   gathers and reports; the caller decides what is worth keeping. A child that
-   records its own conclusions commits the parent to them without the parent
-   ever seeing them, from a session whose transcript nobody reads. A definition
-   that wants the memory tools can name them.
+   The shipped example definition for a subagent drops the memory writes, which
+   is the mechanism above being used rather than a special case in it. A
+   subagent gathers and reports; the caller decides what is worth keeping. A
+   child that records its own conclusions commits the parent to them without the
+   parent ever seeing them, from a session whose transcript nobody reads. A
+   definition that wants the memory tools can name them.
+
+   It is not named `default`. `default` is the agent a session runs under when
+   none is named, root sessions included, so shipping this as the default would
+   restrict the operator's own session to a subagent's tool list and take away
+   its ability to delegate at all. The `agent` tool requires a definition name
+   in its input, so there is no unnamed subagent for a default to serve.
 
 6. **A child's notifications reach its parent's subscribers.** The child's
    fan-out also delivers to the parent's non-plugin subscribers, tagged with the
