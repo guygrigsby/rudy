@@ -258,6 +258,36 @@ func TestSpawnedPluginThatDiesIsWithdrawn(t *testing.T) {
 	}
 }
 
+// TestSpawnedPluginRegistersAnAgentOverTheWire is ADR 0028 decision 7 driven through the real
+// dispatch, not through plugin.Register directly: the hello plugin sends plugin.register_agent
+// over its stdio connection, which only reaches Host.RegisterAgent if the server's caller-class
+// table (pluginMethods) and its method dispatch both route the method. Calling Register in the
+// internal/plugin package proves the mapping from params to the Registrar; this proves the
+// server actually offers a spawned plugin the method at all.
+func TestSpawnedPluginRegistersAnAgentOverTheWire(t *testing.T) {
+	h := newSpawnHarness(t, &scriptProvider{textOnly: true}, nil)
+	if got := helloStates(t, h.cl, string(plugin.StateReady)); !equalStrings(got, []string{"loading", "ready"}) {
+		t.Fatalf("plugin states = %v (notices %v)", got, h.notices())
+	}
+
+	var info protocol.SessionInfo
+	err := h.cl.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{
+		Cwd: h.ws, Agent: "hello_agent",
+	}, &info)
+	if err != nil {
+		t.Fatalf("open under the spawned plugin's agent: %v", err)
+	}
+	h.runTurn(t, info)
+
+	req := h.prov.request(0)
+	if !strings.HasPrefix(req.System, "You are hello's own subagent.") {
+		t.Fatalf("system prompt = %q, want the spawned plugin's agent prompt first", req.System)
+	}
+	if !hasTool(req.Tools, "hello_upper") || len(req.Tools) != 1 {
+		t.Fatalf("tools = %v, want only hello_upper: the agent's own tools list", defNames(req.Tools))
+	}
+}
+
 func hasTool(defs []provider.ToolDef, name string) bool {
 	for _, d := range defs {
 		if d.Name == name {

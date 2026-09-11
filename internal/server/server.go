@@ -361,7 +361,8 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 		return s.handleAppendNote(cn, req.Params)
 	case protocol.MethodPluginRegisterTool, protocol.MethodPluginRegisterCommand,
 		protocol.MethodPluginRegisterHook, protocol.MethodPluginRegisterProvider,
-		protocol.MethodPluginRegisterWidget, protocol.MethodPluginSetStatus:
+		protocol.MethodPluginRegisterAgent, protocol.MethodPluginRegisterWidget,
+		protocol.MethodPluginSetStatus:
 		return s.handleRegister(cn, req)
 	default:
 		return nil, perr(protocol.CodeNotFound, "unknown method "+req.Method)
@@ -391,6 +392,7 @@ var pluginMethods = map[string]bool{
 	protocol.MethodPluginRegisterHook:     true,
 	protocol.MethodPluginRegisterWidget:   true,
 	protocol.MethodPluginRegisterProvider: true,
+	protocol.MethodPluginRegisterAgent:    true,
 	protocol.MethodPluginSetStatus:        true,
 }
 

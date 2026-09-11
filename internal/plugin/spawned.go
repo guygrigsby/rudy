@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 
 	toml "github.com/pelletier/go-toml/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -172,6 +174,9 @@ type Registrar interface {
 	RegisterCommand(name, description string) error
 	RegisterHook(point HookPoint, priority int) error
 	RegisterProvider(name, wire string) error
+	// RegisterAgent contributes an agent definition. tools is a pointer so an absent field and
+	// an explicit empty list stay distinguishable, the same as agents/<name>.md's frontmatter.
+	RegisterAgent(name, description, prompt string, tools *[]string, model, thinking string, maxTurns int) error
 	SetStatus(key string, content []Span)
 	SetWidget(key string, slot WidgetSlot, content []Span) error
 	// Deliver hands over a notification the plugin sent (tool.progress, provider.delta).
@@ -208,6 +213,12 @@ func Register(reg Registrar, method string, params json.RawMessage) (any, error)
 			return nil, fmt.Errorf("%w: %s", protocol.ErrInvalidArgument, err)
 		}
 		return ok, reg.RegisterProvider(p.Name, p.Wire)
+	case protocol.MethodPluginRegisterAgent:
+		var p protocol.PluginRegisterAgentParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("%w: %s", protocol.ErrInvalidArgument, err)
+		}
+		return ok, reg.RegisterAgent(p.Name, p.Description, p.Prompt, p.Tools, p.Model, p.Thinking, p.MaxTurns)
 	case protocol.MethodPluginRegisterWidget:
 		var p protocol.PluginRegisterWidgetParams
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -635,6 +646,35 @@ func (s *Spawned) RegisterProvider(name, wire string) error {
 		return fmt.Errorf("%w: wire %q is for a linked provider plugin; a spawned plugin registers wire custom", protocol.ErrInvalidArgument, wire)
 	}
 	return fmt.Errorf("%w: unknown provider wire %q", protocol.ErrInvalidArgument, wire)
+}
+
+// RegisterAgent stages an agent definition, the same thing an agents/<name>.md file carries. A
+// definition is static data, so unlike RegisterTool and RegisterProvider it needs no callback.
+// A spawned plugin is outside the process, so its input is validated here the same way
+// agentdef.parse validates a file's frontmatter, rather than trusted the way a linked plugin's
+// own agentdef.Definition value is.
+func (s *Spawned) RegisterAgent(name, description, prompt string, tools *[]string, model, thinking string, maxTurns int) error {
+	if err := s.refuseLate("agent", name); err != nil {
+		return err
+	}
+	if description == "" {
+		return fmt.Errorf("%w: plugin %s: agent %s: description is required", protocol.ErrInvalidArgument, s.m.Name, name)
+	}
+	level := session.ThinkingLevel(thinking)
+	if thinking != "" && !level.Valid() {
+		return fmt.Errorf("%w: plugin %s: agent %s: thinking %q is not off, low, medium or high", protocol.ErrInvalidArgument, s.m.Name, name, thinking)
+	}
+	if maxTurns < 0 {
+		return fmt.Errorf("%w: plugin %s: agent %s: max_turns %d must be zero or positive", protocol.ErrInvalidArgument, s.m.Name, name, maxTurns)
+	}
+	d := agentdef.Definition{
+		Name: name, Description: description, Prompt: prompt,
+		Model: model, Thinking: level, MaxTurns: maxTurns,
+	}
+	if tools != nil {
+		d.Tools = slices.Clone(*tools)
+	}
+	return s.host.RegisterAgent(d)
 }
 
 func (s *Spawned) SetStatus(key string, content []Span) { s.host.SetStatus(key, content) }

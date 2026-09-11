@@ -2020,6 +2020,7 @@ func TestEveryProtocolMethodIsDecidedForPlugins(t *testing.T) {
 		protocol.MethodPluginRegisterHook:     true,
 		protocol.MethodPluginRegisterWidget:   true,
 		protocol.MethodPluginRegisterProvider: true,
+		protocol.MethodPluginRegisterAgent:    true,
 		protocol.MethodPluginSetStatus:        true,
 	}
 	methods := protocolMethods(t)

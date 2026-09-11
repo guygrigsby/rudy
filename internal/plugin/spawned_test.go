@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -23,12 +24,13 @@ type fakeChild struct {
 
 	peer *protocol.Peer
 
-	version      int  // what to answer plugin.init with
-	register     bool // send registrations before answering plugin.init
-	provider     bool // register a wire: custom provider too
-	slowTool     bool // never answer tool.invoke, so the caller's context is what ends it
-	slowCommand  bool // never answer command.invoke
-	failComplete bool // answer provider.complete with an error
+	version      int            // what to answer plugin.init with
+	register     bool           // send registrations before answering plugin.init
+	provider     bool           // register a wire: custom provider too
+	slowTool     bool           // never answer tool.invoke, so the caller's context is what ends it
+	slowCommand  bool           // never answer command.invoke
+	failComplete bool           // answer provider.complete with an error
+	extraRegs    []registerCall // additional plugin.register_* calls, sent last
 
 	mu      sync.Mutex
 	init    protocol.PluginInitParams
@@ -168,15 +170,18 @@ func (c *fakeChild) handle(ctx context.Context, req protocol.Request) (any, *pro
 	return nil, protocol.NewError(protocol.CodeMethodNotFound, "no method "+req.Method, nil), false
 }
 
+// registerCall is one plugin.register_* the fake child sends during registerAll.
+type registerCall struct {
+	method string
+	params any
+}
+
 // registerAll sends every registration and waits for each answer before the next, so they
 // are all committed by the time the init response goes out. That ordering is the contract a
 // spawned plugin has to keep.
 func (c *fakeChild) registerAll(ctx context.Context) {
 	cl := c.peer.Client()
-	calls := []struct {
-		method string
-		params any
-	}{
+	calls := []registerCall{
 		{protocol.MethodPluginRegisterTool, protocol.PluginRegisterToolParams{
 			Name: "hello_upper", Description: "upper cases text",
 			InputSchema: json.RawMessage(helloSchema), Safety: tool.Safe,
@@ -186,11 +191,9 @@ func (c *fakeChild) registerAll(ctx context.Context) {
 		{protocol.MethodPluginSetStatus, protocol.PluginSetStatusParams{Key: "hello", Content: []Span{{Text: "hello ready", Role: "muted"}}}},
 	}
 	if c.provider {
-		calls = append(calls, struct {
-			method string
-			params any
-		}{protocol.MethodPluginRegisterProvider, protocol.PluginRegisterProviderParams{Name: "hello", Wire: protocol.WireCustom}})
+		calls = append(calls, registerCall{protocol.MethodPluginRegisterProvider, protocol.PluginRegisterProviderParams{Name: "hello", Wire: protocol.WireCustom}})
 	}
+	calls = append(calls, c.extraRegs...)
 	for _, call := range calls {
 		if err := cl.Call(ctx, call.method, call.params, nil); err != nil {
 			c.mu.Lock()
@@ -659,5 +662,123 @@ func TestSpawnedProviderFailureCarriesTheProviderClass(t *testing.T) {
 	}
 	if pe.Class != session.ErrProvider || pe.Attempts != 1 || !strings.Contains(pe.Message, "the model said no") {
 		t.Fatalf("provider error = %+v", pe)
+	}
+}
+
+func TestSpawnedPluginRegistersAnAgent(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) {
+		c.extraRegs = []registerCall{{protocol.MethodPluginRegisterAgent, map[string]any{
+			"name": "reviewer", "description": "reviews a diff", "prompt": "You review.",
+			"tools": []string{"read", "grep"}, "thinking": "high", "max_turns": 12,
+		}}}
+	})
+	h.child.mu.Lock()
+	regErrs := append([]error(nil), h.child.regErrs...)
+	h.child.mu.Unlock()
+	if len(regErrs) != 0 {
+		t.Fatalf("registering the agent came back with %v", regErrs)
+	}
+	defs := h.reg.AgentDefs()
+	got, ok := defs["reviewer"]
+	if !ok {
+		t.Fatalf("agents = %+v", defs)
+	}
+	if got.Description != "reviews a diff" || got.Prompt != "You review." || got.MaxTurns != 12 {
+		t.Fatalf("definition = %+v", got)
+	}
+	if !slices.Equal(got.Tools, []string{"read", "grep"}) {
+		t.Fatalf("tools = %v", got.Tools)
+	}
+	if got.Thinking != session.ThinkingHigh {
+		t.Fatalf("thinking = %q", got.Thinking)
+	}
+}
+
+// TestSpawnedAgentToolsPointerDistinguishesAbsentFromEmpty is the property the contracts row
+// calls out by name: an absent tools key must resolve to nil (every tool), and an explicit
+// empty list to a non-nil empty slice (no tool). A []string field instead of *[]string cannot
+// tell the two apart once decoded, which is the bug this wave already shipped once elsewhere.
+func TestSpawnedAgentToolsPointerDistinguishesAbsentFromEmpty(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) {
+		c.extraRegs = []registerCall{
+			{protocol.MethodPluginRegisterAgent, map[string]any{
+				"name": "generalist", "description": "no tools key at all",
+			}},
+			{protocol.MethodPluginRegisterAgent, map[string]any{
+				"name": "locked-down", "description": "an explicit empty list", "tools": []string{},
+			}},
+		}
+	})
+	h.child.mu.Lock()
+	regErrs := append([]error(nil), h.child.regErrs...)
+	h.child.mu.Unlock()
+	if len(regErrs) != 0 {
+		t.Fatalf("registering the agents came back with %v", regErrs)
+	}
+	defs := h.reg.AgentDefs()
+	generalist, ok := defs["generalist"]
+	if !ok {
+		t.Fatalf("agents = %+v", defs)
+	}
+	if generalist.Tools != nil {
+		t.Fatalf("no tools key: Tools = %#v, want nil (every tool)", generalist.Tools)
+	}
+	lockedDown, ok := defs["locked-down"]
+	if !ok {
+		t.Fatalf("agents = %+v", defs)
+	}
+	if lockedDown.Tools == nil || len(lockedDown.Tools) != 0 {
+		t.Fatalf("explicit empty list: Tools = %#v, want a non-nil empty slice (no tool)", lockedDown.Tools)
+	}
+}
+
+// TestSpawnedAgentRegistrationValidatesAtTheBoundary is decision 7's line that a spawned
+// plugin's input is not trusted the way a linked plugin's own agentdef.Definition value is:
+// each of these mirrors a check agentdef.parse makes against a file's frontmatter.
+func TestSpawnedAgentRegistrationValidatesAtTheBoundary(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) {
+		c.extraRegs = []registerCall{
+			{protocol.MethodPluginRegisterAgent, map[string]any{
+				"name": "no-description", "description": "",
+			}},
+			{protocol.MethodPluginRegisterAgent, map[string]any{
+				"name": "bad-thinking", "description": "d", "thinking": "extreme",
+			}},
+			{protocol.MethodPluginRegisterAgent, map[string]any{
+				"name": "bad-max-turns", "description": "d", "max_turns": -1,
+			}},
+		}
+	})
+	h.child.mu.Lock()
+	regErrs := append([]error(nil), h.child.regErrs...)
+	h.child.mu.Unlock()
+	if len(regErrs) != 3 {
+		t.Fatalf("reg errs = %v, want 3", regErrs)
+	}
+	for i, want := range []string{"description", "thinking", "max_turns"} {
+		var pe *protocol.Error
+		if !errors.As(regErrs[i], &pe) {
+			t.Fatalf("err %d = %v (%T), want a *protocol.Error", i, regErrs[i], regErrs[i])
+		}
+		if pe.Code != protocol.CodeInvalidArgument {
+			t.Fatalf("err %d code = %d, want invalid_argument", i, pe.Code)
+		}
+		if !strings.Contains(pe.Message, want) {
+			t.Fatalf("err %d message = %q, want it to mention %q", i, pe.Message, want)
+		}
+	}
+	if defs := h.reg.AgentDefs(); len(defs) != 0 {
+		t.Fatalf("a definition that failed validation was still registered: %+v", defs)
+	}
+}
+
+func TestSpawnedAgentRegistrationAfterInitIsRefused(t *testing.T) {
+	h := loadSpawned(t, nil, nil)
+	err := h.sp.RegisterAgent("late", "too late", "", nil, "", "", 0)
+	if !errors.Is(err, session.ErrInvariant) {
+		t.Fatalf("error = %v, want ErrInvariant: the agent set a session opened with never changes under it", err)
+	}
+	if defs := h.reg.AgentDefs(); len(defs) != 0 {
+		t.Fatalf("a late registration was still committed: %+v", defs)
 	}
 }

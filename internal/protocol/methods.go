@@ -44,6 +44,7 @@ const (
 	MethodPluginRegisterHook     = "plugin.register_hook"
 	MethodPluginRegisterWidget   = "plugin.register_widget"
 	MethodPluginRegisterProvider = "plugin.register_provider"
+	MethodPluginRegisterAgent    = "plugin.register_agent"
 	MethodPluginSetStatus        = "plugin.set_status"
 )
 
@@ -391,6 +392,20 @@ type PluginSetStatusParams struct {
 type PluginRegisterProviderParams struct {
 	Name string `json:"name"`
 	Wire string `json:"wire"`
+}
+
+// PluginRegisterAgentParams carries the same fields agents/<name>.md does. Tools is a pointer
+// so an absent key (every tool) stays distinguishable from an explicit empty list (no tool),
+// exactly as the file's frontmatter does; a plain []string cannot make that distinction once
+// decoded.
+type PluginRegisterAgentParams struct {
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	Prompt      string    `json:"prompt"`
+	Tools       *[]string `json:"tools,omitempty"`
+	Model       string    `json:"model,omitempty"`
+	Thinking    string    `json:"thinking,omitempty"`
+	MaxTurns    int       `json:"max_turns,omitempty"`
 }
 
 // The provider wires a plugin may register.

@@ -2,9 +2,9 @@
 // stdout with nothing but the standard library, which is the point. A third party writes one
 // of these in any language; nothing here imports rudy.
 //
-// It registers a tool, a slash command, a before_turn hook and a status item, and answers
-// what the server asks of them. With HELLO_CRASH=1 it exits 3 as soon as it is ready, which
-// is how rudy's tests see a plugin die under a live session.
+// It registers a tool, a slash command, a before_turn hook, an agent definition and a status
+// item, and answers what the server asks of them. With HELLO_CRASH=1 it exits 3 as soon as it
+// is ready, which is how rudy's tests see a plugin die under a live session.
 package main
 
 import (
@@ -54,6 +54,8 @@ const (
 	protocolVersion = 1
 	toolName        = "hello_upper"
 	inputSchema     = `{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`
+	agentName       = "hello_agent"
+	agentPrompt     = "You are hello's own subagent."
 )
 
 type plugin struct {
@@ -189,6 +191,14 @@ func (p *plugin) register() error {
 		}},
 		{"plugin.register_command", map[string]any{"name": name, "description": "Says hello."}},
 		{"plugin.register_hook", map[string]any{"point": "before_turn", "priority": 50}},
+		{"plugin.register_agent", map[string]any{
+			"name":        agentName,
+			"description": "hello's own subagent",
+			"prompt":      agentPrompt,
+			"tools":       []string{toolName},
+			"thinking":    "low",
+			"max_turns":   3,
+		}},
 		{"plugin.set_status", map[string]any{
 			"key":     name,
 			"content": []map[string]string{{"text": "hello ready", "role": "muted"}},
