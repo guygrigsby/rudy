@@ -78,16 +78,21 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    are contending because the model asked for that, and serializing them would
    hide it rather than fix it.
 
-4. **The gate coalesces concurrent asks.** It reads a session's allowances when
-   a call begins and appends the allow when the asker answers, so without this
-   two concurrent calls to one unsafe tool both prompt and "allow for the
-   session" stops meaning what it says. A call that finds an ask already
-   outstanding for the same tool and scope joins it rather than raising a second
-   one. The asker already keys pending asks by `tool_use` id, so the machinery
-   for more than one in flight exists; what is added is the joining.
+4. **Concurrent calls matching one outstanding question ask once.** Allowances
+   are read when a call begins and the allow is appended when the asker answers,
+   so without this two concurrent calls to one unsafe tool both prompt and
+   "allow for the session" stops meaning what it says. A call that finds a
+   question already outstanding for the same matcher and scope waits on it
+   rather than raising a second one, and takes its answer.
 
-   This is a permission bug that concurrency exposes, not a concurrency bug. It
-   is fixed in the gate, where it lives.
+   It is enforced at the asker rather than in the verdict. `Gate.Evaluate` is a
+   pure function of the input it is handed and holds no session, so it has
+   nothing to coalesce against; the asker already keys every pending question by
+   `tool_use` id and already holds the session lock, so the joining is the only
+   part that is new.
+
+   This is a permission bug that concurrency exposes, not a concurrency bug, and
+   it is fixed on the permission path rather than by serializing the caller.
 
 5. **Every agent runs under a tool list, and a caller may only narrow it.**
    This is one mechanism, not a rule about subagents. Root or child, an agent
