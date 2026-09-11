@@ -48,36 +48,59 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    This is one change serving two features, and it is the reason they are one
    wave rather than two.
 
-2. **A call dispatches concurrently only if its tool is safe and declares
-   itself concurrent.** Two conditions, because they answer two different
-   questions, and neither answers the other's.
+2. **Every tool call in an assistant message dispatches concurrently.** No
+   exceptions keyed on safety, and no opt-in field.
 
-   Safe, because of the gate. It reads a session's allowances when a call begins
-   and appends the allow when the asker answers, so two concurrent calls to one
-   unsafe tool would both prompt and "allow for the session" would stop meaning
-   what it says. Keeping unsafe calls serial closes that window rather than
-   patching it. It also settles the contended-workspace hazard by construction:
-   `bash`, `edit` and `write` are unsafe, so two of them never overlap and
-   neither the git index nor a same-file write is ever contended.
+   Permission and reentrancy are orthogonal questions and tying them answers
+   neither. `tool.Safe` states that the operator need not be asked. It says
+   nothing about whether a second copy of the tool may run, and a rule that
+   reads it as though it did would serialize two unrelated MCP reads while
+   waving through two writes to one concept file. An opt-in field inverts the
+   default instead: concurrency then requires every author to have thought about
+   it, almost nothing declares it, and the feature is nominally present and
+   practically absent. Fan-out is the whole reason to delegate.
 
-   Declared, because safety is a statement about permission and says nothing
-   about side effects. `memory_remember` is the proof: it is safe, since
-   recording a memory needs no operator's consent, and it read-modify-writes a
-   concept file on disk, so two of them at once would race. Inferring that a
-   tool tolerates a second copy of itself from the fact that it needs no
-   permission is a guess about code the harness did not write, and a plugin
-   author writing a safe tool has no reason to suspect reentrancy was required
-   of them. So `tool.Tool` gains a field, it defaults to serial, and a tool that
-   wants concurrency says so.
+   So the runner makes no judgement about which calls may overlap. A tool's
+   `Invoke` may be called concurrently with itself and with any other tool, and
+   that is part of the tool contract rather than a property the harness infers.
 
-   `read`, `grep`, `glob` and `agent` declare it. `memory_remember` does not.
-   The default preserves today's behaviour for every tool that does not think
-   about the question, including every tool already written.
+3. **A tool that is not reentrant guards itself.** The obligation sits with the
+   code that owns the state, which is the only code that knows what the state
+   is. `memory_remember` is the live case and the reason this is written down
+   rather than assumed: `memory.Remember` reads a concept, revises it and writes
+   it back with no lock, so two concurrent calls on one title both revise the
+   same base and one revision is lost. The memory plugin serializes its own
+   invocations; memory-go keeps its own defect.
 
-   The cost is named rather than hidden: MCP tools are all unsafe, so two
-   independent MCP reads serialize when nothing required it.
+   The two hazards this is often raised against are less than they look. Two
+   edits to one file fail cleanly, because an edit matches on the text it
+   expects and the second no longer finds it. Two shell commands that contend
+   are contending because the model asked for that, and serializing them would
+   hide it rather than fix it.
 
-3. **A child's notifications reach its parent's subscribers.** The child's
+4. **The gate coalesces concurrent asks.** It reads a session's allowances when
+   a call begins and appends the allow when the asker answers, so without this
+   two concurrent calls to one unsafe tool both prompt and "allow for the
+   session" stops meaning what it says. A call that finds an ask already
+   outstanding for the same tool and scope joins it rather than raising a second
+   one. The asker already keys pending asks by `tool_use` id, so the machinery
+   for more than one in flight exists; what is added is the joining.
+
+   This is a permission bug that concurrency exposes, not a concurrency bug. It
+   is fixed in the gate, where it lives.
+
+5. **A subagent returns an answer and writes nothing durable.** Its default
+   tool view excludes the memory writes, because a subagent exists to gather and
+   report: it hands its result to the caller, and the caller decides what is
+   worth keeping. A child that records its own conclusions commits the parent to
+   them without the parent ever seeing them, and it does so from a session whose
+   transcript nobody reads.
+
+   Agent definitions already carry a tool list and the server already stamps it
+   onto the child, so this is what the shipped default definition says rather
+   than a new mechanism. A definition that wants the memory tools can name them.
+
+6. **A child's notifications reach its parent's subscribers.** The child's
    fan-out also delivers to the parent's non-plugin subscribers, tagged with the
    child's session id, which every payload already carries. It is the mirror of
    the walk that already exists in the other direction: a child with no asker of
@@ -89,7 +112,7 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    Watching is not owning, and the routing rule keeps them apart without
    inventing a second tier of subscription to hold them apart.
 
-4. **A plugin may contribute an agent definition.** `Host.RegisterAgent` follows
+7. **A plugin may contribute an agent definition.** `Host.RegisterAgent` follows
    the shape `RegisterProvider` already established for a resource that is
    registered rather than called, and `resolveAgent` merges the registry's
    definitions into the roots it reads. A definition is static data, so a spawned
@@ -101,7 +124,7 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
    override what an installed plugin shipped, and installing a plugin cannot
    break a session that already worked.
 
-5. **The `agent` tool stops enumerating agents in its description.** The
+8. **The `agent` tool stops enumerating agents in its description.** The
    description is built once when the plugin initializes, from the user's config
    directory alone, which is why it omits a workspace's own definitions today and
    would omit every plugin-contributed one tomorrow: plugins initialize in order,
@@ -128,13 +151,16 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
   client that assumes every notification belongs to the session it is rendering
   will render a subagent's output as the parent's own; the session id in the
   payload is what distinguishes them, and it was always there.
-- Fan-out under the session lock includes an fsync on an allow decision, so
-  concurrent safe calls contend on it. Safe calls do not append permission
-  decisions, so the contention is bounded by what unsafe calls were doing
-  anyway.
-- `tool.Tool` gains a field, so the tool contract changes and the spawned
-  plugin registration carries one more value. It defaults to the old behaviour,
-  so a plugin written before this wave keeps working and keeps its meaning.
+- Appending an allow decision fsyncs under the session lock, so concurrent
+  calls contend on it. The tools that append one are the tools that asked, so
+  the contention is bounded by how often the operator is being prompted.
+- Reentrancy becomes a stated obligation on every tool, including every tool
+  already written and every tool a plugin author writes next. The contract says
+  so explicitly rather than leaving it to be discovered, and `memory_remember`
+  is the worked example of getting it wrong.
+- A turn's wall-clock cost stops being the sum of its tool calls, so a timeout
+  that was tuned against serial execution is now loose rather than tight. None
+  is tightened here.
 - `rudy-ulb`, a flaky cancel test in the subagents plugin, is a race in the
   cancel path this wave rewrites. It is fixed here rather than separately.
 
@@ -145,16 +171,20 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
   private path to a capability the kernel otherwise denies every other tool, and
   the kernel has no private paths. It also leaves the interrupt and cancel bugs
   in place, since they are only invisible while one call runs at a time.
-- Unbounded concurrency with a configured cap: honest about what the model
-  asked for, but it leaves the contended-workspace and double-ask problems to be
-  solved separately and explicitly, and a cap is a number nobody knows how to
-  choose.
-- Inferring concurrency from `tool.Safe` alone, with no declared field: it needs
-  no new vocabulary and it decides the workspace hazards correctly, which is why
-  it was the first shape of decision 2. It is wrong because safe means the
-  operator need not be asked, and a tool can be both safe and stateful.
-  `memory_remember` already is, so the rule would have shipped a race on the day
-  it landed rather than a latent one.
+- Safe tools concurrent, unsafe tools serial: it settles the contended-workspace
+  and double-ask problems without writing any new code, which is why it was the
+  first shape of this decision. It is wrong twice over. Permission and
+  reentrancy are orthogonal, so the rule serializes two unrelated MCP reads
+  while waving through two writes to one concept file, and it buys its
+  correctness by giving up most of the concurrency it was introduced to get.
+- The same rule plus an opt-in field on `tool.Tool`, so a safe tool declares
+  itself reentrant: it closes the `memory_remember` hole, but it makes serial
+  the default that every author has to escape, and a feature nobody opts into is
+  a feature nobody has. Reentrancy belongs in the contract every tool is held
+  to, not in a field most of them will leave unset.
+- A configured concurrency cap: a number nobody knows how to choose, defended by
+  the fear that the model will ask for too much at once. If it does, that is
+  visible and fixable where it happened.
 - Namespacing plugin-contributed agents as `<plugin>:<agent>`: collisions become
   impossible, at the cost of changing every name the model types and the tool's
   input vocabulary, to solve a collision that ordering already answers.
