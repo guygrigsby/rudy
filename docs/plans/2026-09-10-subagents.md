@@ -1069,11 +1069,27 @@ Follow the file's existing lock ordering exactly. If `broadcastObsLocked` is cal
 Run: `go test -race ./internal/server/ -run 'ParentsClientSees|ParentsClientCannotDrive|DoesNotReceiveItsOwn' -v -count=5`
 Expected: PASS on every run.
 
-- [ ] **Step 5: Confirm no replay to the parent on attach**
+- [ ] **Step 5: Track in-flight tool states so a client attaching mid-turn sees them**
+
+The `tool.state` contracts row says every call in flight is sent to a client attaching mid-turn, after the replay and before the resume response. Task 3 added the notification but nothing records which calls are currently in flight, so there is nothing to send. This step owns that row.
+
+On `liveSession`, keep the current state per `tool_use` id: set it when a `tool.state` of `running` or `awaiting_permission` is emitted, and drop the entry on `done`. Send the surviving set to a connection attaching while a turn is active, in the same place the current `turn.state` is sent, before the resume response. A finished call is not replayed: it is its `tool_result` entry and the client reads it from the log.
+
+```go
+func TestAClientAttachingMidTurnSeesCallsInFlight(t *testing.T) {
+	// Two calls running, one awaiting permission. A client attaching now must receive a
+	// tool.state for each before the resume response, or it renders a turn with no visible
+	// tool activity until something finishes.
+}
+```
+
+Fill the body in the style of the package's other attach tests. Assert on the notifications the attaching connection receives, and assert that a call which already completed is NOT among them.
+
+- [ ] **Step 6: Confirm no replay to the parent on attach**
 
 The contract says a child's entries are not replayed to a parent's client on attach: the parent's own log carries the `agent` tool result, and a finished child is read by resuming it. Confirm the attach path does not walk down, and add a test asserting a client attaching to a parent with a finished child receives no entries for that child.
 
-- [ ] **Step 6: Both transports, then commit**
+- [ ] **Step 7: Both transports, then commit**
 
 Run: `go test -race ./internal/server/ && RUDY_TEST_TRANSPORT=socket go test -race ./internal/server/`
 

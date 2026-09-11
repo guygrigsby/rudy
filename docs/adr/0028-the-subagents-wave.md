@@ -210,8 +210,21 @@ an agent, which is what ADR 0025 said installing a plugin would be for.
 - A turn's wall-clock cost stops being the sum of its tool calls, so a timeout
   that was tuned against serial execution is now loose rather than tight. None
   is tightened here.
-- `rudy-ulb`, a flaky cancel test in the subagents plugin, is a race in the
-  cancel path this wave rewrites. It is fixed here rather than separately.
+- `rudy-ulb`, a flaky cancel test in the subagents plugin, was recorded here as
+  a race in the cancel path this wave rewrites. That was wrong, and the record
+  is corrected rather than quietly dropped: the test never constructs a
+  `turn.Runner`, and the rewrite left it failing. Its actual cause was in
+  `protocol.Client`, which routed responses on a goroutine separate from the
+  reader, so a `Send` returning did not mean a pending `Call` could yet see the
+  response. Routing on the reader fixes it.
+
+  Looking there turned up a defect worth more than the flake. `Call`'s select
+  discarded a response that had already been delivered whenever the caller's
+  context was cancelled in the same moment, so a `session.submit` that actually
+  succeeded was reported as `context.Canceled`, and the `agent` tool then never
+  interrupted the child it had just started. Both are fixed in this wave. The
+  lesson is the ordinary one: a flake blamed on the code about to be rewritten
+  is a diagnosis nobody checked.
 
 ## Alternatives considered
 
