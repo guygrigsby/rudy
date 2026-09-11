@@ -43,6 +43,10 @@ type Question struct {
 	Tool      string
 	Input     json.RawMessage
 	Matcher   session.Matcher
+	// Dangerous is the Gate's own verdict.Dangerous for this call (ADR 0011): an Asker must
+	// never settle it from another call's session-scope allow, only from an answer to this
+	// question itself.
+	Dangerous bool
 }
 
 // Answer is the asker's reply.
@@ -436,6 +440,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 	input, modified, hookDec := r.askHooks(ctx, tu, t.Safety)
 	var dec session.PermissionDecision
 	ask := false
+	dangerous := false
 	if hookDec != nil {
 		// A hook decided, so the gate never weighs in: what it would have said about the
 		// mode, the allowances or an asker no longer applies. The matcher is still the
@@ -471,6 +476,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 			Reason:    verdict.Reason,
 		}
 		ask = verdict.Ask
+		dangerous = verdict.Dangerous
 	}
 	if modified {
 		// The log records what the tool will actually run with, or nothing about the input
@@ -481,7 +487,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) (done bool, err 
 		r.setState(AwaitingPermission)
 		askCtx, cancel := context.WithCancel(ctx)
 		r.setCancel(cancel)
-		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: input, Matcher: dec.Matcher})
+		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: input, Matcher: dec.Matcher, Dangerous: dangerous})
 		cancel()
 		if how := r.takeInterrupt(); how != "" {
 			if err := r.refuse(ctx, interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {

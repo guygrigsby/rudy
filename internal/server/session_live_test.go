@@ -375,6 +375,14 @@ func (ls *liveSession) pendingCount() int {
 	return len(ls.pending)
 }
 
+// askingCount is how many distinct questions are currently standing at the coalescing layer.
+// Self-locking (takes ls.mu).
+func (ls *liveSession) askingCount() int {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return len(ls.asking)
+}
+
 // waitFor polls pred until it holds or five seconds pass, failing the test if it never does.
 func waitFor(t *testing.T, pred func() bool) {
 	t.Helper()
@@ -409,13 +417,11 @@ func TestConcurrentAsksOnOneMatcherAskOnce(t *testing.T) {
 	answers := make([]turn.Answer, 3)
 	errs := make([]error, 3)
 	for i := range 3 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			one := q
 			one.ToolUseID = fmt.Sprintf("tu%d", i)
 			answers[i], errs[i] = asker.Ask(context.Background(), one)
-		}()
+		})
 	}
 	// Let all three reach the asker before any answer lands. Only the raiser ever registers
 	// into pending, so pendingCount staying at 1 alongside waitingAsks reaching 3 is the
@@ -455,14 +461,12 @@ func TestDifferentMatchersAskSeparately(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for i, prefix := range []string{"git status", "go build"} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, _ = asker.Ask(context.Background(), turn.Question{
 				ToolUseID: fmt.Sprintf("tu%d", i), Tool: "bash",
 				Matcher: session.Matcher{Tool: "bash", Prefix: prefix},
 			})
-		}()
+		})
 	}
 	waitFor(t, func() bool { return ls.waitingAsks() == 2 })
 	close(release)
@@ -492,14 +496,12 @@ func TestSessionScopeAnswerSettlesOtherParkedQuestions(t *testing.T) {
 	answers := make([]turn.Answer, 2)
 	errs := make([]error, 2)
 	for i := range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			answers[i], errs[i] = asker.Ask(context.Background(), turn.Question{
 				ToolUseID: toolUseIDs[i], Tool: "write",
 				Input: json.RawMessage(inputs[i]), Matcher: m,
 			})
-		}()
+		})
 	}
 	// Both calls must be genuinely parked, not just registered as waiting on their own
 	// question: pendingCount reaching 2 is each one's own raiser having actually asked, which
@@ -509,6 +511,10 @@ func TestSessionScopeAnswerSettlesOtherParkedQuestions(t *testing.T) {
 	ls.answer(t, toolUseIDs[0], session.Allow, session.ScopeSession)
 	wg.Wait()
 
+	// subscribeAsker's watcher counts notifications on its own goroutine, independent of
+	// wg.Wait() (which only waits on the Ask calls, not on that goroutine catching up), so the
+	// count is polled rather than read the instant the calls return.
+	waitFor(t, func() bool { return prompts.Load() == 2 })
 	if got := prompts.Load(); got != 2 {
 		t.Fatalf("prompts = %d, want 2: both calls genuinely parked before either was decided, so both raised their own question", got)
 	}
@@ -652,7 +658,7 @@ func TestArrivingAfterResolutionAsksAgain(t *testing.T) {
 	if ans, err := asker.Ask(context.Background(), first); err != nil || ans.Decision != session.Allow {
 		t.Fatalf("first ask = %+v, %v", ans, err)
 	}
-	if n := len(ls.asking); n != 0 {
+	if n := ls.askingCount(); n != 0 {
 		t.Fatalf("asking has %d entries once the first call resolved, want 0", n)
 	}
 
@@ -663,5 +669,97 @@ func TestArrivingAfterResolutionAsksAgain(t *testing.T) {
 	}
 	if got := prompts.Load(); got != 2 {
 		t.Fatalf("prompts = %d, want 2: a call arriving after the question resolved must ask again, not take the old answer", got)
+	}
+}
+
+// TestDangerousQuestionNeverSettlesFromASessionAllow is ADR 0011's ordering carried through
+// settlement (ADR 0028 decision 4, amended commit 70153dd): a session-scope allow must never
+// resolve a question the Gate marked dangerous, only that question's own answer. Two concurrent
+// dangerous bash calls on different paths park under two questions (same matcher, different
+// input, per fix (a)); without settleLocked's skip on Dangerous, the operator answering the first
+// "allow for the session" would silence the second, which is exactly the ordering ADR 0011 exists
+// to refuse - a session allowance never outranks the dangerous set.
+func TestDangerousQuestionNeverSettlesFromASessionAllow(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+	var prompts atomic.Int32
+	ls.subscribeAsker(t, func(protocol.PermissionRequested) { prompts.Add(1) })
+
+	m := session.Matcher{Tool: "bash", Prefix: "rm -rf"}
+	inputs := []string{`{"command":"rm -rf /tmp/a"}`, `{"command":"rm -rf /tmp/b"}`}
+	toolUseIDs := []string{"tu0", "tu1"}
+	var wg sync.WaitGroup
+	answers := make([]turn.Answer, 2)
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Go(func() {
+			answers[i], errs[i] = asker.Ask(context.Background(), turn.Question{
+				ToolUseID: toolUseIDs[i], Tool: "bash",
+				Input: json.RawMessage(inputs[i]), Matcher: m, Dangerous: true,
+			})
+		})
+	}
+	waitFor(t, func() bool { return ls.pendingCount() == 2 })
+
+	// Answering the first for the session must not touch the second: it stays parked, waiting
+	// for its own answer, because both are dangerous.
+	ls.answer(t, toolUseIDs[0], session.Allow, session.ScopeSession)
+	if got := ls.pendingCount(); got != 1 {
+		t.Fatalf("pendingCount = %d after the first answer, want 1: a dangerous question must not be settled by another call's session allow", got)
+	}
+	if got := ls.waitingAsks(); got != 1 {
+		t.Fatalf("waitingAsks = %d, want 1: the second dangerous call must still be waiting on its own question", got)
+	}
+
+	ls.answer(t, toolUseIDs[1], session.Allow, session.ScopeOnce)
+	wg.Wait()
+
+	// subscribeAsker's watcher counts notifications on its own goroutine, independent of
+	// wg.Wait() (which only waits on the Ask calls, not on that goroutine catching up), so the
+	// count is polled rather than read the instant the calls return.
+	waitFor(t, func() bool { return prompts.Load() == 2 })
+	if got := prompts.Load(); got != 2 {
+		t.Fatalf("prompts = %d, want 2: two dangerous calls with different inputs are two separate questions", got)
+	}
+	for i := range 2 {
+		if errs[i] != nil {
+			t.Fatalf("call %d: %v", i, errs[i])
+		}
+		if answers[i].Decision != session.Allow {
+			t.Fatalf("call %d decision = %q, want allow", i, answers[i].Decision)
+		}
+	}
+}
+
+// TestRetireIfCurrentLockedSkipsAReplacedEntry is the deterministic half of the stale-holder
+// finding: a departing raiser (or leave's hand-off) must not delete asking[key] once a new call
+// has already created a fresh standingAsk there. resolveAnswer can retire a key while its old
+// raiser has not yet resumed from a's ask select (the channel send does not wait for the
+// receiver); a new call arriving in that gap sees no entry, raises its own, and gathers joiners.
+// If the old raiser then deleted by key alone, that live, joined-on entry would vanish and a
+// later call would raise a duplicate question for one already standing.
+//
+// This proves the guard in isolation rather than forcing the full interleaving through real
+// goroutines: doing that deterministically would mean pausing a goroutine after it has a value
+// ready on a buffered channel but before it resumes from the receive, which nothing in this
+// package (or the race detector) gives a hook to force reliably. A raced version of this test
+// would be timing-dependent in exactly the way the project's testing rules ask not to write, so
+// this checks the mechanism the fix actually relies on instead.
+func TestRetireIfCurrentLockedSkipsAReplacedEntry(t *testing.T) {
+	key := askKey{matcher: session.Matcher{Tool: "bash", Prefix: "git status"}, input: ""}
+	stale := &standingAsk{done: make(chan struct{})}
+	fresh := &standingAsk{done: make(chan struct{})}
+	asking := map[askKey]*standingAsk{key: fresh}
+
+	// The stale holder resumes after resolveAnswer already retired its own entry and a new
+	// call created a fresh one at the same key with joiners of its own.
+	retireIfCurrentLocked(asking, key, stale)
+	if got := asking[key]; got != fresh {
+		t.Fatalf("asking[key] = %p, want the fresh entry %p left untouched", got, fresh)
+	}
+
+	// The entry that actually is current still retires normally.
+	retireIfCurrentLocked(asking, key, fresh)
+	if _, ok := asking[key]; ok {
+		t.Fatal("asking[key] still present after retiring the entry that was actually current")
 	}
 }

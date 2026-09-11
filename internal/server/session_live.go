@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -603,10 +604,14 @@ type standingAsk struct {
 // Filing the key alongside the channel is what lets session.answer retire the standing entry in
 // the same critical section that claims the channel (see liveSession.resolveAnswer): otherwise a
 // call could join the standing entry in the window between the answer being sent and the raiser
-// getting back around to deleting it, and take an answer given before it ever asked.
+// getting back around to deleting it, and take an answer given before it ever asked. dangerous is
+// the Gate's own verdict for this call (turn.Question.Dangerous): settleLocked must never settle
+// one from another call's session-scope allow (ADR 0011, ADR 0028 decision 4), so it is recorded
+// here rather than re-derived from the matcher, which cannot tell dangerous from ordinary.
 type pendingAsk struct {
-	ch  chan turn.Answer
-	key askKey
+	ch        chan turn.Answer
+	key       askKey
+	dangerous bool
 }
 
 // liveAsker puts one turn's permission questions to every asker connection the session has
@@ -622,9 +627,10 @@ type liveAsker struct {
 // while an earlier question stands. Calls that ask the same thing (same matcher, same input
 // bytes) share one question: the operator sees one prompt and every call waiting on it takes the
 // answer when it lands. A call that arrives after a question resolves asks again, unless the
-// answer was session scope, in which case resolveAnswer has already settled every other question
-// the new allowance covers, and a call arriving later still finds the allowance through the Gate
-// and never asks at all.
+// answer was session scope, in which case resolveAnswer has already settled every other
+// non-dangerous question the new allowance covers, and a call arriving later still finds the
+// allowance through the Gate and never asks at all. A dangerous call never settles this way and
+// never skips asking through the Gate either (ADR 0011): it always takes its own answer.
 func (a *liveAsker) Ask(ctx context.Context, q turn.Question) (turn.Answer, error) {
 	key := keyFor(q)
 	a.ls.mu.Lock()
@@ -669,11 +675,11 @@ func (a *liveAsker) Ask(ctx context.Context, q turn.Question) (turn.Answer, erro
 // real answer, including no_asker, retires the question for everyone waiting on it.
 func (a *liveAsker) raise(ctx context.Context, key askKey, q turn.Question, st *standingAsk) (turn.Answer, error) {
 	ans, err := a.ask(ctx, q)
-	if err != nil && err == ctx.Err() {
+	if err != nil && errors.Is(err, ctx.Err()) {
 		return a.leave(key, st, err)
 	}
 	a.ls.mu.Lock()
-	delete(a.ls.asking, key)
+	retireIfCurrentLocked(a.ls.asking, key, st)
 	a.ls.mu.Unlock()
 	defer close(st.done)
 	st.ans, st.err = ans, err
@@ -695,11 +701,28 @@ func (a *liveAsker) leave(key askKey, st *standingAsk, err error) (turn.Answer, 
 		close(next)
 		return turn.Answer{}, err
 	}
-	delete(a.ls.asking, key)
+	// Still the same critical section that just decided the queue is empty: another call
+	// finding nothing to join and creating a fresh standingAsk at this key can only happen
+	// once mu is released, so retiring here cannot yet be dropping a live successor's entry.
+	retireIfCurrentLocked(a.ls.asking, key, st)
 	a.ls.mu.Unlock()
 	defer close(st.done)
 	st.ans, st.err = turn.Answer{}, err
 	return turn.Answer{}, err
+}
+
+// retireIfCurrentLocked deletes asking[key] only when it is still st. resolveAnswer's own
+// settlement can already have deleted it (see resolveAnswer, settleLocked) before whoever raised
+// it gets back around to cleaning up after itself, and by then a new call may have created a
+// fresh standingAsk at the same key and gathered joiners of its own. Deleting on the key alone,
+// once the old holder finally does resume, would drop that live entry out from under them, and
+// later calls would raise a duplicate question for one that is already standing. Caller holds
+// mu; taking it here would either deadlock leave's already-held lock or reopen the exact gap
+// this closes for raise's separately-acquired one.
+func retireIfCurrentLocked(asking map[askKey]*standingAsk, key askKey, st *standingAsk) {
+	if asking[key] == st {
+		delete(asking, key)
+	}
 }
 
 // removeChan deletes the first occurrence of ch from *queue and reports whether it found one.
@@ -715,10 +738,11 @@ func removeChan(queue *[]chan struct{}, ch chan struct{}) bool {
 }
 
 // resolveAnswer claims the pending question for toolUseID, retires its standing entry, and, when
-// ans is a session-scope allow, settles every other parked question the new allowance now covers
-// (ADR 0028 decision 4): two calls can read the session's allowances before either has recorded
-// one, both park, and answering the first for the session leaves the second asking for something
-// that is now already granted. ok is false when there is no pending question for toolUseID;
+// ans is a session-scope allow, settles every other parked, non-dangerous question the new
+// allowance now covers (ADR 0028 decision 4, see settleLocked for the dangerous exception): two
+// calls can read the session's allowances before either has recorded one, both park, and
+// answering the first for the session leaves the second asking for something that is now already
+// granted. ok is false when there is no pending question for toolUseID;
 // already then says whether that is because it was already decided (a conflict) rather than
 // never asked (not_found). The caller sends ans on ch, and on every channel in settle, itself,
 // outside any lock: this only prepares the delivery.
@@ -746,13 +770,19 @@ func (ls *liveSession) resolveAnswer(toolUseID string, ans turn.Answer) (ch chan
 // settleLocked retires every other tool_use currently asking under matcher m: a session-scope
 // allow just granted for m covers them too, by the same rule Gate.Evaluate applies to a call
 // that has not asked yet (ADR 0028 decision 4), so a question raised before that allowance
-// existed does not stay open asking for something already granted. Caller holds mu; it takes and
-// releases obsMu itself, once, for the standing and answered bookkeeping each retirement needs.
+// existed does not stay open asking for something already granted. A question the Gate marked
+// dangerous is never settled this way: ADR 0011 puts the dangerous set ahead of session
+// allowances in every mode but off, so a dangerous command must always take its own answer,
+// never one settled from a different call's allow, or settlement becomes a way to launder
+// consent past exactly the check ADR 0011 exists to enforce (two concurrent `rm -rf` calls on
+// different paths must not let a session allow on one silence the other). Caller holds mu; it
+// takes and releases obsMu itself, once, for the standing and answered bookkeeping each
+// retirement needs.
 func (ls *liveSession) settleLocked(m session.Matcher) []chan turn.Answer {
 	var chans []chan turn.Answer
 	var ids []string
 	for id, pend := range ls.pending {
-		if pend.key.matcher != m {
+		if pend.key.matcher != m || pend.dangerous {
 			continue
 		}
 		chans = append(chans, pend.ch)
@@ -787,7 +817,7 @@ func (a *liveAsker) ask(ctx context.Context, q turn.Question) (turn.Answer, erro
 	ch := make(chan turn.Answer, 1)
 	abandon := make(chan struct{})
 	a.ls.mu.Lock()
-	a.ls.pending[q.ToolUseID] = pendingAsk{ch: ch, key: keyFor(q)}
+	a.ls.pending[q.ToolUseID] = pendingAsk{ch: ch, key: keyFor(q), dangerous: q.Dangerous}
 	a.ls.mu.Unlock()
 	askers := a.ls.stand(standingQuestion{req: req, abandon: abandon})
 	if len(askers) == 0 {

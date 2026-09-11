@@ -25,6 +25,11 @@ type Verdict struct {
 	DecidedBy session.DecidedBy
 	Ask       bool // true means Decision is not final and the asker must answer
 	Matcher   session.Matcher
+	// Dangerous is true when this call matched the dangerous set (ADR 0011): the asker must
+	// wait for its own answer rather than ever taking one settled from another call's
+	// session-scope allow (ADR 0028 decision 4). The Gate is the only place this is decided;
+	// nothing downstream may re-derive it from the matcher's shape.
+	Dangerous bool
 	Reason    string
 }
 
@@ -53,7 +58,9 @@ func (g *Gate) Evaluate(in Input) Verdict {
 		return Verdict{Decision: session.Allow, DecidedBy: session.ByMode, Matcher: m, Reason: "mode off"}
 	}
 	var askReason string
+	isDangerous := false
 	if dangerous, entry := g.Dangerous(in.Tool, in.Args); dangerous {
+		isDangerous = true
 		askReason = "dangerous " + entry
 	} else {
 		for _, a := range in.Allowances {
@@ -71,7 +78,7 @@ func (g *Gate) Evaluate(in Input) Verdict {
 		}
 	}
 	if !in.AskerPresent {
-		return Verdict{Decision: session.Deny, DecidedBy: session.ByNoAsker, Matcher: m, Reason: "no asker attached"}
+		return Verdict{Decision: session.Deny, DecidedBy: session.ByNoAsker, Matcher: m, Dangerous: isDangerous, Reason: "no asker attached"}
 	}
-	return Verdict{Ask: true, Matcher: m, Reason: askReason}
+	return Verdict{Ask: true, Matcher: m, Dangerous: isDangerous, Reason: askReason}
 }
