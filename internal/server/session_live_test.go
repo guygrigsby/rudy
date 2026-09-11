@@ -3,10 +3,14 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -264,5 +268,191 @@ func TestAttachBeforeTheFirstStateChangeHearsNoStaleTurn(t *testing.T) {
 	at := ls.subscribeLocked(askerConn(2))
 	if at.state == nil || at.state.TurnID != "turn-1" || at.state.State != string(turn.Streaming) {
 		t.Fatalf("attach state = %+v, want streaming on turn-1", at.state)
+	}
+}
+
+// newAskTestSession builds a liveSession with one asker connection attached and the liveAsker
+// in front of it, the setup every coalescing test below shares. The runner's Provider is nil,
+// as elsewhere in this file: liveAsker.Ask only ever calls TurnID on it.
+func newAskTestSession(t *testing.T) (*liveSession, *liveAsker) {
+	t.Helper()
+	ls := newTestLive(t)
+	ls.conns = []*conn{askerConn(1)}
+	r := turn.NewRunner(turn.Config{
+		Session:  ls.sess,
+		Provider: nil,
+		Model:    ls.model,
+		Tools:    plugin.NewRegistry(nil, func(string) {}),
+		Gate:     gate.New(nil),
+		Observer: &fanout{ls: ls, sid: ls.sess.ID().String()},
+		System:   "test",
+	})
+	return ls, &liveAsker{ls: ls, sid: ls.sess.ID().String(), runner: r}
+}
+
+// subscribeAsker watches ls's one asker connection for permission.requested notifications and
+// calls fn with each, in the order sent, until the test ends. conn.notify only ever enqueues
+// (see conn.send), so reading the queue directly is the whole of what a pump would otherwise do
+// with no transport underneath to send to.
+func (ls *liveSession) subscribeAsker(t *testing.T, fn func(protocol.PermissionRequested)) {
+	t.Helper()
+	if len(ls.conns) != 1 {
+		t.Fatalf("subscribeAsker wants exactly one connection, got %d", len(ls.conns))
+	}
+	cn := ls.conns[0]
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-cn.wake:
+			}
+			for {
+				cn.mu.Lock()
+				if len(cn.queue) == 0 {
+					cn.mu.Unlock()
+					break
+				}
+				msg := cn.queue[0]
+				cn.queue = cn.queue[1:]
+				cn.mu.Unlock()
+				req, ok := msg.(protocol.Request)
+				if !ok || req.Method != protocol.NotifyPermissionRequested {
+					continue
+				}
+				var pr protocol.PermissionRequested
+				if err := json.Unmarshal(req.Params, &pr); err != nil {
+					t.Errorf("permission.requested params: %v", err)
+					continue
+				}
+				fn(pr)
+			}
+		}
+	}()
+}
+
+// answer plays session.answer's own claim-then-send against ls directly (see
+// Server.handleAnswer), without a live connection or dispatcher to send it through. It is
+// called from subscribeAsker's watcher goroutine, never the test's own, so a missing question
+// is reported with Errorf rather than Fatalf: FailNow is only safe from the goroutine running
+// the test.
+func (ls *liveSession) answer(t *testing.T, toolUseID string, d session.Decision, scope session.Scope) {
+	t.Helper()
+	ls.mu.Lock()
+	ch, ok := ls.pending[toolUseID]
+	delete(ls.pending, toolUseID)
+	ls.obsMu.Lock()
+	if ok {
+		ls.answered[toolUseID] = true
+		delete(ls.standing, toolUseID)
+	}
+	ls.obsMu.Unlock()
+	ls.mu.Unlock()
+	if !ok {
+		t.Errorf("answer: no pending question for %s", toolUseID)
+		return
+	}
+	ch <- turn.Answer{Decision: d, Scope: scope, Reason: "test"}
+}
+
+// waitingAsks is how many calls are currently parked at the coalescing layer across every
+// standing question: the raiser doing the real ask plus whoever has joined it. Self-locking
+// (takes ls.mu).
+func (ls *liveSession) waitingAsks() int {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	n := 0
+	for _, st := range ls.asking {
+		n += st.waiting
+	}
+	return n
+}
+
+// waitFor polls pred until it holds or five seconds pass, failing the test if it never does.
+func waitFor(t *testing.T, pred func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if pred() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !pred() {
+		t.Fatal("waitFor: condition never became true")
+	}
+}
+
+// TestConcurrentAsksOnOneMatcherAskOnce: several goroutines racing the same tool call's
+// permission question raise it once and all take the one answer, rather than each putting its
+// own question to the operator.
+func TestConcurrentAsksOnOneMatcherAskOnce(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+
+	var prompts atomic.Int32
+	release := make(chan struct{})
+	ls.subscribeAsker(t, func(req protocol.PermissionRequested) {
+		prompts.Add(1)
+		<-release
+		ls.answer(t, req.ToolUseID, session.Allow, session.ScopeOnce)
+	})
+
+	q := turn.Question{Tool: "bash", Matcher: session.Matcher{Tool: "bash", Prefix: "git status"}}
+	var wg sync.WaitGroup
+	answers := make([]turn.Answer, 3)
+	errs := make([]error, 3)
+	for i := range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			one := q
+			one.ToolUseID = fmt.Sprintf("tu%d", i)
+			answers[i], errs[i] = asker.Ask(context.Background(), one)
+		}()
+	}
+	// Let all three reach the asker before any answer lands.
+	waitFor(t, func() bool { return ls.waitingAsks() == 3 })
+	close(release)
+	wg.Wait()
+
+	if got := prompts.Load(); got != 1 {
+		t.Fatalf("the operator was asked %d times, want 1", got)
+	}
+	for i := range 3 {
+		if errs[i] != nil {
+			t.Fatalf("call %d: %v", i, errs[i])
+		}
+		if answers[i].Decision != session.Allow {
+			t.Fatalf("call %d decision = %q, want allow", i, answers[i].Decision)
+		}
+	}
+}
+
+// TestDifferentMatchersAskSeparately: two calls whose matcher differs are two different
+// questions, each asked and answered on its own.
+func TestDifferentMatchersAskSeparately(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+	var prompts atomic.Int32
+	ls.subscribeAsker(t, func(req protocol.PermissionRequested) {
+		prompts.Add(1)
+		ls.answer(t, req.ToolUseID, session.Allow, session.ScopeOnce)
+	})
+
+	var wg sync.WaitGroup
+	for i, prefix := range []string{"git status", "go build"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = asker.Ask(context.Background(), turn.Question{
+				ToolUseID: fmt.Sprintf("tu%d", i), Tool: "bash",
+				Matcher: session.Matcher{Tool: "bash", Prefix: prefix},
+			})
+		}()
+	}
+	wg.Wait()
+	if got := prompts.Load(); got != 2 {
+		t.Fatalf("prompts = %d, want 2: different matchers are different questions", got)
 	}
 }

@@ -68,6 +68,12 @@ type liveSession struct {
 	closed      bool     // sess has been closed and removed from Server.live; never touch sess again
 	hookContext []string // what session_opened handlers added to this session's system prompt
 
+	// asking is the questions currently in front of the operator, keyed by what they ask
+	// rather than by which call asked. Tool calls run concurrently, so several calls can want
+	// the same permission at once; they share one question and its answer instead of
+	// prompting the operator once per call (ADR 0028).
+	asking map[askKey]*standingAsk
+
 	// overrides is what after_tool handlers replaced, by tool_use id, for as long as this
 	// session is live. The map reference is set once in newLive and never replaced, so it
 	// needs no lock; its contents belong to whichever turn.Runner is currently running and
@@ -123,6 +129,7 @@ func newLive(sess *session.Session, m provider.Model) *liveSession {
 		model:     m,
 		entries:   append([]session.Entry(nil), sess.Entries()...),
 		pending:   map[string]chan turn.Answer{},
+		asking:    map[askKey]*standingAsk{},
 		overrides: map[string][]session.Block{},
 		children:  map[string]bool{},
 		standing:  map[string]standingQuestion{},
@@ -562,6 +569,21 @@ func (o *firstAppendSignal) StateChanged(turnID string, s turn.State) {
 	o.Observer.StateChanged(turnID, s)
 }
 
+// askKey is the question a call would put to the operator. Two calls with the same matcher ask
+// the same thing, whatever their tool_use ids are.
+type askKey struct{ tool, prefix string }
+
+// standingAsk is one outstanding question and the answer the calls waiting on it will take.
+// done is closed once ans and err are final; nothing reads them before that. waiting is how many
+// calls are currently parked on it, the raiser included: it is what lets a caller tell that every
+// concurrent call asking the same thing has arrived, before any of them has been answered.
+type standingAsk struct {
+	done    chan struct{}
+	ans     turn.Answer
+	err     error
+	waiting int
+}
+
 // liveAsker puts one turn's permission questions to every asker connection the session has
 // (see askers for the binding, the child sessions included) and waits for the first
 // session.answer to resolve each of them by tool_use id.
@@ -571,11 +593,48 @@ type liveAsker struct {
 	runner *turn.Runner
 }
 
-// Ask runs on the turn.Runner's own goroutine, between steps, with no turn.Runner or
-// liveSession lock held (see turn.Runner.runTool): calling a.runner.TurnID() here is safe and
-// gives the freshest value, unlike a handler that already holds mu or obsMu, which must use
-// the mirror instead.
+// Ask is called from every goroutine running a tool call in the turn, so it may be re-entered
+// while an earlier question stands. Calls that ask the same thing share one question: the
+// operator sees one prompt and every call waiting on it when it is answered takes that answer.
+// A call that arrives after a question resolves asks again, unless the answer was session
+// scope, in which case the allowance exists and the Gate never asks.
 func (a *liveAsker) Ask(ctx context.Context, q turn.Question) (turn.Answer, error) {
+	key := askKey{tool: q.Matcher.Tool, prefix: q.Matcher.Prefix}
+	a.ls.mu.Lock()
+	if st, ok := a.ls.asking[key]; ok {
+		st.waiting++
+		a.ls.mu.Unlock()
+		select {
+		case <-st.done:
+			return st.ans, st.err
+		case <-ctx.Done():
+			// This call is going away; the question stands for whoever else is waiting.
+			a.ls.mu.Lock()
+			st.waiting--
+			a.ls.mu.Unlock()
+			return turn.Answer{}, ctx.Err()
+		}
+	}
+	st := &standingAsk{done: make(chan struct{}), waiting: 1}
+	a.ls.asking[key] = st
+	a.ls.mu.Unlock()
+
+	ans, err := a.ask(ctx, q)
+
+	a.ls.mu.Lock()
+	delete(a.ls.asking, key)
+	a.ls.mu.Unlock()
+	st.ans, st.err = ans, err
+	close(st.done)
+	return ans, err
+}
+
+// ask puts one question to the operator and waits for its answer: the whole of what Ask did
+// before calls could coalesce, unchanged, and now the path only the call that raises a question
+// takes. It runs on the caller's own goroutine, with no turn.Runner or liveSession lock held
+// (see turn.Runner.runTool): calling a.runner.TurnID() here is safe and gives the freshest
+// value, unlike a handler that already holds mu or obsMu, which must use the mirror instead.
+func (a *liveAsker) ask(ctx context.Context, q turn.Question) (turn.Answer, error) {
 	// TurnID before any lock is taken: calling a Runner method under one is what the
 	// liveSession doc rules out, and here no lock is held, so it is also the freshest value.
 	req := protocol.PermissionRequested{
