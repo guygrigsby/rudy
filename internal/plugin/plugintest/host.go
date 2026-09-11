@@ -9,6 +9,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -24,6 +25,7 @@ type Host struct {
 	RegisteredTools    []tool.Tool
 	RegisteredCommands []plugin.Command
 	Providers          []provider.Provider
+	Agents             []agentdef.Definition
 	Hooks              []plugin.HookHandler
 	Notices            []string
 	Status             []plugin.StatusItem
@@ -53,6 +55,11 @@ func (h *Host) RegisterProvider(p provider.Provider) error {
 
 func (h *Host) RegisterHook(hh plugin.HookHandler) error {
 	h.Hooks = append(h.Hooks, hh)
+	return nil
+}
+
+func (h *Host) RegisterAgent(d agentdef.Definition) error {
+	h.Agents = append(h.Agents, d)
 	return nil
 }
 
@@ -97,3 +104,12 @@ func (h *Host) Connect(context.Context) (*protocol.Client, error) { return nil, 
 func (h *Host) Commands() []plugin.Command { return h.RegisteredCommands }
 func (h *Host) Tools() []tool.Tool         { return h.RegisteredTools }
 func (h *Host) Statuses() []plugin.Status  { return h.PluginStatuses }
+
+// AgentDefs indexes RegisteredAgents by name, the shape the real registry's getter has.
+func (h *Host) AgentDefs() map[string]agentdef.Definition {
+	out := make(map[string]agentdef.Definition, len(h.Agents))
+	for _, d := range h.Agents {
+		out[d.Name] = d
+	}
+	return out
+}

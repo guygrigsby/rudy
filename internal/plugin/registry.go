@@ -10,6 +10,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -43,6 +44,8 @@ type Registry struct {
 	cmdOrder    []string
 	providers   map[string]owned[provider.Provider]
 	provOrder   []string
+	agents      map[string]owned[agentdef.Definition]
+	agentOrder  []string
 	hooks       []OwnedHook // load order; Hooks sorts a point's handlers by priority
 	loaded      []Plugin    // every plugin whose Init returned nil, in load order, for Close
 	statuses    []Status
@@ -62,6 +65,7 @@ func NewRegistry(config map[string]map[string]any, notice func(string)) *Registr
 		tools:     map[string]owned[tool.Tool]{},
 		commands:  map[string]owned[Command]{},
 		providers: map[string]owned[provider.Provider]{},
+		agents:    map[string]owned[agentdef.Definition]{},
 		disabled:  map[string]bool{},
 		failed:    map[string]bool{},
 		status:    map[ownerKey]StatusItem{},
@@ -249,6 +253,10 @@ func (r *Registry) commit(h *host) {
 		r.providers[n] = owned[provider.Provider]{owner: h.name, value: h.providers[n]}
 		r.provOrder = append(r.provOrder, n)
 	}
+	for _, n := range h.agentOrder {
+		r.agents[n] = owned[agentdef.Definition]{owner: h.name, value: h.agents[n]}
+		r.agentOrder = append(r.agentOrder, n)
+	}
 	for _, hh := range h.hooks {
 		r.hooks = append(r.hooks, OwnedHook{Owner: h.name, HookHandler: hh})
 	}
@@ -362,6 +370,7 @@ func (r *Registry) Fail(name, reason string) {
 	r.toolOrder = withdraw(r.tools, r.toolOrder, name)
 	r.cmdOrder = withdraw(r.commands, r.cmdOrder, name)
 	r.provOrder = withdraw(r.providers, r.provOrder, name)
+	r.agentOrder = withdraw(r.agents, r.agentOrder, name)
 	r.hooks = slices.DeleteFunc(r.hooks, func(h OwnedHook) bool { return h.Owner == name })
 	hadStatus := false
 	for _, k := range r.statusOrder {
@@ -517,6 +526,19 @@ func (r *Registry) providersLocked() []provider.Provider {
 	return out
 }
 
+// AgentDefs is every agent definition plugins have registered, by name. A map rather than an
+// ordered slice because resolveAgent merges it with the definitions read from disk, where the
+// name is the key and precedence has already decided the winner.
+func (r *Registry) AgentDefs() map[string]agentdef.Definition {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]agentdef.Definition, len(r.agentOrder))
+	for _, n := range r.agentOrder {
+		out[n] = r.agents[n].value
+	}
+	return out
+}
+
 func (r *Registry) Statuses() []Status {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -538,6 +560,8 @@ type host struct {
 	cmdOrder    []string
 	providers   map[string]provider.Provider
 	provOrder   []string
+	agents      map[string]agentdef.Definition
+	agentOrder  []string
 	hooks       []HookHandler
 	status      map[string]StatusItem
 	statusOrder []string
@@ -552,6 +576,7 @@ func newHost(r *Registry, name string) *host {
 		tools:     map[string]tool.Tool{},
 		commands:  map[string]Command{},
 		providers: map[string]provider.Provider{},
+		agents:    map[string]agentdef.Definition{},
 		status:    map[string]StatusItem{},
 		widgets:   map[string]Widget{},
 	}
@@ -570,6 +595,16 @@ func (h *host) RegisterProvider(p provider.Provider) error {
 		return errors.New("plugin: nil provider")
 	}
 	return stageRegister(h, "provider", p.Name(), p, h.r.providers, h.providers, &h.provOrder)
+}
+
+func (h *host) RegisterAgent(d agentdef.Definition) error {
+	if d.Description == "" {
+		return fmt.Errorf("plugin %s: agent %s: description is required", h.name, d.Name)
+	}
+	if d.Thinking != "" && !d.Thinking.Valid() {
+		return fmt.Errorf("plugin %s: agent %s: thinking %q is not off, low, medium or high", h.name, d.Name, d.Thinking)
+	}
+	return stageRegister(h, "agent", d.Name, d, h.r.agents, h.agents, &h.agentOrder)
 }
 
 // stageRegister checks name against both the committed table and this
@@ -687,6 +722,7 @@ func (h *host) Connect(ctx context.Context) (*protocol.Client, error) {
 
 // Commands, Tools and Statuses are the committed registry, not this host's stage: a plugin
 // asking what else is loaded wants what the kernel will actually run.
-func (h *host) Commands() []Command { return h.r.Commands() }
-func (h *host) Tools() []tool.Tool  { return h.r.Tools() }
-func (h *host) Statuses() []Status  { return h.r.Statuses() }
+func (h *host) Commands() []Command                       { return h.r.Commands() }
+func (h *host) Tools() []tool.Tool                        { return h.r.Tools() }
+func (h *host) Statuses() []Status                        { return h.r.Statuses() }
+func (h *host) AgentDefs() map[string]agentdef.Definition { return h.r.AgentDefs() }

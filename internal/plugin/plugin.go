@@ -9,6 +9,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -116,7 +117,11 @@ type Host interface {
 	RegisterCommand(c Command) error
 	RegisterProvider(p provider.Provider) error
 	RegisterHook(h HookHandler) error // invalid point or nil Handle refused
-	Config() map[string]any           // the plugin's [plugins.<name>] table, never nil
+	// RegisterAgent contributes an agent definition, the same thing an agents/<name>.md file
+	// carries. A definition is static data, so it needs no callback. An operator's file of the
+	// same name wins: resolveAgent reads the disk roots first (ADR 0028).
+	RegisterAgent(d agentdef.Definition) error
+	Config() map[string]any // the plugin's [plugins.<name>] table, never nil
 	Notice(text string)
 
 	// SetStatus replaces this plugin's status item under key; empty content clears it. A
@@ -136,6 +141,9 @@ type Host interface {
 	Commands() []Command
 	Tools() []tool.Tool
 	Statuses() []Status
+	// AgentDefs is every agent definition plugins have registered, by name. Read side of
+	// RegisterAgent, for a plugin that wants to see what its peers contributed.
+	AgentDefs() map[string]agentdef.Definition
 }
 
 type Plugin interface {

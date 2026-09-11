@@ -1214,11 +1214,13 @@ func firstNonEmpty(vs ...string) string {
 	return ""
 }
 
-// resolveAgent reads the definitions visible to a session in ws (the user's, then the
-// workspace's, first name winning) and resolves one by name, telling cn about any file that
-// would not parse. Read per session rather than cached, so a definition edited between two
-// sessions takes effect on the second without a restart. ok is false only for a name no root
-// defines; "" and "default" always resolve.
+// resolveAgent reads the definitions visible to a session in ws and resolves one by name,
+// telling cn about any file that would not parse. The user's root, then the workspace's, then
+// whatever plugins registered, first name winning: an operator's file always beats a plugin's
+// registration, so installing a plugin cannot take a name that is already in use and cannot
+// change what an existing session resolves to (ADR 0028). Read per session rather than cached,
+// so a definition edited between two sessions takes effect on the second without a restart. ok
+// is false only for a name nothing defines; "" and "default" always resolve.
 func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agentdef.Definition, bool) {
 	defs, errs := agentdef.Load([]string{
 		filepath.Join(s.d.Config.ConfigDir, "agents"),
@@ -1226,6 +1228,11 @@ func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agen
 	})
 	for _, e := range errs {
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: e.Error()})
+	}
+	for n, d := range s.d.Plugins.AgentDefs() {
+		if _, seen := defs[n]; !seen {
+			defs[n] = d
+		}
 	}
 	return agentdef.Resolve(defs, name)
 }

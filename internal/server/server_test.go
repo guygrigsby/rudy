@@ -23,6 +23,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	yaml "go.yaml.in/yaml/v3"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -4241,5 +4242,117 @@ func TestPermissionsCommandSetsTheMode(t *testing.T) {
 	}, &protocol.CommandRunResult{})
 	if code(t, err) != protocol.CodePluginError {
 		t.Errorf("an unknown mode is refused: %v", err)
+	}
+}
+
+// fakeAgentPlugin contributes one agent definition through Host.RegisterAgent, the way a real
+// plugin would ship one instead of a file. description doubles as the definition's Prompt: that
+// is the one field of a definition applyAgent actually stamps onto a live session (ls.system),
+// so it is what a test can observe back out through the fake provider's recorded requests.
+// Description itself never reaches the provider and has no other wire in the protocol today.
+type fakeAgentPlugin struct {
+	name        string
+	description string
+}
+
+func (p fakeAgentPlugin) Name() string { return "fake-agent-" + p.name }
+
+func (p fakeAgentPlugin) Init(_ context.Context, h plugin.Host) error {
+	return h.RegisterAgent(agentdef.Definition{Name: p.name, Description: p.description, Prompt: p.description})
+}
+
+// fakeFailingAgentPlugin registers an agent and then fails its own Init, the shape of "a plugin
+// whose registration failed": Load's stage-then-commit never installs anything from a plugin
+// whose Init returned an error, so the agent it tried to register must not be resolvable either.
+type fakeFailingAgentPlugin struct {
+	name        string
+	description string
+}
+
+func (p fakeFailingAgentPlugin) Name() string { return "fake-failing-agent-" + p.name }
+
+func (p fakeFailingAgentPlugin) Init(_ context.Context, h plugin.Host) error {
+	if err := h.RegisterAgent(agentdef.Definition{Name: p.name, Description: p.description}); err != nil {
+		return err
+	}
+	return errors.New("boom")
+}
+
+// writeAgentDefWithPrompt is writeAgentDef but for a test reading the prompt back rather than
+// the tools list: writeAgentDef's body is always the constant "Test agent.", which is fine when
+// a test only checks which tools came through but useless for telling two definitions of the
+// same name apart, so this writes prompt as the body instead.
+func writeAgentDefWithPrompt(t *testing.T, srv *testServer, name, description, prompt string) {
+	t.Helper()
+	dir := filepath.Join(srv.configDir, "agents")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	head := struct {
+		Description string `yaml:"description"`
+	}{Description: description}
+	fm, err := yaml.Marshal(head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "---\n" + string(fm) + "---\n" + prompt + "\n"
+	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// agentDescriptionOf drives one bare turn on sess and returns the rendered system prompt the
+// server sent the provider. applyAgent stamps ls.system to the resolved definition's Prompt
+// (ADR 0028), and the request assembler renders that as the prompt's own text followed by the
+// template's own sections (tools, AGENTS.md, memory), so the definition's Prompt is always the
+// prefix a caller checks against rather than the whole string. It reuses toolNames' own "already
+// live" drive rather than duplicating it; the tool names it returns are discarded here, since
+// what this helper reports is the first request's System.
+func agentDescriptionOf(t *testing.T, srv *testServer, sess string) string {
+	t.Helper()
+	toolNames(t, srv, sess)
+	reqs := srv.prov.requestsFor(sess)
+	if len(reqs) == 0 {
+		t.Fatalf("no request recorded for %s", sess)
+	}
+	return reqs[0].System
+}
+
+// TestADiskDefinitionBeatsAPluginsOfTheSameName is ADR 0028 decision 7: an operator's file
+// always wins over a plugin's registration of the same name, so installing a plugin can never
+// change what an existing session resolves to.
+func TestADiskDefinitionBeatsAPluginsOfTheSameName(t *testing.T) {
+	srv, cn := newTestServerWithPlugins(t, fakeAgentPlugin{"explorer", "from the plugin"})
+	writeAgentDefWithPrompt(t, srv, "explorer", "from disk", "from disk")
+
+	s := openSession(t, cn, sessionOpenParams{Agent: "explorer"})
+	if got := agentDescriptionOf(t, srv, s); !strings.HasPrefix(got, "from disk") {
+		t.Fatalf("resolved prompt = %q, want the operator's file to win", got)
+	}
+}
+
+// TestAPluginDefinitionResolvesWhenNoFileClaimsTheName is the other direction: a plugin's own
+// agent is reachable when nothing on disk uses that name.
+func TestAPluginDefinitionResolvesWhenNoFileClaimsTheName(t *testing.T) {
+	srv, cn := newTestServerWithPlugins(t, fakeAgentPlugin{"reviewer", "from the plugin"})
+
+	s := openSession(t, cn, sessionOpenParams{Agent: "reviewer"})
+	if got := agentDescriptionOf(t, srv, s); !strings.HasPrefix(got, "from the plugin") {
+		t.Fatalf("resolved prompt = %q, want the plugin's", got)
+	}
+}
+
+// TestAFailedPluginsAgentIsNotResolvable is the third direction the precedence tests above do
+// not cover: a plugin whose Init failed never committed anything, agents included, so a session
+// naming its agent must be refused rather than picking it up.
+func TestAFailedPluginsAgentIsNotResolvable(t *testing.T) {
+	_, cn := newTestServerWithPlugins(t, fakeFailingAgentPlugin{"ghost", "should not resolve"})
+
+	var info protocol.SessionInfo
+	err := cn.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{
+		Cwd: t.TempDir(), Agent: "ghost",
+	}, &info)
+	if code(t, err) != protocol.CodeNotFound {
+		t.Fatalf("open with a failed plugin's agent name: err = %v, want not_found", err)
 	}
 }

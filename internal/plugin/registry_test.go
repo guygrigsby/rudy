@@ -9,6 +9,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentdef"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -555,5 +556,68 @@ func TestCloseHandsTheContextToAContextCloser(t *testing.T) {
 	// costs nothing.
 	if got := strings.Join(closed, ","); got != "plain" {
 		t.Errorf("closed %q, want plain", got)
+	}
+}
+
+func TestRegisterAgentKeepsFirstAndNotices(t *testing.T) {
+	r, notices := newTestRegistry(nil)
+	var second error
+	r.Load(context.Background(),
+		fakePlugin{"first", func(_ context.Context, h Host) error {
+			return h.RegisterAgent(agentdef.Definition{Name: "explorer", Description: "reads"})
+		}},
+		fakePlugin{"second", func(_ context.Context, h Host) error {
+			second = h.RegisterAgent(agentdef.Definition{Name: "explorer", Description: "impostor"})
+			return nil
+		}},
+	)
+	if !errors.Is(second, ErrDuplicate) {
+		t.Fatalf("second registration error = %v", second)
+	}
+	defs := r.AgentDefs()
+	if len(defs) != 1 || defs["explorer"].Description != "reads" {
+		t.Fatalf("agents = %+v", defs)
+	}
+	if len(*notices) != 1 || (*notices)[0] != "plugin second: agent explorer already registered by first" {
+		t.Fatalf("notices = %v", *notices)
+	}
+	st := r.Statuses()
+	if st[1].State != StateReady {
+		t.Fatalf("second should still be ready: %+v", st[1])
+	}
+}
+
+func TestFailedPluginWithdrawsItsAgents(t *testing.T) {
+	r, _ := newTestRegistry(nil)
+	r.Load(context.Background(), fakePlugin{"one", func(_ context.Context, h Host) error {
+		return h.RegisterAgent(agentdef.Definition{Name: "explorer", Description: "reads"})
+	}})
+	if len(r.AgentDefs()) != 1 {
+		t.Fatalf("agents = %+v", r.AgentDefs())
+	}
+	r.Fail("one", "died")
+	if len(r.AgentDefs()) != 0 {
+		t.Fatalf("a failed plugin's agents are still registered: %+v", r.AgentDefs())
+	}
+}
+
+// TestRegisterAgentValidates is the contracts row for plugin.register_agent: invalid_argument
+// for an empty description or a thinking level that is not off, low, medium or high.
+func TestRegisterAgentValidates(t *testing.T) {
+	r, _ := newTestRegistry(nil)
+	var noDescription, badThinking error
+	r.Load(context.Background(), fakePlugin{"p", func(_ context.Context, h Host) error {
+		noDescription = h.RegisterAgent(agentdef.Definition{Name: "a"})
+		badThinking = h.RegisterAgent(agentdef.Definition{Name: "b", Description: "d", Thinking: "urgent"})
+		return nil
+	}})
+	if noDescription == nil {
+		t.Fatal("empty description must be refused")
+	}
+	if badThinking == nil {
+		t.Fatal("invalid thinking level must be refused")
+	}
+	if len(r.AgentDefs()) != 0 {
+		t.Fatalf("agents = %+v", r.AgentDefs())
 	}
 }
