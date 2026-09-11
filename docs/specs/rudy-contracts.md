@@ -286,10 +286,12 @@ Kinds:
 | `parent_tool_use_id` | string | no | the `tool_use` id in the parent that opened this one; empty exactly when `parent_session_id` is empty |
 
 ```json
-{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":1,"rudy_version":"0.1.0","workspace":{"root":"/Users/guy/projects/rudy","git_root":"/Users/guy/projects/rudy","project_id":"local/rudy"},"model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"thinking":"high","mode":"strict","agent":"default","parent_session_id":"","parent_tool_use_id":""}
+{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":1,"rudy_version":"0.1.0","workspace":{"root":"/Users/guy/projects/rudy","git_root":"/Users/guy/projects/rudy","project_id":"local/rudy"},"model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"thinking":"high","mode":"strict","agent":"default","parent_session_id":"","parent_tool_use_id":"","tools":null}
 ```
 
 A pass 1 log lacks the two parent fields; `Load` reads their absence as empty.
+
+`tools` is the session's resolved tool set: the agent definition's list, intersected with the caller's `tools` and with the parent's effective set, minus `agent` for a child. `null` means every tool the registry offers and an empty list means none, the same distinction the definition file carries. It is written because a session is rebuilt on resume long after its parent is gone, and recomputing it from the definition alone would hand back exactly what the intersection removed (ADR 0028). A log written before this field reads as `null`, which is the pre-existing behaviour for those sessions.
 
 **`fork_point`**
 
@@ -648,7 +650,7 @@ Invariants and where they are enforced:
 | steer only in steering state | `Turn.Resume` | `Load` checks the preceding entry |
 | one process writes a session | lock file | `flock` on `lock` |
 | tool names unique | `PluginRegistry.RegisterTool` | none; runtime |
-| a session's tool set never exceeds its parent's | `Session.Open` intersects definition, `tools` and parent before stamping the view | none; runtime, rebuilt on resume from the agent name in the log and the parent link |
+| a session's tool set never exceeds its parent's | `Session.Open` intersects definition, `tools` and parent before stamping the view | the resolved set is written on `session_opened` and replayed on resume. It is recorded rather than recomputed because a child is cold by the time anyone resumes it, its parent may be gone, and recomputing from the definition alone hands back exactly what the intersection removed. What a session ran under is a fact about that session, so the log is where it belongs |
 | a call never runs on consent given for another call's arguments | the asker coalesces only calls whose matcher and input bytes are both equal; a `session` answer resolves parked questions its allowance covers, never one the Gate marked dangerous, which keeps ADR 0011's ordering that puts the dangerous set ahead of allowances | one `permission_decision` per `tool_use`, so each call records its own decision row citing the answer that bound it |
 | an interrupted turn records no call as succeeding | every in-flight call observes the interrupt rather than one consuming it | `tool_result` outcome `killed` for each call that was running |
 
