@@ -56,6 +56,14 @@ type Store struct {
 	// everywhere but the CLI, which wires in its own stdout so the operator watching the
 	// command sees what the build does.
 	Out io.Writer
+	// GoEnv, when set, overrides variables (GOPROXY, GONOSUMDB, ...) in a go: source's `go mod
+	// download` subprocess environment, applied after the operator's own os.Environ() but
+	// before GOFLAGS and GOMODCACHE are pinned, which nothing overrides. Nil everywhere but
+	// tests: production always inherits the operator's real GOPROXY, GOPRIVATE, GONOSUMDB and
+	// any credential helper unchanged, since a private module needs them. A test sets this
+	// instead of t.Setenv, which would mutate the whole test binary's environment for as long
+	// as the test runs and race any other test in this package that shells out to go too.
+	GoEnv []string
 }
 
 // buildOut is where a manifest's build command output goes: Out when the caller set one,
@@ -272,7 +280,7 @@ func (s *Store) Install(ctx context.Context, source string, now time.Time) (Inst
 		}
 	}()
 
-	resolved, err := stageForInstall(ctx, src, stage)
+	resolved, err := s.stageForInstall(ctx, src, stage)
 	if err != nil {
 		return Installed{}, plugin.Manifest{}, err
 	}
@@ -415,7 +423,7 @@ func (s *Store) Update(ctx context.Context, name string, now time.Time) (Install
 		}
 	}()
 
-	resolved, err := stageForUpdate(ctx, src, stage)
+	resolved, err := s.stageForUpdate(ctx, src, stage, inst.Digest)
 	if err != nil {
 		return Installed{}, err
 	}
@@ -536,17 +544,17 @@ func isRemoteSource(source string) bool {
 }
 
 // stageForInstall fills stage (already created, empty) with src's contents for a fresh
-// install, and reports what it resolved to: the checked-out commit for git, empty for path
-// (there is no version concept to record), and an error for go and https, not yet
-// implemented (tasks 4 and 5 add a stager for each behind this same dispatch).
-func stageForInstall(ctx context.Context, src Source, stage string) (resolved string, err error) {
+// install, and reports what it resolved to: the checked-out commit for git, the module version
+// and proxy sum for go, empty for path (there is no version concept to record), and an error
+// for https, not yet implemented (task 5 adds a stager behind this same dispatch).
+func (s *Store) stageForInstall(ctx context.Context, src Source, stage string) (resolved string, err error) {
 	switch src.Kind {
 	case KindGit:
 		return stageGitInstall(ctx, src, stage)
 	case KindPath:
 		return "", stagePath(ctx, src, stage)
 	case KindGo:
-		return "", fmt.Errorf("pluginstore: go: sources are not yet supported")
+		return s.stageGo(ctx, src, stage)
 	case KindHTTPS:
 		return "", fmt.Errorf("pluginstore: https sources are not yet supported")
 	default:
@@ -556,15 +564,17 @@ func stageForInstall(ctx context.Context, src Source, stage string) (resolved st
 
 // stageForUpdate is stageForInstall's counterpart for rudy plugins update: the same dispatch,
 // but git re-resolves a pinned ref instead of taking whatever a fresh clone's default branch
-// happens to be at (see stageGitUpdate).
-func stageForUpdate(ctx context.Context, src Source, stage string) (resolved string, err error) {
+// happens to be at (see stageGitUpdate), and go refuses a pinned ref whose digest no longer
+// matches priorDigest, the lock's own recorded value, rather than silently replacing it (see
+// stageGoUpdate).
+func (s *Store) stageForUpdate(ctx context.Context, src Source, stage string, priorDigest string) (resolved string, err error) {
 	switch src.Kind {
 	case KindGit:
 		return stageGitUpdate(ctx, src, stage)
 	case KindPath:
 		return "", stagePath(ctx, src, stage)
 	case KindGo:
-		return "", fmt.Errorf("pluginstore: go: sources are not yet supported")
+		return s.stageGoUpdate(ctx, src, stage, priorDigest)
 	case KindHTTPS:
 		return "", fmt.Errorf("pluginstore: https sources are not yet supported")
 	default:

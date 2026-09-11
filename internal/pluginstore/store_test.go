@@ -1164,18 +1164,11 @@ func TestSwapCheckoutRepairsAMissingDirWithNoBackup(t *testing.T) {
 	}
 }
 
-// TestInstallRefusesGoSources and TestInstallRefusesHTTPSSources cover fix round 1's minor:
-// nothing previously asserted that the dispatch itself refuses go and https, only that
-// ParseSource classifies them; a refactor that routed either into the git stager by mistake
-// would have passed every other test in this file.
-func TestInstallRefusesGoSources(t *testing.T) {
-	s := newTestStore(t)
-	_, _, err := s.Install(context.Background(), "go:example.com/m/plugin@v1", time.Now())
-	if err == nil || !strings.Contains(err.Error(), "not yet supported") {
-		t.Fatalf("err = %v, want a not-yet-supported error", err)
-	}
-}
-
+// TestInstallRefusesHTTPSSources covers fix round 1's minor: nothing previously asserted that
+// the dispatch itself refuses https, only that ParseSource classifies it; a refactor that
+// routed it into the git stager by mistake would have passed every other test in this file. Go
+// had the same test until task 4 gave go: sources a real stager; source_go_test.go's
+// TestInstallsAGoModuleFromTheProxy is the dispatch coverage for go now.
 func TestInstallRefusesHTTPSSources(t *testing.T) {
 	s := newTestStore(t)
 	_, _, err := s.Install(context.Background(), "https://example.com/p.tar.gz", time.Now())
