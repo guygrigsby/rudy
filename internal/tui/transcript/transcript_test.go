@@ -230,6 +230,137 @@ func TestChildRowsInsertRightAfterTheirGroupNotAtTheEnd(t *testing.T) {
 	}
 }
 
+// TestAChildsPromptSuppressesItsOwnToolRowAndIndents is rudy-ssz on the transcript side: a
+// subagent's own permission question renders in place of its own tool row (the row draws
+// nothing while it stands, the same as this transcript's own), indented under the agent
+// call that opened the child, and AnsweredFrom takes it down again so the tool row resumes
+// drawing.
+func TestAChildsPromptSuppressesItsOwnToolRowAndIndents(t *testing.T) {
+	tr := newTestTranscript(t)
+	tr.Apply(assistantEntry(t, session.ToolUseBlock("tu1", "agent", json.RawMessage(`{"agent":"explorer","prompt":"look"}`))))
+	tr.ApplyFrom("child-session-id", "tu1", assistantEntry(t,
+		session.ToolUseBlock("tu_bash", "bash", json.RawMessage(`{"command":"rm -rf /tmp/x"}`))))
+
+	toolRow := rowByKey(t, tr.Rows(), "child-session-id/tu_bash")
+	if lines := tr.Render(toolRow); len(lines) == 0 {
+		t.Fatal("setup: the tool row must draw before any prompt stands")
+	}
+
+	tr.PromptFrom("child-session-id", "tu1", protocol.PermissionRequested{
+		SessionID: "child-session-id", ToolUseID: "tu_bash", Tool: "bash",
+		Input: json.RawMessage(`{"command":"rm -rf /tmp/x"}`),
+	})
+	if lines := tr.Render(toolRow); len(lines) != 0 {
+		t.Fatalf("the tool row must draw nothing while its own question stands: %v", lines)
+	}
+
+	rows := tr.Rows()
+	agentRow := rowByKey(t, rows, "tu1")
+	var promptRow *Row
+	for _, r := range rows {
+		if r.Kind == RowPrompt {
+			promptRow = r
+		}
+	}
+	if promptRow == nil {
+		t.Fatal("no prompt row rendered for the child's question")
+	}
+	if promptRow.SessionID != "child-session-id" || promptRow.ParentToolUseID != "tu1" {
+		t.Fatalf("prompt row origin = %+v, want child-session-id/tu1", promptRow)
+	}
+	lines := tr.Layout()
+	promptLine := lineForRow(t, lines, promptRow)
+	agentLine := lineForRow(t, lines, agentRow)
+	if indentOf(promptLine) <= indentOf(agentLine) {
+		t.Fatalf("the prompt is not indented under its call: parent=%d prompt=%d",
+			indentOf(agentLine), indentOf(promptLine))
+	}
+
+	tr.AnsweredFrom("child-session-id", "tu1", "tu_bash")
+	if lines := tr.Render(toolRow); len(lines) == 0 {
+		t.Fatal("the tool row must draw again once its question is answered")
+	}
+	for _, r := range tr.Rows() {
+		if r.Kind == RowPrompt {
+			t.Fatalf("the prompt row survived AnsweredFrom: %+v", r)
+		}
+	}
+}
+
+// TestAChildsToolStateShowsAwaitingPermission is rudy-ssz's visibility half: tool.state
+// always precedes permission.requested for the same call (contracts), and without this a
+// child's tool row says "running" for that whole gap with nothing telling the operator it
+// is actually waiting on them.
+func TestAChildsToolStateShowsAwaitingPermission(t *testing.T) {
+	tr := newTestTranscript(t)
+	tr.Apply(assistantEntry(t, session.ToolUseBlock("tu1", "agent", json.RawMessage(`{"agent":"explorer","prompt":"look"}`))))
+	tr.ApplyFrom("child-session-id", "tu1", assistantEntry(t,
+		session.ToolUseBlock("tu_bash", "bash", json.RawMessage(`{"command":"rm -rf /tmp/x"}`))))
+	toolRow := rowByKey(t, tr.Rows(), "child-session-id/tu_bash")
+
+	before := ansi.Strip(strings.Join(tr.Render(toolRow), "\n"))
+	if !strings.Contains(before, "running") {
+		t.Fatalf("setup: want the default running text, got %q", before)
+	}
+
+	tr.SetToolState("child-session-id", "tu_bash", protocol.ToolStateAwaitingPermission)
+	after := ansi.Strip(strings.Join(tr.Render(toolRow), "\n"))
+	if !strings.Contains(after, "awaiting permission") {
+		t.Fatalf("tool.state(awaiting_permission) did not reach the row: %q", after)
+	}
+}
+
+// TestChildMarkdownWrapsInsideTheWidth is markdown's indent fix: a subagent's answer wraps
+// at Width-Gutter-indent, the same as line and wrap, rather than at the top-level Width-Gutter
+// with indent only added afterward, which would let a wrapped line reach Width+indent columns
+// and corrupt the inline region a tea.Println later writes it into.
+func TestChildMarkdownWrapsInsideTheWidth(t *testing.T) {
+	width := 40
+	tr := New(Options{Width: width, ToolCollapsed: true, ToolPreviewLines: 2, BlockGap: 1}, theme.Default())
+	tr.Apply(assistantEntry(t, session.ToolUseBlock("tu1", "agent", json.RawMessage(`{"agent":"explorer","prompt":"look"}`))))
+	long := strings.Repeat("lorem ipsum dolor sit amet consectetur adipiscing ", 3)
+	tr.ApplyFrom("child-session-id", "tu1", assistantEntry(t, session.TextBlock(long)))
+
+	for _, l := range tr.Layout() {
+		if got := ansi.StringWidth(l.Text); got > width {
+			t.Fatalf("line %q is %d columns wide, want at most %d (the terminal's own width)", l.Text, got, width)
+		}
+	}
+}
+
+// TestALateChildEntryStillCommits is the fix for callTurn's fallback: a child's straggler
+// entry, arriving after the parent's turn (and the agent call's own row) has already gone
+// to scrollback, must still carry a TurnID CommitLate recognizes as already committed,
+// or it strands in the live region for the rest of the session.
+func TestALateChildEntryStillCommits(t *testing.T) {
+	tr := newTestTranscript(t)
+	u := entry(t, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+	tr.Apply(u)
+	tr.Apply(assistantEntry(t, session.ToolUseBlock("tu1", "agent", json.RawMessage(`{"agent":"explorer","prompt":"look"}`))))
+
+	// The parent's turn rests and is committed off screen, the agent call's own row with it.
+	if lines := tr.Commit(u.ID.String()); len(lines) == 0 {
+		t.Fatal("setup: nothing committed")
+	}
+	if len(tr.Rows()) != 0 {
+		t.Fatalf("setup: rows survived the commit: %+v", tr.Rows())
+	}
+
+	// The straggler: the child answers after its own call's row is already gone.
+	tr.ApplyFrom("child-session-id", "tu1", assistantEntry(t, session.TextBlock("I looked, late")))
+	if len(tr.Rows()) != 1 {
+		t.Fatalf("the straggler must land somewhere live first: %+v", tr.Rows())
+	}
+
+	lines := tr.CommitLate()
+	if len(lines) == 0 {
+		t.Fatal("a late child row must commit, not strand in the live region")
+	}
+	if got := tr.Rows(); len(got) != 0 {
+		t.Fatalf("the straggler must leave the live region once CommitLate runs: %+v", got)
+	}
+}
+
 func TestDeltaThenCommitReplacesTheLiveRow(t *testing.T) {
 	tr := New(Options{Width: 80}, theme.Default())
 	tr.Delta("turn1", provider.Part{Type: provider.PartTextDelta, Text: "Looking "})

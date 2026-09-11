@@ -189,16 +189,56 @@ func (m *Model) requested(p protocol.PermissionRequested) {
 	m.tr.Prompt(p)
 }
 
-// answered takes the question for toolUseID down, wherever the decision came from: this
-// client's own answer, a hook, the gate, or another asker.
-func (m *Model) answered(toolUseID string) {
-	if m.turn.prompt != nil && m.turn.prompt.ToolUseID == toolUseID {
+// requestedFrom is requested for a subagent's own permission question (rudy-ssz): a child
+// has no asker of its own, so its question reaches this client borrowing the parent's, and
+// this client is entitled to answer it (contracts: session.answer checks cn.asker only, not
+// subscription). Rendered under the agent call that opened the child (Transcript.PromptFrom)
+// rather than in place of a tool row this session's own turn owns.
+func (m *Model) requestedFrom(sid, callToolUseID string, p protocol.PermissionRequested) {
+	m.turn.prompt = &p
+	m.tr.PromptFrom(sid, callToolUseID, p)
+}
+
+// clearPrompt takes down the standing or in-flight question sid asked for toolUseID,
+// whichever of the two it is, wherever the decision came from: this client's own answer, a
+// hook, the gate, or another asker. The session id guard is what keeps a subagent's
+// tool_use id, or another subagent's, from being read as an answer to a different session's
+// question of the same id (ADR 0028: two sessions can mint the same shape of id).
+func (m *Model) clearPrompt(sid, toolUseID string) {
+	if m.turn.prompt != nil && m.turn.prompt.ToolUseID == toolUseID && m.turn.prompt.SessionID == sid {
 		m.turn.prompt = nil
 	}
-	if m.turn.asked != nil && m.turn.asked.ToolUseID == toolUseID {
+	if m.turn.asked != nil && m.turn.asked.ToolUseID == toolUseID && m.turn.asked.SessionID == sid {
 		m.turn.asked = nil
 	}
+}
+
+// answered takes this session's own question for toolUseID down.
+func (m *Model) answered(toolUseID string) {
+	m.clearPrompt(m.session.SessionID, toolUseID)
 	m.tr.Answered(toolUseID)
+}
+
+// answeredFrom is answered for a subagent's own question.
+func (m *Model) answeredFrom(sid, callToolUseID, toolUseID string) {
+	m.clearPrompt(sid, toolUseID)
+	m.tr.AnsweredFrom(sid, callToolUseID, toolUseID)
+}
+
+// takeDownPrompt removes p's own row and the tracking that held it, wherever it came from:
+// this session's own tool row, or a subagent's under the call that opened it. The mapping
+// being gone (a stale prompt surviving a session switch) still clears the tracking, so the
+// keyboard does not keep answering a question that no longer has anywhere to land.
+func (m *Model) takeDownPrompt(p *protocol.PermissionRequested) {
+	if p.SessionID == m.session.SessionID {
+		m.answered(p.ToolUseID)
+		return
+	}
+	if call, ok := m.tr.AgentCallFor(p.SessionID); ok {
+		m.answeredFrom(p.SessionID, call, p.ToolUseID)
+		return
+	}
+	m.clearPrompt(p.SessionID, p.ToolUseID)
 }
 
 // reask puts back the question this client answered when the answer never reached the
@@ -210,8 +250,15 @@ func (m *Model) reask() {
 	if m.turn.asked == nil || m.turn.prompt != nil {
 		return
 	}
-	m.turn.prompt = m.turn.asked
-	m.tr.Prompt(*m.turn.asked)
+	p := m.turn.asked
+	m.turn.prompt = p
+	if p.SessionID != m.session.SessionID {
+		if call, ok := m.tr.AgentCallFor(p.SessionID); ok {
+			m.tr.PromptFrom(p.SessionID, call, *p)
+			return
+		}
+	}
+	m.tr.Prompt(*p)
 }
 
 // answer is the standing question's own key handling, and it runs before anything else:
@@ -231,10 +278,14 @@ func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {
 	// the answer, and a question that stays on screen after it was answered reads as one
 	// that was not. It is kept in hand until the call comes back, since an answer that
 	// never arrived has to go back up.
-	m.answered(p.ToolUseID)
+	m.takeDownPrompt(p)
 	m.turn.asked = p
 	return m.call(protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
-		SessionID: m.session.SessionID,
+		// The session the prompt actually named, not this client's own: a subagent's
+		// question carries the child's session id, and session.answer is deliberately not
+		// subscription gated (contracts), so this is the mechanism working as designed
+		// (rudy-ssz), not this session answering for another it does not own.
+		SessionID: p.SessionID,
 		ToolUseID: p.ToolUseID,
 		Decision:  decision,
 		Scope:     scope,

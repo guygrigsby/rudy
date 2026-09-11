@@ -50,6 +50,12 @@ type Transcript struct {
 	// notification that names it, and read by a client deciding whether a notification for
 	// a session that is not this one belongs to a subagent it is already showing.
 	calls map[string]string
+	// toolTurn maps every tool_use id this transcript has ever built a row for to the turn
+	// it belongs to, and is never pruned, unlike the row itself: callTurn reads it once a
+	// call's own row has gone to scrollback, which is what lets a subagent's straggler
+	// entry, arriving after the parent's turn already committed, still carry the right
+	// TurnID for CommitLate to find rather than stranding it in the live region forever.
+	toolTurn map[string]string
 }
 
 // origin is where a row came from when it is not the session this transcript renders: a
@@ -287,13 +293,25 @@ func (t *Transcript) childToolRow(o origin, toolUseID string) *Row {
 }
 
 // callTurn is the TurnID a subagent's rows are stamped with: the agent call's own row's, not
-// the child's. "", for a call whose own row has already gone to scrollback, still renders
-// fine and is swept by the next CommitLate the same as any other late row.
+// the child's. The row itself may already be gone to scrollback by the time a straggler
+// entry asks (a child answering after the parent's turn has committed), so this falls back
+// to toolTurn, recorded when the row was built and never pruned, rather than "", which
+// CommitLate would never recognize as a turn it has already committed and would strand the
+// straggler in the live region for the rest of the session.
 func (t *Transcript) callTurn(parentToolUseID string) string {
 	if r := t.byKey[parentToolUseID]; r != nil {
 		return r.TurnID
 	}
-	return ""
+	return t.toolTurn[parentToolUseID]
+}
+
+// recordToolTurn remembers that toolUseID's row belongs to turn, kept even after Commit
+// takes the row itself off screen (see callTurn).
+func (t *Transcript) recordToolTurn(toolUseID, turn string) {
+	if t.toolTurn == nil {
+		t.toolTurn = make(map[string]string)
+	}
+	t.toolTurn[toolUseID] = turn
 }
 
 // addChild inserts r under its own origin unless its key is already on screen, a replayed
@@ -343,6 +361,7 @@ func (t *Transcript) applyAssistant(e session.Entry, m session.AssistantMessage)
 			}
 		case session.BlockToolUse:
 			built = append(built, &Row{Key: b.ID, Kind: RowTool, TurnID: turn, Entry: e, ToolUse: b})
+			t.recordToolTurn(b.ID, turn)
 		}
 	}
 	if len(built) == 0 {
@@ -605,6 +624,47 @@ func (t *Transcript) Prompt(p protocol.PermissionRequested) {
 func (t *Transcript) Answered(toolUseID string) {
 	if i := t.indexOf(promptKey(toolUseID)); i >= 0 {
 		t.removeAt(i)
+	}
+}
+
+// PromptFrom is Prompt for a subagent's own permission question (rudy-ssz): a child has no
+// asker of its own, so its permission.requested reaches the parent's askers carrying the
+// child's session id, and answering it is entitled the same way (contracts: session.answer
+// is deliberately not subscription gated). The row is keyed and stamped under sessionID and
+// parentToolUseID so it renders in front of the child's own tool row, under the agent call
+// that opened it, the same as any other of that call's rows.
+func (t *Transcript) PromptFrom(sessionID, parentToolUseID string, p protocol.PermissionRequested) {
+	o := origin{sessionID: sessionID, parentToolUseID: parentToolUseID}
+	key := o.key(promptKey(p.ToolUseID))
+	if t.byKey[key] != nil {
+		return
+	}
+	r := o.stamp(&Row{Key: key, Kind: RowPrompt, TurnID: t.callTurn(parentToolUseID), Prompt: &p})
+	if i := t.indexOf(o.key(p.ToolUseID)); i >= 0 {
+		t.byKey[key] = r
+		t.rows = slices.Insert(t.rows, i, r)
+		return
+	}
+	t.insertAfterGroup(parentToolUseID, r)
+}
+
+// AnsweredFrom is Answered for a subagent's own question.
+func (t *Transcript) AnsweredFrom(sessionID, parentToolUseID, toolUseID string) {
+	o := origin{sessionID: sessionID, parentToolUseID: parentToolUseID}
+	if i := t.indexOf(o.key(promptKey(toolUseID))); i >= 0 {
+		t.removeAt(i)
+	}
+}
+
+// SetToolState records a subagent's own tool call progress on its row (Row.ToolState), so
+// the moment between tool.state(awaiting_permission) and the permission.requested that
+// follows it (contracts) shows the operator why the call is not moving, rather than a bare
+// "running" for however long that ask takes to reach an asker (rudy-ssz). A tool_use this
+// transcript has no row for (an unknown call, or one whose row has already gone) is silently
+// ignored: there is nothing to mark.
+func (t *Transcript) SetToolState(sessionID, toolUseID, state string) {
+	if r := t.rowIfTool(origin{sessionID: sessionID}.key(toolUseID)); r != nil {
+		r.ToolState = state
 	}
 }
 

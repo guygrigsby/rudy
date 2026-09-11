@@ -71,6 +71,13 @@ type Row struct {
 	// SessionID is set. It is what layout indents under, and what Commit removes with the
 	// call when the turn is dropped.
 	ParentToolUseID string
+	// ToolState is a tool row's own last-seen protocol.ToolStateChanged.State, contracts:
+	// "tool.state(awaiting_permission) always precedes permission.requested for the same
+	// call", set only for a subagent's own tool calls (SessionID set): the parent's asker is
+	// itself, so permission.requested reaches it with no gap worth naming, but a child's
+	// borrows the parent's asker over the routing this row's SessionID exists for, and the
+	// tool row would otherwise say "running" for however long that ask takes to arrive.
+	ToolState string
 }
 
 // Options are the [ui.transcript] and [ui.diff] render choices, one field per config key

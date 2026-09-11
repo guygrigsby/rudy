@@ -16,6 +16,7 @@ import (
 	"github.com/aymanbagabas/go-udiff"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/icons"
 	"github.com/guygrigsby/rudy/internal/tui/theme"
@@ -123,8 +124,11 @@ func (t *Transcript) assistant(r *Row, indent int) []string {
 func (t *Transcript) tool(r *Row, indent int) []string {
 	// A permission question renders inline where the tool row would be (the design's
 	// Client section), so while one is open the tool row it stands in front of draws
-	// nothing rather than repeating its summary a line below the question.
-	if t.byKey[promptKey(r.ToolUse.ID)] != nil {
+	// nothing rather than repeating its summary a line below the question. The key is
+	// prefixed the same way a subagent's own tool row is (origin.key), or a child's own
+	// prompt, keyed under its session, would never match this bare lookup and both would
+	// draw at once.
+	if t.byKey[origin{sessionID: r.SessionID}.key(promptKey(r.ToolUse.ID))] != nil {
 		return nil
 	}
 	// A before_tool hook can change the bytes a tool ran with, and the decision records
@@ -141,7 +145,16 @@ func (t *Transcript) tool(r *Row, indent int) []string {
 		return append(out, t.line(theme.RoleError, previewIndent+indent, "denied: "+r.Decision.Reason, false))
 	}
 	if r.Result == nil {
-		return append(out, t.line(theme.RoleMuted, previewIndent+indent, "running", false))
+		// A subagent's own tool.state(awaiting_permission) always precedes the
+		// permission.requested that follows it (rudy-contracts.md), and a walk up to the
+		// parent's askers can take a moment; without this the row says "running" for
+		// however long that takes, with nothing telling the operator it is actually
+		// waiting on them (rudy-ssz).
+		text := "running"
+		if r.ToolState == protocol.ToolStateAwaitingPermission {
+			text = "awaiting permission"
+		}
+		return append(out, t.line(theme.RoleMuted, previewIndent+indent, text, false))
 	}
 	if s := outcomes[r.Result.Outcome]; s != "" {
 		out = append(out, t.line(theme.RoleWarning, previewIndent+indent, s, false))
@@ -436,24 +449,17 @@ func isControl(r rune) bool {
 }
 
 // markdown renders one answer block through glamour, with chroma on fences. indent adds to
-// the left margin every line is given, for a subagent's answer; the renderer itself is
-// cached at the transcript's own width regardless (mdCache), so a wide indented block wraps
-// to the same column count an unindented one would rather than rebuilding glamour's styles
-// per indent level. previewIndent is small next to the width this is built for, so the rare
-// overflow that leaves possible reads as a soft edge case, not a design gap.
+// the left margin every line is given, for a subagent's answer, and is subtracted from the
+// word-wrap width first (mdRenderer), the same way line and wrap already subtract an indent
+// before truncating: wrapping to the full width and only indenting the output afterward
+// would let a wrapped line reach Width+indent columns, corrupting the inline region below it
+// once a tea.Println writes it out.
 func (t *Transcript) markdown(s string, indent int) ([]string, error) {
-	if t.md.r == nil && t.md.err == nil {
-		t.md.r, t.md.err = glamour.NewTermRenderer(
-			glamour.WithStyles(glamourStyle(t.th)),
-			// One column narrower than the row, since every line it draws is moved into
-			// the gutter below; wrapping to the full width would overflow by that column.
-			glamour.WithWordWrap(t.opts.Width-Gutter),
-		)
+	r, err := t.mdRenderer(indent)
+	if err != nil {
+		return nil, err
 	}
-	if t.md.err != nil {
-		return nil, t.md.err
-	}
-	out, err := t.md.r.Render(s)
+	out, err := r.Render(s)
 	if err != nil {
 		return nil, fmt.Errorf("transcript: render markdown: %w", err)
 	}
@@ -472,10 +478,35 @@ func (t *Transcript) markdown(s string, indent int) ([]string, error) {
 	return trimBlank(lines), nil
 }
 
-// mdCache holds the glamour renderer for the current width. SetWidth drops it.
+// mdRenderer is the glamour renderer word-wrapped for indent, built on first use for that
+// indent level and kept alongside whatever other levels have already been asked for: a
+// subagent's row and this transcript's own share one Transcript and so must share one
+// mdCache, but they wrap to different widths and cannot share one renderer. previewIndent is
+// the only indent this package ever asks for besides zero, so this holds at most two
+// renderers per transcript. SetWidth drops the whole cache.
+func (t *Transcript) mdRenderer(indent int) (*glamour.TermRenderer, error) {
+	if r, ok := t.md.renderers[indent]; ok {
+		return r, t.md.errs[indent]
+	}
+	r, err := glamour.NewTermRenderer(
+		glamour.WithStyles(glamourStyle(t.th)),
+		// One column narrower than the row, since every line it draws is moved into the
+		// gutter below, and indent columns narrower again for a subagent's row.
+		glamour.WithWordWrap(max(t.opts.Width-Gutter-indent, 1)),
+	)
+	if t.md.renderers == nil {
+		t.md.renderers = map[int]*glamour.TermRenderer{}
+		t.md.errs = map[int]error{}
+	}
+	t.md.renderers[indent], t.md.errs[indent] = r, err
+	return r, err
+}
+
+// mdCache holds one glamour renderer per indent level at the current width. SetWidth drops
+// it, which is what starts a fresh set for the new width the next time each level renders.
 type mdCache struct {
-	r   *glamour.TermRenderer
-	err error
+	renderers map[int]*glamour.TermRenderer
+	errs      map[int]error
 }
 
 // glamourStyle builds glamour's style from the theme: the answer text in the assistant

@@ -526,27 +526,46 @@ func entryAppendedOf(n protocol.Notification) (protocol.EntryAppended, bool) {
 // childNotification folds one of a subagent's notifications into the transcript, under
 // callToolUseID, the agent call that opened sid. entry.appended and stream.delta render the
 // same way they would for this session's own entries, just tagged and indented
-// (Transcript.ApplyFrom, Transcript.DeltaFrom).
+// (Transcript.ApplyFrom, Transcript.DeltaFrom); a permission_decision entry among them also
+// takes down the standing question it answers, the same as this session's own decisions do
+// in entry (m.answered), which nothing else here would do for a child's.
 //
-// turn.state and tool.state do not: a child's turn is not this session's turn, and letting
-// a child's completed reach turnChanged would rest this session's spinner and offer the
-// composer while the parent is still mid-turn (ADR 0028 decision 6). The agent row already
-// says "running" for as long as its own tool_result has not arrived (transcript.tool), which
-// is every moment covered by these two notifications, so there is nothing further to fold:
-// what matters is that neither one reaches m.turn.
+// permission.requested renders too (Transcript.PromptFrom, rudy-ssz): a child has no asker
+// of its own, so its question reaches this client borrowing the parent's, and answering it
+// is entitled the same way (session.answer checks cn.asker only, not subscription).
+//
+// turn.state does not: a child's turn is not this session's turn, and letting a child's
+// completed reach turnChanged would rest this session's spinner and offer the composer
+// while the parent is still mid-turn (ADR 0028 decision 6). tool.state only ever updates the
+// agent row's own display (Transcript.SetToolState); it never reaches m.turn either.
 func (m *Model) childNotification(sid, callToolUseID string, n protocol.Notification) tea.Cmd {
 	switch n.Method {
 	case protocol.NotifyEntryAppended:
 		var p protocol.EntryAppended
-		if m.decode(n, &p) {
-			return m.lateRows(m.tr.ApplyFrom(sid, callToolUseID, p.Entry))
+		if !m.decode(n, &p) {
+			return nil
 		}
+		added := m.tr.ApplyFrom(sid, callToolUseID, p.Entry)
+		if d, ok := p.Entry.Payload.(session.PermissionDecision); ok {
+			m.answeredFrom(sid, callToolUseID, d.ToolUseID)
+		}
+		return m.lateRows(added)
 	case protocol.NotifyStreamDelta:
 		var p protocol.StreamDelta
 		if m.decode(n, &p) {
 			m.tr.DeltaFrom(sid, callToolUseID, p.Part)
 		}
-	case protocol.NotifyTurnState, protocol.NotifyToolState:
+	case protocol.NotifyPermissionRequested:
+		var p protocol.PermissionRequested
+		if m.decode(n, &p) {
+			m.requestedFrom(sid, callToolUseID, p)
+		}
+	case protocol.NotifyToolState:
+		var p protocol.ToolStateChanged
+		if m.decode(n, &p) {
+			m.tr.SetToolState(sid, p.ToolUseID, p.State)
+		}
+	case protocol.NotifyTurnState:
 	}
 	return nil
 }
