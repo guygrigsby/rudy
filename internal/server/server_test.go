@@ -2443,14 +2443,17 @@ type agentProvider struct {
 
 	armed         bool
 	delegateAgent string
+	delegateTools []string
 }
 
 // armDelegate makes agentProvider's very next Complete call, whatever session it is for, open a
-// child under agent through the agent tool, instead of running the root/child switch.
-func (p *agentProvider) armDelegate(agent string) {
+// child under agent through the agent tool, instead of running the root/child switch. tools,
+// when given, rides along as that call's own tools narrowing, the way the real agent tool's
+// input field carries one through to session.open.
+func (p *agentProvider) armDelegate(agent string, tools ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.armed, p.delegateAgent = true, agent
+	p.armed, p.delegateAgent, p.delegateTools = true, agent, tools
 }
 
 func (p *agentProvider) Name() string { return "fake" }
@@ -2486,7 +2489,7 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 	n := p.calls[req.SessionID]
 	p.reqs[req.SessionID] = append(p.reqs[req.SessionID], req)
 	root := req.SessionID == p.root
-	fire, delegateAgent := p.armed, p.delegateAgent
+	fire, delegateAgent, delegateTools := p.armed, p.delegateAgent, p.delegateTools
 	p.armed = false
 	p.mu.Unlock()
 
@@ -2509,7 +2512,11 @@ func (p *agentProvider) Complete(ctx context.Context, req provider.Request, emit
 	var parts []provider.Part
 	switch {
 	case fire:
-		parts = call("tu_agent", "agent", `{"agent":"`+delegateAgent+`"}`)
+		in, _ := json.Marshal(struct {
+			Agent string   `json:"agent"`
+			Tools []string `json:"tools,omitempty"`
+		}{delegateAgent, delegateTools})
+		parts = call("tu_agent", "agent", string(in))
 	case root && n == 1:
 		parts = call("tu_agent", "agent", `{"agent":"explorer","prompt":"look"}`)
 	case root && n == 2:
@@ -3070,7 +3077,7 @@ func (o *openerPlugin) Init(_ context.Context, h plugin.Host) error {
 	return h.RegisterTool(tool.Tool{
 		Name:        "agent",
 		Description: "test stand-in: opens a child session naming an agent definition",
-		Schema:      json.RawMessage(`{"type":"object","properties":{"agent":{"type":"string"}},"required":["agent"]}`),
+		Schema:      json.RawMessage(`{"type":"object","properties":{"agent":{"type":"string"},"tools":{"type":"array","items":{"type":"string"}}},"required":["agent"]}`),
 		Safety:      tool.Safe,
 		Invoke:      o.invoke,
 	})
@@ -3078,7 +3085,8 @@ func (o *openerPlugin) Init(_ context.Context, h plugin.Host) error {
 
 func (o *openerPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var in struct {
-		Agent string `json:"agent"`
+		Agent string   `json:"agent"`
+		Tools []string `json:"tools"`
 	}
 	if err := json.Unmarshal(call.Input, &in); err != nil || in.Agent == "" {
 		return tool.Result{IsError: true, Content: []session.Block{session.TextBlock("agent: bad input")}}, nil
@@ -3089,7 +3097,7 @@ func (o *openerPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result,
 	}
 	var info protocol.SessionInfo
 	err = client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
-		Cwd: call.Workspace.Root, Agent: in.Agent,
+		Cwd: call.Workspace.Root, Agent: in.Agent, Tools: in.Tools,
 		Parent: &protocol.ParentRef{SessionID: call.SessionID.String(), ToolUseID: call.ID},
 	}, &info)
 	if err != nil {
@@ -3160,6 +3168,7 @@ func newTestServerWithPlugins(t *testing.T, extra ...plugin.Plugin) (*testServer
 // an agent name, with the cwd and everything else defaulted.
 type sessionOpenParams struct {
 	Agent string
+	Tools []string
 }
 
 // openSession opens a root session and returns its id.
@@ -3167,7 +3176,7 @@ func openSession(t *testing.T, cn *testConn, p sessionOpenParams) string {
 	t.Helper()
 	var info protocol.SessionInfo
 	if err := cn.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{
-		Cwd: t.TempDir(), Agent: p.Agent,
+		Cwd: t.TempDir(), Agent: p.Agent, Tools: p.Tools,
 	}, &info); err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -3199,9 +3208,9 @@ func writeAgentDef(t *testing.T, srv *testServer, name, description string, tool
 // plugin's own agent tool does: from inside a Safe tool's own pending tool_use, over that
 // plugin's own connection. It arms cn's provider and drives one turn on parent through it, then
 // reads the child's session id back off the tool result the opener tool returned.
-func openChildSession(t *testing.T, cn *testConn, parent, childAgent string) string {
+func openChildSession(t *testing.T, cn *testConn, parent, childAgent string, tools ...string) string {
 	t.Helper()
-	cn.ts.prov.armDelegate(childAgent)
+	cn.ts.prov.armDelegate(childAgent, tools...)
 	ctx := context.Background()
 	var sub protocol.SessionSubmitResult
 	if err := cn.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
@@ -3305,6 +3314,27 @@ func TestChildToolsCannotExceedItsParent(t *testing.T) {
 	}
 }
 
+// TestSessionOpenToolsOnlyNarrows is ADR 0028 decision 5's third term: the caller's own tools
+// narrowing on session.open. wide's definition holds every tool, so nothing here is bounded by
+// the definition or a parent (there is none); what bounds it is the request's own Tools field.
+func TestSessionOpenToolsOnlyNarrows(t *testing.T) {
+	srv, cn := newTestServer(t)
+	writeAgentDef(t, srv, "wide", "everything", nil)
+
+	// Asking for more than the definition grants gains nothing: the set is an intersection.
+	s := openSession(t, cn, sessionOpenParams{Agent: "wide", Tools: []string{"read", "nonexistent"}})
+	got := toolNames(t, srv, s)
+	if slices.Contains(got, "nonexistent") {
+		t.Fatalf("a name no tool answers to was admitted: %v", got)
+	}
+	if slices.Contains(got, "bash") {
+		t.Fatalf("tools did not narrow: %v", got)
+	}
+	if !slices.Contains(got, "read") {
+		t.Fatalf("read was dropped: %v", got)
+	}
+}
+
 // wantBoundedChild is the assertion both TestResumedChildKeepsItsOwnList and
 // TestForkedChildKeepsItsOwnList make on got: exactly what the child held live (read), never
 // what its own "wide" definition would have handed it unintersected (bash, edit, write), and
@@ -3340,6 +3370,39 @@ func TestResumedChildKeepsItsOwnList(t *testing.T) {
 	srv.op.closeAll()
 
 	wantBoundedChild(t, "resumed", driveTurn(t, srv, child))
+}
+
+// TestResumedChildKeepsItsCallerNarrowing is task 5's own version of rudy-ef4: the caller's
+// tools narrowing has to be folded into resolveTools's result before session_opened is written,
+// the same way the parent bound already is, or a resumed child regains exactly what the caller
+// (not the definition, not the parent) removed. wide holds every tool and the parent is
+// unrestricted, so read surviving and bash not are entirely the caller narrowing's doing.
+func TestResumedChildKeepsItsCallerNarrowing(t *testing.T) {
+	srv, cn := newTestServer(t)
+	writeAgentDef(t, srv, "wide", "everything", nil)
+
+	parent := openSession(t, cn, sessionOpenParams{Agent: "wide"})
+	child := openChildSession(t, cn, parent, "wide", "read")
+
+	// Live, before any reload: the narrowing already applies.
+	live := toolNames(t, srv, child)
+	if slices.Contains(live, "bash") {
+		t.Fatalf("the caller's own tools narrowing did not apply live: %v", live)
+	}
+	if !slices.Contains(live, "read") {
+		t.Fatalf("read was dropped though the caller named it: %v", live)
+	}
+
+	// Force a cold reload the same way TestResumedChildKeepsItsOwnList does.
+	srv.op.closeAll()
+
+	got := driveTurn(t, srv, child)
+	if slices.Contains(got, "bash") {
+		t.Fatalf("a resumed child regained bash, which the caller's tools narrowing removed: %v", got)
+	}
+	if !slices.Contains(got, "read") {
+		t.Fatalf("a resumed child lost read, which it held live: %v", got)
+	}
 }
 
 // TestForkedChildKeepsItsOwnList is TestResumedChildKeepsItsOwnList's fork counterpart: forkAt

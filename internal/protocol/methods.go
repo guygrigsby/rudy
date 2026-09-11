@@ -155,6 +155,10 @@ type SessionOpenParams struct {
 	Mode     string `json:"mode,omitempty"`
 	Thinking string `json:"thinking,omitempty"`
 	Agent    string `json:"agent,omitempty"`
+	// Tools narrows the session's tool set to these names. It only ever removes: a name the
+	// agent definition or the parent did not hold is dropped rather than refused, since the
+	// set is an intersection and asking for less than you are owed is not an error (ADR 0028).
+	Tools []string `json:"tools,omitempty"`
 	// Parent names the session and tool_use a child session hangs off. Only a plugin may
 	// send it; a client gets invalid_argument.
 	Parent *ParentRef `json:"parent,omitempty"`

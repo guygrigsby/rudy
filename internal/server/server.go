@@ -1138,7 +1138,7 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	// 0028, rudy-ef4). SchemaVersion 2 is what tells that recorded value apart from a version 1
 	// log that has no tools key at all: both decode Tools() to nil, and reading a version 1
 	// log's absent key as "every tool" would be the same escalation one field earlier.
-	allow := resolveTools(parent, def)
+	allow := resolveTools(parent, def, p.Tools)
 	opened := session.SessionOpened{
 		SchemaVersion: 2, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
 		Thinking: thinking, Mode: mode, Agent: def.Name, Tools: allow,
@@ -1206,15 +1206,19 @@ func (s *Server) applyAgent(ls *liveSession, def agentdef.Definition, allow []st
 }
 
 // resolveTools is the intersection a fresh session.open needs: the definition's list narrowed
-// by the live parent's own effective set, when there is one. It runs once, at open time, and
-// its result is persisted on session_opened rather than recomputed on a later resume or fork,
-// since the parent may be gone by then and recomputing from the definition alone would hand
-// back exactly what the intersection removed (ADR 0028, rudy-ef4).
-func resolveTools(parent *liveSession, def agentdef.Definition) []string {
+// by the caller's own tools (when given), narrowed again by the live parent's own effective set
+// (when there is one). It runs once, at open time, and its result is persisted on session_opened
+// rather than recomputed on a later resume or fork, since the parent may be gone by then and
+// recomputing from the definition alone would hand back exactly what the intersection removed
+// (ADR 0028, rudy-ef4). The caller term is applied before the parent term rather than after: the
+// two commute mathematically, but doing it this way makes the parent bound visibly the outer
+// limit, the one term nothing else in this chain can widen past.
+func resolveTools(parent *liveSession, def agentdef.Definition, tools []string) []string {
+	allow := intersectTools(def.Tools, tools)
 	if parent == nil {
-		return def.Tools
+		return allow
 	}
-	return intersectTools(def.Tools, parentToolNames(parent))
+	return intersectTools(allow, parentToolNames(parent))
 }
 
 // intersectTools narrows want by have. A nil want means every tool, so the result is have; a

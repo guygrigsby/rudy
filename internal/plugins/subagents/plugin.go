@@ -24,7 +24,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/tool"
 )
 
-const schema = `{"type":"object","properties":{"agent":{"type":"string","description":"An agent definition name from agents/<name>.md"},"prompt":{"type":"string","description":"The task for the subagent"}},"required":["agent","prompt"],"additionalProperties":false}`
+const schema = `{"type":"object","properties":{"agent":{"type":"string","description":"An agent definition name from agents/<name>.md"},"prompt":{"type":"string","description":"The task for the subagent"},"tools":{"type":"array","items":{"type":"string"},"description":"Narrow the subagent to these tools. Only removes: naming a tool the definition or this session does not hold does not grant it."}},"required":["agent","prompt"],"additionalProperties":false}`
 
 type agentPlugin struct {
 	configDir string
@@ -65,8 +65,9 @@ func describe(defs map[string]agentdef.Definition) string {
 
 func (p *agentPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, error) {
 	var a struct {
-		Agent  string `json:"agent"`
-		Prompt string `json:"prompt"`
+		Agent  string   `json:"agent"`
+		Prompt string   `json:"prompt"`
+		Tools  []string `json:"tools"`
 	}
 	if err := json.Unmarshal(call.Input, &a); err != nil || a.Agent == "" || strings.TrimSpace(a.Prompt) == "" {
 		return fsroot.Fail("agent: input needs agent and prompt"), nil
@@ -79,7 +80,7 @@ func (p *agentPlugin) invoke(ctx context.Context, call tool.Call) (tool.Result, 
 
 	var info protocol.SessionInfo
 	err = client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{
-		Cwd: call.Workspace.Root, Agent: a.Agent,
+		Cwd: call.Workspace.Root, Agent: a.Agent, Tools: a.Tools,
 		Parent: &protocol.ParentRef{SessionID: call.SessionID.String(), ToolUseID: call.ID},
 	}, &info)
 	if err != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +91,10 @@ type childServer struct {
 	onSubmit    func(cs *childServer)
 	onInterrupt func(cs *childServer)
 	interrupted chan struct{}
+
+	// openParams is the session.open request the tool sent to open this child, captured for
+	// tests that check what the tool asked for rather than what it got back.
+	openParams protocol.SessionOpenParams
 }
 
 func newChildServer(t *testing.T) (*childServer, protocol.Conn) {
@@ -118,6 +123,7 @@ func (cs *childServer) serve(ctx context.Context) {
 		var result any = struct{}{}
 		switch req.Method {
 		case protocol.MethodSessionOpen:
+			_ = json.Unmarshal(req.Params, &cs.openParams)
 			result = protocol.SessionInfo{SessionID: cs.childID.String()}
 		case protocol.MethodSessionSubmit:
 			result = protocol.SessionSubmitResult{TurnID: cs.turnID.String()}
@@ -194,6 +200,30 @@ func agentTool(t *testing.T, conn protocol.Conn) func(context.Context, tool.Call
 		t.Fatal(err)
 	}
 	return h.RegisteredTools[0].Invoke
+}
+
+// TestAgentToolPassesItsNarrowing is ADR 0028 decision 5's caller term reaching session.open:
+// the orchestrating model names tools on the agent tool's own input, and the tool carries it
+// through to the child's session.open request unchanged, rather than deciding anything about it
+// itself. The server, not the tool, is what turns that into a narrowing.
+func TestAgentToolPassesItsNarrowing(t *testing.T) {
+	cs, clientEnd := newChildServer(t)
+	cs.onSubmit = func(cs *childServer) {
+		cs.say("done")
+		cs.state("completed")
+	}
+	res, err := agentTool(t, clientEnd)(context.Background(), tool.Call{
+		ID: "tu1", Input: json.RawMessage(`{"agent":"explorer","prompt":"look","tools":["read","grep"]}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("result %+v %q", res, text(res))
+	}
+	if !slices.Equal(cs.openParams.Tools, []string{"read", "grep"}) {
+		t.Errorf("session.open did not carry the tools narrowing: %+v", cs.openParams.Tools)
+	}
 }
 
 func TestInterruptedChildIsNotAnAnswer(t *testing.T) {
