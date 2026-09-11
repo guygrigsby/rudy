@@ -51,6 +51,11 @@ const (
 	// summaryMax caps the summary of a tool nothing here knows the input shape of.
 	summaryMax    = 60
 	promptChoices = "allow once [y]  allow for session [a]  deny [n]"
+	// promptWaiting is what a question that is NOT the focused one says in place of the keys.
+	// Concurrent tool calls put more than one question on screen at once (ADR 0028), only one
+	// of them answers to the keyboard, and a row drawing keys it does not own is how an
+	// operator consents to arguments they were not reading (rudy-omc).
+	promptWaiting = "waiting, answer the question below first"
 )
 
 // Render is the lines of one row under the current options and theme, styled: the
@@ -293,15 +298,22 @@ func firstHunk(u string) []string {
 	return lines[start:]
 }
 
-// prompt renders a permission question in the place of its tool row.
+// prompt renders a permission question in the place of its tool row. Only the focused one
+// draws the keys, because only the focused one answers to them: every row offering the same
+// three letters is what let an operator read the arguments on one row and consent to another's
+// (rudy-omc). The rest name where the keyboard is instead.
 func (t *Transcript) prompt(r *Row, indent int) []string {
 	p := r.Prompt
 	if p == nil {
 		return nil
 	}
+	hint, role := promptChoices, theme.RoleWarning
+	if t.FocusedPrompt() != p {
+		hint, role = promptWaiting, theme.RoleMuted
+	}
 	return []string{
 		t.summaryLine(p.Tool, p.Input, "", indent),
-		t.line(theme.RoleWarning, previewIndent+indent, promptChoices, false),
+		t.line(role, previewIndent+indent, hint, false),
 	}
 }
 

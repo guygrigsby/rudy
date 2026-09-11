@@ -2,7 +2,11 @@ package app
 
 import (
 	"encoding/json"
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -89,8 +93,8 @@ func TestAChildsPermissionPromptRendersAndAnswers(t *testing.T) {
 		Input: json.RawMessage(`{"command":"rm -rf /tmp/x"}`),
 	})
 
-	if h.m.turn.focused() == nil || h.m.turn.focused().SessionID != child {
-		t.Fatalf("the child's prompt did not become the standing question: %+v", h.m.turn.focused())
+	if h.m.focused() == nil || h.m.focused().SessionID != child {
+		t.Fatalf("the child's prompt did not become the standing question: %+v", h.m.focused())
 	}
 	var promptRow *transcript.Row
 	for _, r := range h.m.tr.Rows() {
@@ -131,8 +135,8 @@ func TestAChildsPermissionPromptRendersAndAnswers(t *testing.T) {
 		Matcher: session.Matcher{Tool: "bash", Prefix: "rm -rf"}, Decision: session.Allow,
 		DecidedBy: session.ByAsker, Scope: session.ScopeOnce, Reason: answerReason,
 	})})
-	if h.m.turn.focused() != nil {
-		t.Fatalf("the standing question survived its own decision: %+v", h.m.turn.focused())
+	if h.m.focused() != nil {
+		t.Fatalf("the standing question survived its own decision: %+v", h.m.focused())
 	}
 	for _, r := range h.m.tr.Rows() {
 		if r.Kind == transcript.RowPrompt {
@@ -165,7 +169,7 @@ func TestADecisionFromElsewhereTakesDownAChildsPrompt(t *testing.T) {
 		SessionID: child, ToolUseID: "tu_bash", Tool: "bash",
 		Input: json.RawMessage(`{"command":"rm -rf /tmp/x"}`),
 	})
-	if h.m.turn.focused() == nil {
+	if h.m.focused() == nil {
 		t.Fatal("setup: the child's prompt never became the standing question")
 	}
 
@@ -175,8 +179,8 @@ func TestADecisionFromElsewhereTakesDownAChildsPrompt(t *testing.T) {
 		DecidedBy: session.ByHook, Scope: session.ScopeOnce, Reason: "before_tool hook",
 	})})
 
-	if h.m.turn.focused() != nil {
-		t.Fatalf("a decision from elsewhere left the standing question up: %+v", h.m.turn.focused())
+	if h.m.focused() != nil {
+		t.Fatalf("a decision from elsewhere left the standing question up: %+v", h.m.focused())
 	}
 	for _, r := range h.m.tr.Rows() {
 		if r.Kind == transcript.RowPrompt {
@@ -257,5 +261,74 @@ func TestInterruptTargetsTheParentWhileAChildIsOnScreen(t *testing.T) {
 	got := interruptSessionIDs(t, h)
 	if len(got) != 1 || got[0] != sid {
 		t.Fatalf("session.interrupt targeted %v, want [%s]: the parent, never the child on screen", got, sid)
+	}
+}
+
+// TestTheKeyboardAnswersTheQuestionNearestTheInput is rudy-omc, in the shape one assistant
+// message reaches: an agent call and an unsafe call of the parent's own. The parent's question
+// is drawn in front of its own tool row, at the bottom; the child's arrives afterwards and is
+// inserted under the agent call, ABOVE it. Answering the newest question would send the answer
+// the operator typed while reading "rm -rf build" to the child's call instead, which is consent
+// for arguments they never saw.
+func TestTheKeyboardAnswersTheQuestionNearestTheInput(t *testing.T) {
+	h := newHarness(t, nil)
+	sid := h.m.session.SessionID
+	child := session.NewID().String()
+	turn := session.NewID().String()
+
+	h.appended(session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+		Content: []session.Block{
+			session.ToolUseBlock("t_agent", "agent", json.RawMessage(`{"agent":"explorer","prompt":"look"}`)),
+			session.ToolUseBlock("t_bash", "bash", json.RawMessage(`{"command":"rm -rf build"}`)),
+		},
+	})
+	h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: child, Entry: childOpened(t, sid, "t_agent")})
+
+	// The parent's own question first, then the child's: arrival order and row order disagree
+	// from here on.
+	h.notify(protocol.NotifyPermissionRequested, protocol.PermissionRequested{
+		SessionID: sid, TurnID: turn, ToolUseID: "t_bash", Tool: "bash",
+		Input: json.RawMessage(`{"command":"rm -rf build"}`), Matcher: session.Matcher{Tool: "bash", Prefix: "rm -rf"},
+	})
+	h.notify(protocol.NotifyPermissionRequested, protocol.PermissionRequested{
+		SessionID: child, TurnID: turn, ToolUseID: "tu_child", Tool: "bash",
+		Input: json.RawMessage(`{"command":"ls"}`), Matcher: session.Matcher{Tool: "bash", Prefix: "ls"},
+	})
+
+	if got := promptRows(h); got != 2 {
+		t.Fatalf("setup: %d question rows on screen, want 2:\n%s", got, h.view())
+	}
+	var order []string
+	for _, r := range h.m.tr.Rows() {
+		if r.Kind == transcript.RowPrompt {
+			order = append(order, r.Prompt.ToolUseID)
+		}
+	}
+	if !slices.Equal(order, []string{"tu_child", "t_bash"}) {
+		t.Fatalf("setup: prompt rows top to bottom = %v, want the child's above the parent's", order)
+	}
+	if focused := h.m.focused(); focused == nil || focused.ToolUseID != "t_bash" || focused.SessionID != sid {
+		t.Fatalf("focused = %+v, want the parent's t_bash, the row nearest the input", focused)
+	}
+
+	// The bottom row draws the keys, and it is the only one that does: what the operator reads
+	// as answerable is what the keyboard answers.
+	screen := ansi.Strip(h.view())
+	if got := strings.Count(screen, "allow once [y]"); got != 1 {
+		t.Fatalf("%d rows drew the keys, want exactly the focused one:\n%s", got, h.view())
+	}
+	keys := strings.Index(screen, "allow once [y]")
+	if rm := strings.Index(screen, "rm -rf build"); rm < 0 || rm > keys {
+		t.Fatalf("the keys are not under the command they answer for:\n%s", h.view())
+	}
+
+	runCmd(t, h.press("y"))
+	got := answerRequests(t, h)
+	if len(got) != 1 {
+		t.Fatalf("session.answer calls = %d, want 1: %+v", len(got), got)
+	}
+	if got[0].SessionID != sid || got[0].ToolUseID != "t_bash" {
+		t.Fatalf("y answered %s/%s, want the parent's own t_bash: the row the operator was reading", got[0].SessionID, got[0].ToolUseID)
 	}
 }

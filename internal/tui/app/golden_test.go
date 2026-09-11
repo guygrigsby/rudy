@@ -367,3 +367,43 @@ func TestGoldenSubagentRunning(t *testing.T) {
 		}))
 	}))
 }
+
+// TestGoldenTwoPromptsOneKeyboard pins rudy-omc: with two questions on screen it is
+// unambiguous which one a keypress answers. One assistant message dispatches a subagent and
+// asks to run `rm -rf ./bin`; the parent's own question is drawn in front of its tool row at
+// the bottom, and the child's, arriving later, is inserted under the agent call ABOVE it. The
+// bottom row is the one the keyboard answers, so it is the only one that draws the keys; the
+// other says where the keyboard is instead of offering three letters it does not own.
+func TestGoldenTwoPromptsOneKeyboard(t *testing.T) {
+	golden(t, "two_prompts", screen(t, nil, func(tm *teatest.TestModel, sid string) {
+		child := session.NewID().String()
+		turn := session.NewID().String()
+		tm.Send(appendedMsg(t, sid, session.AssistantMessage{
+			Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+			Content: []session.Block{
+				session.ToolUseBlock("t9", "agent", json.RawMessage(`{"agent":"explorer","prompt":"find the caller"}`)),
+				session.ToolUseBlock("t3", "bash", json.RawMessage(dangerInput)),
+			},
+			Usage: goldenUsage,
+		}))
+		tm.Send(appendedMsg(t, child, session.SessionOpened{
+			SchemaVersion: 1, RudyVersion: "test",
+			Workspace: testWorkspace, Model: testRef, Mode: session.ModeStrict,
+			Thinking: session.ThinkingHigh, Agent: "explorer",
+			ParentSessionID: sid, ParentToolUseID: "t9",
+		}))
+		tm.Send(notify(t, protocol.NotifyTurnState, protocol.TurnStateChanged{
+			SessionID: sid, TurnID: turn, State: stateAwaitingPermission,
+		}))
+		tm.Send(notify(t, protocol.NotifyPermissionRequested, protocol.PermissionRequested{
+			SessionID: sid, TurnID: turn, ToolUseID: "t3", Tool: "bash",
+			Input:   json.RawMessage(dangerInput),
+			Matcher: session.Matcher{Tool: "bash", Prefix: "rm -rf"},
+		}))
+		tm.Send(notify(t, protocol.NotifyPermissionRequested, protocol.PermissionRequested{
+			SessionID: child, TurnID: turn, ToolUseID: "tu_child", Tool: "bash",
+			Input:   json.RawMessage(`{"command":"git status"}`),
+			Matcher: session.Matcher{Tool: "bash", Prefix: "git status"},
+		}))
+	}))
+}

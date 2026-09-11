@@ -171,7 +171,7 @@ func TestAFailedAnswerPutsTheQuestionBack(t *testing.T) {
 	if !strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
 		t.Errorf("an answer that never reached the server puts the question back:\n%s", h.view())
 	}
-	if h.m.turn.focused() == nil {
+	if h.m.focused() == nil {
 		t.Error("and the keyboard answers it again")
 	}
 	if !strings.Contains(ansi.Strip(h.view()), "session.answer: boom") {
@@ -212,10 +212,14 @@ func TestTwoConcurrentQuestionsBothResolve(t *testing.T) {
 		Input: json.RawMessage(`{"path":"x","content":"y"}`), Matcher: session.Matcher{Tool: "write"},
 	})
 
-	if got := strings.Count(ansi.Strip(h.view()), "allow once [y]"); got != 2 {
-		t.Fatalf("setup: %d questions on screen, want 2:\n%s", got, h.view())
+	if got := promptRows(h); got != 2 {
+		t.Fatalf("setup: %d question rows on screen, want 2:\n%s", got, h.view())
 	}
-	if focused := h.m.turn.focused(); focused == nil || focused.ToolUseID != "t2" {
+	// Two rows, one set of keys: only the focused row offers them (rudy-omc).
+	if got := strings.Count(ansi.Strip(h.view()), "allow once [y]"); got != 1 {
+		t.Fatalf("setup: %d rows drew the keys, want exactly the focused one:\n%s", got, h.view())
+	}
+	if focused := h.m.focused(); focused == nil || focused.ToolUseID != "t2" {
 		t.Fatalf("setup: focused = %+v, want t2 (the one nearest the input)", focused)
 	}
 
@@ -225,10 +229,14 @@ func TestTwoConcurrentQuestionsBothResolve(t *testing.T) {
 	if len(got) != 1 || got[0].ToolUseID != "t2" {
 		t.Fatalf("first answer = %+v, want exactly one naming t2", got)
 	}
-	if got := strings.Count(ansi.Strip(h.view()), "allow once [y]"); got != 1 {
-		t.Fatalf("t1's row must still stand after t2 is answered: %d questions on screen:\n%s", got, h.view())
+	if got := promptRows(h); got != 1 {
+		t.Fatalf("t1's row must still stand after t2 is answered: %d question rows on screen:\n%s", got, h.view())
 	}
-	if focused := h.m.turn.focused(); focused == nil || focused.ToolUseID != "t1" {
+	// And it takes the keys over now that it is the one nearest the input.
+	if !strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
+		t.Fatalf("t1's row did not take the keys when t2 went:\n%s", h.view())
+	}
+	if focused := h.m.focused(); focused == nil || focused.ToolUseID != "t1" {
 		t.Fatalf("focused after t2 = %+v, want t1", focused)
 	}
 
@@ -242,12 +250,24 @@ func TestTwoConcurrentQuestionsBothResolve(t *testing.T) {
 	if got[1].ToolUseID != "t1" {
 		t.Fatalf("second answer = %+v, want t1", got[1])
 	}
-	if h.m.turn.focused() != nil {
-		t.Fatalf("a question is still standing after both were answered: %+v", h.m.turn.focused())
+	if h.m.focused() != nil {
+		t.Fatalf("a question is still standing after both were answered: %+v", h.m.focused())
 	}
-	if strings.Contains(ansi.Strip(h.view()), "allow once [y]") {
-		t.Fatalf("a question row is still on screen after both were answered:\n%s", h.view())
+	if got := promptRows(h); got != 0 {
+		t.Fatalf("%d question rows still on screen after both were answered:\n%s", got, h.view())
 	}
+}
+
+// promptRows is how many permission questions are on screen. It counts rows rather than the
+// key hints, since only the focused row draws those (rudy-omc).
+func promptRows(h *harness) int {
+	n := 0
+	for _, r := range h.m.tr.Rows() {
+		if r.Kind == transcript.RowPrompt {
+			n++
+		}
+	}
+	return n
 }
 
 func TestALateRowCommitsAtOnce(t *testing.T) {
@@ -390,7 +410,7 @@ func TestPermissionPromptInline(t *testing.T) {
 	if dec.Reason != "asker" {
 		t.Errorf("reason %q", dec.Reason)
 	}
-	if h.m.turn.focused() != nil {
+	if h.m.focused() != nil {
 		t.Error("the answered question is cleared")
 	}
 	h.waitPrinted("ran go test ./...")

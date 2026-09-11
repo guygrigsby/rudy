@@ -620,6 +620,25 @@ func (t *Transcript) Prompt(p protocol.PermissionRequested) {
 	t.add(r)
 }
 
+// FocusedPrompt is the standing question nearest the input: the last prompt row in row order.
+// It is the one a client's keyboard answers and the one prompt() draws the keys on, and those
+// two must be the same row or a keypress lands on a question the operator was not reading
+// (rudy-omc). nil when no question is on screen.
+//
+// Row order is not arrival order. This session's own question is appended at the end, or stands
+// in front of its tool row (Prompt); a subagent's is inserted under the agent call that opened
+// it (PromptFrom, insertAfterGroup), so a child's later question lands ABOVE a parent's earlier
+// one. What an operator reads as the bottom question is what row order says, never what arrived
+// last.
+func (t *Transcript) FocusedPrompt() *protocol.PermissionRequested {
+	for _, r := range slices.Backward(t.rows) {
+		if r.Kind == RowPrompt && r.Prompt != nil {
+			return r.Prompt
+		}
+	}
+	return nil
+}
+
 // Answered removes a permission question. The tool row it stood in front of stays.
 func (t *Transcript) Answered(toolUseID string) {
 	if i := t.indexOf(promptKey(toolUseID)); i >= 0 {

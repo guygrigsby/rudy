@@ -48,8 +48,9 @@ type turnControl struct {
 	// questions reach this client too), since more than one can be outstanding on this
 	// session alone, before a subagent adds its own on top (rudy-9nc).
 	prompts map[promptKey]*protocol.PermissionRequested
-	// order is prompts' keys in arrival order. A map has none of its own, and the composer
-	// answers whichever one arrived last (focused), the one nearest the input on screen.
+	// order is prompts' keys in arrival order. A map has none of its own, and a question with
+	// no row on screen has no place in the transcript's own order either, which is what
+	// newest falls back to.
 	order []promptKey
 	// asked is the same shape as prompts, for a question whose answer is in flight, kept so
 	// a call that never reached the server can put it back.
@@ -82,9 +83,28 @@ func parsePromptName(name string) (sid, toolUseID string) {
 	return sid, toolUseID
 }
 
-// focused is the question the composer answers: the most recently arrived one still
-// standing, the one nearest the input on screen. nil when none stands.
-func (t turnControl) focused() *protocol.PermissionRequested {
+// focused is the question the keyboard answers: the one whose row is nearest the input, which
+// is the row the transcript draws the keys on (Transcript.FocusedPrompt). The two read the same
+// row on purpose. Arrival order is not row order, so answering the newest question would answer
+// whichever one arrived last wherever it happens to be drawn: a subagent's question is inserted
+// under the agent call that opened it, so a child's later question lands above a parent's
+// earlier one, and the operator reading the bottom row and pressing y would have consented to
+// arguments they never saw (rudy-omc).
+//
+// A question with no row falls back to arrival order: nothing is on screen for the keyboard to
+// be nearest to, and the row can genuinely be gone while the question stands (a session switch
+// rebuilds the transcript and leaves the tracking, which takeDownPrompt already allows for).
+func (m *Model) focused() *protocol.PermissionRequested {
+	if p := m.tr.FocusedPrompt(); p != nil {
+		if tracked, ok := m.turn.prompts[keyOf(p)]; ok {
+			return tracked
+		}
+	}
+	return m.turn.newest()
+}
+
+// newest is the most recently arrived standing question, or nil when none stands.
+func (t turnControl) newest() *protocol.PermissionRequested {
 	if len(t.order) == 0 {
 		return nil
 	}
@@ -340,12 +360,12 @@ func (m *Model) reaskOne(sid, toolUseID string) {
 // answer is the standing question's own key handling, and it runs before anything else:
 // the turn is waiting on it, so nothing may take y, a, n or Esc from it. Any other key
 // falls through to the rest of the keyboard, which is what keeps ctrl+c and ctrl+d
-// working while a question stands. It answers the focused question: the most recently
-// arrived one still standing, the one nearest the input (rudy-9nc) — concurrent tool calls
-// mean more than one can be waiting, and the keyboard has no way to name one but the
-// nearest until a picker gives it one.
+// working while a question stands. It answers the focused question, the one nearest the input
+// (rudy-9nc, rudy-omc) — concurrent tool calls mean more than one can be waiting, and the
+// keyboard has no way to name one but the nearest until a picker gives it one, which is why
+// that row is also the only one that draws the keys.
 func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {
-	p := m.turn.focused()
+	p := m.focused()
 	if p == nil {
 		return nil, false
 	}
