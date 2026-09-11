@@ -605,3 +605,44 @@ func TestDownloadFailsImmediatelyOnA4xx(t *testing.T) {
 		t.Fatalf("requests = %d, want exactly 1 (no retry on a plain 4xx)", got)
 	}
 }
+
+// TestATarballWithTooManyEntriesIsRefused covers rudy-79q: moving the unpacked-size cap from
+// the gzip stream to bytes actually written left the entry count bounded by nothing but the
+// download cap, and an empty directory writes no bytes at all while gzipping to almost nothing.
+// A million of them fit in 4.7 MiB, well inside maxDownloadBytes, and cost a MkdirAll and an
+// inode each. The refusal happens in the scanning pass, before the first entry is written, so
+// the stage is still empty afterwards.
+func TestATarballWithTooManyEntriesIsRefused(t *testing.T) {
+	entries := make([]tarEntry, 0, maxTarEntries+1)
+	for i := range maxTarEntries + 1 {
+		entries = append(entries, tarEntry{name: fmt.Sprintf("d%06d/", i), typeflag: tar.TypeDir})
+	}
+	tgz := tarballWithEntries(t, entries)
+	// The point of the cap: the download cap does not come close to catching this.
+	if len(tgz) > maxDownloadBytes {
+		t.Fatalf("fixture is %d bytes, want it well inside the %d byte download cap", len(tgz), maxDownloadBytes)
+	}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(tgz)
+	}))
+	defer srv.Close()
+
+	// stageHTTPS directly, with a stage this test owns, so what did or did not get written can be
+	// looked at: Install removes the whole stage on any error.
+	stage := t.TempDir()
+	src := Source{Kind: KindHTTPS, Location: srv.URL + "/p.tar.gz"}
+	_, err := stageHTTPS(context.Background(), src, stage, srv.Client())
+	if err == nil {
+		t.Fatalf("stageHTTPS of %d entries: want an error", len(entries))
+	}
+	if !strings.Contains(err.Error(), "entries") {
+		t.Fatalf("err = %v, want it to name the entry cap", err)
+	}
+	left, readErr := os.ReadDir(stage)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(left) != 0 {
+		t.Fatalf("stage holds %d entries after the refusal, want nothing written at all", len(left))
+	}
+}

@@ -31,6 +31,14 @@ const maxDownloadBytes = 256 << 20
 // same reason: nothing this store installs is expected to be bigger than that either way.
 const maxUnpackedBytes = 256 << 20
 
+// maxTarEntries bounds how many entries unpackTarball will accept, alongside maxUnpackedBytes:
+// an empty directory or file costs nothing against a budget of bytes written and gzips to
+// almost nothing, so the download cap alone leaves the entry count bounded only at roughly a
+// million per 5 MiB, each one a MkdirAll or an OpenFile and an inode (rudy-79q). Twenty
+// thousand is far more than a plugin bundle needs (rudy's own repository is under four hundred
+// files) and refuses the pathological archive in scanTarball, before a byte of it is written.
+const maxTarEntries = 20000
+
 // httpRetryAttempts bounds the retry loop stageHTTPS runs against a 429 or 5xx response: enough
 // to ride out a rate limit or a transient server hiccup, not enough to hang an install forever
 // against a server that is simply down.
@@ -260,7 +268,7 @@ func userAgent() string {
 
 // tarballReader is one open gzip tarball: the file, the decompressor over it and the tar
 // reader over that, closed together. unpackTarball opens the archive twice, once to survey it
-// and once to write it out (see soleTopLevelDir), so this exists to keep the three-step open
+// and once to write it out (see scanTarball), so this exists to keep the three-step open
 // and the two closes in one place rather than twice over.
 type tarballReader struct {
 	f  *os.File
@@ -286,25 +294,31 @@ func (t *tarballReader) Close() {
 	_ = t.f.Close()
 }
 
-// soleTopLevelDir reports the one top-level directory every entry of the tarball at path sits
-// under, or "" when the entries already sit at the root, sit under more than one directory, or
-// include a name the unpacking pass is going to refuse anyway. `git archive` and every GitHub
-// release tarball wrap their contents in exactly one such directory, so stripping it is what
-// makes the likeliest https: URL there is installable at all; any other nesting is still
+// scanTarball reads the whole archive at path once before anything is written, and answers the
+// two questions that have to be settled before the first write: is there a sole top-level
+// directory to strip, and are there more entries than this store will extract at all.
+//
+// The prefix is "" when the entries already sit at the root, sit under more than one directory,
+// or include a name the unpacking pass is going to refuse anyway. `git archive` and every
+// GitHub release tarball wrap their contents in exactly one such directory, so stripping it is
+// what makes the likeliest https: URL there is installable at all; any other nesting is still
 // refused, by checkManifestAtRoot, naming what it found (contracts, plugins.lock.toml).
 //
-// This is a whole extra pass over the archive, decompression included, before a byte is
-// written. Deciding while writing instead would mean either buffering entries until the answer
-// is known or moving files up a level afterwards, and the rule is that nothing is written under
-// the extra directory in the first place.
-func soleTopLevelDir(path string) (string, error) {
+// This is a whole extra pass over the archive, decompression included. Deciding while writing
+// instead would mean either buffering entries until the answer is known or moving files up a
+// level afterwards, and the rule is that nothing is written under the extra directory in the
+// first place; the entry cap gets the same benefit, refusing before the first MkdirAll rather
+// than partway through a million of them.
+func scanTarball(path string) (string, error) {
 	tb, err := openTarball(path)
 	if err != nil {
 		return "", err
 	}
 	defer tb.Close()
 
-	prefix, nested := "", false
+	// rooted is set by anything that rules stripping out, and the loop then runs on rather than
+	// returning: the entry count is only trustworthy if every entry is actually reached.
+	prefix, nested, rooted, entries := "", false, false, 0
 	for {
 		hdr, err := tb.tr.Next()
 		if err == io.EOF {
@@ -316,11 +330,16 @@ func soleTopLevelDir(path string) (string, error) {
 		if hdr.Typeflag == tar.TypeXGlobalHeader {
 			continue
 		}
+		entries++
+		if entries > maxTarEntries {
+			return "", fmt.Errorf("pluginstore: %s: more than %d entries; a plugin bundle is smaller than that", path, maxTarEntries)
+		}
 		clean, err := cleanTarName(hdr.Name)
 		if err != nil {
 			// An entry no name check will accept: say nothing about a prefix and let the
 			// unpacking pass refuse it, so a refusal is worded in exactly one place.
-			return "", nil
+			rooted = true
+			continue
 		}
 		if clean == "." {
 			continue
@@ -330,18 +349,17 @@ func soleTopLevelDir(path string) (string, error) {
 		case prefix == "":
 			prefix = first
 		case first != prefix:
-			return "", nil
+			rooted = true
 		}
-		switch {
-		case rest != "":
+		if rest == "" && hdr.Typeflag != tar.TypeDir {
+			// A top-level entry that is a file: stripping its own name would drop the file.
+			rooted = true
+		}
+		if rest != "" {
 			nested = true
-		case hdr.Typeflag != tar.TypeDir:
-			// The one top-level entry is a file: there is nothing to strip, and stripping its
-			// own name would drop the file itself.
-			return "", nil
 		}
 	}
-	if !nested {
+	if rooted || !nested {
 		return "", nil
 	}
 	return prefix, nil
@@ -382,9 +400,10 @@ func stripTopLevel(rel, prefix string) string {
 // copy itself in io.LimitReader(tr, remaining) is the actual enforcement: it is what bounds
 // bytes landing on disk regardless of what any entry's header claims or a reader's internal
 // zero-fill synthesizes, and remaining is decremented by what writeTarFile reports was actually
-// copied, not by hdr.Size.
+// copied, not by hdr.Size. The entry count is capped too, at maxTarEntries, by the scanning
+// pass this calls first: entries that write nothing at all cost nothing against a byte budget.
 func unpackTarball(path, stage string) error {
-	prefix, err := soleTopLevelDir(path)
+	prefix, err := scanTarball(path)
 	if err != nil {
 		return err
 	}
@@ -500,7 +519,7 @@ func stageTarget(stage, rel string) (string, error) {
 // checkManifestAtRoot refuses a tarball whose plugin.toml is not at the root of what was
 // unpacked, naming what was found instead of letting the generic plugin.ReadManifest fail later
 // with a bare "no such file" that does not say why. An archive whose every entry sits under one
-// top-level directory has already had it stripped by then (soleTopLevelDir), so what reaches
+// top-level directory has already had it stripped by then (scanTarball), so what reaches
 // here is real nesting: two levels deep, or a bundle of several directories with no manifest
 // among them.
 func checkManifestAtRoot(stage string) error {
