@@ -46,15 +46,41 @@ const maxBackoffWait = 5 * time.Second
 // touches the live checkout, per the contracts row's update semantics for a non-git source.
 var errDigestUnchanged = errors.New("pluginstore: digest unchanged")
 
+// httpTimeout bounds one entire download from an https: source, request through response body
+// fully read. http.DefaultClient has no timeout at all, so a server that accepts the connection
+// and then dribbles bytes (or none) would otherwise hang rudy install forever: the bounded
+// retry-attempt count in doWithRetry only bounds how many requests are tried, not how long any
+// one of them is allowed to run. Ten minutes is generous next to maxDownloadBytes even on a slow
+// link, and short enough that an install that has actually stalled eventually fails instead of
+// hanging the terminal it was run in.
+const httpTimeout = 10 * time.Minute
+
+// defaultHTTPClient is what stageHTTPS/stageHTTPSUpdate use in production (a test hands in its
+// own via Store.HTTPClient). It exists, rather than reusing http.DefaultClient, for two
+// hardening properties DefaultClient lacks: httpTimeout above, and CheckRedirect refusing a
+// redirect to anything but https. Without the latter, an https: URL that redirects to a plain
+// http one would have the "downloaded bytes" the digest is taken over be whatever that
+// unencrypted hop actually served, silently downgrading the one guarantee installing from
+// https: is supposed to carry.
+var defaultHTTPClient = &http.Client{
+	Timeout: httpTimeout,
+	CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+		if req.URL.Scheme != "https" {
+			return fmt.Errorf("pluginstore: refusing to follow a redirect to %s", req.URL)
+		}
+		return nil
+	},
+}
+
 // httpClient is the *http.Client a stageHTTPS/stageHTTPSUpdate call uses: Store.HTTPClient when
-// a caller (a test, with an httptest server's own client) set one, http.DefaultClient
-// otherwise. Same shape as Store.GoEnv: production always gets the real default, and a test
-// hands in a fixture client instead of touching anything package-global.
+// a caller (a test, with an httptest server's own client) set one, defaultHTTPClient otherwise.
+// Same shape as Store.GoEnv: production always gets the real default, and a test hands in a
+// fixture client instead of touching anything package-global.
 func (s *Store) httpClient() *http.Client {
 	if s.HTTPClient != nil {
 		return s.HTTPClient
 	}
-	return http.DefaultClient
+	return defaultHTTPClient
 }
 
 // stageHTTPS fills dir with an https: source's contents for a fresh install: download
@@ -118,11 +144,16 @@ func downloadTarball(ctx context.Context, client *http.Client, url, dir string) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	tmpPath = filepath.Join(dir, ".download.tar.gz")
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// A random suffix, not a fixed name: a tar entry literally named ".download.tar.gz" would
+	// otherwise get extracted (writeTarFile opens its target O_TRUNC) onto this very file while
+	// unpackTarball is still reading it, corrupting the read mid-stream. The server sends its
+	// response body before this file is created, so it cannot know the suffix os.CreateTemp
+	// picks and cannot craft an entry to collide with it.
+	f, err := os.CreateTemp(dir, ".download-*.tar.gz")
 	if err != nil {
 		return "", "", fmt.Errorf("pluginstore: %w", err)
 	}
+	tmpPath = f.Name()
 	defer func() { _ = f.Close() }()
 
 	h := sha256.New()
@@ -229,13 +260,28 @@ func userAgent() string {
 
 // unpackTarball unpacks the gzip tarball at path into stage, which the caller has already
 // created empty. Every entry is refused, and the whole install refused with it, unless its
-// cleaned name resolves inside stage (safeTarPath: no "..", no absolute path) and it is a
-// regular file or a directory. Anything else — a symlink or a hard link most of all, since
-// either one's target can point anywhere on disk the process can reach, escaping or not — is
-// refused outright rather than validated case by case: a plugin bundle has no legitimate need
-// for either, and refusing the whole type removes a class of link-resolution bugs from ever
-// having to be gotten right against bytes an arbitrary https URL served. The decompressed
-// stream is capped independently of the download size (maxUnpackedBytes) against a gzip bomb.
+// cleaned name resolves inside stage (safeTarPath: no "..", no absolute path, no backslash) and
+// it is a regular file or a directory. Anything else — a symlink or a hard link most of all,
+// since either one's target can point anywhere on disk the process can reach, escaping or not —
+// is refused outright rather than validated case by case: a plugin bundle has no legitimate
+// need for either, and refusing the whole type removes a class of link-resolution bugs from
+// ever having to be gotten right against bytes an arbitrary https URL served. A PAX global
+// header (typeflag 'g'), the entry git archive and GitHub's release tarballs emit ahead of the
+// real content, names no file of the archive's own and is skipped rather than falling into the
+// refusal for entry types this store does not extract.
+//
+// The total bytes actually written to disk are capped at maxUnpackedBytes, tracked as a
+// shrinking budget rather than by counting bytes read off the gzip stream: a GNU or PAX sparse
+// entry can declare a Size far larger than the archive bytes that back it (the reader fills the
+// declared holes with zeros without consuming any archive bytes for them), so counting the
+// compressed or even the raw tar-format bytes read never sees the true, expanded size at all. A
+// 402 byte crafted archive can carry a sparse entry whose declared Size alone already exceeds
+// the cap; io.Copy(w, tr) would otherwise still happily write all of it. Refusing whenever a
+// single entry's declared Size exceeds what remains catches that up front, and wrapping the
+// copy itself in io.LimitReader(tr, remaining) is the actual enforcement: it is what bounds
+// bytes landing on disk regardless of what any entry's header claims or a reader's internal
+// zero-fill synthesizes, and remaining is decremented by what writeTarFile reports was actually
+// copied, not by hdr.Size.
 func unpackTarball(path, stage string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -249,7 +295,8 @@ func unpackTarball(path, stage string) error {
 	}
 	defer func() { _ = gz.Close() }()
 
-	tr := tar.NewReader(&cappedReader{r: gz, limit: maxUnpackedBytes})
+	tr := tar.NewReader(gz)
+	remaining := int64(maxUnpackedBytes)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -257,6 +304,12 @@ func unpackTarball(path, stage string) error {
 		}
 		if err != nil {
 			return fmt.Errorf("pluginstore: %s: %w", path, err)
+		}
+		if hdr.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
+		if hdr.Size < 0 || hdr.Size > remaining {
+			return fmt.Errorf("pluginstore: %s: entry %q would exceed the %d byte unpacked cap", path, hdr.Name, maxUnpackedBytes)
 		}
 		target, err := safeTarPath(stage, hdr.Name)
 		if err != nil {
@@ -268,7 +321,9 @@ func unpackTarball(path, stage string) error {
 				return fmt.Errorf("pluginstore: %w", err)
 			}
 		case tar.TypeReg:
-			if err := writeTarFile(target, tr, hdr); err != nil {
+			n, err := writeTarFile(target, io.LimitReader(tr, remaining), hdr)
+			remaining -= n
+			if err != nil {
 				return fmt.Errorf("pluginstore: %s: %w", path, err)
 			}
 		default:
@@ -280,10 +335,12 @@ func unpackTarball(path, stage string) error {
 
 // writeTarFile extracts one regular-file entry to target, creating its parent directory (a tar
 // stream is not required to list a directory entry before a file inside it) and preserving the
-// entry's own permission bits so an executable like a build script stays executable.
-func writeTarFile(target string, r io.Reader, hdr *tar.Header) error {
+// entry's own permission bits so an executable like a build script stays executable. It reports
+// how many bytes it actually wrote, which is what the caller's remaining unpacked-size budget is
+// decremented by, rather than hdr.Size.
+func writeTarFile(target string, r io.Reader, hdr *tar.Header) (int64, error) {
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return err
+		return 0, err
 	}
 	mode := os.FileMode(hdr.Mode & 0o777) //nolint:gosec // the tar header's own mode bits, masked to permissions only
 	if mode == 0 {
@@ -291,32 +348,14 @@ func writeTarFile(target string, r io.Reader, hdr *tar.Header) error {
 	}
 	w, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, copyErr := io.Copy(w, r)
+	n, copyErr := io.Copy(w, r)
 	closeErr := w.Close()
 	if copyErr != nil {
-		return copyErr
+		return n, copyErr
 	}
-	return closeErr
-}
-
-// cappedReader wraps r, refusing to read past limit total bytes with a clear error rather than
-// truncating silently: truncation would surface later as a confusing tar-format error instead
-// of naming the actual reason, an unpacked size that exceeded the cap.
-type cappedReader struct {
-	r     io.Reader
-	limit int64
-	n     int64
-}
-
-func (c *cappedReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	if c.n > c.limit {
-		return n, fmt.Errorf("unpacked size exceeds the %d byte cap", c.limit)
-	}
-	return n, err
+	return n, closeErr
 }
 
 // safeTarPath resolves a tar entry's name to a path inside stage, refusing anything that could
@@ -325,6 +364,13 @@ func (c *cappedReader) Read(p []byte) (int, error) {
 // merely careless archive can name an entry "../../evil" or "/etc/cron.d/whatever" to write
 // outside the extraction directory.
 func safeTarPath(stage, name string) (string, error) {
+	// "..\..\x" is one legal, backslash-containing filename to filepath.Clean on a unix build
+	// (backslash is not a separator there), so it survives every check below unchanged; refuse
+	// it outright rather than rely on this running only on unix, since this package's path
+	// handling is the OS-provided filepath, not a unix-only one.
+	if strings.ContainsRune(name, '\\') {
+		return "", fmt.Errorf("entry %q contains a backslash", name)
+	}
 	clean := filepath.Clean(filepath.FromSlash(name))
 	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("entry %q escapes the stage", name)

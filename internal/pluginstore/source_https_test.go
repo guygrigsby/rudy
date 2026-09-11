@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -142,8 +143,209 @@ func TestInstallsATarballOverHTTPS(t *testing.T) {
 // TestATarballEscapingTheStageIsRefused covers the security property of an https: install: an
 // entry whose cleaned name climbs out of the stage must refuse the whole install rather than
 // write anywhere outside it.
+//
+// The tarball also carries a legitimate plugin.toml at its root: without one, an unguarded
+// build would still fail (checkManifestAtRoot has nothing to find), so the earlier version of
+// this test passed for the wrong reason regardless of whether the traversal guard did anything
+// at all. The containment check runs before the error checks, and against the one path an
+// unguarded "../../evil" actually reaches: the stage sits two directories below s.Root
+// (Root/plugins/.install-*), so climbing out two levels lands exactly at Root/evil.
 func TestATarballEscapingTheStageIsRefused(t *testing.T) {
-	tgz := tarballWithEntries(t, []tarEntry{{name: "../../evil", content: "haha"}})
+	tgz := tarballWithEntries(t, []tarEntry{
+		{name: "plugin.toml", content: helloManifest},
+		{name: "../../evil", content: "haha"},
+	})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(tgz)
+	}))
+	defer srv.Close()
+
+	s := newTestStore(t)
+	s.HTTPClient = srv.Client()
+
+	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
+	if _, statErr := os.Stat(filepath.Join(s.Root, "evil")); !os.IsNotExist(statErr) {
+		t.Fatalf("the escaping entry landed at %s: stat = %v", filepath.Join(s.Root, "evil"), statErr)
+	}
+	if err == nil {
+		t.Fatal("Install with a plugin.toml plus a ../../evil entry: want an error")
+	}
+	if !strings.Contains(err.Error(), "escapes the stage") {
+		t.Fatalf("err = %v, want it to name the escape", err)
+	}
+}
+
+// TestATarballWithAnAbsolutePathIsRefused covers the other half of the traversal guard: an
+// absolute entry name, which "../.." alone does not exercise.
+//
+// filepath.Join never actually resolves a later absolute-looking element back to the real
+// filesystem root (Join("/stage", "/etc/evil") is "/stage/etc/evil", not "/etc/evil"), so an
+// unguarded absolute name lands inside the stage rather than escaping it outright; checking the
+// real /etc/evil would pass whether or not the guard exists. stageHTTPS is called directly, with
+// a stage this test owns, rather than through Install, since Install removes the whole stage on
+// any error and would otherwise erase the evidence before this test could look at it.
+func TestATarballWithAnAbsolutePathIsRefused(t *testing.T) {
+	tgz := tarballWithEntries(t, []tarEntry{
+		{name: "plugin.toml", content: helloManifest},
+		{name: "/etc/evil", content: "haha"},
+	})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(tgz)
+	}))
+	defer srv.Close()
+
+	stage := t.TempDir()
+	src := Source{Kind: KindHTTPS, Location: srv.URL + "/p.tar.gz"}
+	_, err := stageHTTPS(context.Background(), src, stage, srv.Client())
+
+	if _, statErr := os.Stat(filepath.Join(stage, "etc", "evil")); !os.IsNotExist(statErr) {
+		t.Fatalf("the absolute-path entry landed inside the stage: stat = %v", statErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "escapes the stage") {
+		t.Fatalf("err = %v, want it to refuse the absolute entry name", err)
+	}
+}
+
+// TestATarballWithABackslashInTheNameIsRefused covers a name like "..\..\evil": on a unix build,
+// filepath.Clean leaves a backslash alone (it is not a separator there), so the name survives
+// every other check as one legal, if odd, filename with no actual traversal effect on this
+// platform. It is refused anyway, since this package's path handling is the OS-provided
+// filepath, not a unix-only one, and there is no legitimate reason for a plugin bundle to name
+// a file this way.
+func TestATarballWithABackslashInTheNameIsRefused(t *testing.T) {
+	tgz := tarballWithEntries(t, []tarEntry{
+		{name: "plugin.toml", content: helloManifest},
+		{name: `..\..\evil`, content: "haha"},
+	})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(tgz)
+	}))
+	defer srv.Close()
+
+	s := newTestStore(t)
+	s.HTTPClient = srv.Client()
+
+	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "backslash") {
+		t.Fatalf("err = %v, want it to refuse the backslash in the entry name", err)
+	}
+}
+
+// sparseBombTarballB64 is a genuine archive, produced by macOS bsdtar (libarchive), of a single
+// sparse file: `python3 -c "f=open('bomb.bin','wb'); f.seek(size-1); f.write(b'\0')"` (size =
+// 257 MiB, one MiB over maxUnpackedBytes) followed by `tar --format=pax -czf bomb.tar.gz
+// bomb.bin`. The archive itself is 402 bytes; its one entry declares Size == the full 257 MiB.
+// Go's archive/tar reads that entry back as an ordinary TypeReg with Size 269484032 and, if
+// asked to, will synthesize that many zero bytes on Read without consuming more than the 402
+// archive bytes backing it: nothing about the Header says "sparse" to a caller that only
+// inspects Typeflag and Size, which is exactly why unpackTarball budgets bytes actually written
+// rather than trusting Size to reflect real archive content, still less bytes read off the
+// compressed stream.
+const sparseBombTarballB64 = `H4sIANJ+pGoAA+3UTW/TMBjA8cIx4s7VnyDY8UvSQw9lAlZpRdCKSTu6nVUyNWmVdKPdV+Ezcdg3wp
+00aYytp1ZD7P+7WPFjW49fnnzx6+Pgz0PzbrKoJumkrDt7J6V0xohtmzt720Z3rZTGWqFsZpXMc51lQionpeqI9f5T+dtl
+u/JNTGV2uZk15aydbB4f9+N7CPMd6/y5KXGIVA9BSzFdlVXoqbzoKmcz51IjTZ65QtskRv0jUZfrvKu30erpufEiP33+lrZ
+L37QhrfzFoumph71lHXtlkhX3e2sf17x7jonW92NN8PO2vA69zHVNYaTOEpuLk8H7/ujoeHD6IV371apJp4sq9cvlPKTLZ
+nEVal9PQ6//ddAf2qvR9Wg6DKfDxHTFOE46Ods16dXrjv558+vtm804ee7LOoB4tOPbk/1Yxn3Lg/wFdte/UduPB/VvnekI
+uc8knvLC6z9WZCwklztTJMrpwvyPjxwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/kG/AfBCaUIATAAA`
+
+// decodeSparseBombTarball decodes sparseBombTarballB64, joining the wrapped lines back into one
+// base64 string first.
+func decodeSparseBombTarball(t *testing.T) []byte {
+	t.Helper()
+	b, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(sparseBombTarballB64), ""))
+	if err != nil {
+		t.Fatalf("decode sparseBombTarballB64: %v", err)
+	}
+	return b
+}
+
+// TestASparseEntryClaimingAHugeSizeIsRefused is the Critical: a sparse tar entry's declared Size
+// can vastly exceed the archive bytes that actually back it, so a cap that counts bytes read off
+// the (possibly compressed) input stream never sees the true expanded size — verified against
+// this exact archive before the fix landed: it read as 402 archive bytes through the old
+// gzip-wrapping cap yet copied the full 269,484,032 declared bytes to disk with no error at all.
+//
+// stageHTTPS is called directly, with a stage this test owns, so the write can be inspected
+// before Install's own cleanup (which runs on any error) would erase the evidence.
+func TestASparseEntryClaimingAHugeSizeIsRefused(t *testing.T) {
+	tgz := decodeSparseBombTarball(t)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(tgz)
+	}))
+	defer srv.Close()
+
+	stage := t.TempDir()
+	src := Source{Kind: KindHTTPS, Location: srv.URL + "/p.tar.gz"}
+	_, err := stageHTTPS(context.Background(), src, stage, srv.Client())
+
+	var written int64
+	if walkErr := filepath.WalkDir(stage, func(_ string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		info, infoErr := d.Info()
+		if infoErr == nil {
+			written += info.Size()
+		}
+		return nil
+	}); walkErr != nil {
+		t.Fatalf("walk stage: %v", walkErr)
+	}
+	// Nothing this store legitimately writes for a refused install is anywhere near the
+	// entry's declared 257 MiB; 10 MiB is a generous margin above the tiny download artifact
+	// alone, so this catches "wrote most of the bomb before failing" just as well as "wrote all
+	// of it".
+	const tooMuch = 10 << 20
+	if written > tooMuch {
+		t.Fatalf("stage holds %d bytes after the refusal, want nowhere near the declared 257 MiB", written)
+	}
+	if err == nil {
+		t.Fatal("Install of a sparse entry declaring 257 MiB: want an error")
+	}
+	if !strings.Contains(err.Error(), "byte unpacked cap") {
+		t.Fatalf("err = %v, want it to name the unpacked cap", err)
+	}
+}
+
+// TestAGitArchiveGlobalHeaderStillFindsANestedManifest covers Important 1: `git archive
+// --format=tar` and GitHub's own release tarballs (the shape behind the single most likely URL
+// an operator types, https://github.com/o/r/archive/refs/tags/v1.tar.gz) emit a
+// pax_global_header entry, typeflag 'g', ahead of the real content. Before the fix that entry
+// fell into the refusal for entry types this store does not extract, failing with a message
+// about tar internals instead of ever reaching checkManifestAtRoot's actually useful "under
+// top-level directory" error for the (also present, and equally real for a github.com archive
+// URL) nested-manifest mistake.
+func TestAGitArchiveGlobalHeaderStillFindsANestedManifest(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:       "pax_global_header",
+		Typeflag:   tar.TypeXGlobalHeader,
+		PAXRecords: map[string]string{"comment": "git archive"},
+	}); err != nil {
+		t.Fatalf("WriteHeader(global): %v", err)
+	}
+	content := []byte(helloManifest)
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "myrepo-abc1234/plugin.toml",
+		Size:     int64(len(content)),
+		Mode:     0o644,
+		Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatalf("WriteHeader(manifest): %v", err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		t.Fatalf("Write(manifest): %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar Close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip Close: %v", err)
+	}
+	tgz := buf.Bytes()
+
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(tgz)
 	}))
@@ -154,37 +356,36 @@ func TestATarballEscapingTheStageIsRefused(t *testing.T) {
 
 	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
 	if err == nil {
-		t.Fatal("Install with a ../../evil entry: want an error")
+		t.Fatal("Install with plugin.toml nested under a top-level directory: want an error")
 	}
-	if !strings.Contains(err.Error(), "escapes the stage") {
-		t.Fatalf("err = %v, want it to name the escape", err)
+	if strings.Contains(err.Error(), "not a regular file or a directory") {
+		t.Fatalf("err = %v, the global header entry should have been skipped rather than refused", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(s.Root, "..", "evil")); !os.IsNotExist(statErr) {
-		t.Fatalf("the escaping entry landed outside the store root: stat = %v", statErr)
-	}
-	if _, statErr := os.Stat(filepath.Join(filepath.Dir(s.Root), "evil")); !os.IsNotExist(statErr) {
-		t.Fatalf("the escaping entry landed outside the store root: stat = %v", statErr)
+	if !strings.Contains(err.Error(), "myrepo-abc1234") || !strings.Contains(err.Error(), "tarball root") {
+		t.Fatalf("err = %v, want the helpful not-rooted error naming the found directory", err)
 	}
 }
 
-// TestATarballWithAnAbsolutePathIsRefused covers the other half of the traversal guard: an
-// absolute entry name, which "../.." alone does not exercise.
-func TestATarballWithAnAbsolutePathIsRefused(t *testing.T) {
-	tgz := tarballWithEntries(t, []tarEntry{{name: "/etc/evil", content: "haha"}})
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(tgz)
-	}))
-	defer srv.Close()
-
-	s := newTestStore(t)
-	s.HTTPClient = srv.Client()
-
-	_, _, err := s.Install(context.Background(), srv.URL+"/p.tar.gz", time.Now())
-	if err == nil || !strings.Contains(err.Error(), "escapes the stage") {
-		t.Fatalf("err = %v, want it to refuse the absolute entry name", err)
+// TestDefaultHTTPClientRefusesARedirectToPlainHTTP covers the Important on the default client:
+// without a CheckRedirect of its own, an https: URL that redirects to a plain http one would
+// have the digest taken over whatever that unencrypted hop actually served. Tested directly
+// against the func rather than through a live redirecting server: a real end-to-end redirect
+// test would need a second, differently-trusted server for the http hop and adds nothing this
+// unit test of the policy itself doesn't already prove.
+func TestDefaultHTTPClientRefusesARedirectToPlainHTTP(t *testing.T) {
+	toHTTP, err := http.NewRequest(http.MethodGet, "http://example.com/evil", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, statErr := os.Stat("/etc/evil"); !os.IsNotExist(statErr) {
-		t.Fatalf("the absolute entry landed on disk: stat = %v", statErr)
+	if err := defaultHTTPClient.CheckRedirect(toHTTP, nil); err == nil {
+		t.Fatal("CheckRedirect: want an error for a redirect to a plain http URL")
+	}
+	toHTTPS, err := http.NewRequest(http.MethodGet, "https://example.com/ok", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultHTTPClient.CheckRedirect(toHTTPS, nil); err != nil {
+		t.Fatalf("CheckRedirect: want no error for an https redirect target, got %v", err)
 	}
 }
 
