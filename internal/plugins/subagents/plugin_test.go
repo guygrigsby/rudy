@@ -154,6 +154,43 @@ func TestRosterEmptyReturnsNoResult(t *testing.T) {
 	}
 }
 
+// TestTheRosterIsNotOfferedToASubagent: a child session never holds the agent tool, since
+// session.open strips it (ADR 0028, the depth cap), so listing the agents it could delegate to
+// would invite a turn that ends in an unknown-tool result. The same hook fires for every child.
+func TestTheRosterIsNotOfferedToASubagent(t *testing.T) {
+	dir := t.TempDir()
+	writeDef(t, filepath.Join(dir, "agents"), "explorer", "reads the codebase")
+	h := &plugintest.Host{Name: "subagents"}
+	if err := New(dir).Init(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	ws := session.Workspace{Root: t.TempDir()}
+
+	root, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
+		Point:   plugin.HookSessionOpened,
+		Payload: &plugin.SessionOpenedPayload{Workspace: ws},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root == nil {
+		t.Fatal("setup: a root session with a definition on disk was given no roster")
+	}
+
+	child, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
+		Point: plugin.HookSessionOpened,
+		Payload: &plugin.SessionOpenedPayload{
+			Workspace: ws, ParentSessionID: session.NewID().String(),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child != nil {
+		t.Fatalf("a subagent was told it can delegate: %+v", child)
+	}
+}
+
 // TestRegistersTheAgentToolWithAStaticDescription is ADR 0028 decision 8: the description
 // cannot enumerate agents, since a registration cannot be revised once a workspace or a later
 // plugin adds one, so it must not name any and must instead point at the system prompt, where

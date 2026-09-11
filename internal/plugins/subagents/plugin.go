@@ -68,6 +68,13 @@ func (p *agentPlugin) roster(_ context.Context, call plugin.HookCall) (any, erro
 	if !ok || payload == nil {
 		return nil, nil
 	}
+	if payload.ParentSessionID != "" {
+		// A child holds no agent tool: session.open strips it for a subagent, so telling this
+		// session who it could delegate to invites a turn that ends in an unknown-tool result.
+		// The shipped example lists bash, edit and write, so it is a live invitation, not a
+		// theoretical one (ADR 0028).
+		return nil, nil
+	}
 	defs, errs := agentdef.Load([]string{
 		filepath.Join(p.configDir, "agents"),
 		filepath.Join(payload.Workspace.Root, ".rudy", "agents"),

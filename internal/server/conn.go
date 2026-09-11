@@ -75,8 +75,12 @@ func (cn *conn) notify(method string, params any) {
 // disagree about who counts (see liveSession.askers for why a plugin never does).
 func (cn *conn) isAsker() bool { return cn.asker && cn.plugin == "" }
 
-// subscribed reports whether this connection holds sid. Self-locking (takes cn.mu, which
-// is never nested inside any of the server's locks).
+// subscribed reports whether this connection holds sid. Self-locking (takes cn.mu, which is the
+// innermost lock in the process: every server lock may nest it, and nothing is ever taken while
+// it is held). Server.mu nests it in subscribeLocked and childAttachmentsLocked, and a
+// liveSession's obsMu nests it in broadcastObsLocked (through notify) and in watchers, which
+// asks this very question about each of a parent's connections. Reversing that, holding cn.mu
+// and then reaching for a session's lock, is what would deadlock.
 func (cn *conn) subscribed(sid ulid.ULID) bool {
 	cn.mu.Lock()
 	defer cn.mu.Unlock()

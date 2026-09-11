@@ -891,6 +891,15 @@ func (a *liveAsker) leave(key askKey, st *standingAsk, err error) (turn.Answer, 
 // later calls would raise a duplicate question for one that is already standing. Caller holds
 // mu; taking it here would either deadlock leave's already-held lock or reopen the exact gap
 // this closes for raise's separately-acquired one.
+//
+// This is the rule for a departing call, not for every writer: resolveAnswer and settleLocked
+// delete on the key alone and are exempt, because a successor cannot yet exist when they run.
+// Both delete only for a pendingAsk they found live in the same mu section, and a key holds at
+// most one pending entry at a time: a second call asking the same thing joins the standingAsk
+// instead of publishing a pending of its own (Ask), and a promoted joiner only publishes one
+// after the previous holder's ask() has already forgotten its own. A successor standingAsk, in
+// turn, can only be created once asking[key] is gone, which happens after that forget. So the
+// entry these two delete is always the one their own pending belonged to.
 func retireIfCurrentLocked(asking map[askKey]*standingAsk, key askKey, st *standingAsk) {
 	if asking[key] == st {
 		delete(asking, key)
