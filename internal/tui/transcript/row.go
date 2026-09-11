@@ -73,10 +73,11 @@ type Row struct {
 	ParentToolUseID string
 	// ToolState is a tool row's own last-seen protocol.ToolStateChanged.State, contracts:
 	// "tool.state(awaiting_permission) always precedes permission.requested for the same
-	// call", set only for a subagent's own tool calls (SessionID set): the parent's asker is
-	// itself, so permission.requested reaches it with no gap worth naming, but a child's
-	// borrows the parent's asker over the routing this row's SessionID exists for, and the
-	// tool row would otherwise say "running" for however long that ask takes to arrive.
+	// call". It covers the window between those two, which is a moment for this session's own
+	// call and however long a walk up to the parent's askers takes for a subagent's; and it is
+	// what a client attaching mid-turn is handed for every call already in flight, where the
+	// question it is parked on may have been asked long before this client arrived. Without it
+	// a row parked on the operator reads as one merely working.
 	ToolState string
 }
 

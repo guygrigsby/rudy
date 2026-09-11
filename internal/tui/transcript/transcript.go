@@ -675,6 +675,12 @@ func (t *Transcript) AnsweredFrom(sessionID, parentToolUseID, toolUseID string) 
 	}
 }
 
+// SetOwnToolState is SetToolState for this transcript's own session, whose rows carry no origin
+// prefix (origin.key). It exists so no caller reaches for the session id it is rendering: that
+// builds a prefixed key, which matches a subagent's rows and never one of this session's own, so
+// every state for the session on screen would be dropped silently.
+func (t *Transcript) SetOwnToolState(toolUseID, state string) { t.SetToolState("", toolUseID, state) }
+
 // SetToolState records a subagent's own tool call progress on its row (Row.ToolState), so
 // the moment between tool.state(awaiting_permission) and the permission.requested that
 // follows it (contracts) shows the operator why the call is not moving, rather than a bare

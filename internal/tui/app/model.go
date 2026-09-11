@@ -476,6 +476,15 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 		if m.decode(n, &p) {
 			return m.turnChanged(p)
 		}
+	case protocol.NotifyToolState:
+		var p protocol.ToolStateChanged
+		if m.decode(n, &p) {
+			// Own session, so no origin prefix (SetOwnToolState). It says awaiting permission
+			// on a row that would otherwise say running: the gap matters most on attach, where
+			// the server replays a state for every call in flight (the tool.state contracts
+			// row) and a call parked on the operator would read as one merely working.
+			m.tr.SetOwnToolState(p.ToolUseID, p.State)
+		}
 	case protocol.NotifyPermissionRequested:
 		var p protocol.PermissionRequested
 		if m.decode(n, &p) {

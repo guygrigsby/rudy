@@ -258,6 +258,29 @@ func TestGoldenPermissionPrompt(t *testing.T) {
 	}))
 }
 
+// TestGoldenOwnCallAwaitingPermission pins the tool.state contracts row on this session's own
+// call: a call parked on the operator says so, rather than saying "running" like one that is
+// working. The state is what a client attaching mid-turn is handed for every call in flight, so
+// this is what a headless attach, or the moment before the question arrives, actually shows;
+// the question itself is not sent here, which is exactly the window the state covers.
+func TestGoldenOwnCallAwaitingPermission(t *testing.T) {
+	golden(t, "awaiting_permission", screen(t, nil, func(tm *teatest.TestModel, sid string) {
+		turn := session.NewID().String()
+		tm.Send(appendedMsg(t, sid, session.AssistantMessage{
+			Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+			Content: []session.Block{session.ToolUseBlock("t3", "bash", json.RawMessage(dangerInput))},
+			Usage:   goldenUsage,
+		}))
+		tm.Send(notify(t, protocol.NotifyTurnState, protocol.TurnStateChanged{
+			SessionID: sid, TurnID: turn, State: stateAwaitingPermission,
+		}))
+		tm.Send(notify(t, protocol.NotifyToolState, protocol.ToolStateChanged{
+			SessionID: sid, TurnID: turn, ToolUseID: "t3", Name: "bash",
+			State: protocol.ToolStateAwaitingPermission,
+		}))
+	}))
+}
+
 // TestGoldenAShellDraft pins what `!` looks like before it runs: the composer in the shell
 // role, and a command already run above it (ADR 0023).
 func TestGoldenAShellDraft(t *testing.T) {
@@ -344,15 +367,11 @@ func TestGoldenWidgetsAndStatus(t *testing.T) {
 func TestGoldenSubagentRunning(t *testing.T) {
 	golden(t, "subagent_running", screen(t, nil, func(tm *teatest.TestModel, sid string) {
 		child := session.NewID().String()
-		turn := session.NewID().String()
 		tm.Send(appendedMsg(t, sid, session.AssistantMessage{
 			Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
 			Content: []session.Block{session.ToolUseBlock("t9", "agent",
 				json.RawMessage(`{"agent":"explorer","prompt":"find the caller"}`))},
 			Usage: goldenUsage,
-		}))
-		tm.Send(notify(t, protocol.NotifyToolState, protocol.ToolStateChanged{
-			SessionID: sid, TurnID: turn, ToolUseID: "t9", Name: "agent", State: protocol.ToolStateRunning,
 		}))
 		tm.Send(appendedMsg(t, child, session.SessionOpened{
 			SchemaVersion: 1, RudyVersion: "test",
