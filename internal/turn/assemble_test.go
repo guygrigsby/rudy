@@ -61,11 +61,91 @@ func TestAssembleMapsEntriesToMessages(t *testing.T) {
 			t.Fatalf("message %d role %q want %q", i, req.Messages[i].Role, r)
 		}
 	}
-	if req.Messages[2].ToolUseID != "tu1" || req.Messages[2].Content[0].Text != "module x" {
+	res := req.Messages[2].Results
+	if len(res) != 1 || res[0].ToolUseID != "tu1" || res[0].Content[0].Text != "module x" || res[0].IsError {
 		t.Fatalf("tool result message %+v", req.Messages[2])
 	}
 	if string(req.Messages[1].Content[1].Input) != `{"path":"go.mod"}` {
 		t.Fatalf("tool_use input must be verbatim, got %s", req.Messages[1].Content[1].Input)
+	}
+}
+
+// TestAssemblePutsOneTurnsResultsInOneMessage is the shape parallel tool use is specified in.
+// One message per result is accepted on the wire (the Messages API combines consecutive
+// same-role turns, and nothing separates these: the permission decisions in between are
+// skipped and a steer's user_message is appended by the next Run), so no error would ever
+// appear. What would happen instead is that the model, shown its parallel calls answered one
+// turn at a time, stops making them, and the fan-out this wave exists for goes quiet with
+// nothing to debug. See the Turn.RunTool row in the contracts.
+func TestAssemblePutsOneTurnsResultsInOneMessage(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	mustAppend(t, s, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+	mustAppend(t, s, session.AssistantMessage{
+		Model: s.Model(), Thinking: s.Thinking(),
+		Content: []session.Block{
+			session.ToolUseBlock("tu1", "read", json.RawMessage(`{"path":"a"}`)),
+			session.ToolUseBlock("tu2", "read", json.RawMessage(`{"path":"b"}`)),
+		},
+		StopReason: session.StopToolUse, StopReasonRaw: "tool_calls",
+	})
+	for _, id := range []string{"tu1", "tu2"} {
+		mustAppend(t, s, session.PermissionDecision{ToolUseID: id, Tool: "read", Mode: session.ModeOff, Matcher: session.Matcher{Tool: "read"}, Decision: session.Allow, DecidedBy: session.ByMode, Scope: session.ScopeOnce, Reason: "mode off"})
+	}
+	// Out of tool_use order on purpose: calls run at once, so the log records whichever
+	// finished first, and the pairing is by id.
+	mustAppend(t, s, session.ToolResult{ToolUseID: "tu2", Outcome: session.OutcomeError, Content: []session.Block{session.TextBlock("no b")}})
+	mustAppend(t, s, session.ToolResult{ToolUseID: "tu1", Outcome: session.OutcomeOK, Content: []session.Block{session.TextBlock("a body")}})
+
+	req := Assemble(s, nil, "S", 100, nil)
+	wantRoles := []provider.Role{provider.RoleUser, provider.RoleAssistant, provider.RoleToolResult}
+	if len(req.Messages) != len(wantRoles) {
+		t.Fatalf("two results must be one message, got %d messages: %+v", len(req.Messages), req.Messages)
+	}
+	for i, r := range wantRoles {
+		if req.Messages[i].Role != r {
+			t.Fatalf("message %d role %q want %q", i, req.Messages[i].Role, r)
+		}
+	}
+	res := req.Messages[2].Results
+	if len(res) != 2 {
+		t.Fatalf("results = %d, want both in the one message: %+v", len(res), res)
+	}
+	if res[0].ToolUseID != "tu2" || !res[0].IsError || res[0].Content[0].Text != "no b" {
+		t.Fatalf("first result %+v", res[0])
+	}
+	if res[1].ToolUseID != "tu1" || res[1].IsError || res[1].Content[0].Text != "a body" {
+		t.Fatalf("second result %+v", res[1])
+	}
+}
+
+// TestAssembleSplitsResultsOfDifferentTurns is the other half: a run ends where the next
+// assistant message begins, so two turns never merge into one reply.
+func TestAssembleSplitsResultsOfDifferentTurns(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	mustAppend(t, s, session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("go")}})
+	for _, id := range []string{"tu1", "tu2"} {
+		mustAppend(t, s, session.AssistantMessage{
+			Model: s.Model(), Thinking: s.Thinking(),
+			Content:    []session.Block{session.ToolUseBlock(id, "read", json.RawMessage(`{}`))},
+			StopReason: session.StopToolUse, StopReasonRaw: "tool_calls",
+		})
+		mustAppend(t, s, session.PermissionDecision{ToolUseID: id, Tool: "read", Mode: session.ModeOff, Matcher: session.Matcher{Tool: "read"}, Decision: session.Allow, DecidedBy: session.ByMode, Scope: session.ScopeOnce, Reason: "mode off"})
+		mustAppend(t, s, session.ToolResult{ToolUseID: id, Outcome: session.OutcomeOK, Content: []session.Block{session.TextBlock(id)}})
+	}
+	req := Assemble(s, nil, "S", 100, nil)
+	want := []provider.Role{provider.RoleUser, provider.RoleAssistant, provider.RoleToolResult, provider.RoleAssistant, provider.RoleToolResult}
+	if len(req.Messages) != len(want) {
+		t.Fatalf("messages %+v, want %v", req.Messages, want)
+	}
+	for i, r := range want {
+		if req.Messages[i].Role != r {
+			t.Fatalf("message %d role %q want %q", i, req.Messages[i].Role, r)
+		}
+	}
+	for _, i := range []int{2, 4} {
+		if len(req.Messages[i].Results) != 1 {
+			t.Fatalf("message %d carries %d results, want its turn's one", i, len(req.Messages[i].Results))
+		}
 	}
 }
 

@@ -165,11 +165,11 @@ func TestPrintToolRoundTrip(t *testing.T) {
 	}
 	second := fp.request(1)
 	last := second.Messages[len(second.Messages)-1]
-	if last.Role != provider.RoleToolResult || last.ToolUseID != "tu_1" {
+	if last.Role != provider.RoleToolResult || len(last.Results) != 1 || last.Results[0].ToolUseID != "tu_1" {
 		t.Fatalf("last message %+v", last)
 	}
-	if !strings.Contains(session.TextOf(last.Content), "a.txt") {
-		t.Fatalf("tool result %q", session.TextOf(last.Content))
+	if !strings.Contains(session.TextOf(last.Results[0].Content), "a.txt") {
+		t.Fatalf("tool result %q", session.TextOf(last.Results[0].Content))
 	}
 }
 

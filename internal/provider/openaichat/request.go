@@ -74,14 +74,14 @@ func buildRequest(req provider.Request) ([]byte, error) {
 		w.Messages = append(w.Messages, wireMessage{Role: "system", Content: req.System})
 	}
 	for i, m := range req.Messages {
-		wm, err := buildMessage(m)
+		wms, err := buildMessage(m)
 		if errors.Is(err, errNothingToSend) {
 			continue
 		}
 		if err != nil {
 			return nil, fmt.Errorf("openaichat: message %d: %w", i, err)
 		}
-		w.Messages = append(w.Messages, wm)
+		w.Messages = append(w.Messages, wms...)
 	}
 	for _, t := range req.Tools {
 		w.Tools = append(w.Tools, wireTool{Type: "function", Function: wireToolFunction{
@@ -93,14 +93,19 @@ func buildRequest(req provider.Request) ([]byte, error) {
 	return json.Marshal(w)
 }
 
-func buildMessage(m provider.Message) (wireMessage, error) {
+// buildMessage turns one domain message into the wire messages it becomes. Every role but
+// tool_result is one message; a tool_result message is one "tool" message per result, since
+// chat completions answers each call in its own message keyed by tool_call_id. That is the
+// opposite of what the Messages API wants for the same group, which is why the grouping
+// travels in provider.Message and the shape is decided here.
+func buildMessage(m provider.Message) ([]wireMessage, error) {
 	switch m.Role {
 	case provider.RoleUser:
 		text, err := textOf(m.Content)
 		if err != nil {
-			return wireMessage{}, err
+			return nil, err
 		}
-		return wireMessage{Role: "user", Content: text}, nil
+		return []wireMessage{{Role: "user", Content: text}}, nil
 	case provider.RoleAssistant:
 		var calls []wireToolCall
 		for _, b := range m.Content {
@@ -116,9 +121,9 @@ func buildMessage(m provider.Message) (wireMessage, error) {
 			case session.BlockThinking:
 				// Not sent back in this plan.
 			case session.BlockImage:
-				return wireMessage{}, errImageUnsupported
+				return nil, errImageUnsupported
 			default:
-				return wireMessage{}, fmt.Errorf("openaichat: block type %q in assistant message", b.Type)
+				return nil, fmt.Errorf("openaichat: block type %q in assistant message", b.Type)
 			}
 		}
 		text := session.TextOf(m.Content)
@@ -126,17 +131,24 @@ func buildMessage(m provider.Message) (wireMessage, error) {
 			// Only reachable for an assistant message whose blocks were all thinking,
 			// which this codec never sends back: a Ctrl-C during thinking records exactly
 			// that. A message carrying a tool call or any text still has something here.
-			return wireMessage{}, errNothingToSend
+			return nil, errNothingToSend
 		}
-		return wireMessage{Role: "assistant", Content: text, ToolCalls: calls}, nil
+		return []wireMessage{{Role: "assistant", Content: text, ToolCalls: calls}}, nil
 	case provider.RoleToolResult:
-		text, err := textOf(m.Content)
-		if err != nil {
-			return wireMessage{}, err
+		out := make([]wireMessage, 0, len(m.Results))
+		for _, r := range m.Results {
+			text, err := textOf(r.Content)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, wireMessage{Role: "tool", Content: text, ToolCallID: r.ToolUseID})
 		}
-		return wireMessage{Role: "tool", Content: text, ToolCallID: m.ToolUseID}, nil
+		if len(out) == 0 {
+			return nil, errNothingToSend
+		}
+		return out, nil
 	}
-	return wireMessage{}, fmt.Errorf("openaichat: unknown role %q", m.Role)
+	return nil, fmt.Errorf("openaichat: unknown role %q", m.Role)
 }
 
 // textOf is session.TextOf behind the codec's own refusal: an image is refused until the

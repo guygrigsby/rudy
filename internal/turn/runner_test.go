@@ -1378,7 +1378,7 @@ func TestRunnerFiresHooksInOrder(t *testing.T) {
 	// The second request saw the replacement, the log kept the real result.
 	msgs := prov.requests[1].Messages
 	lastMsg := msgs[len(msgs)-1]
-	if lastMsg.Role != provider.RoleToolResult || lastMsg.Content[0].Text != "REPLACED" {
+	if lastMsg.Role != provider.RoleToolResult || len(lastMsg.Results) != 1 || lastMsg.Results[0].Content[0].Text != "REPLACED" {
 		t.Errorf("request saw %+v", lastMsg)
 	}
 	for _, e := range s.Entries() {
@@ -1507,10 +1507,10 @@ func TestRunnerOverridesOutliveTheTurn(t *testing.T) {
 	for i, req := range prov.requests[1:] {
 		found := false
 		for _, m := range req.Messages {
-			if m.Role == provider.RoleToolResult {
+			for _, res := range m.Results {
 				found = true
-				if m.Content[0].Text != "REDACTED" {
-					t.Errorf("request %d carried %q", i+1, m.Content[0].Text)
+				if res.Content[0].Text != "REDACTED" {
+					t.Errorf("request %d carried %q", i+1, res.Content[0].Text)
 				}
 			}
 		}

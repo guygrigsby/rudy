@@ -42,7 +42,7 @@ func TestCompleteStreamsTextAndToolUse(t *testing.T) {
 		Messages: []provider.Message{
 			{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("hi")}},
 			{Role: provider.RoleAssistant, Content: []session.Block{{Type: session.BlockThinking, Text: "hm", Signature: "SIG"}, session.ToolUseBlock("toolu_00", "read", json.RawMessage(`{"path": "a"}`))}},
-			{Role: provider.RoleToolResult, ToolUseID: "toolu_00", Content: []session.Block{session.TextBlock("contents")}},
+			{Role: provider.RoleToolResult, Results: []provider.ToolResult{{ToolUseID: "toolu_00", Content: []session.Block{session.TextBlock("contents")}}}},
 		},
 		Tools:     []provider.ToolDef{{Name: "read", Description: "Read", Schema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`)}},
 		SessionID: ulid.Make(),
@@ -318,8 +318,10 @@ func TestToolResultCarriesItsOutcome(t *testing.T) {
 	req := provider.Request{
 		Model: session.ModelRef{Provider: "anth", Model: "claude-sonnet-5"}, MaxTokens: 100,
 		Messages: []provider.Message{
-			{Role: provider.RoleToolResult, ToolUseID: "toolu_ok", Content: []session.Block{session.TextBlock("fine")}},
-			{Role: provider.RoleToolResult, ToolUseID: "toolu_bad", Content: []session.Block{session.TextBlock("boom")}, IsError: true},
+			{Role: provider.RoleToolResult, Results: []provider.ToolResult{
+				{ToolUseID: "toolu_ok", Content: []session.Block{session.TextBlock("fine")}},
+				{ToolUseID: "toolu_bad", Content: []session.Block{session.TextBlock("boom")}, IsError: true},
+			}},
 		},
 	}
 	p, err := buildParams(req)

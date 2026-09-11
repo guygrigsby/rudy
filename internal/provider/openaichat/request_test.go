@@ -29,7 +29,7 @@ func TestBuildRequestGolden(t *testing.T) {
 				{Type: session.BlockThinking, Text: "I should read it.", Signature: "sig"},
 				session.ToolUseBlock("call_1", "read", json.RawMessage(`{"path":"go.mod"}`)),
 			}},
-			{Role: provider.RoleToolResult, ToolUseID: "call_1", Content: []session.Block{session.TextBlock("module x")}},
+			{Role: provider.RoleToolResult, Results: []provider.ToolResult{{ToolUseID: "call_1", Content: []session.Block{session.TextBlock("module x")}}}},
 		},
 		Tools: []provider.ToolDef{{
 			Name:        "read",
@@ -136,5 +136,48 @@ func TestBuildRequestDropsAnEmptyAssistantMessage(t *testing.T) {
 	}`)
 	if string(got) != want {
 		t.Fatalf("body mismatch\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestParallelToolResultsAreOneMessageEach is the mirror of the Messages API's rule, not a
+// copy of it. Chat completions keys each answer to its own "tool" message by tool_call_id, so
+// the group the kernel hands over (provider.Message.Results, one per concurrent call) is fanned
+// back out here. Merging them the way the Anthropic codec must would send one answer for two
+// calls and leave the second call unanswered.
+func TestParallelToolResultsAreOneMessageEach(t *testing.T) {
+	req := provider.Request{
+		Model: session.ModelRef{Provider: "aperture", Model: "m"}, MaxTokens: 10,
+		Messages: []provider.Message{
+			{Role: provider.RoleAssistant, Content: []session.Block{
+				session.ToolUseBlock("call_1", "read", json.RawMessage(`{}`)),
+				session.ToolUseBlock("call_2", "read", json.RawMessage(`{}`)),
+			}},
+			{Role: provider.RoleToolResult, Results: []provider.ToolResult{
+				{ToolUseID: "call_1", Content: []session.Block{session.TextBlock("one")}},
+				{ToolUseID: "call_2", Content: []session.Block{session.TextBlock("two")}},
+			}},
+		},
+	}
+	got, err := buildRequest(req)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	var w wireRequest
+	if err := json.Unmarshal(got, &w); err != nil {
+		t.Fatalf("unmarshal %s: %v", got, err)
+	}
+	var tools []wireMessage
+	for _, m := range w.Messages {
+		if m.Role == "tool" {
+			tools = append(tools, m)
+		}
+	}
+	if len(tools) != 2 {
+		t.Fatalf("tool messages = %d, want one per call: %s", len(tools), got)
+	}
+	for i, want := range []struct{ id, content string }{{"call_1", "one"}, {"call_2", "two"}} {
+		if tools[i].ToolCallID != want.id || tools[i].Content != want.content {
+			t.Fatalf("tool message %d = %+v, want %s answered with %q", i, tools[i], want.id, want.content)
+		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -217,12 +218,12 @@ func TestModelCompactorUsesTheAfterToolOverrides(t *testing.T) {
 	if _, err := c.Compact(context.Background(), s, ulid.ULID{}, "go"); err != nil {
 		t.Fatal(err)
 	}
-	var result *provider.Message
+	var result *provider.ToolResult
 	for i, m := range prov.requests[0].Messages {
-		if m.Role == provider.RoleToolResult {
-			result = &prov.requests[0].Messages[i]
+		for j := range m.Results {
+			result = &prov.requests[0].Messages[i].Results[j]
 		}
-		for _, b := range m.Content {
+		for _, b := range slices.Concat(m.Content, blocksOf(m.Results)) {
 			if strings.Contains(b.Text, "SECRET") {
 				t.Fatalf("the stored result reached the summary request: %+v", m)
 			}
@@ -231,4 +232,14 @@ func TestModelCompactorUsesTheAfterToolOverrides(t *testing.T) {
 	if result == nil || result.Content[0].Text != "REDACTED" {
 		t.Fatalf("tool result message %+v", result)
 	}
+}
+
+// blocksOf is every block the results of a message carry, for a test that checks what reached
+// the wire without caring which result it came from.
+func blocksOf(results []provider.ToolResult) []session.Block {
+	var out []session.Block
+	for _, r := range results {
+		out = append(out, r.Content...)
+	}
+	return out
 }

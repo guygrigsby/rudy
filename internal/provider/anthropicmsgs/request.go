@@ -89,11 +89,15 @@ func thinkingBudget(l session.ThinkingLevel) int64 {
 	return 0
 }
 
-// buildMessage turns one domain message into one Messages API turn. A tool result is a user
-// message of its own; several results in a row stay several consecutive user messages, which
-// the API combines into one turn. An assistant message left with no block at all is reported
-// as errNothingToSend for the caller to drop: the messages either side of it are still sent,
-// and two user messages left adjacent by the drop combine the same way.
+// buildMessage turns one domain message into one Messages API turn. The results of one
+// assistant message are a single user message carrying a tool_result block per call, which is
+// the shape parallel tool use is specified in. Sending them as consecutive one-result user
+// messages is not refused, since the API combines same-role turns, but acceptance is not the
+// question: a model shown its parallel calls answered one turn at a time learns to stop making
+// them, and the fan-out this exists for quietly stops happening with no error to find
+// (ADR 0028). An assistant message left with no block at all is reported as errNothingToSend
+// for the caller to drop: the messages either side of it are still sent, and two user messages
+// left adjacent by the drop combine the same way.
 func buildMessage(m provider.Message) (anthropic.MessageParam, error) {
 	switch m.Role {
 	case provider.RoleUser:
@@ -139,11 +143,18 @@ func buildMessage(m provider.Message) (anthropic.MessageParam, error) {
 		}
 		return anthropic.NewAssistantMessage(blocks...), nil
 	case provider.RoleToolResult:
-		text, err := textOf(m.Content)
-		if err != nil {
-			return anthropic.MessageParam{}, err
+		blocks := make([]anthropic.ContentBlockParamUnion, 0, len(m.Results))
+		for _, r := range m.Results {
+			text, err := textOf(r.Content)
+			if err != nil {
+				return anthropic.MessageParam{}, err
+			}
+			blocks = append(blocks, anthropic.NewToolResultBlock(r.ToolUseID, text, r.IsError))
 		}
-		return anthropic.NewUserMessage(anthropic.NewToolResultBlock(m.ToolUseID, text, m.IsError)), nil
+		if len(blocks) == 0 {
+			return anthropic.MessageParam{}, errNothingToSend
+		}
+		return anthropic.NewUserMessage(blocks...), nil
 	}
 	return anthropic.MessageParam{}, fmt.Errorf("anthropicmsgs: unknown role %q", m.Role)
 }

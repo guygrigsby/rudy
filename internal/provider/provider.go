@@ -23,13 +23,25 @@ const (
 
 // Message is one turn of conversation in the shape the loop keeps it.
 type Message struct {
-	Role      Role            `json:"role"`
+	Role    Role            `json:"role"`
+	Content []session.Block `json:"content"`
+	// Results is what a RoleToolResult message carries, in call order, and Content is empty
+	// for that role. It is a list rather than one result because the calls of one assistant
+	// message are answered as a group: they run at once (ADR 0028) and every one of their
+	// results belongs to the same reply. Which shape that reply takes on the wire is the
+	// codec's to decide, and the two APIs want opposite ones, so the group travels as a group
+	// and each codec renders it.
+	Results []ToolResult `json:"results,omitempty"`
+}
+
+// ToolResult is one call's answer inside a RoleToolResult message.
+type ToolResult struct {
+	ToolUseID string          `json:"tool_use_id"`
 	Content   []session.Block `json:"content"`
-	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result only
-	// IsError is the tool_result's outcome as the wire spells it: true for anything but a
-	// clean run (an error, a killed tool, a result lost to a crash). A provider that has a
-	// flag for it says so, which is what lets the model tell a failure from an answer
-	// instead of reading the text and guessing. tool_result only.
+	// IsError is the result's outcome as the wire spells it: true for anything but a clean
+	// run (an error, a killed tool, a result lost to a crash). A provider that has a flag for
+	// it says so, which is what lets the model tell a failure from an answer instead of
+	// reading the text and guessing.
 	IsError bool `json:"is_error,omitempty"`
 }
 
