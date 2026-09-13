@@ -86,7 +86,7 @@ func startServe(t *testing.T, ctx context.Context, build buildFunc, socket strin
 	w := newWatcher("serving on " + socket)
 	done := make(chan served, 1)
 	go func() {
-		code, err := runServe(ctx, build, socket, io.Discard, w)
+		code, err := runServe(ctx, build, socket, "", io.Discard, w)
 		done <- served{code, err}
 	}()
 	select {
@@ -335,7 +335,7 @@ func TestServeReleasesTheSocketWhenTheBuildFails(t *testing.T) {
 		return nil, errors.New("no provider reachable")
 	}
 	var errb bytes.Buffer
-	code, err := runServe(context.Background(), fail, socket, io.Discard, &errb)
+	code, err := runServe(context.Background(), fail, socket, "", io.Discard, &errb)
 	if code != 1 || err == nil {
 		t.Fatalf("runServe = %d, %v; want 1 and the build error", code, err)
 	}
@@ -399,7 +399,7 @@ func TestServeRefusesABusySocket(t *testing.T) {
 		return nil, errors.New("must not build")
 	}
 	var errb bytes.Buffer
-	code, err := runServe(context.Background(), refuse, socket, io.Discard, &errb)
+	code, err := runServe(context.Background(), refuse, socket, "", io.Discard, &errb)
 	if code != 1 || err != nil {
 		t.Fatalf("second runServe = %d, %v; stderr %q", code, err, errb.String())
 	}

@@ -20,6 +20,7 @@ import (
 // work.
 var topLevelVerbs = map[string]string{
 	"serve":      "the daemon itself; there is no noun it acts on",
+	"bridge":     "the box side of --host; like serve, it is the transport itself and acts on no noun (ADR 0029)",
 	"help":       "cobra's own",
 	"completion": "cobra's own",
 	"install":    "the one verb everybody types; the noun form rudy plugins install remains (ADR 0025)",

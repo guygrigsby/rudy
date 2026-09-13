@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -31,14 +33,14 @@ var serveShutdownBudget = 10 * time.Second
 // instead of an in-process pipe. It takes the same buildFunc every other command does, since
 // there is one wiring and a daemon that built its own would be a second one.
 func newServeCommand(build buildFunc) *cobra.Command {
-	var socket string
+	var socket, pidFile string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "serve the protocol on a unix socket until interrupted",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stderr := cmd.ErrOrStderr()
-			code, err := runServe(cmd.Context(), build, socket, cmd.OutOrStdout(), stderr)
+			code, err := runServe(cmd.Context(), build, socket, pidFile, cmd.OutOrStdout(), stderr)
 			if err != nil {
 				_, _ = fmt.Fprintln(stderr, err)
 				if code == 0 {
@@ -53,6 +55,11 @@ func newServeCommand(build buildFunc) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&socket, "socket", "", "unix socket to serve on (default: rudy.sock under the XDG runtime dir)")
+	// Only a process that started this daemon has anything to do with its pid, so the file is
+	// written on request rather than always: rudy bridge asks for one because rudy hosts
+	// install has to be able to stop an idle daemon it did not start, and a daemon an operator
+	// ran by hand is theirs to signal by the means they already have.
+	cmd.Flags().StringVar(&pidFile, "pidfile", "", "write this process's pid here while it serves (default: write none)")
 	return cmd
 }
 
@@ -64,7 +71,7 @@ func newServeCommand(build buildFunc) *cobra.Command {
 // Everything it prints is a diagnostic, so it all goes to stderr with the prefix Build's own
 // notices use; stdout stays free for a future flag that wants to report the socket to a
 // program rather than to an operator.
-func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, stderr io.Writer) (int, error) {
+func runServe(ctx context.Context, build buildFunc, socket, pidFile string, _ io.Writer, stderr io.Writer) (int, error) {
 	// SIGTERM as well as SIGINT: a daemon is stopped by a service manager at least as often
 	// as by a Ctrl-C, and both mean the same thing here.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -108,6 +115,14 @@ func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, 
 	// nothing is reading any more. See runPrint, which does the same.
 	unwind := func() error {
 		stop()
+		// The pid file goes first and unconditionally: whatever the sessions do on the way out,
+		// a file naming a pid this process no longer has is one a later rudy hosts install
+		// would signal, and the pid is reused by then as often as not.
+		if pidFile != "" {
+			if err := os.Remove(pidFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				notice(err.Error())
+			}
+		}
 		shutdownCtx, done := context.WithTimeout(context.Background(), serveShutdownBudget)
 		defer done()
 		err := b.Close(shutdownCtx)
@@ -124,6 +139,20 @@ func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, 
 	// that dialed on the strength of this line and then waited out a plugin load and a
 	// registry refresh in the backlog would be worse served than one that got no line yet.
 	notice("serving on " + socket)
+	// Written once the daemon is actually serving, so a pid file is evidence of a server and
+	// not of a process that is still deciding whether it can be one. A caller only passes
+	// --pidfile because it means to signal this process later, so failing to write one is
+	// failing to be the daemon that caller asked for: carrying on would leave rudy hosts
+	// install reading no file, concluding there is no daemon and starting a second one that
+	// this socket's lock then refuses.
+	if pidFile != "" {
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+			if cerr := l.Close(); cerr != nil {
+				notice(cerr.Error())
+			}
+			return 1, errors.Join(fmt.Errorf("pid file %s: %w", pidFile, err), unwind())
+		}
+	}
 
 	// Every connection is served under a context of this one, so the signal that ends the
 	// process ends the serve loops too. Shutdown waits for those loops before it closes a
