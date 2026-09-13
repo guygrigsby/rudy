@@ -399,9 +399,11 @@ func TestServeRefusesABusySocket(t *testing.T) {
 		return nil, errors.New("must not build")
 	}
 	var errb bytes.Buffer
+	// exitSocketBusy, not 1: a bridge that started this daemon reads the code to tell the one
+	// failure that means another daemon won from every failure that means none is coming.
 	code, err := runServe(context.Background(), refuse, socket, "", io.Discard, &errb)
-	if code != 1 || err != nil {
-		t.Fatalf("second runServe = %d, %v; stderr %q", code, err, errb.String())
+	if code != exitSocketBusy || err != nil {
+		t.Fatalf("second runServe = %d, %v; want %d; stderr %q", code, err, exitSocketBusy, errb.String())
 	}
 	if want := "a server is already serving " + socket; !strings.Contains(errb.String(), want) {
 		t.Fatalf("stderr %q, want %q", errb.String(), want)

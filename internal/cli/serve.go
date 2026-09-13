@@ -29,6 +29,13 @@ import (
 // the budget runs out is behavior, and ten seconds of it is not a test.
 var serveShutdownBudget = 10 * time.Second
 
+// exitSocketBusy is what rudy serve exits with when the socket already has a server on it. A
+// code of its own rather than a plain 1 because it is the one failure that is somebody else
+// succeeding: two bridges on a cold box both start a daemon, and the loser has to be told
+// apart from a daemon that could not build, which the winner's client would otherwise be
+// shown as the reason its healthy connection failed.
+const exitSocketBusy = 3
+
 // newServeCommand is the daemon: the same server the embedded client runs, on a unix socket
 // instead of an in-process pipe. It takes the same buildFunc every other command does, since
 // there is one wiring and a daemon that built its own would be a second one.
@@ -94,7 +101,7 @@ func runServe(ctx context.Context, build buildFunc, socket, pidFile string, _ io
 	if err != nil {
 		if errors.Is(err, protocol.ErrSocketBusy) {
 			_, _ = fmt.Fprintf(stderr, "a server is already serving %s\n", socket)
-			return 1, nil
+			return exitSocketBusy, nil
 		}
 		return 1, err
 	}

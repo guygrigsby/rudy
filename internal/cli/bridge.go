@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -116,7 +118,15 @@ func dialOrStart(ctx context.Context, socket, logFile string, noStart bool) (pro
 		// a daemon that served and then exited is still a daemon that served.
 		select {
 		case werr := <-exited:
-			return nil, nil, daemonExited(werr, logFile)
+			// exitSocketBusy is the other bridge winning the race, which is a daemon arriving
+			// and not a daemon failing: keep dialing until the winner finishes building. The
+			// child is gone either way, so there is no exit left to consult and exited goes
+			// nil, which is how an attached bridge already reads.
+			if exitCodeOf(werr) != exitSocketBusy {
+				return nil, nil, daemonExited(werr, logFile)
+			}
+			slog.Info("bridge: another daemon holds the socket; waiting for it", "socket", socket)
+			exited = nil
 		default:
 		}
 		select {
@@ -135,6 +145,56 @@ func dialOrStart(ctx context.Context, socket, logFile string, noStart bool) (pro
 // child has already gone by then, so the wait is a wait4 landing and nothing else; the bound
 // is there for the case where the daemon closed one connection and stayed up.
 const daemonExitGrace = time.Second
+
+// exitCodeOf is the process exit code an error from cmd.Wait carries, or -1 for an error that
+// is not one: a signal, or a failure to run the thing at all.
+func exitCodeOf(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+// ErrStalePID means a pid file named a daemon that is not there any more. The file is gone by
+// the time a caller sees this: a pid nobody is serving behind is a number the kernel has since
+// handed to something else, and signalling it is how a stale file becomes a killed process
+// that had nothing to do with rudy.
+var ErrStalePID = errors.New("cli: the pid file is stale")
+
+// PIDFile is where the daemon serving socket leaves its pid, which is beside the socket and
+// inside the same 0700 directory. One definition, because the bridge tells rudy serve to write
+// it here and rudy hosts install has to look for it in the same place.
+func PIDFile(socket string) string { return filepath.Join(filepath.Dir(socket), "serve.pid") }
+
+// DaemonPID is the pid of the daemon serving socket, and nothing at all when the socket does
+// not answer. The socket is the proof, not the file: unwind removes the pid file on every
+// ordinary path, but a daemon that was SIGKILLed or panicked leaves one behind, and the number
+// in it belongs to whatever the kernel has given it to since. So a file with nothing serving
+// is removed and reported as ErrStalePID rather than handed to a caller that means to signal
+// it. Callers that stop a daemon (rudy hosts install, the tests) go through this.
+func DaemonPID(socket string) (int, error) {
+	path := PIDFile(socket)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("pid file %s holds %q: %w", path, data, err)
+	}
+	ctx, done := context.WithTimeout(context.Background(), attachTimeout)
+	defer done()
+	conn, derr := protocol.DialUnix(ctx, socket, attachTimeout)
+	if derr != nil {
+		if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			return 0, rerr
+		}
+		return 0, fmt.Errorf("%w: %s named pid %d but nothing serves %s: %w", ErrStalePID, path, pid, socket, derr)
+	}
+	_ = conn.Close()
+	return pid, nil
+}
 
 // daemonStatus takes the exit of a daemon this process started, or reports that none arrived
 // within grace. A nil channel is a daemon this process attached to rather than started, and
@@ -197,8 +257,8 @@ func logTail(path string, n int) string {
 
 // spawnDaemon runs this binary's serve detached: its own session so ssh ending does not
 // take it, stdio on the log file so a plugin's complaint has somewhere to go. Two bridges
-// racing both get here; the loser's serve exits on ErrSocketBusy and the loser's dial
-// loop finds the winner.
+// racing both get here; the loser's serve exits exitSocketBusy and the loser's dial loop
+// finds the winner.
 //
 // The child is kept rather than released, and its exit comes back on the returned channel.
 // Setsid is what makes the daemon outlive this process, so holding the child costs nothing
@@ -206,6 +266,13 @@ func logTail(path string, n int) string {
 func spawnDaemon(socket, logFile string) (<-chan error, error) {
 	self, err := os.Executable()
 	if err != nil {
+		return nil, err
+	}
+	// Nothing answered the socket or this call would not have been made, so a pid file here is
+	// one a daemon that died without unwinding left behind. Clearing it now means the next
+	// reader sees the child's own pid or no file, never a dead one; DaemonPID's own check is
+	// the same rule from the reading side.
+	if _, err := DaemonPID(socket); err != nil && !errors.Is(err, ErrStalePID) && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(logFile), 0o700); err != nil {
@@ -216,7 +283,7 @@ func spawnDaemon(socket, logFile string) (<-chan error, error) {
 		return nil, err
 	}
 	defer func() { _ = out.Close() }()
-	cmd := exec.Command(self, "serve", "--socket", socket, "--pidfile", filepath.Join(filepath.Dir(socket), "serve.pid"))
+	cmd := exec.Command(self, "serve", "--socket", socket, "--pidfile", PIDFile(socket))
 	cmd.Stdout = out
 	cmd.Stderr = out
 	// Not this process's stdin: that is the protocol stream from the client, and a daemon
@@ -267,34 +334,26 @@ func copyBoth(ctx context.Context, up, down protocol.Conn, exited <-chan error, 
 	}
 	go pipe(up, down, false)
 	go pipe(down, up, true)
-	var f failure
-	select {
-	case f = <-errc:
-		// The socket closing and the daemon exiting are one event seen twice, and they race:
-		// a daemon that gave up during its build closes the connection it had already been
-		// dialed on in the same instant it goes. The exit is the half that carries the reason,
-		// so it gets a moment to land before a closed stream is called a clean end.
-		if f.daemon {
-			if werr, ok := daemonStatus(exited, daemonExitGrace); ok && werr != nil {
-				cancel()
-				return 1, daemonExited(werr, logFile)
-			}
-			// Said rather than left silent: this stderr is the operator's terminal on the far
-			// end of ssh, and a session that ended because the daemon went is not the same
-			// news as one that ended because they closed it.
-			_, _ = fmt.Fprintln(stderr, "the daemon closed the connection")
-		}
-	case werr := <-exited:
-		if werr != nil {
-			cancel()
+	// Only a stream ending ends this, never the child exiting: a bridge whose own serve lost
+	// the start race has a dead child and a perfectly good connection to the winner, and a
+	// select that watched the exit would fail that connection on the spot.
+	f := <-errc
+	cancel()
+	if f.daemon {
+		// The socket closing and the daemon exiting are one event seen twice, and they race: a
+		// daemon that gave up during its build closes the connection it had already been dialed
+		// on in the same instant it goes. The exit is the half that carries the reason, so it
+		// gets a moment to land before a closed stream is called a clean end. exitSocketBusy is
+		// not a reason for anything: that child never served this connection.
+		if werr, ok := daemonStatus(exited, daemonExitGrace); ok && werr != nil && exitCodeOf(werr) != exitSocketBusy {
 			return 1, daemonExited(werr, logFile)
 		}
-		// A clean shutdown closed the connection, so the copy loop has the same news with the
-		// stream's own words for it.
-		f = <-errc
+		// Said rather than left silent: this stderr is the operator's terminal on the far end
+		// of ssh, and a session that ended because the daemon went is not the same news as one
+		// that ended because they closed it.
+		_, _ = fmt.Fprintln(stderr, "the daemon closed the connection")
 	}
 	err := f.err
-	cancel()
 	if errors.Is(err, io.EOF) || errors.Is(err, protocol.ErrConnClosed) || errors.Is(err, context.Canceled) {
 		return 0, nil
 	}

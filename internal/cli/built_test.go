@@ -15,9 +15,21 @@ import (
 
 var (
 	builtOnce sync.Once
+	builtDir  string
 	builtPath string
 	builtErr  error
 )
+
+// TestMain removes the binary builtRudy compiled. t.TempDir is per test and the binary is
+// per package run, so the directory is this package's to clean and nothing else's: without
+// this every `go test ./internal/cli/` leaves 41MB under the OS temp dir, for good.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if builtDir != "" {
+		_ = os.RemoveAll(builtDir)
+	}
+	os.Exit(code)
+}
 
 // builtRudy builds ./cmd/rudy once per package run and returns the binary. Tests that run
 // the real command line (the bridge, the ssh shim) use it; os.Executable() in a test is the
@@ -33,6 +45,7 @@ func builtRudy(t *testing.T) string {
 			builtErr = err
 			return
 		}
+		builtDir = dir // TestMain removes it once every test that runs the binary is done
 		builtPath = filepath.Join(dir, "rudy")
 		// The version is pinned rather than left at "dev" because the tests assert on it: the
 		// bridge test reads it back out of the hello, and task 7's install check compares it
