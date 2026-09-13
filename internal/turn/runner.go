@@ -293,6 +293,7 @@ func (r *Runner) Run(ctx context.Context, msg session.UserMessage) error {
 		r.mu.Lock()
 		r.turn = e.ID
 		r.mu.Unlock()
+		slog.Info("turn: start", "session", r.cfg.Session.ID(), "turn", e.ID, "source", msg.Source)
 		r.startTurnState(ctx, e)
 	}
 	return r.loop(ctx)
@@ -838,6 +839,7 @@ func (r *Runner) appendToolResult(ctx context.Context, tr session.ToolResult) (s
 	if err != nil {
 		return e, err
 	}
+	slog.Debug("tool: done", "tool_use", tr.ToolUseID, "outcome", tr.Outcome, "ms", tr.DurationMS)
 	sid, tid := r.ids()
 	for _, res := range r.fire(ctx, plugin.HookAfterTool, &plugin.AfterToolPayload{SessionID: sid, TurnID: tid, ToolUseID: tr.ToolUseID, Result: e}) {
 		at, ok := res.(*plugin.AfterToolResult)
@@ -904,7 +906,9 @@ func (r *Runner) rest(ctx context.Context, s State) error {
 	}
 	if s == Completed {
 		sid, tid := r.ids()
-		r.fire(ctx, plugin.HookTurnCompleted, &plugin.TurnCompletedPayload{SessionID: sid, TurnID: tid, Usage: r.usage()})
+		u := r.usage()
+		slog.Info("turn: completed", "session", sid, "turn", tid, "input", u.Input, "output", u.Output)
+		r.fire(ctx, plugin.HookTurnCompleted, &plugin.TurnCompletedPayload{SessionID: sid, TurnID: tid, Usage: u})
 	}
 	r.clearInterrupt()
 	r.setState(s)
@@ -940,6 +944,7 @@ func (r *Runner) fail(class session.ErrorClass, err error) error {
 	r.mu.Lock()
 	turn := r.turn
 	r.mu.Unlock()
+	slog.Error("turn: failed", "turn", turn, "class", class, "err", msg, "retries", retries)
 	if e, aerr := r.cfg.Session.Append(session.TurnFailed{TurnID: turn, Class: class, Message: msg, Retries: retries}); aerr == nil {
 		r.cfg.Observer.EntryAppended(e)
 	}

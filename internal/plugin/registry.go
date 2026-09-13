@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"slices"
 	"sync"
 
@@ -203,6 +204,7 @@ func (r *Registry) setStatus(s Status) int {
 	i := len(r.statuses) - 1
 	f := r.services.OnStatus
 	r.mu.Unlock()
+	slog.Info("plugin: "+string(s.State), "plugin", s.Name, "origin", s.Origin)
 	if f != nil {
 		f(s)
 	}
@@ -214,6 +216,11 @@ func (r *Registry) statusAt(i int, s Status) {
 	r.statuses[i] = s
 	f := r.services.OnStatus
 	r.mu.Unlock()
+	if s.State == StateFailed {
+		slog.Error("plugin: failed", "plugin", s.Name, "origin", s.Origin, "reason", s.Reason)
+	} else {
+		slog.Info("plugin: "+string(s.State), "plugin", s.Name, "origin", s.Origin)
+	}
 	if f != nil {
 		f(s)
 	}

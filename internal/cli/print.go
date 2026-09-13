@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -100,6 +101,7 @@ func registerPrint(root *cobra.Command, build buildFunc) {
 			}
 		}
 		if code != 0 {
+			slog.Error("rudy: exit", "command", "print", "code", code, "err", err)
 			return ExitError{code}
 		}
 		return nil

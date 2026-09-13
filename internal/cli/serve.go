@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -45,6 +46,7 @@ func newServeCommand(build buildFunc) *cobra.Command {
 				}
 			}
 			if code != 0 {
+				slog.Error("rudy: exit", "command", "serve", "code", code, "err", err)
 				return ExitError{code}
 			}
 			return nil
@@ -97,6 +99,9 @@ func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, 
 		}
 		return 1, err
 	}
+	// Logged after build rather than at bind: the logger is Build's, so a bind record before
+	// it would land on stderr with the standard logger's prefix.
+	slog.Info("serve: listening", "socket", socket)
 	// unwind is the whole shutdown, in the order that keeps a second Ctrl-C useful: stop() puts
 	// SIGINT back to its default disposition before anything that waits, so an operator who
 	// gives up on the shutdown budget kills the process instead of cancelling a context

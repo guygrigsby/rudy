@@ -7,8 +7,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/guygrigsby/rudy/internal/provider"
 )
 
 // logLines reads rudy.log under the built cache dir and decodes every line. An absent file
@@ -103,6 +106,45 @@ func TestANoticeIsMirroredIntoTheLog(t *testing.T) {
 	}
 	if !mirrored {
 		t.Fatal("the notice the operator saw is not in rudy.log; that is the first thing anyone reads after a failure")
+	}
+}
+
+// msgsIn returns every msg in rudy.log under the cache dir the test's XDG env points at,
+// for tests that reach the kernel through a command rather than through Build directly.
+func msgsIn(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(os.Getenv("XDG_CACHE_HOME"), "rudy", "rudy.log"))
+	if err != nil {
+		t.Fatalf("read rudy.log: %v", err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var rec struct {
+			Msg string `json:"msg"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("rudy.log line is not JSON: %q", line)
+		}
+		out = append(out, rec.Msg)
+	}
+	return out
+}
+
+func TestATurnLeavesATrail(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
+	code, err := runPrint(context.Background(), printOptions{Output: "text"}, dialOptions{}, "hi", testBuilder(t, fp), io.Discard, io.Discard)
+	if err != nil || code != 0 {
+		t.Fatalf("code %d err %v", code, err)
+	}
+	msgs := msgsIn(t)
+	for _, want := range []string{"rudy: start", "plugin: ready", "session: open", "turn: start", "turn: completed", "session: detach"} {
+		if !slices.Contains(msgs, want) {
+			t.Fatalf("rudy.log has no %q record after a full turn; records were %v", want, msgs)
+		}
+	}
+	if slices.Contains(msgs, "rudy: exit") {
+		t.Fatalf("a clean run logged an exit record: %v", msgs)
 	}
 }
 

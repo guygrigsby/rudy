@@ -149,6 +149,7 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	cn.hello = name != ""
 	s.conns[cn.id] = cn
 	s.mu.Unlock()
+	slog.Info("server: conn open", "conn", cn.id, "plugin", name)
 
 	pumpCtx, stopPump := context.WithCancel(ctx)
 	go cn.pump(pumpCtx)
@@ -158,6 +159,7 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 		s.mu.Unlock()
 		s.detachAll(cn)
 		stopPump()
+		slog.Info("server: conn closed", "conn", cn.id, "plugin", name)
 	}()
 	return s.serve(ctx, cn)
 }
@@ -1664,6 +1666,7 @@ func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInf
 	at.children = s.childAttachmentsLocked(cn, ls)
 	s.mu.Unlock()
 	deliverAttach(cn, ls.sess.ID(), at)
+	slog.Info("session: open", "session", ls.sess.ID(), "agent", ls.sess.Agent(), "conn", cn.id)
 	return at.info
 }
 
@@ -1714,6 +1717,7 @@ func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bo
 	at.children = s.childAttachmentsLocked(cn, ls)
 	s.mu.Unlock()
 	deliverAttach(cn, sid, at)
+	slog.Info("session: resume", "session", sid, "conn", cn.id)
 	return at.info, true
 }
 
@@ -1765,6 +1769,7 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	cn.mu.Lock()
 	delete(cn.subs, ls.sess.ID())
 	cn.mu.Unlock()
+	slog.Info("session: detach", "session", ls.sess.ID(), "conn", cn.id)
 
 	s.mu.Lock()
 
