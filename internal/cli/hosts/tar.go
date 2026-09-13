@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -67,20 +68,20 @@ const (
 	maxPullBytes   = 2 << 30
 )
 
-// unpackInto stages the host's archive beside the local tree and moves it in only once the
+// unpackInto stages the host's archive inside the local tree and moves it in only once the
 // whole thing has been read and accepted. Unpacking straight over the operator's files would
 // mean a refused entry halfway through an archive had already written the half before it, and
 // the archive is bytes a box produced: what it names is not this client's to trust. The stage
-// is beside the root rather than inside it so the move is a rename on the same filesystem and
-// so a session opening on the tree never sees a half-unpacked copy of it.
+// is inside the root so every move is a rename within one directory tree, which is what lets
+// the move go through os.Root and never leave it; it is removed on every path out of here.
 func unpackInto(localRoot, placement string, stream io.Reader) (int, error) {
 	buf := bufio.NewReader(stream)
 	if err := checkArchive(buf, placement); err != nil {
 		return 0, err
 	}
-	stage, err := os.MkdirTemp(filepath.Dir(localRoot), ".rudy-pull-")
+	stage, err := os.MkdirTemp(localRoot, ".rudy-pull-")
 	if err != nil {
-		return 0, fmt.Errorf("staging %s beside %s: %w", placement, localRoot, err)
+		return 0, fmt.Errorf("staging %s inside %s: %w", placement, localRoot, err)
 	}
 	defer func() { _ = os.RemoveAll(stage) }()
 	opts := tarx.Options{Entries: maxPullEntries, Bytes: maxPullBytes}
@@ -90,13 +91,35 @@ func unpackInto(localRoot, placement string, stream io.Reader) (int, error) {
 	return moveInto(localRoot, stage)
 }
 
+// staged is one entry of the stage on its way into the tree: where it goes relative to the
+// root, whether it is a directory, and the mode it arrived with, which is the archive's own.
+type staged struct {
+	rel  string
+	dir  bool
+	mode fs.FileMode
+}
+
 // moveInto moves a staged tree into the operator's own, entry by entry: the pull overlays
 // rather than replaces, since a file the box deleted stays here and a file this machine has
 // that the box never saw is not the box's to remove. An existing file is replaced by the
 // rename, which is atomic per file.
-func moveInto(root, stage string) (int, error) {
-	files := 0
-	err := filepath.WalkDir(stage, func(p string, d fs.DirEntry, err error) error {
+//
+// Every write goes through os.Root, and that is the security property of this leg rather than
+// a tidiness: the plain os calls resolve every path component, so a symlink already sitting in
+// the operator's tree (sub -> /etc) turns an archive entry named sub/passwd into a write to
+// /etc/passwd, without the archive ever carrying a link for tarx to refuse. Root.MkdirAll and
+// Root.Rename refuse to traverse a symlink at all. The pass below it refuses first and names
+// what it found, so the whole-archive-or-nothing property survives: nothing moves until every
+// destination has been looked at.
+func moveInto(localRoot, stage string) (int, error) {
+	root, err := os.OpenRoot(localRoot)
+	if err != nil {
+		return 0, fmt.Errorf("opening %s: %w", localRoot, err)
+	}
+	defer func() { _ = root.Close() }()
+
+	var entries []staged
+	err = filepath.WalkDir(stage, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -104,23 +127,76 @@ func moveInto(root, stage string) (int, error) {
 		if err != nil || rel == "." {
 			return err
 		}
-		dst := filepath.Join(root, rel)
-		if d.IsDir() {
-			return os.MkdirAll(dst, 0o755)
-		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		info, err := d.Info()
+		if err != nil {
 			return err
 		}
-		if err := os.Rename(p, dst); err != nil {
-			return err
-		}
-		files++
+		entries = append(entries, staged{rel: rel, dir: d.IsDir(), mode: info.Mode().Perm()})
 		return nil
 	})
 	if err != nil {
-		return files, fmt.Errorf("moving the host's files into %s: %w", root, err)
+		return 0, fmt.Errorf("reading what %s sent: %w", localRoot, err)
+	}
+	for _, e := range entries {
+		if err := checkPlace(root, e); err != nil {
+			return 0, fmt.Errorf("copying back into %s: %w; nothing was moved", localRoot, err)
+		}
+	}
+
+	stageRel := filepath.Base(stage)
+	files := 0
+	for _, e := range entries {
+		if e.dir {
+			if err := root.MkdirAll(e.rel, e.mode); err != nil {
+				return files, fmt.Errorf("moving the host's files into %s: %w", localRoot, err)
+			}
+			continue
+		}
+		if dir := filepath.Dir(e.rel); dir != "." {
+			if err := root.MkdirAll(dir, 0o755); err != nil {
+				return files, fmt.Errorf("moving the host's files into %s: %w", localRoot, err)
+			}
+		}
+		if err := root.Rename(filepath.Join(stageRel, e.rel), e.rel); err != nil {
+			return files, fmt.Errorf("moving the host's files into %s: %w", localRoot, err)
+		}
+		files++
 	}
 	return files, nil
+}
+
+// checkPlace looks at where one staged entry is going, before anything moves. A symlink
+// anywhere along the path is a refusal rather than something to follow: it is the operator's
+// own link, and the host's archive is not what decides to write through it. So is an existing
+// entry of the other kind, a directory where the archive has a file or the reverse, which no
+// rename can do anyway and which would otherwise fail halfway through the move.
+func checkPlace(root *os.Root, e staged) error {
+	parts := strings.Split(filepath.ToSlash(e.rel), "/")
+	for i := range parts {
+		prefix := filepath.Join(parts[:i+1]...)
+		fi, err := root.Lstat(prefix)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			// Nothing here, so nothing below it either: the move makes the rest.
+			return nil
+		case err != nil:
+			return fmt.Errorf("%s: %w", prefix, err)
+		case fi.Mode()&fs.ModeSymlink != 0:
+			return fmt.Errorf("%s is a symlink here, and the host's %s is not written through it", prefix, e.rel)
+		case i < len(parts)-1 && !fi.IsDir():
+			return fmt.Errorf("%s is a file here and a directory on the host, which holds %s", prefix, e.rel)
+		case i == len(parts)-1 && fi.IsDir() != e.dir:
+			return fmt.Errorf("%s is a %s here and a %s on the host", prefix, kind(fi.IsDir()), kind(e.dir))
+		}
+	}
+	return nil
+}
+
+func kind(dir bool) string {
+	if dir {
+		return "directory"
+	}
+	return "file"
 }
 
 // checkArchive reads the one thing that says an archive is one: the ustar magic at offset 257

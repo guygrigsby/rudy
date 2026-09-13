@@ -399,6 +399,90 @@ func TestPullRefusesAHostileArchive(t *testing.T) {
 	}
 }
 
+// TestPullNeverWritesThroughSomethingAlreadyHere: the archive need not carry a link at all to
+// escape. A symlink already sitting in the operator's tree (sub -> somewhere else) turns an
+// ordinary entry named sub/passwd into a write to somewhere else, because the plain mkdir and
+// rename resolve every component of a path. The move goes through os.Root, which refuses to
+// traverse a link, and the pass ahead of it refuses first and names what it found, so nothing
+// moves at all. The second case is the same shape without a link: a file here where the host
+// has a directory, which no rename can do and which would otherwise fail halfway through.
+func TestPullNeverWritesThroughSomethingAlreadyHere(t *testing.T) {
+	requireTar(t)
+	for _, c := range []struct{ name, plant string }{{"symlink", "link"}, {"file", "file"}} {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			outside := t.TempDir()
+			local := filepath.Join(home, "tree")
+			if err := os.MkdirAll(local, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if c.plant == "link" {
+				if err := os.Symlink(outside, filepath.Join(local, "sub")); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(filepath.Join(local, "sub"), []byte("mine"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			r := archiveRunner{archive: nestedTar(t)}
+			err := Pull(context.Background(), r, local, "/srv/work", io.Discard)
+			// The damage first, because that is what this is about: the refusal is how the
+			// operator hears why, and a pull that wrote through the link is a failure whatever
+			// it returned.
+			if _, err := os.Stat(filepath.Join(outside, "passwd")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the host's file was written outside the tree: %v", err)
+			}
+			if err == nil || !strings.Contains(err.Error(), "sub") {
+				t.Fatalf("pull onto an existing %s = %v, want a refusal naming sub", c.plant, err)
+			}
+			if _, err := os.Stat(filepath.Join(local, "ok.txt")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the entry before it landed anyway: %v", err)
+			}
+			if c.plant == "file" {
+				if got, _ := os.ReadFile(filepath.Join(local, "sub")); string(got) != "mine" {
+					t.Fatalf("this machine's own file was written: %q", got)
+				}
+			}
+			names, err := os.ReadDir(local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(names) != 1 || names[0].Name() != "sub" {
+				t.Fatalf("the tree holds more than it did: %v", names)
+			}
+		})
+	}
+}
+
+// nestedTar is an ordinary archive of a file inside a directory: nothing in it is hostile, and
+// what it lands on is.
+func nestedTar(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	for _, e := range []struct {
+		name string
+		typ  byte
+		body string
+	}{
+		{"./", tar.TypeDir, ""},
+		{"ok.txt", tar.TypeReg, "landed"},
+		{"sub/", tar.TypeDir, ""},
+		{"sub/passwd", tar.TypeReg, "owned"},
+	} {
+		hdr := &tar.Header{Name: e.name, Typeflag: e.typ, Mode: 0o755, Size: int64(len(e.body))}
+		if err := w.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(e.body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
 // hostileTar is one ordinary entry and then one that reaches outside, the shape of an archive
 // that would do damage entry by entry. Built in Go: no tar on this machine would write it.
 func hostileTar(t *testing.T, name string, typ byte) []byte {

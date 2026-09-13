@@ -124,7 +124,7 @@ func Unpack(tr *tar.Reader, dir string, o Options) error {
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o700); err != nil {
+			if err := os.MkdirAll(target, dirMode(hdr)); err != nil {
 				return err
 			}
 		case tar.TypeReg:
@@ -162,6 +162,15 @@ func stageTarget(dir, rel string) (string, error) {
 		return "", fmt.Errorf("entry %q escapes the stage", rel)
 	}
 	return target, nil
+}
+
+// dirMode is a directory entry's own permission bits, so a tree arrives as it left rather than
+// as whatever this package felt like, with the owner's three forced on: a directory this
+// process cannot enter is one nothing below it can be written into, and an archive is free to
+// carry one (or to carry no mode at all, which is then 0o700). A caller that moves the result
+// somewhere carries these on, as it carries a file's.
+func dirMode(hdr *tar.Header) fs.FileMode {
+	return fs.FileMode(hdr.Mode&0o777) | 0o700 //nolint:gosec // the header's own bits, masked to permissions
 }
 
 // writeFile extracts one regular-file entry to target, creating its parent directory (a tar

@@ -126,9 +126,12 @@ Non-git tree:
   still being written.
 - The archive is the box's bytes, so it is unpacked by rudy rather than by the client's
   `tar`, under the rules of `internal/tarx` (no `..`, no absolute path, no backslash, no
-  symlink or hard link, an entry cap and a byte cap), into a staging directory beside the
-  local root, and moved in file by file only once the whole archive has been accepted. A
-  refusal leaves the working tree untouched.
+  symlink or hard link, an entry cap and a byte cap), into a staging directory inside the
+  local root, and moved in file by file only once the whole archive has been accepted. The
+  move goes through `os.Root` on the local root and refuses a destination whose path passes
+  through a symlink already in the tree, or whose existing entry is of the other kind: the
+  archive need carry no link of its own for `sub -> /etc` here to turn `sub/passwd` into a
+  write outside the tree. A refusal leaves the working tree untouched.
 
 Git trees come back through `rudy hosts pull`: fetch the branch by URL, fast-forward when the
 local tree has no uncommitted changes to tracked files (`git diff-index --quiet HEAD --`,
