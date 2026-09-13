@@ -141,7 +141,19 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		return nil, err
 	}
 	httpc := httpx.New(o.Version)
-	notice := notices(stderr)
+	// The cache dir holds the log, so it exists before the logger opens; the registry
+	// snapshot below lands in the same place.
+	if err := os.MkdirAll(paths.Cache, 0o700); err != nil {
+		return nil, fmt.Errorf("cache dir: %w", err)
+	}
+	plain := notices(stderr)
+	logger := openLog(cfg, o.Version, stderr, plain)
+	// Every notice the operator sees is mirrored into the log: what the user saw before it
+	// died is the first question anyone asks of a trail.
+	notice := func(text string) {
+		plain(text)
+		logger.Warn(text)
+	}
 	plugins := plugin.NewRegistry(cfg.Plugins, notice)
 	plugins.Disable(cfg.PluginsDisabled...)
 	// The provider registry is built here rather than below because the memory plugin folds
@@ -154,9 +166,6 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	discover := set == nil
 	if discover {
 		set = BuiltinPlugins(cfg, paths, httpc, home, env, o.Version, summarizeWith(cfg, registry, notice))
-	}
-	if err := os.MkdirAll(paths.Cache, 0o700); err != nil {
-		return nil, fmt.Errorf("cache dir: %w", err)
 	}
 	// The server is built before the plugins load, and takes its providers from them
 	// afterwards: a plugin's Host reaches the server through the protocol (Connect, Note,

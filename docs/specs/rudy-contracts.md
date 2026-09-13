@@ -233,7 +233,7 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/blobs/<sha256>` | Session | image bytes referenced by `blob` |
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/lock` | Session | `flock` held by the process serving the session; a second process gets `unavailable` and is told the socket path |
 | `$XDG_CACHE_HOME/rudy/registry.json` | Registry | the last discovered snapshot; a snapshot is a cache |
-| `$XDG_CACHE_HOME/rudy/rudy.log` | kernel | slog JSON lines; UNSHIPPED (rudy-oat), nothing writes it yet |
+| `$XDG_CACHE_HOME/rudy/rudy.log` | kernel | slog JSON lines, one record per line, appended for the life of the process, 0600, never rotated. Every record carries `pid`, because a `serve` daemon and a client attaching to it are two processes writing one file; `O_APPEND` keeps lines whole and the pid says whose. Written by `Build`, so every command that boots the kernel writes it. Records: process start with version and paths; every notice the operator was shown, at warn; plugin load, ready and fail with the reason; session open, resume and close; turn start, complete and fail with the error; connection accept and close; the socket bind; the exit path with its error. At `debug`, each tool invocation with duration and outcome, and provider stream errors. A file that cannot be opened is a notice and the records go to stderr instead |
 | `$XDG_CONFIG_HOME/rudy/config.toml` | user | config; rudy never writes it |
 | `$XDG_CONFIG_HOME/rudy/themes/<name>.toml` | user | theme roles |
 | `$XDG_DATA_HOME/rudy/trust.toml` | user | the workspaces whose own plugins the operator agreed to run, and what they agreed to (ADR 0025) |
@@ -500,8 +500,8 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `prompt.file` | path | `` | a system prompt template of the operator's own; empty reads `system.md` under the config directory when it exists, and the built-in template when it does not. `${base}`, `${tools}`, `${agents}`, `${version}`, `${workspace}`, `${project}`, `${model}`, `${date}`, `${os}` are the values a template may name, `$${` writes a literal `${`, and a name outside the set is a warning notice and the built-in prompt (ADR 0024) |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
-| `log.level` | `debug`, `info`, `warn`, `error` | `info` | UNSHIPPED (rudy-oat): nothing logs yet, so neither key exists |
-| `log.file` | path | `$XDG_CACHE_HOME/rudy/rudy.log` | UNSHIPPED (rudy-oat): the file in the record layer table above is written by nobody until this is |
+| `log.level` | `debug`, `info`, `warn`, `error` | `info` | the least severe record written; `debug` adds each tool invocation and provider stream error. Any other value is refused at load |
+| `log.file` | path | `""` | empty means `$XDG_CACHE_HOME/rudy/rudy.log`, filled at load the way `sessions.dir` is; `~` expands. The record layer row above says what is written and what happens when the file cannot be opened |
 | `ui.header.frame` | bool | true | false draws the header's lines with no box around them |
 | `ui.header.greeting` | bool | true | the time of day and a name in the header |
 | `ui.header.mark` | bool | true | the cat in the header |

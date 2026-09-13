@@ -218,6 +218,10 @@ type Config struct {
 	MCP    struct {
 		ConnectTimeoutMS int `mapstructure:"connect_timeout_ms"`
 	} `mapstructure:"mcp"`
+	Log struct {
+		Level string `mapstructure:"level"`
+		File  string `mapstructure:"file"`
+	} `mapstructure:"log"`
 	MaxTokens int      `mapstructure:"max_tokens"`
 	UI        UIConfig `mapstructure:"ui"`
 	// Keys is the [keys] table: pi action id to bound keys. Filled by hand from the raw
@@ -253,6 +257,8 @@ func Defaults() map[string]any {
 		"memory.enabled":                   true,
 		"memory.summary_model":             "",
 		"mcp.connect_timeout_ms":           10000,
+		"log.level":                        "info",
+		"log.file":                         "", // filled from paths.Cache when still empty after Load
 		"max_tokens":                       8192,
 		"prompt.file":                      "",
 		"ui.render":                        "altscreen",
@@ -387,6 +393,10 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 		c.Sessions.Dir = filepath.Join(paths.Data, "sessions")
 	}
 	c.Sessions.Dir = ExpandHome(c.Sessions.Dir, paths.Home)
+	if c.Log.File == "" {
+		c.Log.File = filepath.Join(paths.Cache, "rudy.log")
+	}
+	c.Log.File = ExpandHome(c.Log.File, paths.Home)
 	c.Memory.Dir = ExpandHome(c.Memory.Dir, paths.Home)
 	for i, d := range c.Skills.Dirs {
 		c.Skills.Dirs[i] = ExpandHome(d, paths.Home)
@@ -542,6 +552,11 @@ func (c *Config) validate() error {
 	}
 	if c.MaxTokens <= 0 {
 		errs = append(errs, fmt.Errorf("config: max_tokens %d must be positive", c.MaxTokens))
+	}
+	switch c.Log.Level {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("config: log.level %q must be debug, info, warn or error", c.Log.Level))
 	}
 	errs = append(errs, c.validateUI()...)
 	return errors.Join(errs...)

@@ -16,6 +16,16 @@ hook_timeout_ms = 5000
 # e.g. 60000
 tool_timeout_ms = 600000
 
+# Where the kernel writes its trail: JSON lines, one per record, appended for the
+# life of the process. A daemon and a client that attaches to it are two processes
+# writing one file, so every record carries the pid that wrote it.
+[log]
+# debug, info, warn or error. debug adds each tool invocation and provider stream error.
+level = "info"
+# Empty means $XDG_CACHE_HOME/rudy/rudy.log. A file that cannot be opened is a notice, and the trail goes to stderr instead.
+# e.g. "~/rudy.log"
+file = ""
+
 # The provider and model a new session opens on.
 [default]
 # A name from [providers.<name>] below.

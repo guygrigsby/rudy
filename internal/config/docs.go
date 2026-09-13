@@ -58,6 +58,18 @@ var Sections = []Section{
 		},
 	},
 	{
+		Table: "log",
+		Comment: []string{
+			"Where the kernel writes its trail: JSON lines, one per record, appended for the",
+			"life of the process. A daemon and a client that attaches to it are two processes",
+			"writing one file, so every record carries the pid that wrote it.",
+		},
+		Keys: []Doc{
+			{Key: "log.level", Comment: "debug, info, warn or error. debug adds each tool invocation and provider stream error."},
+			{Key: "log.file", Comment: "Empty means $XDG_CACHE_HOME/rudy/rudy.log. A file that cannot be opened is a notice, and the trail goes to stderr instead.", Example: `"~/rudy.log"`},
+		},
+	},
+	{
 		Table:   "default",
 		Comment: []string{"The provider and model a new session opens on."},
 		Keys: []Doc{
