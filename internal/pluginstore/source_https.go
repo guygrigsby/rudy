@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/guygrigsby/rudy/internal/tarx"
 )
 
 // maxDownloadBytes bounds how much of an https: tarball stageHTTPS will read at all. The
@@ -25,19 +27,14 @@ import (
 // any plugin bundle actually meant to be checked out (source plus maybe a small binary).
 const maxDownloadBytes = 256 << 20
 
-// maxUnpackedBytes bounds the total bytes unpackTarball writes to disk while decompressing,
-// independent of maxDownloadBytes: gzip compresses well, so a small downloaded body can still
-// expand into an enormous one (a "gzip bomb"). The same figure is used for both caps for the
-// same reason: nothing this store installs is expected to be bigger than that either way.
-const maxUnpackedBytes = 256 << 20
-
-// maxTarEntries bounds how many entries unpackTarball will accept, alongside maxUnpackedBytes:
-// an empty directory or file costs nothing against a budget of bytes written and gzips to
-// almost nothing, so the download cap alone leaves the entry count bounded only at roughly a
-// million per 5 MiB, each one a MkdirAll or an OpenFile and an inode (rudy-79q). Twenty
-// thousand is far more than a plugin bundle needs (rudy's own repository is under four hundred
-// files) and refuses the pathological archive in scanTarball, before a byte of it is written.
-const maxTarEntries = 20000
+// maxTarEntries bounds how many entries scanTarball will walk before refusing the archive,
+// the same figure tarx.Unpack caps the unpacking pass at: an empty directory or file costs
+// nothing against a budget of bytes written and gzips to almost nothing, so the download cap
+// alone leaves the entry count bounded only at roughly a million per 5 MiB, each one a MkdirAll
+// or an OpenFile and an inode (rudy-79q). Twenty thousand is far more than a plugin bundle
+// needs (rudy's own repository is under four hundred files) and refuses the pathological
+// archive here, before a byte of it is written.
+const maxTarEntries = tarx.MaxEntries
 
 // httpRetryAttempts bounds the retry loop stageHTTPS runs against a 429 or 5xx response: enough
 // to ride out a rate limit or a transient server hiccup, not enough to hang an install forever
@@ -334,7 +331,7 @@ func scanTarball(path string) (string, error) {
 		if entries > maxTarEntries {
 			return "", fmt.Errorf("pluginstore: %s: more than %d entries; a plugin bundle is smaller than that", path, maxTarEntries)
 		}
-		clean, err := cleanTarName(hdr.Name)
+		clean, err := tarx.Clean(hdr.Name)
 		if err != nil {
 			// An entry no name check will accept: say nothing about a prefix and let the
 			// unpacking pass refuse it, so a refusal is worded in exactly one place.
@@ -365,43 +362,13 @@ func scanTarball(path string) (string, error) {
 	return prefix, nil
 }
 
-// stripTopLevel removes prefix, the archive's sole top-level directory, from one cleaned entry
-// name. The prefix's own directory entry becomes ".", the stage itself, which the caller skips.
-func stripTopLevel(rel, prefix string) string {
-	if prefix == "" {
-		return rel
-	}
-	if rel == prefix {
-		return "."
-	}
-	return strings.TrimPrefix(rel, prefix+string(filepath.Separator))
-}
-
 // unpackTarball unpacks the gzip tarball at path into stage, which the caller has already
-// created empty. Every entry is refused, and the whole install refused with it, unless its
-// cleaned name resolves inside stage (cleanTarName: no "..", no absolute path, no backslash) and
-// it is a regular file or a directory. Anything else — a symlink or a hard link most of all,
-// since either one's target can point anywhere on disk the process can reach, escaping or not —
-// is refused outright rather than validated case by case: a plugin bundle has no legitimate
-// need for either, and refusing the whole type removes a class of link-resolution bugs from
-// ever having to be gotten right against bytes an arbitrary https URL served. A PAX global
-// header (typeflag 'g'), the entry git archive and GitHub's release tarballs emit ahead of the
-// real content, names no file of the archive's own and is skipped rather than falling into the
-// refusal for entry types this store does not extract.
-//
-// The total bytes actually written to disk are capped at maxUnpackedBytes, tracked as a
-// shrinking budget rather than by counting bytes read off the gzip stream: a GNU or PAX sparse
-// entry can declare a Size far larger than the archive bytes that back it (the reader fills the
-// declared holes with zeros without consuming any archive bytes for them), so counting the
-// compressed or even the raw tar-format bytes read never sees the true, expanded size at all. A
-// 402 byte crafted archive can carry a sparse entry whose declared Size alone already exceeds
-// the cap; io.Copy(w, tr) would otherwise still happily write all of it. Refusing whenever a
-// single entry's declared Size exceeds what remains catches that up front, and wrapping the
-// copy itself in io.LimitReader(tr, remaining) is the actual enforcement: it is what bounds
-// bytes landing on disk regardless of what any entry's header claims or a reader's internal
-// zero-fill synthesizes, and remaining is decremented by what writeTarFile reports was actually
-// copied, not by hdr.Size. The entry count is capped too, at maxTarEntries, by the scanning
-// pass this calls first: entries that write nothing at all cost nothing against a byte budget.
+// created empty. The rules are tarx's, shared with the sync that unpacks a tar a host wrote:
+// a name that could land outside stage, an entry type that names anything on disk (a symlink
+// or a hard link most of all), more entries than the cap or more bytes than the cap is a
+// refusal, and the whole install is refused with it. What is this package's own is the prefix:
+// `git archive` and every GitHub release tarball wrap their contents in exactly one top-level
+// directory, and scanTarball is the pass that decides whether there is one to strip.
 func unpackTarball(path, stage string) error {
 	prefix, err := scanTarball(path)
 	if err != nil {
@@ -412,108 +379,10 @@ func unpackTarball(path, stage string) error {
 		return err
 	}
 	defer tb.Close()
-
-	remaining := int64(maxUnpackedBytes)
-	for {
-		hdr, err := tb.tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("pluginstore: %s: %w", path, err)
-		}
-		if hdr.Typeflag == tar.TypeXGlobalHeader {
-			continue
-		}
-		if hdr.Size < 0 || hdr.Size > remaining {
-			return fmt.Errorf("pluginstore: %s: entry %q would exceed the %d byte unpacked cap", path, hdr.Name, maxUnpackedBytes)
-		}
-		rel, err := cleanTarName(hdr.Name)
-		if err != nil {
-			return fmt.Errorf("pluginstore: %s: %w", path, err)
-		}
-		rel = stripTopLevel(rel, prefix)
-		if rel == "." {
-			continue
-		}
-		target, err := stageTarget(stage, rel)
-		if err != nil {
-			return fmt.Errorf("pluginstore: %s: %w", path, err)
-		}
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o700); err != nil {
-				return fmt.Errorf("pluginstore: %w", err)
-			}
-		case tar.TypeReg:
-			n, err := writeTarFile(target, io.LimitReader(tb.tr, remaining), hdr)
-			remaining -= n
-			if err != nil {
-				return fmt.Errorf("pluginstore: %s: %w", path, err)
-			}
-		default:
-			return fmt.Errorf("pluginstore: %s: entry %q is not a regular file or a directory; plugin tarballs may hold only those", path, hdr.Name)
-		}
+	if err := tarx.Unpack(tb.tr, stage, tarx.Options{Strip: prefix}); err != nil {
+		return fmt.Errorf("pluginstore: %s: %w", path, err)
 	}
 	return nil
-}
-
-// writeTarFile extracts one regular-file entry to target, creating its parent directory (a tar
-// stream is not required to list a directory entry before a file inside it) and preserving the
-// entry's own permission bits so an executable like a build script stays executable. It reports
-// how many bytes it actually wrote, which is what the caller's remaining unpacked-size budget is
-// decremented by, rather than hdr.Size.
-func writeTarFile(target string, r io.Reader, hdr *tar.Header) (int64, error) {
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return 0, err
-	}
-	mode := os.FileMode(hdr.Mode & 0o777) //nolint:gosec // the tar header's own mode bits, masked to permissions only
-	if mode == 0 {
-		mode = 0o644
-	}
-	w, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return 0, err
-	}
-	n, copyErr := io.Copy(w, r)
-	closeErr := w.Close()
-	if copyErr != nil {
-		return n, copyErr
-	}
-	return n, closeErr
-}
-
-// cleanTarName resolves a tar entry's name to a stage-relative path, refusing anything that
-// could land outside the stage. This is the security property of installing from an https:
-// tarball: the bytes come from wherever the operator's URL happened to serve them from, and a
-// hostile or merely careless archive can name an entry "../../evil" or "/etc/cron.d/whatever"
-// to write outside the extraction directory. It runs before any top-level prefix is stripped,
-// so a prefix can never be derived from a name that would have been refused.
-func cleanTarName(name string) (string, error) {
-	// "..\..\x" is one legal, backslash-containing filename to filepath.Clean on a unix build
-	// (backslash is not a separator there), so it survives every check below unchanged; refuse
-	// it outright rather than rely on this running only on unix, since this package's path
-	// handling is the OS-provided filepath, not a unix-only one.
-	if strings.ContainsRune(name, '\\') {
-		return "", fmt.Errorf("entry %q contains a backslash", name)
-	}
-	clean := filepath.Clean(filepath.FromSlash(name))
-	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("entry %q escapes the stage", name)
-	}
-	return clean, nil
-}
-
-// stageTarget joins a cleaned, stage-relative entry name onto stage.
-func stageTarget(stage, rel string) (string, error) {
-	target := filepath.Join(stage, rel)
-	// Defense in depth: cleanTarName should already make this impossible, but a stager touching
-	// arbitrary paths on disk on attacker-controlled input is exactly the place to double-check
-	// rather than trust one code path to have gotten it right.
-	if target != stage && !strings.HasPrefix(target, stage+string(filepath.Separator)) {
-		return "", fmt.Errorf("entry %q escapes the stage", rel)
-	}
-	return target, nil
 }
 
 // checkManifestAtRoot refuses a tarball whose plugin.toml is not at the root of what was
