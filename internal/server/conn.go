@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/oklog/ulid/v2"
@@ -63,7 +63,7 @@ func (cn *conn) send(msg any) {
 func (cn *conn) notify(method string, params any) {
 	req, err := protocol.NewNotification(method, params)
 	if err != nil {
-		log.Printf("server: conn %d: marshal %s notification: %v", cn.id, method, err)
+		slog.Error("server: marshal notification", "conn", cn.id, "method", method, "err", err)
 		return
 	}
 	cn.send(req)

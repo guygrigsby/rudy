@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"maps"
 	"strings"
 	"sync"
@@ -229,7 +229,7 @@ func (r *Runner) Interrupt(how session.Interrupt) {
 			// This ends the turn, so sync it here as rest does elsewhere. A failure can
 			// only be logged: fail takes r.mu, which this branch already holds.
 			if err := r.cfg.Session.Sync(); err != nil {
-				log.Printf("turn: sync session log at turn_interrupted: %v", err)
+				slog.Error("turn: sync session log at turn_interrupted", "err", err)
 			}
 			r.setStateLocked(Idle)
 		}
@@ -805,7 +805,7 @@ func (r *Runner) maybeCompact(ctx context.Context, am session.AssistantMessage) 
 	if err != nil {
 		// A compaction that failed is not a turn that failed: the turn continues with the
 		// context it already has, and the next response over the threshold tries again.
-		log.Printf("turn: compaction: %v", err)
+		slog.Error("turn: compaction", "err", err)
 		return
 	}
 	if !ce.ID.IsZero() {
@@ -947,7 +947,7 @@ func (r *Runner) fail(class session.ErrorClass, err error) error {
 	// caller is about to receive, says more about what went wrong than a write error on
 	// the record of it would.
 	if serr := r.cfg.Session.Sync(); serr != nil {
-		log.Printf("turn: sync session log at turn_failed: %v", serr)
+		slog.Error("turn: sync session log at turn_failed", "err", serr)
 	}
 	r.clearInterrupt()
 	r.setState(Failed)

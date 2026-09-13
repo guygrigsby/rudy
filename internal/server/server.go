@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -802,7 +802,7 @@ func (s *Server) compactHoldingSession(ctx context.Context, ls *liveSession, ins
 	// broadcast. A crash before the next turn would charge for it twice. A sync that fails
 	// can only be logged, since the compaction itself succeeded.
 	if err := ls.sess.Sync(); err != nil {
-		log.Printf("server: sync session log at compaction: %v", err)
+		slog.Error("server: sync session log at compaction", "err", err)
 	}
 	ls.mirror(e)
 	return e, n, nil
