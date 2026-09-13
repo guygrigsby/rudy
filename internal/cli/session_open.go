@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/cli/hosts"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -66,9 +68,13 @@ func greet(ctx context.Context, client *protocol.Client, name, version string, a
 // store and registry when there is one and over the protocol when the server is another
 // process: an attached client resolves the same session and the same model as an embedded
 // one, from the same values, without a store or a registry of its own.
-func openOrResume(ctx context.Context, d *dialed, o printOptions, cwd, source string) (protocol.SessionInfo, int, error) {
+//
+// stderr is where the sync says what it did with the working tree, the one thing here that
+// talks to the operator before the session exists.
+func openOrResume(ctx context.Context, d *dialed, o printOptions, cwd, source string, stderr io.Writer) (protocol.SessionInfo, int, error) {
 	var info protocol.SessionInfo
 	id := o.Resume
+	localCwd := cwd
 	if id == "" {
 		// The one place the placement is applied, and only on the two branches that read the
 		// cwd: opening on this directory, and finding the newest session on it. A remote
@@ -94,6 +100,16 @@ func openOrResume(ctx context.Context, d *dialed, o printOptions, cwd, source st
 		id = newest
 	}
 	if id == "" {
+		// The tree moves to the box before anything opens on it, and only here: a resume and
+		// a fork open on a workspace the box already has, and --continue resolved to an id
+		// above, so by this point a remote id is the one case that is a new session on a
+		// placement this machine's tree belongs at. --no-sync is the operator saying the box
+		// is already how they want it.
+		if !d.Host.IsZero() && !d.NoSync {
+			if err := hosts.Sync(ctx, hosts.SSHRunner(d.Host), d.Host, localCwd, cwd, stderr); err != nil {
+				return info, 1, err
+			}
+		}
 		err := d.Client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: cwd, Model: o.Model, Mode: o.Mode, Thinking: o.Thinking}, &info)
 		if err != nil {
 			return info, 1, fmt.Errorf("open session: %w", err)

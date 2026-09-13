@@ -44,7 +44,7 @@ func newSessionsCommand(build buildFunc) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stderr := cmd.ErrOrStderr()
-			return tuiExit(runTUI(cmd.Context(), build, resumeDial, resumeWith(printOptions{Resume: args[0]}, "sessions resume"), launchTUI, "", stderr))
+			return tuiExit(runTUI(cmd.Context(), build, resumeDial, resumeWith(printOptions{Resume: args[0]}, "sessions resume", stderr), launchTUI, "", stderr))
 		},
 	}
 	registerDialFlags(resume, &resumeDial)

@@ -61,10 +61,12 @@ var launchTUI launchFunc = launchApp
 
 // resumeWith resolves the session a command opens on: a new one, or the one --resume or
 // --continue names, with --model, --mode and --thinking applied to it. source names the
-// flag or verb the session id came from, for the error a bad one gets.
-func resumeWith(o printOptions, source string) resolveFunc {
+// flag or verb the session id came from, for the error a bad one gets. stderr is carried in
+// rather than added to resolveFunc because it is this resolver's own business: a new session
+// over --host moves the working tree first and says so, and a fork has nothing to say.
+func resumeWith(o printOptions, source string, stderr io.Writer) resolveFunc {
 	return func(ctx context.Context, d *dialed, cwd string) (protocol.SessionInfo, int, error) {
-		return openOrResume(ctx, d, o, cwd, source)
+		return openOrResume(ctx, d, o, cwd, source, stderr)
 	}
 }
 

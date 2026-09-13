@@ -146,7 +146,7 @@ func TestResumeByIDNeedsNoPlacement(t *testing.T) {
 	if err != nil || code != 0 {
 		t.Fatalf("dial = %d, %v", code, err)
 	}
-	opened, code, err := openOrResume(context.Background(), first, printOptions{}, outside, "--resume")
+	opened, code, err := openOrResume(context.Background(), first, printOptions{}, outside, "--resume", io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("open = %d, %v", code, err)
 	}
@@ -167,7 +167,7 @@ func TestResumeByIDNeedsNoPlacement(t *testing.T) {
 	if _, err := d.place(outside); err == nil {
 		t.Fatalf("fixture: %s has a placement under %s, so this test proves nothing", outside, d.Paths.Home)
 	}
-	got, code, err := openOrResume(context.Background(), d, printOptions{Resume: opened.SessionID}, outside, "--resume")
+	got, code, err := openOrResume(context.Background(), d, printOptions{Resume: opened.SessionID}, outside, "--resume", io.Discard)
 	if err != nil || code != 0 {
 		t.Fatalf("resume by id over --host = %d, %v; a resume never reads the cwd", code, err)
 	}
@@ -239,4 +239,106 @@ func TestPrintOverHostRunsTheTurnOnTheBox(t *testing.T) {
 	if !strings.Contains(string(first), placement) {
 		t.Fatalf("the box session's workspace is not the placement %s:\n%s", placement, first)
 	}
+}
+
+// TestPrintOverHostSyncsTheTreeFirst is the real path this wave's sync exists for: no
+// --no-sync, a checkout under the local home and nothing at all at the placement, so the
+// session opens on a checkout the client made on the box out of this one, committed history
+// and uncommitted edit alike. Everything goes through the ssh shim, git's own connection
+// included, since RUDY_SSH is what git is told to push with.
+func TestPrintOverHostSyncsTheTreeFirst(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	requireBoxGit(t)
+	bin := builtRudy(t)
+	upstream := fakeOpenAI(t, "hello from the box")
+	home, env := boxWithProvider(t, bin, upstream.URL)
+	t.Cleanup(func() { stopBoxDaemon(t, env) })
+	t.Setenv("RUDY_SSH", sshShim(t, env))
+
+	localHome := t.TempDir()
+	t.Setenv("HOME", localHome)
+	local := filepath.Join(localHome, "projects", "demo")
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRepoAt(t, local)
+	if err := os.WriteFile(filepath.Join(local, "draft.txt"), []byte("not committed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(local)
+	placement := filepath.Join(home, "projects", "demo")
+
+	var stdout, stderr bytes.Buffer
+	code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{Host: "box"}, "hi", testBuilder(t, &fakeProvider{}), &stdout, &stderr)
+	if err != nil || code != 0 {
+		t.Fatalf("code %d err %v\nstderr: %s", code, err, stderr.String())
+	}
+	var res printResult
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatalf("%v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	if res.Result != "hello from the box" {
+		t.Fatalf("result = %q", res.Result)
+	}
+	if got := gitAt(t, placement, "rev-parse", "--abbrev-ref", "HEAD"); got != "main" {
+		t.Fatalf("the placement is not a checkout on main: %q\nstderr: %s", got, stderr.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(placement, "one.txt")); err != nil || string(got) != "one" {
+		t.Fatalf("the committed file did not arrive: %q %v", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(placement, "draft.txt")); err != nil || string(got) != "not committed" {
+		t.Fatalf("the uncommitted file did not arrive: %q %v", got, err)
+	}
+}
+
+// requireBoxGit skips unless both ends of the sync have git and tar. This machine's half
+// finds them anywhere on PATH; the box's half runs under the fixture's own environment,
+// whose PATH is /usr/bin:/bin. It also puts a hermetic git environment on the test process,
+// so no developer's global config decides whether these tests pass.
+func requireBoxGit(t *testing.T) {
+	t.Helper()
+	for _, bin := range []string{"git", "tar"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not on PATH", bin)
+		}
+		if _, err := os.Stat("/usr/bin/" + bin); err != nil {
+			t.Skipf("the box fixture's PATH is /usr/bin:/bin and %s is not there", bin)
+		}
+	}
+	for k, v := range map[string]string{
+		"GIT_CONFIG_GLOBAL":   "/dev/null",
+		"GIT_CONFIG_SYSTEM":   "/dev/null",
+		"GIT_AUTHOR_NAME":     "rudy test",
+		"GIT_AUTHOR_EMAIL":    "rudy@test",
+		"GIT_COMMITTER_NAME":  "rudy test",
+		"GIT_COMMITTER_EMAIL": "rudy@test",
+		"GIT_TERMINAL_PROMPT": "0",
+	} {
+		t.Setenv(k, v)
+	}
+}
+
+// gitRepoAt makes dir a checkout on main with one commit, the tree a client has when it
+// reaches for a box.
+func gitRepoAt(t *testing.T, dir string) {
+	t.Helper()
+	gitAt(t, dir, "init", "-q", "-b", "main", ".")
+	if err := os.WriteFile(filepath.Join(dir, "one.txt"), []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitAt(t, dir, "add", "-A")
+	gitAt(t, dir, "commit", "-qm", "one")
+}
+
+// gitAt runs one git command in dir and returns its first line of output.
+func gitAt(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+	line, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	return line
 }

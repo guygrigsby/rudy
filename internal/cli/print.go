@@ -76,7 +76,7 @@ func registerPrint(root *cobra.Command, build buildFunc) {
 	root.RunE = func(cmd *cobra.Command, args []string) error {
 		stderr := cmd.ErrOrStderr()
 		if !headless {
-			return tuiExit(runTUI(cmd.Context(), build, d, resumeWith(o, "--resume"), launchTUI, strings.Join(args, " "), stderr))
+			return tuiExit(runTUI(cmd.Context(), build, d, resumeWith(o, "--resume", stderr), launchTUI, strings.Join(args, " "), stderr))
 		}
 		switch o.Output {
 		case "text", "json", "stream-json":
@@ -157,7 +157,7 @@ func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt str
 	if err != nil {
 		return 1, err
 	}
-	info, code, err := openOrResume(bg, d, o, cwd, "--resume")
+	info, code, err := openOrResume(bg, d, o, cwd, "--resume", stderr)
 	if err != nil {
 		// Printed here, not just returned: runPrint is called directly (bypassing
 		// registerPrint's own error printing) by tests and, once the TUI exists, other

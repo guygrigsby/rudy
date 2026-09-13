@@ -31,9 +31,9 @@ var topLevelVerbs = map[string]string{
 // names that read as a noun (path, example) are listed with the rest because they are the
 // object of an implied show, the way `npm config get` is.
 var verbs = []string{
-	"add", "disable", "enable", "example", "fork", "get", "install", "list",
-	"migrate", "new", "path", "remove", "resume", "show", "sync", "trust", "uninstall",
-	"update",
+	"add", "check", "disable", "enable", "example", "fork", "get", "install", "list",
+	"migrate", "new", "path", "pull", "push", "remove", "resume", "show", "sync", "trust",
+	"uninstall", "update",
 }
 
 // shapeRoot is the command tree as a run builds it. The builder is never called: these
