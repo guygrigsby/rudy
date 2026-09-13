@@ -149,6 +149,9 @@ func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt str
 		// any more, and the operator watches a plugin's close budget run out in silence.
 		stop()
 		d.Close()
+		// The tree comes home last, once the session on the box is closed and nothing is going
+		// to write at the placement again.
+		pullBack(d, stderr)
 	}()
 
 	// Calls use a background context so an interrupt can still be delivered after ctx ends.

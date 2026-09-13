@@ -61,6 +61,19 @@ func (s sshRunner) Run(ctx context.Context, line string, stdin io.Reader) (strin
 // operator's ssh config resolves the host and no remote is added to either checkout.
 func (s sshRunner) URL(placement string) string { return "ssh://" + s.host.String() + placement }
 
+// String names the machine for a log line. Pull's arguments are the tree and the placement and
+// it is handed no Host, so the destination is the runner's to say.
+func (s sshRunner) String() string { return s.host.String() }
+
+// runnerHost is what to call the machine in a log line: the runner's own name where it has one,
+// and nothing where it has none, which is a test's runner and no operator's.
+func runnerHost(r Runner) string {
+	if s, ok := r.(fmt.Stringer); ok {
+		return s.String()
+	}
+	return ""
+}
+
 // Plan is what Sync decided to do with the tree.
 type Plan int
 
@@ -310,12 +323,21 @@ func Copy(ctx context.Context, r Runner, host Host, localRoot, placement string,
 // truth whenever it holds work: a dirty or ahead placement is opened as it is, and only a
 // divergence, or a placement that is not the kind of thing the local tree is, refuses.
 func Sync(ctx context.Context, r Runner, host Host, localCwd, placement string, out io.Writer) error {
+	_, err := SyncCopied(ctx, r, host, localCwd, placement, out)
+	return err
+}
+
+// SyncCopied is Sync, saying whether what the session opens on is a copy rather than a
+// checkout. A copy has no other way home, so the client that opened a session on one brings
+// the placement back when that session closes; a checkout waits for `rudy hosts pull`, because
+// a fast-forward is the operator's to ask for.
+func SyncCopied(ctx context.Context, r Runner, host Host, localCwd, placement string, out io.Writer) (bool, error) {
 	local, err := Local(ctx, localCwd)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if local.IsGit && local.Branch == "" {
-		return fmt.Errorf("HEAD is detached in %s, so there is no branch to push to %s:%s; check out a branch, or pass --no-sync", local.Root, host, placement)
+		return false, fmt.Errorf("HEAD is detached in %s, so there is no branch to push to %s:%s; check out a branch, or pass --no-sync", local.Root, host, placement)
 	}
 	// The tree that moves is the root, so the placement that receives it is the root's, not
 	// the cwd's: from inside a checkout the repository goes to the repository's own place
@@ -323,11 +345,11 @@ func Sync(ctx context.Context, r Runner, host Host, localCwd, placement string, 
 	// still opens at the cwd's placement, which the tree brings with it.
 	root, err := rootPlacement(local.Root, localCwd, placement)
 	if err != nil {
-		return err
+		return false, err
 	}
 	remote, err := Inspect(ctx, r, root)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// The ancestry is the extra round trip the git case pays, and only where it decides
 	// something: a dirty box is opened as it is whatever the heads say.
@@ -337,15 +359,96 @@ func Sync(ctx context.Context, r Runner, host Host, localCwd, placement string, 
 	plan, note := Decide(local, remote)
 	switch plan {
 	case PlanPush:
-		return Push(ctx, r, host, local.Root, local.Branch, root, out)
+		return false, Push(ctx, r, host, local.Root, local.Branch, root, out)
 	case PlanCopy:
-		return Copy(ctx, r, host, local.Root, root, out)
+		return true, Copy(ctx, r, host, local.Root, root, out)
 	case PlanOpenAsIs:
 		notice(out, note)
-		return nil
+		// The box's own tree, left as it is. It is a copy whenever this one is not a checkout,
+		// which is the only way a non-git tree ends up here: Decide's other two open-as-is rows
+		// are a git tree that is dirty or ahead on the box, and those come back through git.
+		return !local.IsGit, nil
 	default:
-		return fmt.Errorf("%s:%s: %s", host, root, note)
+		return false, fmt.Errorf("%s:%s: %s", host, root, note)
 	}
+}
+
+// Pull brings the host's work back, the direction an operator asks for rather than one a
+// session open implies. A checkout fast-forwards when this tree is clean and behind; a tree no
+// git tracks comes back whole. What travels is the workspace root's placement, as Sync's is: a
+// cwd inside a checkout is a subdirectory of what went over, and the whole checkout comes home.
+func Pull(ctx context.Context, r Runner, localCwd, placement string, out io.Writer) error {
+	local, err := Local(ctx, localCwd)
+	if err != nil {
+		return err
+	}
+	root, err := rootPlacement(local.Root, localCwd, placement)
+	if err != nil {
+		return err
+	}
+	if !local.IsGit {
+		return pullCopy(ctx, r, local.Root, root, out)
+	}
+	if local.Branch == "" {
+		return fmt.Errorf("HEAD is detached in %s, so there is no branch to fetch from %s; check out a branch first", local.Root, root)
+	}
+	return pullGit(ctx, r, local, root, out)
+}
+
+// pullGit fetches the branch by URL and fast-forwards onto it. The fetch happens first and
+// whatever this tree looks like: the refusals below are about what may be written here, and the
+// host's commits sitting in FETCH_HEAD are what makes them something the operator can act on
+// rather than a second trip to the box. No remote is added to either checkout, as the push leg
+// adds none.
+func pullGit(ctx context.Context, r Runner, local LocalState, placement string, out io.Writer) error {
+	if _, err := gitOut(ctx, local.Root, "fetch", "--no-tags", "--quiet", r.URL(placement), local.Branch); err != nil {
+		return fmt.Errorf("fetching %s from %s: %w", local.Branch, placement, err)
+	}
+	switch {
+	case local.Dirty:
+		return fmt.Errorf("%s has uncommitted changes, so nothing was merged; the host's commits are here as FETCH_HEAD, and git rebase FETCH_HEAD takes them once this tree is clean", local.Root)
+	case !gitOK(ctx, local.Root, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"):
+		return fmt.Errorf("%s and %s have both moved, so there is no fast-forward; the host's commits are here as FETCH_HEAD, and git rebase FETCH_HEAD replays this checkout onto them", local.Root, placement)
+	}
+	// Counted before the merge, which is the only moment the two heads differ.
+	files, err := gitNames(ctx, local.Root, "diff", "--name-only", "-z", "HEAD", "FETCH_HEAD")
+	if err != nil {
+		return fmt.Errorf("reading what %s brings to %s: %w", placement, local.Root, err)
+	}
+	// --ff-only is the guard that writes: the ancestry above is a question about a moment
+	// already past, and this is the merge refusing to be anything but the fast-forward that
+	// answer promised.
+	if _, err := gitOut(ctx, local.Root, "merge", "--ff-only", "--quiet", "FETCH_HEAD"); err != nil {
+		return fmt.Errorf("fast-forwarding %s: %w", local.Root, err)
+	}
+	slog.Info("sync: pull", "host", runnerHost(r), "placement", placement, "mode", "git", "files", len(files))
+	if len(files) == 0 {
+		notice(out, fmt.Sprintf("%s is already at the host's head", local.Branch))
+	} else {
+		notice(out, fmt.Sprintf("fast-forwarded %s to the host's head, %d files", local.Branch, len(files)))
+	}
+	return nil
+}
+
+// pullCopy brings back a tree no git tracks: one tar written on the host, unpacked over the
+// local root. What the box changed wins and what it added arrives; what it deleted there stays
+// here, because the archive carries what exists and nothing in it tells a file the box removed
+// from one this machine made while the session ran.
+func pullCopy(ctx context.Context, r Runner, localRoot, placement string, out io.Writer) error {
+	line := fmt.Sprintf("tar -c -C %s -f - .", quote(placement))
+	archive, err := run(ctx, r, "copying "+placement+" back", line, nil)
+	if err != nil {
+		return err
+	}
+	if err := checkArchive(archive, placement); err != nil {
+		return err
+	}
+	if err := extractTar(ctx, localRoot, archive); err != nil {
+		return err
+	}
+	slog.Info("sync: pull", "host", runnerHost(r), "placement", placement, "mode", "copy", "bytes", len(archive))
+	notice(out, fmt.Sprintf("copied %s back over %s", placement, localRoot))
+	return nil
 }
 
 // rootPlacement is where the tree's root goes on the host. The placement maps the cwd, and a

@@ -293,6 +293,62 @@ func TestPrintOverHostSyncsTheTreeFirst(t *testing.T) {
 	}
 }
 
+// TestPrintOverHostPullsACopiedTreeBack is the other half of the sync, on the tree that has no
+// other way home: a directory no git tracks goes over as a copy, the session runs on it there,
+// and the client that opened that session tars the placement back when it closes.
+//
+// The box's work is a file written into the placement between the two runs by hand rather than
+// by a tool call through the fake upstream: what is under test is the close-time pull, and a
+// tool_calls fixture would be a second, larger fake upstream to keep for the same assertion.
+// The first run is the copy leg (nothing at the placement), the second is the box holding a
+// copy already, which is the other way a session ends up on a tree that comes home by tar.
+func TestPrintOverHostPullsACopiedTreeBack(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	requireBoxGit(t)
+	bin := builtRudy(t)
+	upstream := fakeOpenAI(t, "hello from the box")
+	home, env := boxWithProvider(t, bin, upstream.URL)
+	t.Cleanup(func() { stopBoxDaemon(t, env) })
+	t.Setenv("RUDY_SSH", sshShim(t, env))
+
+	localHome := t.TempDir()
+	t.Setenv("HOME", localHome)
+	local := filepath.Join(localHome, "projects", "plain")
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(local)
+	placement := filepath.Join(home, "projects", "plain")
+
+	build := testBuilder(t, &fakeProvider{})
+	var stdout, stderr bytes.Buffer
+	code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{Host: "box"}, "hi", build, &stdout, &stderr)
+	if err != nil || code != 0 {
+		t.Fatalf("first run = %d, %v\nstderr: %s", code, err, stderr.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(placement, "a.txt")); err != nil || string(got) != "a" {
+		t.Fatalf("the tree was not copied to the placement: %q %v\nstderr: %s", got, err, stderr.String())
+	}
+
+	if err := os.WriteFile(filepath.Join(placement, "box.txt"), []byte("box work"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code, err = runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{Host: "box"}, "hi", build, &stdout, &stderr)
+	if err != nil || code != 0 {
+		t.Fatalf("second run = %d, %v\nstderr: %s", code, err, stderr.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(local, "box.txt")); err != nil || string(got) != "box work" {
+		t.Fatalf("the box's file did not come back when the session closed: %q %v\nstderr: %s", got, err, stderr.String())
+	}
+}
+
 // requireBoxGit skips unless both ends of the sync have git and tar. This machine's half
 // finds them anywhere on PATH; the box's half runs under the fixture's own environment,
 // whose PATH is /usr/bin:/bin. It also puts a hermetic git environment on the test process,

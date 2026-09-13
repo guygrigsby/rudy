@@ -51,6 +51,38 @@ func sendTar(ctx context.Context, r Runner, what, line string, tar *exec.Cmd) er
 	return nil
 }
 
+// checkArchive reads the one thing that says an archive is one: the ustar magic at offset 257
+// of the first header block. Inspect's reason, on a stream nobody can read by eye: what comes
+// back from a host line is a shell's stdout, and a box that greets every ssh command writes
+// into this one too. A greeting handed to tar fails naming neither the box nor the greeting,
+// so it is named here instead.
+func checkArchive(archive, placement string) error {
+	const magic, at = "ustar", 257
+	if len(archive) >= at+len(magic) && archive[at:at+len(magic)] == magic {
+		return nil
+	}
+	first, _, _ := strings.Cut(strings.TrimSpace(archive), "\n")
+	if len(first) > 80 {
+		first = first[:80]
+	}
+	return fmt.Errorf("copying %s back: the host answered %q, which is not a tar archive; a shell that greets every ssh command writes into this stream and rudy cannot read past it", placement, first)
+}
+
+// extractTar unpacks over dir an archive the host wrote. The archive is a value rather than a
+// stream because a Runner answers with its output: what comes back this way is a tree no git
+// tracks, small enough that the box holds a copy of it at all, and streaming it would mean a
+// second shape of Run for the one caller that reads bytes rather than words.
+func extractTar(ctx context.Context, dir, archive string) error {
+	cmd := exec.CommandContext(ctx, "tar", "-x", "-C", dir, "-f", "-")
+	cmd.Stdin = strings.NewReader(archive)
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("unpacking into %s: tar: %v: %s", dir, err, strings.TrimSpace(errb.String()))
+	}
+	return nil
+}
+
 // treeFiles is every file under root, as paths relative to it. Symlinks are names, not the
 // things they point at: WalkDir does not follow them and neither does tar, so a link arrives
 // as a link.

@@ -87,6 +87,11 @@ type dialed struct {
 	// NoSync is --no-sync: the working tree is not moved to the placement before a session
 	// opens on it.
 	NoSync bool
+	// copied is the sync step's answer: the session opened on a copy of a tree no git tracks
+	// rather than on a checkout. A copy has no other way home, so the client brings the
+	// placement back when the session closes. Unexported because nothing outside this package
+	// sets it and no flag says it.
+	copied bool
 }
 
 // place is the cwd a session opens on: the placement on the host when this connection is

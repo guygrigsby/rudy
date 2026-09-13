@@ -131,6 +131,9 @@ func runTUI(ctx context.Context, build buildFunc, dopts dialOptions, resolve res
 		// a context nothing is reading any more.
 		stop()
 		d.Close()
+		// And then the tree, once the session on the box is closed. The terminal is the
+		// client's again by now, so the notices land where the operator can read them.
+		pullBack(d, stderr)
 	}()
 	lk, err := loadLook(d.Paths, d.Config)
 	if err != nil {

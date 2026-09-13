@@ -230,6 +230,119 @@ func TestSyncCopiesANonGitTreeOnce(t *testing.T) {
 	}
 }
 
+// TestPullFastForwardsACleanCheckout is the return leg of the git case: the box committed,
+// this checkout is clean and behind, and the commit arrives here without a remote being added
+// to either side.
+func TestPullFastForwardsACleanCheckout(t *testing.T) {
+	requireGit(t)
+	box := t.TempDir()
+	r := localRunner{home: box}
+	local := gitRepo(t, "one")
+	placement := filepath.Join(box, "projects", "demo")
+	if err := Sync(context.Background(), r, Host{destination: "box"}, local, placement, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	commit(t, placement, "box side")
+	if err := Pull(context.Background(), r, local, placement, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if gitLine(t, local, "rev-parse", "HEAD") != gitLine(t, placement, "rev-parse", "HEAD") {
+		t.Fatal("pull did not fast-forward the Mac to the box's head")
+	}
+}
+
+// TestPullRefusesADirtyOrDivergedMac: the fetch always happens, so the box's commits are here
+// to act on, and nothing is merged over work this machine holds. Two ways it holds work: an
+// uncommitted edit, and a commit of its own beside the box's.
+func TestPullRefusesADirtyOrDivergedMac(t *testing.T) {
+	requireGit(t)
+	box := t.TempDir()
+	r := localRunner{home: box}
+	local := gitRepo(t, "one")
+	placement := filepath.Join(box, "projects", "demo")
+	_ = Sync(context.Background(), r, Host{destination: "box"}, local, placement, io.Discard)
+	commit(t, placement, "box side")
+	_ = os.WriteFile(filepath.Join(local, "one.txt"), []byte("mac edit"), 0o644)
+	err := Pull(context.Background(), r, local, placement, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "FETCH_HEAD") {
+		t.Fatalf("pull onto a dirty Mac = %v, want a refusal that names FETCH_HEAD", err)
+	}
+	if gitLine(t, local, "rev-parse", "FETCH_HEAD") != gitLine(t, placement, "rev-parse", "HEAD") {
+		t.Fatal("the fetch itself should have happened before the refusal")
+	}
+
+	// The other half, on a second pair: a Mac that is clean and has a commit the box does not.
+	// There is no fast-forward to make, and the answer is the rebase rather than a merge commit
+	// nobody asked for.
+	otherBox := t.TempDir()
+	other := localRunner{home: otherBox}
+	mac := gitRepo(t, "one")
+	theirs := filepath.Join(otherBox, "projects", "demo")
+	_ = Sync(context.Background(), other, Host{destination: "box"}, mac, theirs, io.Discard)
+	commit(t, theirs, "box side")
+	commit(t, mac, "mac side")
+	head := gitLine(t, mac, "rev-parse", "HEAD")
+	err = Pull(context.Background(), other, mac, theirs, io.Discard)
+	// The placement as well as the two names: git's own refusal says FETCH_HEAD and rebase
+	// too, and the one thing only this client can say is which tree on which box the Mac
+	// diverged from.
+	if err == nil || !strings.Contains(err.Error(), "FETCH_HEAD") || !strings.Contains(err.Error(), "git rebase") || !strings.Contains(err.Error(), theirs) {
+		t.Fatalf("pull onto a diverged Mac = %v, want a refusal naming %s, FETCH_HEAD and git rebase", err, theirs)
+	}
+	if gitLine(t, mac, "rev-parse", "HEAD") != head {
+		t.Fatalf("the diverged pull moved the Mac's head to %s", gitLine(t, mac, "rev-parse", "HEAD"))
+	}
+}
+
+// TestPullCopiesANonGitTreeBack: a tree no git tracks has no other way home, so the whole
+// placement comes back over the local one. What the box changed wins and what it added
+// arrives; what it deleted stays here, since the tar carries what exists.
+func TestPullCopiesANonGitTreeBack(t *testing.T) {
+	requireTar(t)
+	box := t.TempDir()
+	r := localRunner{home: box}
+	local := t.TempDir()
+	_ = os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644)
+	placement := filepath.Join(box, "projects", "plain")
+	_ = Sync(context.Background(), r, Host{destination: "box"}, local, placement, io.Discard)
+	_ = os.WriteFile(filepath.Join(placement, "a.txt"), []byte("box"), 0o644)
+	_ = os.WriteFile(filepath.Join(placement, "b.txt"), []byte("new on box"), 0o644)
+	if err := Pull(context.Background(), r, local, placement, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(local, "a.txt")); string(got) != "box" {
+		t.Fatalf("a.txt = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(local, "b.txt")); err != nil {
+		t.Fatal("b.txt did not come back")
+	}
+}
+
+// TestAChattyShellCannotCorruptThePulledTree: the reply to a host line is a shell's stdout, and
+// a box with one echo in its .bashrc writes into the archive stream too. Handed to tar, that is
+// a failure naming neither the box nor the greeting, on a command that unpacks over the
+// operator's own working tree. It is refused instead, quoting what the shell said, and nothing
+// here is written.
+func TestAChattyShellCannotCorruptThePulledTree(t *testing.T) {
+	requireTar(t)
+	box := t.TempDir()
+	r := localRunner{home: box, banner: "welcome to the box"}
+	local := t.TempDir()
+	_ = os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644)
+	placement := filepath.Join(box, "projects", "plain")
+	if err := os.MkdirAll(placement, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(placement, "a.txt"), []byte("box"), 0o644)
+	err := Pull(context.Background(), r, local, placement, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "welcome to the box") {
+		t.Fatalf("pull under a greeting shell = %v, want a refusal quoting the greeting", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(local, "a.txt")); string(got) != "a" {
+		t.Fatalf("the local tree was written from an unreadable answer: %q", got)
+	}
+}
+
 // TestAChattyShellCannotMakeAPlacementLookAbsent: an ssh command runs a shell that reads the
 // operator's rc file, so a box with one echo in its .bashrc prints a line before the answer.
 // Read positionally that shifts every field and the placement reads absent, which is the

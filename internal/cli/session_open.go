@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 
 	"github.com/oklog/ulid/v2"
@@ -106,9 +107,11 @@ func openOrResume(ctx context.Context, d *dialed, o printOptions, cwd, source st
 		// placement this machine's tree belongs at. --no-sync is the operator saying the box
 		// is already how they want it.
 		if !d.Host.IsZero() && !d.NoSync {
-			if err := hosts.Sync(ctx, hosts.SSHRunner(d.Host), d.Host, localCwd, cwd, stderr); err != nil {
+			copied, err := hosts.SyncCopied(ctx, hosts.SSHRunner(d.Host), d.Host, localCwd, cwd, stderr)
+			if err != nil {
 				return info, 1, err
 			}
+			d.copied = copied
 		}
 		err := d.Client.Call(ctx, protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: cwd, Model: o.Model, Mode: o.Mode, Thinking: o.Thinking}, &info)
 		if err != nil {
@@ -151,6 +154,32 @@ func openOrResume(ctx context.Context, d *dialed, o printOptions, cwd, source st
 		info.Thinking = session.ThinkingLevel(o.Thinking)
 	}
 	return info, 0, nil
+}
+
+// pullBack brings a copied tree home now the session that ran on it is over. Only a tree this
+// client copied to the box: a checkout comes back through `rudy hosts pull` when the operator
+// asks for it, because a fast-forward is theirs to decide. A failure is a notice and never an
+// exit code: the turn has already run, and its result is what the caller is reporting.
+//
+// The context is this function's own. It runs in the unwind, after an interrupt has cancelled
+// whatever the run was using, and the work on the box still has to come home.
+func pullBack(d *dialed, stderr io.Writer) {
+	if !d.copied {
+		return
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "rudy: bringing the tree back:", err)
+		return
+	}
+	placement, err := d.place(cwd)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, "rudy: bringing the tree back:", err)
+		return
+	}
+	if err := hosts.Pull(context.Background(), hosts.SSHRunner(d.Host), cwd, placement, stderr); err != nil {
+		_, _ = fmt.Fprintln(stderr, "rudy: bringing the tree back:", err)
+	}
 }
 
 // heldElsewhere turns a session another rudy has open into the one thing an operator can act
