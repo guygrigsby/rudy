@@ -42,6 +42,7 @@
 | Plugin | supporting | How every capability arrives, linked or spawned, plus the hook lifecycle |
 | Client | supporting, conformist | Rendering the protocol: the TUI and the headless printer |
 | Memory | generic, external | The OKF bundle, reached through the memory-go SDK |
+| Hosts | supporting | Reaching a kernel on another machine over ssh, placing the workspace there and moving the tree in and out; client side only (ADR 0029) |
 
 Inside Session, groupings that share one language:
 
@@ -63,6 +64,8 @@ Inside Session, groupings that share one language:
 | MCP servers | Plugin | ACL | The `mcp` plugin adapts go-sdk tools into rudy tools; MCP types stay inside it; servers come from `mcp.toml` |
 | Session (child) | Plugin (subagents) | Open Host Service | The `agent` tool opens a child session over the protocol like any client and reads its outcome back |
 | Memory (memory-go) | Plugin | ACL | The memory plugin is the only importer; fold's model call is a port satisfied from Provider |
+| Hosts | Client | Customer/Supplier | The client asks Hosts for a connection and a placement; Hosts speaks ssh and git and hands back a `Conn` and a path. Session never sees a host |
+| sand | Hosts | Separate Ways | Same box, same checkouts, same ssh alias; rudy takes sand's runtime behaviour (PATH over ssh, the doctor, push by URL, fetch back) and leaves the signing ring to sand |
 | Codex, Claude Code, pi | rudy | Separate Ways | Precedents only; no protocol or format shared |
 
 ## Ambiguous terms

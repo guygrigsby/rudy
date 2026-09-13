@@ -30,7 +30,13 @@ flowchart TB
         Theme
         KeyBinding
     end
+    subgraph HO["Hosts"]
+        Host
+        Placement
+    end
     CL -.-> Session
+    CL --> Placement
+    Placement -.-> Workspace
     MEM[["memory-go<br/>(external module)"]] -.-> Plugin
     Turn --> Provider
     Turn --> Tool
@@ -1130,6 +1136,57 @@ Enumeration.
 | `ready` | Registered and serving |
 | `failed` | Load or runtime fault; `failReason` set |
 | `stopped` | Cleanly shut down; registrations released |
+
+## Host
+
+Value object, Hosts context, client side (ADR 0029). An ssh destination as the operator's
+ssh config resolves it.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `destination` | string | Alias or `user@name`, passed to ssh after `--` |
+
+### Invariants
+
+- Non-empty and does not begin with `-`. Refused at construction, never sanitised.
+- Two spellings of one machine are two hosts.
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `Placement` | placed on | 1 to many |
+
+## Placement
+
+Value object, Hosts context. The workspace path on a host for a local cwd.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `host` | Host | Where the path is |
+| `path` | string | Absolute on the host: `<host home>/<local cwd relative to the local home>`, or `--cwd` verbatim |
+
+### Invariants
+
+- Computed only after `client.hello` returned `home`; a cwd outside the local home with no `--cwd` has no placement and the command fails naming the flag.
+- `session.open` is sent with `path` as `cwd`. The kernel detects the Workspace there; a Placement is never a Workspace.
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `Host` | on | many to 1 |
+| `Workspace` | detected at, on the host | 1 to 1 |
+
+## Sync
+
+Domain service, Hosts context. Moves the tree between the local cwd and a Placement before
+a new session opens, and back on demand. Decision table in the spec. The box is truth
+whenever it holds work: a dirty or ahead placement is opened as is.
 
 ## Everything at once
 
