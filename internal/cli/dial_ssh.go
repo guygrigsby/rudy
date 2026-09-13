@@ -43,27 +43,64 @@ func sshBin() string {
 // box. The daemon on the far side is setsid'd and outlives the bridge, so nothing here ends
 // a session; what ends is this machine's half of it.
 type sshProc struct {
-	cmd    *exec.Cmd
+	cmd *exec.Cmd
+	// stdin and stdout are this process's ends of ssh's stdio, owned here rather than by
+	// cmd: see sshTransport.
 	stdin  io.Closer
-	waited chan error // cmd.Wait's result, sent once
+	stdout io.Closer
+	// exited closes once cmd.Wait has returned, which is also when ProcessState is readable.
+	exited chan struct{}
 	once   sync.Once
 }
 
-// Close hangs up and waits. Shutting stdin is what the bridge reads as its client leaving,
-// so ssh exits by itself with the status the remote line produced; only a process still
-// there after the grace is killed, and a killed process reports a signal instead of the 111
-// that says the box has no rudy.
+// Close hangs up and waits. Shutting ssh's stdin is what the bridge reads as its client
+// leaving, so ssh exits by itself carrying the status the remote line produced; only a
+// process still there after the grace is killed, and a killed process reports a signal
+// instead of the 111 that says the box has no rudy. The read end goes last, once nothing can
+// write into it any more: closed while the reader is still draining, it would turn the box's
+// last frames into "file already closed".
 func (p *sshProc) Close() error {
 	p.once.Do(func() {
 		_ = p.stdin.Close()
 		select {
-		case <-p.waited:
+		case <-p.exited:
 		case <-time.After(sshExitGrace):
 			_ = p.cmd.Process.Kill()
-			<-p.waited
+			<-p.exited
 		}
+		_ = p.stdout.Close()
 	})
 	return nil
+}
+
+// sshTransport starts cmd and returns a Conn over its stdio. The pipes are explicit rather
+// than StdinPipe and StdoutPipe because those are closed by Wait, which runs concurrently
+// with the reader here: a box whose daemon died writes its last frames and exits, and a read
+// end closed under the reader loses them and reports "file already closed" in place of the
+// reason. internal/plugin/spawned.go carries the same lesson for a spawned plugin. This
+// process holds both parent ends and closes them in sshProc.Close, in that order.
+func sshTransport(cmd *exec.Cmd) (protocol.Conn, *sshProc, error) {
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		_, _ = inR.Close(), inW.Close()
+		return nil, nil, err
+	}
+	cmd.Stdin, cmd.Stdout = inR, outW
+	if err := cmd.Start(); err != nil {
+		_, _ = inR.Close(), inW.Close()
+		_, _ = outR.Close(), outW.Close()
+		return nil, nil, fmt.Errorf("%s: %w", cmd.Path, err)
+	}
+	// The child holds its own ends now. Ours would otherwise keep the pipes open past its
+	// exit, and a read end nothing can write to is the EOF the reader is waiting for.
+	_, _ = inR.Close(), outW.Close()
+	proc := &sshProc{cmd: cmd, stdin: inW, stdout: outR, exited: make(chan struct{})}
+	go func() { defer close(proc.exited); _ = cmd.Wait() }()
+	return protocol.NewStreamConn(outR, inW, proc), proc, nil
 }
 
 // dialSSH runs the remote line on host through ssh and greets the bridge. Exit 111 before
@@ -78,22 +115,13 @@ func dialSSH(o BuildOptions, host hosts.Host, d dialOptions, name string, asker 
 	// with spaces and hands them to the box's shell, so a line that is already one word is
 	// the line the shell runs.
 	cmd := exec.Command(sshBin(), "--", host.String(), hosts.RemoteLine())
-	stdin, err := cmd.StdinPipe()
+	stderr := protocol.NewTail(protocol.TailBytes) // for the error below; ssh's diagnostics come last
+	cmd.Stderr = stderr
+	conn, _, err := sshTransport(cmd)
 	if err != nil {
 		return nil, 1, err
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, 1, err
-	}
-	var stderr limitedBuffer // the tail of ssh's stderr, for the error below
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return nil, 1, fmt.Errorf("%s: %w", sshBin(), err)
-	}
-	proc := &sshProc{cmd: cmd, stdin: stdin, waited: make(chan error, 1)}
-	go func() { proc.waited <- cmd.Wait() }()
-	client := protocol.NewClient(protocol.NewStreamConn(stdout, stdin, proc))
+	client := protocol.NewClient(conn)
 	// A context of this call's own, never the caller's: an interrupt that arrived before the
 	// client got going would otherwise report a cancelled dial where it means an interrupt,
 	// which is the rule attach follows for the same reason.
@@ -106,7 +134,7 @@ func dialSSH(o BuildOptions, host hosts.Host, d dialOptions, name string, asker 
 		if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == hosts.ExitNoRudy {
 			return nil, 1, fmt.Errorf("%w on %s; run rudy hosts install %s", errNoRudyOnHost, host, host)
 		}
-		if text := stderr.String(); text != "" {
+		if text := strings.TrimSpace(stderr.String()); text != "" {
 			return nil, 1, fmt.Errorf("ssh %s: %s", host, text)
 		}
 		return nil, 1, fmt.Errorf("ssh %s: %w", host, err)
@@ -123,32 +151,4 @@ func dialSSH(o BuildOptions, host hosts.Host, d dialOptions, name string, asker 
 		Cwd:     d.Cwd,
 		NoSync:  d.NoSync,
 	}, 0, nil
-}
-
-// stderrTailBytes is how much of ssh's stderr is kept. Enough for a host key warning and the
-// reason underneath it, and bounded because the other end of that pipe is a machine that may
-// decide to talk for as long as it likes.
-const stderrTailBytes = 4 << 10
-
-// limitedBuffer keeps the last stderrTailBytes written to it and drops the rest. ssh writes
-// its diagnostics last, so the tail is the half that says what went wrong.
-type limitedBuffer struct {
-	mu  sync.Mutex
-	buf []byte
-}
-
-func (b *limitedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.buf = append(b.buf, p...)
-	if len(b.buf) > stderrTailBytes {
-		b.buf = b.buf[len(b.buf)-stderrTailBytes:]
-	}
-	return len(p), nil
-}
-
-func (b *limitedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return strings.TrimSpace(string(b.buf))
 }

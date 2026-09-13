@@ -7,9 +7,13 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/guygrigsby/rudy/internal/cli/hosts"
 )
 
 func TestHostWithSocketOrEmbedIsAUsageError(t *testing.T) {
@@ -74,6 +78,43 @@ func TestRemoteHostIsTheDefaultAndEmbedStillWins(t *testing.T) {
 	}
 }
 
+// TestTheBoxsLastFrameSurvivesSshExiting: the daemon on the box dies mid-turn, the bridge
+// writes its last frames and ssh exits. Those frames are sitting in a pipe this process
+// holds, and StdinPipe/StdoutPipe would have cmd.Wait close the read end the moment ssh
+// went, concurrently with the reader: the frames are lost and the operator is told "file
+// already closed" instead of what happened. The reads here happen after ssh has exited and
+// been reaped, which is that ordering made deterministic in both directions.
+func TestTheBoxsLastFrameSurvivesSshExiting(t *testing.T) {
+	shim := filepath.Join(t.TempDir(), "ssh")
+	// One frame and then gone: no read of stdin and no wait, so the process is over before
+	// anything here has read a byte.
+	const frame = `{"jsonrpc":"2.0","method":"turn.state","params":{"turn_id":"t"}}`
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\nprintf '%s\\n' '"+frame+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	conn, proc, err := sshTransport(exec.Command(shim))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	<-proc.exited
+
+	ctx, done := context.WithTimeout(context.Background(), 10*time.Second)
+	defer done()
+	got, err := conn.Recv(ctx)
+	if err != nil {
+		t.Fatalf("the frame ssh wrote on its way out: %v", err)
+	}
+	if string(got) != frame {
+		t.Fatalf("frame = %s", got)
+	}
+	// And then the stream ends plainly. A read end closed under the reader ends it with
+	// "file already closed", which says nothing about the box.
+	if _, err := conn.Recv(ctx); !errors.Is(err, io.EOF) {
+		t.Fatalf("end of the stream = %v, want io.EOF", err)
+	}
+}
+
 func TestExit111NamesTheInstall(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary")
@@ -87,6 +128,51 @@ func TestExit111NamesTheInstall(t *testing.T) {
 	_, code, err := dial(context.Background(), testBuilder(t, &fakeProvider{}), BuildOptions{Stderr: io.Discard}, dialOptions{Host: "box"}, "t", false)
 	if code != 1 || !errors.Is(err, errNoRudyOnHost) {
 		t.Fatalf("dial to a box without rudy = %d, %v; want errNoRudyOnHost", code, err)
+	}
+}
+
+// TestResumeByIDNeedsNoPlacement: a --resume names its session outright, and the session
+// carries its own workspace. So the cwd it was typed from is not read at all, and a cwd with
+// no place on the host must not fail it: `rudy --host box --resume <id>` from /tmp is a
+// perfectly good command, and telling the operator to pass --cwd for a directory nothing is
+// going to use is a refusal with no cause behind it.
+func TestResumeByIDNeedsNoPlacement(t *testing.T) {
+	build := testBuilder(t, &fakeProvider{})
+	o := BuildOptions{Stderr: io.Discard}
+	// A directory outside the local home, which is what Place has no answer for.
+	outside := t.TempDir()
+
+	first, code, err := dial(context.Background(), build, o, dialOptions{Embed: true}, "t", false)
+	if err != nil || code != 0 {
+		t.Fatalf("dial = %d, %v", code, err)
+	}
+	opened, code, err := openOrResume(context.Background(), first, printOptions{}, outside, "--resume")
+	if err != nil || code != 0 {
+		t.Fatalf("open = %d, %v", code, err)
+	}
+	first.Close() // the store's flock, before the second server takes it
+
+	d, code, err := dial(context.Background(), build, o, dialOptions{Embed: true}, "t", false)
+	if err != nil || code != 0 {
+		t.Fatalf("second dial = %d, %v", code, err)
+	}
+	defer d.Close()
+	// Now the same connection, told it is remote. The fixture is only worth anything if this
+	// cwd really has no placement.
+	host, err := hosts.ParseHost("box")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Host, d.Home = host, "/home/box"
+	if _, err := d.place(outside); err == nil {
+		t.Fatalf("fixture: %s has a placement under %s, so this test proves nothing", outside, d.Paths.Home)
+	}
+	got, code, err := openOrResume(context.Background(), d, printOptions{Resume: opened.SessionID}, outside, "--resume")
+	if err != nil || code != 0 {
+		t.Fatalf("resume by id over --host = %d, %v; a resume never reads the cwd", code, err)
+	}
+	if got.SessionID != opened.SessionID {
+		t.Fatalf("resumed %s, want %s", got.SessionID, opened.SessionID)
 	}
 }
 

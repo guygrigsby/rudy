@@ -256,7 +256,7 @@ type spawnHarness struct {
 	reg   *Registry
 	sp    *Spawned
 	child *fakeChild
-	tail  *tail
+	tail  *protocol.Tail
 	exit  chan error // the child's exit status; send to end it
 	notes func() []string
 }
@@ -281,7 +281,7 @@ func loadSpawned(t *testing.T, cfg map[string]any, tune func(*fakeChild)) *spawn
 	go child.run(ctx)
 	t.Cleanup(func() { _ = child.peer.Close() })
 
-	tl := newTail(4096)
+	tl := protocol.NewTail(4096)
 	exit := make(chan error, 1)
 	h := &spawnHarness{reg: reg, child: child, tail: tl, exit: exit}
 	h.notes = func() []string {
@@ -289,7 +289,7 @@ func loadSpawned(t *testing.T, cfg map[string]any, tune func(*fakeChild)) *spawn
 		defer mu.Unlock()
 		return append([]string(nil), notices...)
 	}
-	start := func(context.Context) (protocol.Conn, *tail, func() error, error) {
+	start := func(context.Context) (protocol.Conn, *protocol.Tail, func() error, error) {
 		return serverEnd, tl, func() error { return <-exit }, nil
 	}
 	h.sp = newSpawnedWith(

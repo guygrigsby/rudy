@@ -260,8 +260,6 @@ const (
 	exitGrace = time.Second
 	// termGrace is how long a terminated child gets between SIGTERM and the kill.
 	termGrace = 5 * time.Second
-	// tailBytes is how much of a child's stderr is kept for the failure notice.
-	tailBytes = 4096
 	// deltaBuffer is how far a streaming provider may run ahead of the turn consuming it.
 	deltaBuffer = 64
 )
@@ -272,11 +270,11 @@ const (
 type Spawned struct {
 	m        Manifest
 	services SpawnServices
-	start    func(ctx context.Context) (protocol.Conn, *tail, func() error, error)
+	start    func(ctx context.Context) (protocol.Conn, *protocol.Tail, func() error, error)
 
 	host Host
 	peer *protocol.Peer
-	tl   *tail
+	tl   *protocol.Tail
 
 	// ready is set when Init has returned: from then on the registry has staged what this
 	// plugin registered and a later registration would never be committed.
@@ -319,7 +317,7 @@ func NewSpawned(m Manifest, s SpawnServices) *Spawned {
 
 // newSpawnedWith is the test seam: start returns the child's Conn, its stderr tail and a
 // wait function that returns when the child exits.
-func newSpawnedWith(m Manifest, s SpawnServices, start func(ctx context.Context) (protocol.Conn, *tail, func() error, error)) *Spawned {
+func newSpawnedWith(m Manifest, s SpawnServices, start func(ctx context.Context) (protocol.Conn, *protocol.Tail, func() error, error)) *Spawned {
 	return &Spawned{
 		m:        m,
 		services: s,
@@ -521,7 +519,7 @@ func (s *Spawned) kill() {
 
 // startProcess runs the manifest's command. The child's lifetime is the plugin's, not the
 // load context's, so it is started on a background context and ended by Close.
-func (s *Spawned) startProcess(context.Context) (protocol.Conn, *tail, func() error, error) {
+func (s *Spawned) startProcess(context.Context) (protocol.Conn, *protocol.Tail, func() error, error) {
 	cmd := exec.CommandContext(context.Background(), s.command(), s.m.Args...)
 	cmd.Dir = s.m.Dir
 	cmd.Env = append(os.Environ(), envPairs(s.m.Env)...)
@@ -539,7 +537,7 @@ func (s *Spawned) startProcess(context.Context) (protocol.Conn, *tail, func() er
 	}
 	cmd.Stdin = inR
 	cmd.Stdout = outW
-	tl := newTail(tailBytes)
+	tl := protocol.NewTail(protocol.TailBytes)
 	cmd.Stderr = tl
 	if err := cmd.Start(); err != nil {
 		_ = closeAll(inR, inW, outR, outW)
@@ -847,30 +845,4 @@ func (s *Spawned) unsubscribe(requestID string) {
 	if sub != nil {
 		close(sub.done)
 	}
-}
-
-// tail keeps the last max bytes written to it, which is what a failed plugin's notice
-// carries: the end of a child's stderr is where it says why it died.
-type tail struct {
-	mu  sync.Mutex
-	max int
-	buf []byte
-}
-
-func newTail(max int) *tail { return &tail{max: max} }
-
-func (t *tail) Write(p []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.buf = append(t.buf, p...)
-	if len(t.buf) > t.max {
-		t.buf = append([]byte(nil), t.buf[len(t.buf)-t.max:]...)
-	}
-	return len(p), nil
-}
-
-func (t *tail) String() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return string(t.buf)
 }

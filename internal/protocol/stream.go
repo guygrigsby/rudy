@@ -159,3 +159,36 @@ func (c *streamConn) Close() error {
 	})
 	return err
 }
+
+// TailBytes is how much of a stdio child's stderr is worth keeping: enough for the notice it
+// printed on its way out, and bounded because the other end is a process that may decide to
+// talk for as long as it likes.
+const TailBytes = 4096
+
+// Tail keeps the last max bytes written to it. Every child process this package carries a
+// stream for points its stderr here: a spawned plugin, ssh on the way to a host. The end of
+// a child's stderr is where it says why it went, and it is the only account of a failure
+// that never reached the protocol.
+type Tail struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func NewTail(max int) *Tail { return &Tail{max: max} }
+
+func (t *Tail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = append([]byte(nil), t.buf[len(t.buf)-t.max:]...)
+	}
+	return len(p), nil
+}
+
+func (t *Tail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.buf)
+}
