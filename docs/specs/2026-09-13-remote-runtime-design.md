@@ -96,6 +96,14 @@ Git tree (the local cwd's workspace root is a git checkout):
 5. Diverged (neither head an ancestor of the other): refuse, naming `rudy hosts pull` and
    `git rebase`. Nothing is written anywhere.
 
+What moves is the workspace root, so the placement the tree lands at is the root's: a cwd
+inside a checkout is a subdirectory of what travels, and the same number of segments come off
+the placement the cwd maps to. The session still opens at the cwd's placement, which the tree
+brings with it. A placement counts as a checkout only when its own toplevel is itself, so a
+plain directory inside another checkout on the box is the refusal of step 1 rather than a push
+into that other repository. A detached HEAD here refuses before any of it: there is no branch
+to push, and `--no-sync` is the way to open on the box anyway.
+
 Non-git tree:
 
 - Placement absent: tar the tree over, everything under the local cwd, and open there.
@@ -159,7 +167,9 @@ The client wraps ssh's stdin and stdout in `NewStreamConn` and greets. The greet
 ssh is 30s rather than 2s: the bridge may be starting a daemon that is loading plugins and
 refreshing its registry.
 
-`RUDY_SSH` names the ssh binary. It exists for the test shim and is not a config key.
+`RUDY_SSH` names the ssh binary. It exists for the test shim and is not a config key. The
+sync's own git runs with `GIT_SSH_COMMAND` set from it, since a push by URL is the same reach
+as the bridge and an ssh honoured for one and ignored for the other would be two transports.
 
 ### Disconnect
 

@@ -30,15 +30,6 @@ var sshExitGrace = 5 * time.Second
 // its PATH. Task 7 answers it with an install; until then the message names the command.
 var errNoRudyOnHost = errors.New("rudy is not on the host's PATH over ssh")
 
-// sshBin is the ssh to run. RUDY_SSH exists for the tests, whose shim runs the remote line
-// locally; it is not a config key because nothing but a test wants it.
-func sshBin() string {
-	if v := os.Getenv("RUDY_SSH"); v != "" {
-		return v
-	}
-	return "ssh"
-}
-
 // sshProc is the Closer under an ssh connection: ending it is the client detaching on the
 // box. The daemon on the far side is setsid'd and outlives the bridge, so nothing here ends
 // a session; what ends is this machine's half of it.
@@ -114,7 +105,7 @@ func dialSSH(o BuildOptions, host hosts.Host, d dialOptions, name string, asker 
 	// The host after --, and the remote line as one argument: ssh joins its command words
 	// with spaces and hands them to the box's shell, so a line that is already one word is
 	// the line the shell runs.
-	cmd := exec.Command(sshBin(), "--", host.String(), hosts.RemoteLine())
+	cmd := exec.Command(hosts.SSHBin(), "--", host.String(), hosts.RemoteLine())
 	stderr := protocol.NewTail(protocol.TailBytes) // for the error below; ssh's diagnostics come last
 	cmd.Stderr = stderr
 	conn, _, err := sshTransport(cmd)
