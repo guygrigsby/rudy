@@ -135,7 +135,10 @@ func readPrompt(args []string, stdin io.Reader, tty bool) (string, error) {
 // runPrint runs one turn against the server dial reached, a running daemon or one this
 // process starts, and prints it. It returns the process exit code: 0 completed, 1 failed,
 // 2 usage, 130 interrupted.
-func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt string, build buildFunc, stdout, stderr io.Writer) (int, error) {
+//
+// The results are named for the unwind's sake: the close-time pull reads the code to know
+// whether the box finished what it was doing, and 0 is the only answer that says it did.
+func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt string, build buildFunc, stdout, stderr io.Writer) (code int, err error) {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
 	defer stop()
 	d, code, err := dial(ctx, build, BuildOptions{Stderr: stderr}, dopts, "rudy-print", false)
@@ -150,8 +153,10 @@ func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt str
 		stop()
 		d.Close()
 		// The tree comes home last, once the session on the box is closed and nothing is going
-		// to write at the placement again.
-		pullBack(d, stderr)
+		// to write at the placement again. An exit code of anything but 0 is a turn that did
+		// not finish here, an interrupt most of all: the daemon on the box is still working and
+		// its tree is not this client's to take a copy of yet.
+		pullBack(d, code == 0, stderr)
 	}()
 
 	// Calls use a background context so an interrupt can still be delivered after ctx ends.

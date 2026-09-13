@@ -439,9 +439,9 @@ func TestLockedSessionPrintsTheSocketHint(t *testing.T) {
 	// about the process holding it.
 	fakeTerminal(t, true)
 	var forkErr bytes.Buffer
-	never := func(context.Context, clientRun) error {
+	never := func(context.Context, clientRun) (bool, error) {
 		t.Error("a fork of a session another process holds must not reach the client")
-		return nil
+		return false, nil
 	}
 	if code := runTUI(context.Background(), build, dialOptions{Embed: true},
 		forkAt(info.SessionID, ""), never, "", &forkErr); code != 1 {

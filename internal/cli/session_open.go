@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 
@@ -156,29 +157,53 @@ func openOrResume(ctx context.Context, d *dialed, o printOptions, cwd, source st
 	return info, 0, nil
 }
 
+// pullBudget bounds the close-time pull. Minutes, not seconds: a working tree tarred over ssh
+// on a slow link is a command doing its job, and the budget is there for the other case, a box
+// that stopped answering after the session closed, where the alternative is a terminal that
+// never comes back. Whatever it cuts short is still on the box, and the notice says so.
+const pullBudget = 5 * time.Minute
+
 // pullBack brings a copied tree home now the session that ran on it is over. Only a tree this
 // client copied to the box: a checkout comes back through `rudy hosts pull` when the operator
-// asks for it, because a fast-forward is theirs to decide. A failure is a notice and never an
-// exit code: the turn has already run, and its result is what the caller is reporting.
+// asks for it, because a fast-forward is theirs to decide.
 //
-// The context is this function's own. It runs in the unwind, after an interrupt has cancelled
-// whatever the run was using, and the work on the box still has to come home.
-func pullBack(d *dialed, stderr io.Writer) {
+// idle is whether the box has finished: closing the connection hangs up the bridge and leaves
+// the daemon running whatever it was running, so a client that quit mid-turn would otherwise
+// tar a tree that is still being written. Every way out of here names `rudy hosts pull`, which
+// is the operator's way to do by hand what this did not do: a failure is a notice and never an
+// exit code, since the turn has already run and its result is what the caller is reporting.
+//
+// The context is this function's own, on the budget above. It runs in the unwind, after an
+// interrupt has cancelled whatever the run was using, and the work on the box still has to come
+// home.
+func pullBack(d *dialed, idle bool, stderr io.Writer) {
 	if !d.copied {
 		return
 	}
+	if !idle {
+		_, _ = fmt.Fprintf(stderr, "rudy: a turn is still running on %s; run rudy hosts pull %s when it finishes\n", d.Host, d.Host)
+		return
+	}
+	failed := func(err error) {
+		_, _ = fmt.Fprintf(stderr, "rudy: bringing the tree back: %v; run rudy hosts pull %s\n", err, d.Host)
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, "rudy: bringing the tree back:", err)
+		failed(err)
 		return
 	}
 	placement, err := d.place(cwd)
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, "rudy: bringing the tree back:", err)
+		failed(err)
 		return
 	}
-	if err := hosts.Pull(context.Background(), hosts.SSHRunner(d.Host), cwd, placement, stderr); err != nil {
-		_, _ = fmt.Fprintln(stderr, "rudy: bringing the tree back:", err)
+	// Said before the tar starts: a large tree over a slow link is a quiet minute otherwise,
+	// on a terminal the operator has already asked to have back.
+	_, _ = fmt.Fprintln(stderr, "rudy: bringing the tree back from", d.Host)
+	ctx, done := context.WithTimeout(context.Background(), pullBudget)
+	defer done()
+	if err := hosts.Pull(ctx, hosts.SSHRunner(d.Host), cwd, placement, stderr); err != nil {
+		failed(err)
 	}
 }
 

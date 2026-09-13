@@ -1,6 +1,7 @@
 package hosts
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -294,6 +296,35 @@ func TestPullRefusesADirtyOrDivergedMac(t *testing.T) {
 	}
 }
 
+// TestPullFastForwardsPastAnUntrackedFile: the question the Mac asks before a fast-forward is
+// about tracked files. An untracked build directory or scratch file is nothing the merge can
+// overwrite, and refusing on one would mean no pull ever lands in a tree anybody works in. The
+// box's side of the sync still counts untracked, because there it is work this machine has not
+// seen; a modified tracked file here is the other half, in the test above.
+func TestPullFastForwardsPastAnUntrackedFile(t *testing.T) {
+	requireGit(t)
+	box := t.TempDir()
+	r := localRunner{home: box}
+	local := gitRepo(t, "one")
+	placement := filepath.Join(box, "projects", "demo")
+	if err := Sync(context.Background(), r, Host{destination: "box"}, local, placement, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	commit(t, placement, "box side")
+	if err := os.WriteFile(filepath.Join(local, "scratch.log"), []byte("untracked"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Pull(context.Background(), r, local, placement, io.Discard); err != nil {
+		t.Fatalf("pull with an untracked file in the tree: %v", err)
+	}
+	if gitLine(t, local, "rev-parse", "HEAD") != gitLine(t, placement, "rev-parse", "HEAD") {
+		t.Fatal("an untracked file blocked a fast-forward")
+	}
+	if got, _ := os.ReadFile(filepath.Join(local, "scratch.log")); string(got) != "untracked" {
+		t.Fatalf("the untracked file was disturbed: %q", got)
+	}
+}
+
 // TestPullCopiesANonGitTreeBack: a tree no git tracks has no other way home, so the whole
 // placement comes back over the local one. What the box changed wins and what it added
 // arrives; what it deleted stays here, since the tar carries what exists.
@@ -317,6 +348,104 @@ func TestPullCopiesANonGitTreeBack(t *testing.T) {
 		t.Fatal("b.txt did not come back")
 	}
 }
+
+// TestPullRefusesAHostileArchive: the archive is bytes a box produced, and an entry named
+// /victim or ../victim or a symlink pointing anywhere is a write outside the tree the operator
+// asked to have back. Every one is refused naming the entry, and nothing lands: not the entry
+// itself, not the perfectly ordinary file ahead of it in the same archive, because the whole
+// archive is staged beside the tree and only moved in once it has all been accepted.
+func TestPullRefusesAHostileArchive(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry string
+		typ   byte
+	}{
+		{"absolute", "/victim.txt", tar.TypeReg},
+		{"parent", "../victim.txt", tar.TypeReg},
+		{"deeper parent", "sub/../../victim.txt", tar.TypeReg},
+		{"symlink", "link", tar.TypeSymlink},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			local := filepath.Join(home, "tree")
+			if err := os.MkdirAll(local, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(local, "mine.txt"), []byte("mine"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			r := archiveRunner{archive: hostileTar(t, c.entry, c.typ)}
+			err := Pull(context.Background(), r, local, "/srv/work", io.Discard)
+			if err == nil || !strings.Contains(err.Error(), strconv.Quote(c.entry)) {
+				t.Fatalf("pull of an archive naming %s = %v, want a refusal naming the entry", c.entry, err)
+			}
+			if _, err := os.Stat(filepath.Join(local, "ok.txt")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the entry before the refusal landed anyway: %v", err)
+			}
+			if got, _ := os.ReadFile(filepath.Join(local, "mine.txt")); string(got) != "mine" {
+				t.Fatalf("this machine's own file was written: %q", got)
+			}
+			left, err := os.ReadDir(home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, e := range left {
+				if e.Name() != "tree" {
+					t.Fatalf("%q was left beside the tree", e.Name())
+				}
+			}
+		})
+	}
+}
+
+// hostileTar is one ordinary entry and then one that reaches outside, the shape of an archive
+// that would do damage entry by entry. Built in Go: no tar on this machine would write it.
+func hostileTar(t *testing.T, name string, typ byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	write := func(hdr *tar.Header, body string) {
+		t.Helper()
+		if err := w.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(&tar.Header{Name: "./", Typeflag: tar.TypeDir, Mode: 0o755}, "")
+	write(&tar.Header{Name: "ok.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: 6}, "landed")
+	hdr := &tar.Header{Name: name, Typeflag: typ, Mode: 0o644}
+	if typ == tar.TypeSymlink {
+		hdr.Linkname = "/etc/passwd"
+	} else {
+		hdr.Size = 5
+	}
+	if typ == tar.TypeSymlink {
+		write(hdr, "")
+	} else {
+		write(hdr, "owned")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// archiveRunner answers every line with one canned archive, for the tar no host would write
+// and any host could.
+type archiveRunner struct{ archive []byte }
+
+func (a archiveRunner) Run(context.Context, string, io.Reader) (string, string, int, error) {
+	return "", "", 0, nil
+}
+
+func (a archiveRunner) Stream(context.Context, string, io.Reader) (io.ReadCloser, func() (string, int, error), error) {
+	return io.NopCloser(bytes.NewReader(a.archive)), func() (string, int, error) { return "", 0, nil }, nil
+}
+
+func (a archiveRunner) URL(placement string) string { return placement }
 
 // TestAChattyShellCannotCorruptThePulledTree: the reply to a host line is a shell's stdout, and
 // a box with one echo in its .bashrc writes into the archive stream too. Handed to tar, that is
@@ -454,6 +583,10 @@ func (f fixedRunner) Run(context.Context, string, io.Reader) (string, string, in
 	return f.stdout, "", 0, nil
 }
 
+func (f fixedRunner) Stream(context.Context, string, io.Reader) (io.ReadCloser, func() (string, int, error), error) {
+	return io.NopCloser(strings.NewReader(f.stdout)), func() (string, int, error) { return "", 0, nil }, nil
+}
+
 func (f fixedRunner) URL(placement string) string { return placement }
 
 // TestQuoteSurvivesASingleQuote: every host line interpolates the placement, so the one
@@ -497,6 +630,36 @@ func (l localRunner) Run(ctx context.Context, line string, stdin io.Reader) (str
 		code, err = ee.ExitCode(), nil
 	}
 	return out.String(), errb.String(), code, err
+}
+
+// Stream is Run's shape for a line whose stdout is a tree, the same shell under the same
+// pretend home. The archive comes back through a pipe rather than a buffer, as it does over
+// ssh, so the unpacker under test reads what it would really read.
+func (l localRunner) Stream(ctx context.Context, line string, stdin io.Reader) (io.ReadCloser, func() (string, int, error), error) {
+	if l.banner != "" {
+		line = "echo " + l.banner + "\n" + line
+	}
+	cmd := exec.CommandContext(ctx, "sh", "-c", line)
+	cmd.Env = append(hermeticGitEnv(), "HOME="+l.home, "PATH="+os.Getenv("PATH"))
+	cmd.Stdin = stdin
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+	wait := func() (string, int, error) {
+		err := cmd.Wait()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return errb.String(), ee.ExitCode(), nil
+		}
+		return errb.String(), 0, err
+	}
+	return out, wait, nil
 }
 
 func (l localRunner) URL(placement string) string { return placement }

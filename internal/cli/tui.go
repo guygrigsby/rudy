@@ -51,9 +51,10 @@ type clientRun struct {
 	stderr io.Writer
 }
 
-// launchFunc draws the client on a greeted connection and an already resolved session.
-// It is a variable below so tests can see what a command wired up without a terminal.
-type launchFunc func(ctx context.Context, r clientRun) error
+// launchFunc draws the client on a greeted connection and an already resolved session, and
+// reports whether the session was at rest when the client quit. It is a variable below so
+// tests can see what a command wired up without a terminal.
+type launchFunc func(ctx context.Context, r clientRun) (resting bool, err error)
 
 // launchTUI is the launcher every command goes through. Tests replace it to assert the
 // session a command resolved, the way stdinIsTerminal is replaced to pretend about stdin.
@@ -106,6 +107,10 @@ func forkAt(id, at string) resolveFunc {
 // run costs no plugin load; the theme and the keys are resolved before the session, so a
 // configuration error never leaves a session open behind a client that cannot draw.
 func runTUI(ctx context.Context, build buildFunc, dopts dialOptions, resolve resolveFunc, launch launchFunc, prompt string, stderr io.Writer) int {
+	// Whether the box's tree has settled, read by the close-time pull below. False until the
+	// client has quit and said so: every way out before that is a client that never drew, and
+	// a session that never opened has nothing to bring home anyway.
+	resting := false
 	// The TUI takes over the terminal; a pipe or a redirect means the caller wanted the
 	// headless client and did not say so.
 	if !stdinIsTerminal() {
@@ -133,7 +138,7 @@ func runTUI(ctx context.Context, build buildFunc, dopts dialOptions, resolve res
 		d.Close()
 		// And then the tree, once the session on the box is closed. The terminal is the
 		// client's again by now, so the notices land where the operator can read them.
-		pullBack(d, stderr)
+		pullBack(d, resting, stderr)
 	}()
 	lk, err := loadLook(d.Paths, d.Config)
 	if err != nil {
@@ -154,7 +159,9 @@ func runTUI(ctx context.Context, build buildFunc, dopts dialOptions, resolve res
 		return code
 	}
 	run := clientRun{dial: d, look: lk, info: info, cwd: cwd, prompt: prompt, stderr: stderr}
-	switch err := launch(ctx, run); {
+	quiet, err := launch(ctx, run)
+	resting = quiet
+	switch {
 	case err == nil:
 		return 0
 	case errors.Is(err, tea.ErrInterrupted):
@@ -212,7 +219,7 @@ func loadLook(paths config.Paths, cfg *config.Config) (look, error) {
 
 // launchApp is the real launcher: the model registry as the client's snapshot of it, then
 // the Bubble Tea program, which owns the terminal until it returns.
-func launchApp(ctx context.Context, r clientRun) error {
+func launchApp(ctx context.Context, r clientRun) (bool, error) {
 	var reg protocol.RegistryListResult
 	if err := r.dial.Client.Call(context.Background(), protocol.MethodRegistryList, nil, &reg); err != nil {
 		// A registry the client could not read costs the context percent and the cost cell,

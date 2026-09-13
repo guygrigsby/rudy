@@ -120,11 +120,21 @@ Non-git tree:
 - Placement present: open there as is. The box is truth.
 - Coming back: `rudy hosts pull` tars the placement over the local tree. Files deleted on
   the box stay on the Mac; the tar carries what exists. Session close from a client that
-  opened the session over `--host` on a copied tree runs the same pull.
+  opened the session over `--host` on a copied tree runs the same pull, and only when the
+  turn finished: closing the connection hangs up the bridge and leaves the daemon running,
+  so an interrupted client says `rudy hosts pull <host>` rather than take a copy of a tree
+  still being written.
+- The archive is the box's bytes, so it is unpacked by rudy rather than by the client's
+  `tar`, under the rules of `internal/tarx` (no `..`, no absolute path, no backslash, no
+  symlink or hard link, an entry cap and a byte cap), into a staging directory beside the
+  local root, and moved in file by file only once the whole archive has been accepted. A
+  refusal leaves the working tree untouched.
 
 Git trees come back through `rudy hosts pull`: fetch the branch by URL, fast-forward when the
-local tree is clean and the local head is an ancestor, refuse otherwise with the fetch already
-done and `FETCH_HEAD` named. Sand's `sign` does the same fetch and the ring stays sand's.
+local tree has no uncommitted changes to tracked files (`git diff-index --quiet HEAD --`,
+untracked files ignored: only the box's side counts untracked, where it is work this machine
+has not seen) and the local head is an ancestor, refuse otherwise with the fetch already done
+and `FETCH_HEAD` named. Sand's `sign` does the same fetch and the ring stays sand's.
 
 No git remote is added to the Mac checkout. Push and fetch go by URL, as sand does, so a
 host renamed in ssh config leaves no stale remote behind.

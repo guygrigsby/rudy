@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -303,7 +306,7 @@ func TestPrintOverHostSyncsTheTreeFirst(t *testing.T) {
 // The first run is the copy leg (nothing at the placement), the second is the box holding a
 // copy already, which is the other way a session ends up on a tree that comes home by tar.
 func TestPrintOverHostPullsACopiedTreeBack(t *testing.T) {
-	local, placement, build := aBoxAndAPlainTree(t)
+	local, placement, build := aBoxAndAPlainTree(t, "hello from the box")
 	var stdout, stderr bytes.Buffer
 	code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{Host: "box"}, "hi", build, &stdout, &stderr)
 	if err != nil || code != 0 {
@@ -332,7 +335,7 @@ func TestPrintOverHostPullsACopiedTreeBack(t *testing.T) {
 // the pull hangs off the connection being remote and the tree being a copy, not off which
 // command opened the session.
 func TestTUIOverHostPullsACopiedTreeBack(t *testing.T) {
-	local, placement, build := aBoxAndAPlainTree(t)
+	local, placement, build := aBoxAndAPlainTree(t, "hello from the box")
 	// The box holds the copy already, with work of its own in it.
 	if err := os.MkdirAll(placement, 0o755); err != nil {
 		t.Fatal(err)
@@ -343,7 +346,8 @@ func TestTUIOverHostPullsACopiedTreeBack(t *testing.T) {
 	fakeTerminal(t, true)
 	var stderr bytes.Buffer
 	drawn := false
-	launch := func(ctx context.Context, r clientRun) error { drawn = true; return nil }
+	// The client drew and quit with the session at rest, which is the close that pulls.
+	launch := func(ctx context.Context, r clientRun) (bool, error) { drawn = true; return true, nil }
 	code := runTUI(context.Background(), build, dialOptions{Host: "box"}, resumeWith(printOptions{}, "--resume", &stderr), launch, "", &stderr)
 	if code != 0 || !drawn {
 		t.Fatalf("runTUI = %d, drawn %v\nstderr: %s", code, drawn, stderr.String())
@@ -353,18 +357,88 @@ func TestTUIOverHostPullsACopiedTreeBack(t *testing.T) {
 	}
 }
 
+// TestPrintOverHostLeavesATreeATurnIsStillWriting: closing the connection hangs up the bridge
+// and leaves the daemon on the box running whatever it was running, so an interrupted run is a
+// placement still being written. Nothing is pulled over the operator's tree, and they are told
+// what to type once the box is done rather than left to wonder where the work went.
+//
+// The turn hangs because the upstream never answers, which is the box mid-tool-call as far as
+// this client can tell: the interrupt lands while the daemon is still working either way.
+func TestPrintOverHostLeavesATreeATurnIsStillWriting(t *testing.T) {
+	upstream, asked, release := fakeOpenAIMidTurn(t)
+	local, placement, build := aBoxAndAPlainTreeAt(t, upstream.URL)
+	// Registered after the box's own cleanups, so it runs before them: the handler lets go
+	// before anything tries to stop the daemon that is waiting on it.
+	t.Cleanup(release)
+	if err := os.MkdirAll(placement, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(placement, "box.txt"), []byte("half written"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-asked
+		cancel()
+	}()
+	var stdout, stderr bytes.Buffer
+	code, err := runPrint(ctx, printOptions{Output: "json"}, dialOptions{Host: "box"}, "hi", build, &stdout, &stderr)
+	if code != 130 || err != nil {
+		t.Fatalf("interrupted run = %d, %v; want 130\nstderr: %s", code, err, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(local, "box.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the tree came home while a turn was still running on it: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "a turn is still running") || !strings.Contains(stderr.String(), "rudy hosts pull box") {
+		t.Fatalf("the operator was not told what to do: %q", stderr.String())
+	}
+}
+
+// fakeOpenAIMidTurn is fakeOpenAI's models endpoint with a completions endpoint that never
+// answers: it says when the box has asked for the turn and holds until released, which is a
+// daemon still working when the operator's Ctrl-C lands.
+func fakeOpenAIMidTurn(t *testing.T) (srv *httptest.Server, asked <-chan struct{}, release func()) {
+	t.Helper()
+	started, done := make(chan struct{}), make(chan struct{})
+	var once, closed sync.Once
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"m","object":"model"}]}`)
+	})
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		once.Do(func() { close(started) })
+		select {
+		case <-done:
+		case <-r.Context().Done():
+		}
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, started, func() { closed.Do(func() { close(done) }) }
+}
+
 // aBoxAndAPlainTree is a box serving turns, this machine's cwd a directory no git tracks under
-// a temp home, and nothing at the placement yet. The two close-time pull tests differ in which
+// a temp home, and nothing at the placement yet. The close-time pull tests differ in which
 // client they run and in nothing else, so the fixture is one.
-func aBoxAndAPlainTree(t *testing.T) (local, placement string, build buildFunc) {
+func aBoxAndAPlainTree(t *testing.T, reply string) (local, placement string, build buildFunc) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	return aBoxAndAPlainTreeAt(t, fakeOpenAI(t, reply).URL)
+}
+
+// aBoxAndAPlainTreeAt is the same fixture against an upstream the caller stood up itself.
+func aBoxAndAPlainTreeAt(t *testing.T, upstream string) (local, placement string, build buildFunc) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("builds the binary and starts a daemon")
 	}
 	requireBoxGit(t)
 	bin := builtRudy(t)
-	upstream := fakeOpenAI(t, "hello from the box")
-	home, env := boxWithProvider(t, bin, upstream.URL)
+	home, env := boxWithProvider(t, bin, upstream)
 	t.Cleanup(func() { stopBoxDaemon(t, env) })
 	t.Setenv("RUDY_SSH", sshShim(t, env))
 

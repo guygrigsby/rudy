@@ -14,11 +14,17 @@ import (
 	"strings"
 )
 
-// Runner runs one shell line on a host and says where a git push to a placement goes. Two
+// Runner runs one shell line on a host and says where a git push to a placement goes. Three
 // methods because the push is git's own connection rather than a line this package runs, and
-// a test that has no ssh needs both rewritten together.
+// a test that has no ssh needs them rewritten together.
 type Runner interface {
+	// Run is a line whose answer is words: a state to parse, or nothing at all.
 	Run(ctx context.Context, line string, stdin io.Reader) (stdout, stderr string, code int, err error)
+	// Stream is a line whose answer is a tree. The reader is the line's stdout as it arrives,
+	// so an archive bigger than this machine's memory is not a problem and nothing is written
+	// to a temporary file to hold it; wait reaps the line once the caller has read what it
+	// wants, and answers what Run would have. The caller closes the reader.
+	Stream(ctx context.Context, line string, stdin io.Reader) (stdout io.ReadCloser, wait func() (stderr string, code int, err error), err error)
 	URL(placement string) string
 }
 
@@ -55,6 +61,36 @@ func (s sshRunner) Run(ctx context.Context, line string, stdin io.Reader) (strin
 		return out.String(), errb.String(), 0, fmt.Errorf("%s: %w", SSHBin(), err)
 	}
 	return out.String(), errb.String(), 0, nil
+}
+
+// Stream runs the line the way Run does and hands back its stdout as it arrives. ssh is
+// started and not waited on: wait is what reaps it, after the caller has read the stream, so a
+// line writing a tree is never held in memory here. A context that ends kills ssh, which ends
+// the read, which is how the caller's budget is enforced on a box that has stopped talking.
+func (s sshRunner) Stream(ctx context.Context, line string, stdin io.Reader) (io.ReadCloser, func() (string, int, error), error) {
+	cmd := exec.CommandContext(ctx, SSHBin(), "--", s.host.String(), line)
+	cmd.Stdin = stdin
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", SSHBin(), err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", SSHBin(), err)
+	}
+	wait := func() (string, int, error) {
+		err := cmd.Wait()
+		var ee *exec.ExitError
+		switch {
+		case errors.As(err, &ee):
+			return errb.String(), ee.ExitCode(), nil
+		case err != nil:
+			return errb.String(), 0, fmt.Errorf("%s: %w", SSHBin(), err)
+		}
+		return errb.String(), 0, nil
+	}
+	return out, wait, nil
 }
 
 // URL is where a git push to placement goes: ssh's own URL for the same destination, so the
@@ -405,8 +441,13 @@ func pullGit(ctx context.Context, r Runner, local LocalState, placement string, 
 		return fmt.Errorf("fetching %s from %s: %w", local.Branch, placement, err)
 	}
 	switch {
-	case local.Dirty:
-		return fmt.Errorf("%s has uncommitted changes, so nothing was merged; the host's commits are here as FETCH_HEAD, and git rebase FETCH_HEAD takes them once this tree is clean", local.Root)
+	// Tracked files only, which is not the question Inspect asks of the box. An untracked
+	// scratch file here is nothing a fast-forward can overwrite, and refusing on one would mean
+	// no pull ever lands in a tree with a build directory in it; on the box, untracked is work
+	// this machine has not seen and status --porcelain is right there. diff-index covers staged
+	// and unstaged alike, and the index it reads was refreshed by Local's own status call.
+	case !gitOK(ctx, local.Root, "diff-index", "--quiet", "HEAD", "--"):
+		return fmt.Errorf("%s has uncommitted changes to tracked files, so nothing was merged; the host's commits are here as FETCH_HEAD, and git rebase FETCH_HEAD takes them once this tree is clean", local.Root)
 	case !gitOK(ctx, local.Root, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD"):
 		return fmt.Errorf("%s and %s have both moved, so there is no fast-forward; the host's commits are here as FETCH_HEAD, and git rebase FETCH_HEAD replays this checkout onto them", local.Root, placement)
 	}
@@ -430,24 +471,37 @@ func pullGit(ctx context.Context, r Runner, local LocalState, placement string, 
 	return nil
 }
 
-// pullCopy brings back a tree no git tracks: one tar written on the host, unpacked over the
-// local root. What the box changed wins and what it added arrives; what it deleted there stays
-// here, because the archive carries what exists and nothing in it tells a file the box removed
-// from one this machine made while the session ran.
+// pullCopy brings back a tree no git tracks: one tar written on the host, staged beside the
+// local tree and moved into it only once the whole archive has been read and accepted. What
+// the box changed wins and what it added arrives; what it deleted there stays here, because
+// the archive carries what exists and nothing in it tells a file the box removed from one this
+// machine made while the session ran.
+//
+// The archive is never held whole: it streams from the host line into the unpacker, and the
+// byte cap is what bounds what a box can make this client write.
 func pullCopy(ctx context.Context, r Runner, localRoot, placement string, out io.Writer) error {
+	what := "copying " + placement + " back"
 	line := fmt.Sprintf("tar -c -C %s -f - .", quote(placement))
-	archive, err := run(ctx, r, "copying "+placement+" back", line, nil)
+	stream, wait, err := r.Stream(ctx, line, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", what, err)
 	}
-	if err := checkArchive(archive, placement); err != nil {
-		return err
+	files, unpackErr := unpackInto(localRoot, placement, stream)
+	// Closed before the wait, and the wait always runs: a stream the unpacker stopped reading
+	// leaves the host's tar writing into a pipe nobody holds, and an ssh nobody reaps is a
+	// process this client leaked.
+	_ = stream.Close()
+	errText, code, waitErr := wait()
+	switch {
+	case unpackErr != nil:
+		return unpackErr
+	case waitErr != nil:
+		return fmt.Errorf("%s: %w", what, waitErr)
+	case code != 0:
+		return fmt.Errorf("%s: exit %d: %s", what, code, strings.TrimSpace(errText))
 	}
-	if err := extractTar(ctx, localRoot, archive); err != nil {
-		return err
-	}
-	slog.Info("sync: pull", "host", runnerHost(r), "placement", placement, "mode", "copy", "bytes", len(archive))
-	notice(out, fmt.Sprintf("copied %s back over %s", placement, localRoot))
+	slog.Info("sync: pull", "host", runnerHost(r), "placement", placement, "mode", "copy", "files", files)
+	notice(out, fmt.Sprintf("copied %d files from %s back over %s", files, placement, localRoot))
 	return nil
 }
 

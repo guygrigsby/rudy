@@ -35,9 +35,9 @@ func fakeLauncher(t *testing.T) *launched {
 	t.Helper()
 	got := &launched{}
 	prev := launchTUI
-	launchTUI = func(ctx context.Context, r clientRun) error {
+	launchTUI = func(ctx context.Context, r clientRun) (bool, error) {
 		got.called, got.info, got.look, got.prompt = true, r.info, r.look, r.prompt
-		return nil
+		return true, nil
 	}
 	t.Cleanup(func() { launchTUI = prev })
 	return got
@@ -156,7 +156,7 @@ func TestTUIDialDeclaresAsker(t *testing.T) {
 
 	var asked protocol.PermissionRequested
 	prev := launchTUI
-	launchTUI = func(ctx context.Context, r clientRun) error {
+	launchTUI = func(ctx context.Context, r clientRun) (bool, error) {
 		var res protocol.SessionSubmitResult
 		params := protocol.SessionSubmitParams{
 			SessionID: r.info.SessionID,
@@ -164,19 +164,19 @@ func TestTUIDialDeclaresAsker(t *testing.T) {
 			Source:    session.SourceTyped,
 		}
 		if err := r.dial.Client.Call(context.Background(), protocol.MethodSessionSubmit, params, &res); err != nil {
-			return err
+			return false, err
 		}
 		deadline := time.After(10 * time.Second)
 		for {
 			select {
 			case n, ok := <-r.dial.Client.Notifications():
 				if !ok {
-					return errors.New("server closed the connection")
+					return false, errors.New("server closed the connection")
 				}
 				switch n.Method {
 				case protocol.NotifyPermissionRequested:
 					if err := json.Unmarshal(n.Params, &asked); err != nil {
-						return err
+						return false, err
 					}
 					// Denied rather than left standing: the turn has to come to rest
 					// before this returns, or the shutdown below waits out its budget
@@ -186,20 +186,20 @@ func TestTUIDialDeclaresAsker(t *testing.T) {
 						Decision: session.Deny, Scope: session.ScopeOnce, Reason: "asker",
 					}
 					if err := r.dial.Client.Call(context.Background(), protocol.MethodSessionAnswer, answer, nil); err != nil {
-						return err
+						return false, err
 					}
 				case protocol.NotifyTurnState:
 					var ts protocol.TurnStateChanged
 					if err := json.Unmarshal(n.Params, &ts); err != nil {
-						return err
+						return false, err
 					}
 					switch ts.State {
 					case "completed", "failed", "idle":
-						return nil
+						return true, nil
 					}
 				}
 			case <-deadline:
-				return errors.New("no permission question arrived")
+				return false, errors.New("no permission question arrived")
 			}
 		}
 	}
@@ -226,20 +226,20 @@ func TestTUIInterruptCancelsTheRunAndExits130(t *testing.T) {
 
 	var opened string
 	prev := launchTUI
-	launchTUI = func(ctx context.Context, r clientRun) error {
+	launchTUI = func(ctx context.Context, r clientRun) (bool, error) {
 		opened = r.info.SessionID
 		self, err := os.FindProcess(os.Getpid())
 		if err != nil {
-			return err
+			return false, err
 		}
 		if err := self.Signal(os.Interrupt); err != nil {
-			return err
+			return false, err
 		}
 		select {
 		case <-ctx.Done():
-			return tea.ErrInterrupted
+			return false, tea.ErrInterrupted
 		case <-time.After(10 * time.Second):
-			return errors.New("SIGINT did not cancel the run context")
+			return false, errors.New("SIGINT did not cancel the run context")
 		}
 	}
 	t.Cleanup(func() { launchTUI = prev })
@@ -272,8 +272,8 @@ func TestTUIKilledProgramIs130OnlyWhenTheContextEnded(t *testing.T) {
 		build := testBuilder(t, &fakeProvider{})
 		fakeTerminal(t, true)
 		prev := launchTUI
-		launchTUI = func(ctx context.Context, r clientRun) error {
-			return fmt.Errorf("%w: %w", tea.ErrProgramKilled, errors.New("could not open TTY"))
+		launchTUI = func(ctx context.Context, r clientRun) (bool, error) {
+			return false, fmt.Errorf("%w: %w", tea.ErrProgramKilled, errors.New("could not open TTY"))
 		}
 		t.Cleanup(func() { launchTUI = prev })
 		out, err := runRoot(t, build)
@@ -289,19 +289,19 @@ func TestTUIKilledProgramIs130OnlyWhenTheContextEnded(t *testing.T) {
 		build := testBuilder(t, &fakeProvider{})
 		fakeTerminal(t, true)
 		prev := launchTUI
-		launchTUI = func(ctx context.Context, r clientRun) error {
+		launchTUI = func(ctx context.Context, r clientRun) (bool, error) {
 			self, err := os.FindProcess(os.Getpid())
 			if err != nil {
-				return err
+				return false, err
 			}
 			if err := self.Signal(os.Interrupt); err != nil {
-				return err
+				return false, err
 			}
 			select {
 			case <-ctx.Done():
-				return tea.ErrProgramKilled
+				return false, tea.ErrProgramKilled
 			case <-time.After(10 * time.Second):
-				return errors.New("SIGINT did not cancel the run context")
+				return false, errors.New("SIGINT did not cancel the run context")
 			}
 		}
 		t.Cleanup(func() { launchTUI = prev })
