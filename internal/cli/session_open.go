@@ -68,6 +68,14 @@ func greet(ctx context.Context, client *protocol.Client, name, version string, a
 // one, from the same values, without a store or a registry of its own.
 func openOrResume(ctx context.Context, d *dialed, o printOptions, cwd, source string) (protocol.SessionInfo, int, error) {
 	var info protocol.SessionInfo
+	// The one place the placement is applied. A remote connection's sessions live on the box
+	// and their summaries carry the box's path, so --continue and --resume have to match on
+	// the same value session.open was given; a cwd with no placement is a usage error naming
+	// --cwd, and there is nothing to open until the operator answers it.
+	cwd, err := d.place(cwd)
+	if err != nil {
+		return info, 2, err
+	}
 	id := o.Resume
 	if o.Continue && id == "" {
 		list, err := d.sessions(ctx)

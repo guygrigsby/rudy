@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/guygrigsby/rudy/internal/cli/hosts"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -33,22 +34,32 @@ const attachTimeout = 2 * time.Second
 // happens when it expires is behavior, and two seconds of it is not a test.
 var greetTimeout = 2 * time.Second
 
-// dialOptions is how a command was told to reach a server. Both empty is the default: probe
+// dialOptions is how a command was told to reach a server. All empty is the default: probe
 // the socket a daemon would be serving and start one in this process if nothing answers.
 type dialOptions struct {
 	// Socket is --socket: that server or nothing.
 	Socket string
 	// Embed is --embed: this process serves itself, whatever is answering the default socket.
 	Embed bool
+	// Host is --host: the kernel runs on that machine, reached by ssh, or the command fails.
+	Host string
+	// Cwd is --cwd: the workspace path on the host, for a cwd the home-relative rule cannot
+	// place. Only meaningful with Host.
+	Cwd string
+	// NoSync is --no-sync: open on the placement as it is, moving nothing there first.
+	NoSync bool
 }
 
-// registerDialFlags puts --socket and --embed on a command that opens a client. Every such
-// command carries both, so where a session runs is a property of the invocation rather than
-// of which verb the operator happened to type.
+// registerDialFlags puts --socket, --embed and the three host flags on a command that opens
+// a client. Every such command carries all of them, so where a session runs is a property of
+// the invocation rather than of which verb the operator happened to type.
 func registerDialFlags(cmd *cobra.Command, d *dialOptions) {
 	f := cmd.Flags()
 	f.StringVar(&d.Socket, "socket", "", "attach to the server on this unix socket instead of probing the default")
 	f.BoolVar(&d.Embed, "embed", false, "serve in this process without probing for a running server")
+	f.StringVar(&d.Host, "host", "", "run the kernel on this ssh host instead of here")
+	f.StringVar(&d.Cwd, "cwd", "", "workspace path on the host (default: your cwd's path relative to your home, under the host's home)")
+	f.BoolVar(&d.NoSync, "no-sync", false, "do not push or copy the working tree to the host before opening")
 }
 
 // dialed is a greeted connection and everything the client needs beside it. Built is nil
@@ -63,18 +74,66 @@ type dialed struct {
 	Version string // the server's, from its hello
 	Built   *Built // nil when attached
 	Close   func()
+	// Host is the machine the kernel is running on, zero when it is this one. Everything that
+	// differs about a remote connection hangs off this being set rather than off a flag the
+	// caller still holds, so a command that was handed a dialed does not need the invocation.
+	Host hosts.Host
+	// Home is the server's home directory, from its hello. The placement is computed against
+	// it; meaningless when Host is zero.
+	Home string
+	// Cwd is --cwd verbatim: the placement the operator named for a cwd the home-relative
+	// rule cannot map.
+	Cwd string
+	// NoSync is --no-sync: the working tree is not moved to the placement before a session
+	// opens on it.
+	NoSync bool
+}
+
+// place is the cwd a session opens on: the placement on the host when this connection is
+// remote, the local cwd otherwise. openOrResume calls it so no caller has to know which.
+func (d *dialed) place(localCwd string) (string, error) {
+	if d.Host.IsZero() {
+		return localCwd, nil
+	}
+	return hosts.Place(localCwd, d.Paths.Home, d.Home, d.Cwd)
 }
 
 // dial reaches a server the way the operator asked for, and starts one when they did not ask
-// for anything and none is running. The order is fixed: an explicit --socket is that server
-// or an error; --embed is this process without a probe; otherwise the default socket gets a
-// short probe and a server that is not there is one this process becomes.
+// for anything and none is running. The order is fixed: a host is that machine over ssh or an
+// error, never a local server; an explicit --socket is that server or an error; --embed is
+// this process without a probe; otherwise the default socket gets a short probe and a server
+// that is not there is one this process becomes.
 //
 // It returns the process exit code alongside the error, 2 for a usage error, so a command
 // can report a bad flag pair as one.
 func dial(ctx context.Context, build buildFunc, o BuildOptions, d dialOptions, name string, asker bool) (*dialed, int, error) {
-	if d.Socket != "" && d.Embed {
+	// The config's remote.host is read here rather than in the caller so every command that
+	// dials gets the same answer. localConfig is what attach reads anyway, and a config this
+	// process cannot parse is reported by the branch that loads it for real rather than
+	// turned into "no host" here. It is a default for an invocation that named no transport:
+	// --socket and --embed each answer where the kernel runs, so an operator who typed one
+	// has answered the question remote.host was answering, and only --host itself contradicts
+	// them.
+	host := d.Host
+	if host == "" && d.Socket == "" && !d.Embed {
+		if _, cfg, err := localConfig(o); err == nil {
+			host = cfg.Remote.Host
+		}
+	}
+	switch {
+	case d.Socket != "" && d.Embed:
 		return nil, 2, errors.New("--socket names a server to attach to and --embed says to be one; pass one or the other")
+	case d.Host != "" && (d.Socket != "" || d.Embed):
+		return nil, 2, errors.New("--host runs the kernel on another machine; it cannot be combined with --socket or --embed")
+	case (d.Cwd != "" || d.NoSync) && host == "":
+		return nil, 2, errors.New("--cwd and --no-sync only mean something with --host")
+	}
+	if host != "" {
+		h, err := hosts.ParseHost(host)
+		if err != nil {
+			return nil, 2, err
+		}
+		return dialSSH(o, h, d, name, asker)
 	}
 	if d.Socket != "" {
 		return attach(o, d.Socket, attachTimeout, name, asker)
