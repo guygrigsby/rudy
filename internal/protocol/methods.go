@@ -148,6 +148,9 @@ type ClientHelloParams struct {
 type ClientHelloResult struct {
 	Server  string `json:"server"`
 	Version string `json:"version"`
+	// Home is the server process's home directory. A client on another machine places the
+	// workspace under it (<home>/<cwd relative to its own home>); a local client ignores it.
+	Home string `json:"home"`
 }
 
 type SessionOpenParams struct {

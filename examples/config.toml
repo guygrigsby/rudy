@@ -26,6 +26,16 @@ level = "info"
 # e.g. "~/rudy.log"
 file = ""
 
+# Run the kernel on another machine over ssh, with this terminal as the client.
+# --host on the command line overrides host. Sessions, plugins, memory and the
+# provider keys are that machine's; only the terminal is here (ADR 0029).
+[remote]
+# ssh alias or user@host. Empty means the kernel runs here.
+# e.g. "box"
+host = ""
+# The rudy checkout on the host; rudy hosts install builds from it at this binary's commit.
+source = "~/projects/rudy"
+
 # The provider and model a new session opens on.
 [default]
 # A name from [providers.<name>] below.
@@ -177,6 +187,8 @@ above_editor = ["turn"]
 # Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is "<plugin>:<key>".
 # e.g. ["vim_mode", "model", "context", "cost", "workspace", "turn"]
 items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "cat"]
+# Prefix the workspace item with host: when the session runs on a --host.
+host = true
 
 # Notices are chrome under the transcript and never reach a session log.
 [ui.notices]

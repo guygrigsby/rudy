@@ -292,6 +292,7 @@ func newServerAt(t *testing.T, cfg *config.Config, storeDir, socket string, plug
 		Gate:     gate.New(nil),
 		Hooks:    plugin.NewHookRunner(preg, 5*time.Second, func(string) {}),
 		Socket:   socket,
+		Home:     t.TempDir(),
 	})
 	services := srv.PluginServices()
 	services.ProvidersChanged = func(ps []provider.Provider) { reg.SetProviders(ps...) }
@@ -1022,6 +1023,25 @@ func TestHelloMustComeFirst(t *testing.T) {
 	var pe *protocol.Error
 	if !errorsAs(err, &pe) || pe.Code != protocol.CodeUnauthorized {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestTheHelloNamesTheServersHome is the hello.home contract: a client over ssh needs the
+// server's home directory to place the workspace under it (ADR 0029).
+func TestTheHelloNamesTheServersHome(t *testing.T) {
+	srv, _ := newServerWith(t, testConfig())
+	conn := dialConn(t, srv)
+	defer func() { _ = conn.Close() }()
+	c := protocol.NewClient(conn)
+	var hello protocol.ClientHelloResult
+	if err := c.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0"}, &hello); err != nil {
+		t.Fatal(err)
+	}
+	if hello.Home == "" {
+		t.Fatal("hello.home is empty; a client over ssh places the workspace under it")
+	}
+	if !filepath.IsAbs(hello.Home) {
+		t.Fatalf("hello.home = %q, want an absolute path", hello.Home)
 	}
 }
 

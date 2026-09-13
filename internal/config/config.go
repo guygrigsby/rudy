@@ -49,6 +49,9 @@ type StatusConfig struct {
 	// typing rather than after: the turn cell and whatever else belongs with it. Same
 	// vocabulary as Items; an item named in both is drawn in both.
 	AboveEditor []string `mapstructure:"above_editor"`
+	// Host prefixes the workspace item with the host name when the session runs on a
+	// machine reached by --host or remote.host. A render choice, so a config field.
+	Host bool `mapstructure:"host"`
 }
 
 // NoticesConfig is the [ui.notices] table. Max is how many notice lines the client draws,
@@ -222,6 +225,13 @@ type Config struct {
 		Level string `mapstructure:"level"`
 		File  string `mapstructure:"file"`
 	} `mapstructure:"log"`
+	Remote struct {
+		// Host is the ssh destination that runs the kernel when --host is not given. Empty
+		// means the kernel runs here.
+		Host string `mapstructure:"host"`
+		// Source is the rudy checkout on the host, which rudy hosts install builds from.
+		Source string `mapstructure:"source"`
+	} `mapstructure:"remote"`
 	MaxTokens int      `mapstructure:"max_tokens"`
 	UI        UIConfig `mapstructure:"ui"`
 	// Keys is the [keys] table: pi action id to bound keys. Filled by hand from the raw
@@ -259,6 +269,8 @@ func Defaults() map[string]any {
 		"mcp.connect_timeout_ms":           10000,
 		"log.level":                        "info",
 		"log.file":                         "", // filled from paths.Cache when still empty after Load
+		"remote.host":                      "",
+		"remote.source":                    "~/projects/rudy",
 		"max_tokens":                       8192,
 		"prompt.file":                      "",
 		"ui.render":                        "altscreen",
@@ -288,6 +300,7 @@ func Defaults() map[string]any {
 		"ui.diff.style":                    "text",
 		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "cat"},
 		"ui.status.above_editor":           []string{"turn"},
+		"ui.status.host":                   true,
 		"ui.notices.max":                   3,
 		"ui.notices.ttl_ms":                8000,
 		"plugins.disabled":                 []string{},
@@ -397,6 +410,7 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 		c.Log.File = filepath.Join(paths.Cache, "rudy.log")
 	}
 	c.Log.File = ExpandHome(c.Log.File, paths.Home)
+	c.Remote.Source = ExpandHome(c.Remote.Source, paths.Home)
 	c.Memory.Dir = ExpandHome(c.Memory.Dir, paths.Home)
 	for i, d := range c.Skills.Dirs {
 		c.Skills.Dirs[i] = ExpandHome(d, paths.Home)
@@ -557,6 +571,9 @@ func (c *Config) validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		errs = append(errs, fmt.Errorf("config: log.level %q must be debug, info, warn or error", c.Log.Level))
+	}
+	if strings.HasPrefix(c.Remote.Host, "-") {
+		errs = append(errs, fmt.Errorf("config: remote.host %q begins with -, which ssh would read as an option; name a host alias or user@host", c.Remote.Host))
 	}
 	errs = append(errs, c.validateUI()...)
 	return errors.Join(errs...)

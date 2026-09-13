@@ -45,6 +45,8 @@ type Deps struct {
 	// one; a file the operator wrote replaces it (ADR 0024). It is read once, when the
 	// server is built, so a turn never waits on a disk read for it.
 	Prompt string
+	// Home is the home directory of the process running this server, answered in the hello.
+	Home string
 }
 
 // EntryIDResult answers session.set_model, set_mode, set_thinking, set_title and
@@ -490,7 +492,7 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// thing about who is an asker.
 	cn.asker = p.Asker
 	cn.asker = cn.isAsker()
-	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version}, nil
+	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, Home: s.d.Home}, nil
 }
 
 func (s *Server) handleClose(cn *conn, raw json.RawMessage) (any, *protocol.Error) {

@@ -503,9 +503,9 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
 | `log.level` | `debug`, `info`, `warn`, `error` | `info` | the least severe record written; `debug` adds each tool invocation and provider stream error. Any other value is refused at load |
 | `log.file` | path | `""` | empty means `$XDG_CACHE_HOME/rudy/rudy.log`, filled at load the way `sessions.dir` is; `~` expands. The record layer row above says what is written and what happens when the file cannot be opened |
-| `remote.host` | string | `""` | UNSHIPPED. The ssh destination, alias or `user@name`, of the machine that runs the kernel when `--host` is not given; empty means the kernel runs here. A value beginning with `-` is refused at load (ADR 0029) |
-| `remote.source` | path | `~/projects/rudy` | UNSHIPPED. Where the rudy checkout sits on the host, which `rudy hosts install` checks out at this binary's commit and runs `make install` in; `~` expands on the host (ADR 0029) |
-| `ui.status.host` | bool | `true` | UNSHIPPED. Show `host:` before the workspace path in the status bar when the session runs on a host reached by `--host` or `remote.host` (ADR 0029) |
+| `remote.host` | string | `""` | The ssh destination, alias or `user@name`, of the machine that runs the kernel when `--host` is not given; empty means the kernel runs here. A value beginning with `-` is refused at load (ADR 0029) |
+| `remote.source` | path | `~/projects/rudy` | Where the rudy checkout sits on the host, which `rudy hosts install` checks out at this binary's commit and runs `make install` in; `~` expands on the host (ADR 0029) |
+| `ui.status.host` | bool | `true` | Show `host:` before the workspace path in the status bar when the session runs on a host reached by `--host` or `remote.host` (ADR 0029) |
 | `ui.header.frame` | bool | true | false draws the header's lines with no box around them |
 | `ui.header.greeting` | bool | true | the time of day and a name in the header |
 | `ui.header.mark` | bool | true | the cat in the header |

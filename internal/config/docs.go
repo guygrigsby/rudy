@@ -70,6 +70,18 @@ var Sections = []Section{
 		},
 	},
 	{
+		Table: "remote",
+		Comment: []string{
+			"Run the kernel on another machine over ssh, with this terminal as the client.",
+			"--host on the command line overrides host. Sessions, plugins, memory and the",
+			"provider keys are that machine's; only the terminal is here (ADR 0029).",
+		},
+		Keys: []Doc{
+			{Key: "remote.host", Comment: "ssh alias or user@host. Empty means the kernel runs here.", Example: `"box"`},
+			{Key: "remote.source", Comment: "The rudy checkout on the host; rudy hosts install builds from it at this binary's commit."},
+		},
+	},
+	{
 		Table:   "default",
 		Comment: []string{"The provider and model a new session opens on."},
 		Keys: []Doc{
@@ -208,6 +220,7 @@ var Sections = []Section{
 		Keys: []Doc{
 			{Key: "ui.status.above_editor", Comment: "The status line, above the composer line: what is worth seeing while you type rather than after.", Example: `["turn", "context"]`},
 			{Key: "ui.status.items", Comment: "Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is \"<plugin>:<key>\".", Example: `["vim_mode", "model", "context", "cost", "workspace", "turn"]`},
+			{Key: "ui.status.host", Comment: "Prefix the workspace item with host: when the session runs on a --host."},
 		},
 	},
 	{

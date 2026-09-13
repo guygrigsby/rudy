@@ -11,6 +11,31 @@ import (
 	"github.com/guygrigsby/rudy/internal/config"
 )
 
+func TestRemoteKeysHaveDefaults(t *testing.T) {
+	paths := testPaths(t)
+	cfg, err := config.Load(paths, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Remote.Host != "" {
+		t.Fatalf("remote.host default = %q, want empty (no remote runtime)", cfg.Remote.Host)
+	}
+	if want := filepath.Join(paths.Home, "projects", "rudy"); cfg.Remote.Source != want {
+		t.Fatalf("remote.source = %q, want %q: ~ expands at load like every other path", cfg.Remote.Source, want)
+	}
+	if !cfg.UI.Status.Host {
+		t.Fatal("ui.status.host default = false, want true")
+	}
+}
+
+func TestRemoteHostRefusesAnOptionLookingValue(t *testing.T) {
+	paths := testPaths(t)
+	_, err := config.Load(paths, map[string]any{"remote.host": "-oProxyCommand=evil"})
+	if err == nil || !strings.Contains(err.Error(), "remote.host") {
+		t.Fatalf("Load accepted an ssh option as a host: %v", err)
+	}
+}
+
 func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
