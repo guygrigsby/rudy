@@ -303,29 +303,7 @@ func TestPrintOverHostSyncsTheTreeFirst(t *testing.T) {
 // The first run is the copy leg (nothing at the placement), the second is the box holding a
 // copy already, which is the other way a session ends up on a tree that comes home by tar.
 func TestPrintOverHostPullsACopiedTreeBack(t *testing.T) {
-	if testing.Short() {
-		t.Skip("builds the binary and starts a daemon")
-	}
-	requireBoxGit(t)
-	bin := builtRudy(t)
-	upstream := fakeOpenAI(t, "hello from the box")
-	home, env := boxWithProvider(t, bin, upstream.URL)
-	t.Cleanup(func() { stopBoxDaemon(t, env) })
-	t.Setenv("RUDY_SSH", sshShim(t, env))
-
-	localHome := t.TempDir()
-	t.Setenv("HOME", localHome)
-	local := filepath.Join(localHome, "projects", "plain")
-	if err := os.MkdirAll(local, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Chdir(local)
-	placement := filepath.Join(home, "projects", "plain")
-
-	build := testBuilder(t, &fakeProvider{})
+	local, placement, build := aBoxAndAPlainTree(t)
 	var stdout, stderr bytes.Buffer
 	code, err := runPrint(context.Background(), printOptions{Output: "json"}, dialOptions{Host: "box"}, "hi", build, &stdout, &stderr)
 	if err != nil || code != 0 {
@@ -347,6 +325,60 @@ func TestPrintOverHostPullsACopiedTreeBack(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(local, "box.txt")); err != nil || string(got) != "box work" {
 		t.Fatalf("the box's file did not come back when the session closed: %q %v\nstderr: %s", got, err, stderr.String())
 	}
+}
+
+// TestTUIOverHostPullsACopiedTreeBack is the same close, on the other client. The launcher
+// draws nothing and returns, which is the client exiting, and the tree still has to come home:
+// the pull hangs off the connection being remote and the tree being a copy, not off which
+// command opened the session.
+func TestTUIOverHostPullsACopiedTreeBack(t *testing.T) {
+	local, placement, build := aBoxAndAPlainTree(t)
+	// The box holds the copy already, with work of its own in it.
+	if err := os.MkdirAll(placement, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(placement, "box.txt"), []byte("box work"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeTerminal(t, true)
+	var stderr bytes.Buffer
+	drawn := false
+	launch := func(ctx context.Context, r clientRun) error { drawn = true; return nil }
+	code := runTUI(context.Background(), build, dialOptions{Host: "box"}, resumeWith(printOptions{}, "--resume", &stderr), launch, "", &stderr)
+	if code != 0 || !drawn {
+		t.Fatalf("runTUI = %d, drawn %v\nstderr: %s", code, drawn, stderr.String())
+	}
+	if got, err := os.ReadFile(filepath.Join(local, "box.txt")); err != nil || string(got) != "box work" {
+		t.Fatalf("the box's file did not come back when the client exited: %q %v\nstderr: %s", got, err, stderr.String())
+	}
+}
+
+// aBoxAndAPlainTree is a box serving turns, this machine's cwd a directory no git tracks under
+// a temp home, and nothing at the placement yet. The two close-time pull tests differ in which
+// client they run and in nothing else, so the fixture is one.
+func aBoxAndAPlainTree(t *testing.T) (local, placement string, build buildFunc) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	requireBoxGit(t)
+	bin := builtRudy(t)
+	upstream := fakeOpenAI(t, "hello from the box")
+	home, env := boxWithProvider(t, bin, upstream.URL)
+	t.Cleanup(func() { stopBoxDaemon(t, env) })
+	t.Setenv("RUDY_SSH", sshShim(t, env))
+
+	localHome := t.TempDir()
+	t.Setenv("HOME", localHome)
+	local = filepath.Join(localHome, "projects", "plain")
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(local)
+	return local, filepath.Join(home, "projects", "plain"), testBuilder(t, &fakeProvider{})
 }
 
 // requireBoxGit skips unless both ends of the sync have git and tar. This machine's half
