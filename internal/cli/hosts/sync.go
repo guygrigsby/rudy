@@ -127,6 +127,13 @@ func Decide(local LocalState, remote State) (Plan, string) {
 	}
 }
 
+// inspectMark opens the answer. An ssh command runs a shell that reads the operator's rc
+// file, and one echo in a box's .bashrc would otherwise shift every field of the reply: the
+// placement would read absent, and absent is the answer that has Push run git init and
+// unpack a tree inside whatever that directory really is. Everything up to the last marker
+// is somebody else's greeting, and an answer with no marker at all is not read at all.
+const inspectMark = "rudy-inspect"
+
 // inspectLine is the one round trip that reads a placement: whether it is there, whether it
 // is a checkout of its own, and if so its head and whether its tree is dirty. A checkout of
 // its own means its toplevel is itself: a plain directory inside somebody else's checkout
@@ -134,7 +141,8 @@ func Decide(local LocalState, remote State) (Plan, string) {
 // top would land in the wrong directory of it. Both paths come back physical, so the
 // comparison is pwd -P against a toplevel git already resolved.
 func inspectLine(placement string) string {
-	return fmt.Sprintf(`if [ ! -e %[1]s ]; then echo absent; exit 0; fi
+	return fmt.Sprintf(`echo `+inspectMark+`
+if [ ! -e %[1]s ]; then echo absent; exit 0; fi
 echo exists
 top=$(git -C %[1]s rev-parse --show-toplevel 2>/dev/null)
 here=$(cd %[1]s 2>/dev/null && pwd -P)
@@ -155,6 +163,16 @@ func Inspect(ctx context.Context, r Runner, placement string) (State, error) {
 	}
 	f := strings.Fields(out)
 	var s State
+	mark := -1
+	for i, field := range f {
+		if field == inspectMark {
+			mark = i
+		}
+	}
+	if mark < 0 {
+		return s, fmt.Errorf("reading %s: the host's shell answered %q, with none of the %s the line prints; that shell greets every ssh command and rudy cannot read past it", placement, strings.TrimSpace(out), inspectMark)
+	}
+	f = f[mark+1:]
 	if len(f) == 0 {
 		return s, fmt.Errorf("reading %s: the host answered nothing", placement)
 	}
@@ -219,12 +237,7 @@ git -C %[1]s config receive.denyCurrentBranch updateInstead`, p, init)
 		}
 	}
 	if len(deleted) > 0 {
-		names := make([]string, len(deleted))
-		for i, name := range deleted {
-			names[i] = quote(name)
-		}
-		rm := fmt.Sprintf("cd %s && rm -f -- %s", p, strings.Join(names, " "))
-		if _, err := run(ctx, r, "removing deleted files", rm, nil); err != nil {
+		if err := removeOnHost(ctx, r, placement, deleted, out); err != nil {
 			return err
 		}
 	}
@@ -233,6 +246,37 @@ git -C %[1]s config receive.denyCurrentBranch updateInstead`, p, init)
 		notice(out, fmt.Sprintf("pushed %s to %s:%s with %d uncommitted files", branch, host, placement, n))
 	} else {
 		notice(out, fmt.Sprintf("pushed %s to %s:%s", branch, host, placement))
+	}
+	return nil
+}
+
+// keptMark opens each line naming something the host would not remove. A prefix rather than
+// a bare path, for inspectMark's reason: a shell that greets its ssh commands writes into
+// this reply too, and a line that does not begin with the marker is not this line's.
+const keptMark = "rudy-keep "
+
+// removeOnHost removes the files the Mac deleted, one line, and removes no directory ever. A
+// path that is a file here and a directory there is somebody's work on the box, and rm -r on
+// it would be this client deleting a tree it never put there; a plain rm -f would exit 1 on
+// it and take the whole sync down with it, so the loop steps over it and says which. A
+// symlink is removed even when it points at a directory: what goes is the link.
+func removeOnHost(ctx context.Context, r Runner, placement string, deleted []string, out io.Writer) error {
+	names := make([]string, len(deleted))
+	for i, name := range deleted {
+		names[i] = quote(name)
+	}
+	line := fmt.Sprintf(`cd %s || exit 1
+for f in %s; do
+  if [ -d "$f" ] && [ ! -L "$f" ]; then echo "%s$f"; else rm -f -- "$f" || exit 1; fi
+done`, quote(placement), strings.Join(names, " "), keptMark)
+	answer, err := run(ctx, r, "removing deleted files", line, nil)
+	if err != nil {
+		return err
+	}
+	for _, l := range strings.Split(answer, "\n") {
+		if kept, ok := strings.CutPrefix(strings.TrimRight(l, "\r"), keptMark); ok {
+			notice(out, fmt.Sprintf("%s is a directory on the host and this deletion was skipped; remove it there if you meant to", path.Join(placement, kept)))
+		}
 	}
 	return nil
 }

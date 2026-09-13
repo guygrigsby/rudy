@@ -230,6 +230,119 @@ func TestSyncCopiesANonGitTreeOnce(t *testing.T) {
 	}
 }
 
+// TestAChattyShellCannotMakeAPlacementLookAbsent: an ssh command runs a shell that reads the
+// operator's rc file, so a box with one echo in its .bashrc prints a line before the answer.
+// Read positionally that shifts every field and the placement reads absent, which is the
+// answer that has Push initialise a repository inside whatever that directory really is and
+// unpack a tree on top of it. The marker is what makes the reply readable, and a directory
+// that is not a checkout is the refusal it was before anybody said hello.
+func TestAChattyShellCannotMakeAPlacementLookAbsent(t *testing.T) {
+	requireGit(t)
+	box := t.TempDir()
+	r := localRunner{home: box, banner: "welcome to the box"}
+	theirs := filepath.Join(box, "projects", "demo")
+	if err := os.MkdirAll(theirs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(theirs, "theirs.txt"), []byte("someone else's"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Inspect(context.Background(), r, theirs)
+	if err != nil || !got.Exists || got.IsGit {
+		t.Fatalf("Inspect under a greeting shell = %+v, %v; want an existing directory that is no checkout", got, err)
+	}
+	local := gitRepo(t, "one")
+	err = Sync(context.Background(), r, Host{destination: "box"}, local, theirs, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "not a git checkout") {
+		t.Fatalf("sync onto a plain directory = %v, want the refusal naming it", err)
+	}
+	if _, err := os.Stat(filepath.Join(theirs, ".git")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a repository was initialised in a directory that is not ours: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(theirs, "theirs.txt")); string(got) != "someone else's" {
+		t.Fatalf("the directory's own file was overwritten: %q", got)
+	}
+}
+
+// TestInspectRefusesAnAnswerWithNoMarker: a reply the client cannot place is not guessed at.
+// Fail closed, naming the shell, rather than read the first word of a greeting as a state.
+func TestInspectRefusesAnAnswerWithNoMarker(t *testing.T) {
+	_, err := Inspect(context.Background(), fixedRunner{stdout: "absent\n"}, "/srv/work")
+	if err == nil || !strings.Contains(err.Error(), "rudy-inspect") {
+		t.Fatalf("Inspect of an unmarked answer = %v, want a refusal naming the marker", err)
+	}
+}
+
+// TestATreeGitRefusesIsNotACopy: git failing is not the same as there being no repository.
+// A checkout git will not open (a dubious owner, a broken gitfile) read as a plain tree
+// would have the copy leg stream the whole object store over ssh, which is both wrong and
+// enormous. Only git's own "not a git repository" means a tree to copy.
+func TestATreeGitRefusesIsNotACopy(t *testing.T) {
+	requireGit(t)
+	box := t.TempDir()
+	r := localRunner{home: box}
+	local := t.TempDir()
+	if err := os.WriteFile(filepath.Join(local, ".git"), []byte("nonsense\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	placement := filepath.Join(box, "projects", "demo")
+	err := Sync(context.Background(), r, Host{destination: "box"}, local, placement, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "gitfile") {
+		t.Fatalf("sync of a tree git refuses = %v, want git's own message", err)
+	}
+	if _, err := os.Stat(placement); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the tree was sent to the box anyway: %v", err)
+	}
+}
+
+// TestPushNeverRemovesADirectoryOnTheHost: a path this machine deleted is a directory of
+// somebody's work on the box. Removing it is not this client's to do and a plain rm exits 1
+// on it, which would take the whole sync down; it is stepped over and named instead. Push
+// rather than Sync because a box this dirty is opened as it is by the table, and the leg
+// under test is Push's own.
+func TestPushNeverRemovesADirectoryOnTheHost(t *testing.T) {
+	requireGit(t)
+	box := t.TempDir()
+	r := localRunner{home: box}
+	local := gitRepo(t, "one")
+	placement := filepath.Join(box, "projects", "demo")
+	if err := Sync(context.Background(), r, Host{destination: "box"}, local, placement, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	work := filepath.Join(placement, "one.txt", "inner", "work.txt")
+	if err := os.Remove(filepath.Join(placement, "one.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(work), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(work, []byte("box work"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(local, "one.txt")); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := Push(context.Background(), r, Host{destination: "box"}, local, "main", placement, &out); err != nil {
+		t.Fatalf("push with a directory where a deleted file was: %v", err)
+	}
+	if got, err := os.ReadFile(work); err != nil || string(got) != "box work" {
+		t.Fatalf("the box's directory went with the deletion: %q %v", got, err)
+	}
+	if !strings.Contains(out.String(), "one.txt") {
+		t.Fatalf("no notice naming the deletion that was skipped: %q", out.String())
+	}
+}
+
+// fixedRunner answers every line the same way, for the replies no real shell would produce.
+type fixedRunner struct{ stdout string }
+
+func (f fixedRunner) Run(context.Context, string, io.Reader) (string, string, int, error) {
+	return f.stdout, "", 0, nil
+}
+
+func (f fixedRunner) URL(placement string) string { return placement }
+
 // TestQuoteSurvivesASingleQuote: every host line interpolates the placement, so the one
 // character that could end the quoting is the one worth a test.
 func TestQuoteSurvivesASingleQuote(t *testing.T) {
@@ -248,10 +361,17 @@ func TestQuoteSurvivesASingleQuote(t *testing.T) {
 // localRunner runs a host line in a local shell under a pretend home, the way the ssh shim
 // does for the cli tests. The push URL a real host gets (ssh://box/path) is rewritten to the
 // path, since there is no ssh here: Sync asks the Runner for the push URL through Runner.URL
-// so the rewrite lives in one place.
-type localRunner struct{ home string }
+// so the rewrite lives in one place. banner is the box whose rc file greets every ssh
+// command, which is a shell nobody would call broken and which every reply has to survive.
+type localRunner struct {
+	home   string
+	banner string
+}
 
 func (l localRunner) Run(ctx context.Context, line string, stdin io.Reader) (string, string, int, error) {
+	if l.banner != "" {
+		line = "echo " + l.banner + "\n" + line
+	}
 	cmd := exec.CommandContext(ctx, "sh", "-c", line)
 	cmd.Env = append(hermeticGitEnv(), "HOME="+l.home, "PATH="+os.Getenv("PATH"))
 	cmd.Stdin = stdin

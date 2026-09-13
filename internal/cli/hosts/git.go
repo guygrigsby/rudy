@@ -3,6 +3,7 @@ package hosts
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,6 +27,32 @@ func gitEnv() []string {
 	return env
 }
 
+// gitError is a git command that did not succeed: what was asked, what git said on stderr and
+// the exit status underneath. The stderr text is kept apart from the message because one
+// failure has to be told from the rest: a cwd in no repository is a tree to copy, and every
+// other refusal (a dubious owner, a broken gitfile, a bare repository) is a tree whose git
+// nature is real and whose files must not be shovelled over ssh as if it had none.
+type gitError struct {
+	args   []string
+	stderr string
+	err    error
+}
+
+func (e *gitError) Error() string {
+	if e.stderr != "" {
+		return fmt.Sprintf("git %s: %v: %s", strings.Join(e.args, " "), e.err, e.stderr)
+	}
+	return fmt.Sprintf("git %s: %v", strings.Join(e.args, " "), e.err)
+}
+
+func (e *gitError) Unwrap() error { return e.err }
+
+// notARepository is the one failure that means "there is no checkout here", git's own words
+// for it. Anything else git refuses with is a failure to report, not a tree to copy.
+func (e *gitError) notARepository() bool {
+	return strings.Contains(e.stderr, "not a git repository")
+}
+
 // gitRaw runs git in dir and returns its stdout untouched. An error names the arguments and
 // carries git's own stderr, which is the only thing that says why.
 func gitRaw(ctx context.Context, dir string, args ...string) (string, error) {
@@ -34,10 +61,7 @@ func gitRaw(ctx context.Context, dir string, args ...string) (string, error) {
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		if text := strings.TrimSpace(errb.String()); text != "" {
-			return out.String(), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, text)
-		}
-		return out.String(), fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+		return out.String(), &gitError{args: args, stderr: strings.TrimSpace(errb.String()), err: err}
 	}
 	return out.String(), nil
 }
@@ -74,10 +98,22 @@ func gitNames(ctx context.Context, dir string, args ...string) ([]string, error)
 // Local is what the client knows about its own tree: where its root is, whether it is a
 // checkout, and what branch and head it is on. A cwd that is in no checkout answers IsGit
 // false with itself as the root, which is the tree Copy sends.
+//
+// Only git's own "not a git repository" is read that way. A checkout git will not open, a
+// bare repository, a git that is not installed: each is an error here, because answering
+// "not a checkout" to any of them would have the copy leg stream the object store of a
+// repository that is sitting right there over ssh.
 func Local(ctx context.Context, localCwd string) (LocalState, error) {
 	s := LocalState{Root: localCwd}
 	root, err := gitOut(ctx, localCwd, "rev-parse", "--show-toplevel")
-	if err != nil || root == "" {
+	if err != nil {
+		var ge *gitError
+		if errors.As(err, &ge) && ge.notARepository() {
+			return s, nil
+		}
+		return s, fmt.Errorf("reading the tree at %s: %w", localCwd, err)
+	}
+	if root == "" {
 		return s, nil
 	}
 	s.IsGit, s.Root = true, root

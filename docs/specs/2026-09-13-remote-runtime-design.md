@@ -96,6 +96,16 @@ Git tree (the local cwd's workspace root is a git checkout):
 5. Diverged (neither head an ancestor of the other): refuse, naming `rudy hosts pull` and
    `git rebase`. Nothing is written anywhere.
 
+The reply to the probe of step 2 opens with a `rudy-inspect` marker and is read from the last
+one: an ssh command runs a shell that reads the operator's rc file, and a box that greets its
+commands would otherwise shift every field, read as absent and have step 1 initialise a
+repository inside a directory that is someone else's. A reply with no marker is refused rather
+than guessed at. On this side, only git's own "not a git repository" makes a cwd a tree to
+copy; a checkout git refuses to open (a dubious owner, a broken gitfile, a bare repository) is
+an error naming git's message, since copying it would stream the object store over ssh. A
+deletion whose path is a directory on the box is never removed, only named: it is work the box
+holds, and `rm` would fail on it and take the sync with it.
+
 What moves is the workspace root, so the placement the tree lands at is the root's: a cwd
 inside a checkout is a subdirectory of what travels, and the same number of segments come off
 the placement the cwd maps to. The session still opens at the cwd's placement, which the tree
