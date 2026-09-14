@@ -28,6 +28,9 @@
 | Skill | A `SKILL.md` discovered under a skills root | Plugin |
 | Agent definition | A named profile of prompt, tools and model that a subagent session runs under | Plugin |
 | Request, Notification | What a client sends the server, what the server sends a client; JSON-RPC words | Protocol |
+| Server | One process-lifetime instance of the Session runtime, identified only while it is running | Session |
+| Shutdown | The Server's orderly terminal transition: stop admission, interrupt work, close runtime resources, then close its control connection | Session |
+| Same-user connection | A unix socket connection whose peer uid the listener proved equals the server uid; the proof is transport state, never a claim in `client.hello` | Protocol |
 | Slot | A region of the client screen with an owner: transcript, input, status, header, widget | Client |
 | Theme | Named color roles with defaults | Client |
 | Row | One thing on the client screen derived from an entry: user, assistant, tool, prompt, marker | Client |
@@ -37,7 +40,7 @@
 
 | Context | Subdomain | About |
 |---------|-----------|-------|
-| Session | core | The log, the turn loop, the gate, the workspace, subagents as child sessions |
+| Session | core | The process runtime and its lifecycle, the log, the turn loop, the gate, the workspace, subagents as child sessions |
 | Provider | supporting | Endpoints, models, the registry, completions in domain types |
 | Plugin | supporting | How every capability arrives, linked or spawned, plus the hook lifecycle |
 | Client | supporting, conformist | Rendering the protocol: the TUI and the headless printer |
@@ -51,6 +54,7 @@ Inside Session, groupings that share one language:
 | Log | Session, Entry and every entry payload |
 | Loop | Turn, its states, steering |
 | Gate | Permission mode, decision, asker, safety class, dangerous set |
+| Runtime | Server, its process-lifetime identity and its orderly shutdown |
 
 ## Relationships
 
@@ -65,6 +69,7 @@ Inside Session, groupings that share one language:
 | Session (child) | Plugin (subagents) | Open Host Service | The `agent` tool opens a child session over the protocol like any client and reads its outcome back |
 | Memory (memory-go) | Plugin | ACL | The memory plugin is the only importer; fold's model call is a port satisfied from Provider |
 | Hosts | Client | Customer/Supplier | The client asks Hosts for a connection and a placement; Hosts speaks ssh and git and hands back a `Conn` and a path. Session never sees a host |
+| Session | Hosts | Open Host Service, Published Language | Hosts requests `server.shutdown` over the same greeted connection it used to inspect the remote Server, then waits for that connection to close before it starts a replacement. No Host type crosses into Session |
 | sand | Hosts | Separate Ways | Same box, same checkouts, same ssh alias; rudy takes sand's runtime behaviour (PATH over ssh, the doctor, push by URL, fetch back) and leaves the signing ring to sand |
 | Codex, Claude Code, pi | rudy | Separate Ways | Precedents only; no protocol or format shared |
 
@@ -81,7 +86,7 @@ Inside Session, groupings that share one language:
 ## Stored and derived
 
 - Stored: entries; config; the registry snapshot with its fetch time; discovered skills and agent definitions as files; provider usage on each `assistant_message`, recorded verbatim as an external fact.
-- Derived, never stored: current model, mode, thinking level and title of a session; the request context; token totals; cost from usage times registry prices; turn state; the list of sessions.
+- Derived, never stored: current model, mode, thinking level and title of a session; the request context; token totals; cost from usage times registry prices; turn state; the list of sessions; Server identity and state. No pid file is a record.
 
 ## Still open
 

@@ -1,12 +1,13 @@
 # rudy domain model
 
-Pass 1. The objects across three contexts: Session (core), Provider, Plugin. Client is conformist and renders from the Session protocol; it holds no domain model beyond the transcript view. Memory is an external Go module imported by the memory plugin; nothing in it is modeled here.
+Pass 2 adds the Server lifecycle to Session for protocol-owned daemon replacement. The model still spans Session (core), Provider, Plugin and Hosts. Client is conformist and renders from the Session protocol; it holds no domain model beyond the transcript view. Memory is an external Go module imported by the memory plugin; nothing in it is modeled here.
 
 ## Contexts
 
 ```mermaid
 flowchart TB
     subgraph SC["Session - core"]
+        Server
         Session
         Entry
         Turn
@@ -36,6 +37,7 @@ flowchart TB
     end
     CL -.-> Session
     CL --> Placement
+    Host -.-> Server
     Placement -.-> Workspace
     MEM[["memory-go<br/>(external module)"]] -.-> Plugin
     Turn --> Provider
@@ -43,7 +45,60 @@ flowchart TB
     Session --> AgentDefinition
 ```
 
-Turn drives a completion through Provider and invokes Tools registered by Plugins. Session runs a child Session under an AgentDefinition for a subagent. The registry snapshot crosses from Provider into Session as the set of selectable models. Nothing else crosses.
+Turn drives a completion through Provider and invokes Tools registered by Plugins. Server owns the process-lifetime Session runtime. Session runs a child Session under an AgentDefinition for a subagent. Hosts reaches Server only through the published protocol and never introduces Host into the kernel. The registry snapshot crosses from Provider into Session as the set of selectable models. Nothing else crosses.
+
+## Server
+
+Entity, aggregate root for one process-lifetime Session runtime. Its identity lets a client prove that a replacement connection reached a different runtime without persisting a process id.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `instanceID` | ULID | Immutable identity generated when the Server is built and returned by `client.hello`; never stored |
+| `state` | `ServerState` | `running`, `shutting_down` or `stopped` |
+| `sessions` | references to `Session` | Live sessions owned by this process |
+| `plugins` | references to `Plugin` | Live plugin runtimes owned by this process |
+
+### Behaviors
+
+- `RequestShutdown()` moves a running Server to `shutting_down` once and wakes its process owner.
+- `CompleteShutdown()` moves a shutting-down Server to `stopped` and releases clients waiting for full cleanup.
+- `ShutdownRequested() <-chan struct{}` lets the process owner react to the transition without a clock or signal guess.
+
+### Invariants
+
+- `server.shutdown` is accepted only after `client.hello`, from a non-plugin connection whose same-user identity the unix listener proved.
+- The successful `server.shutdown` response is physically written before `RequestShutdown` begins the transition.
+- The first accepted request starts shutdown. Repeats cannot start a second transition.
+- A Server in `shutting_down` admits no new work.
+- The control connection closes only after the listener, client connections, turns, sessions and plugins have completed cleanup.
+- Server identity and state are runtime facts. Neither is written to a pid file or another durable record.
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> running: build
+    running --> shutting_down: authenticated server.shutdown<br/>signal or parent context
+    shutting_down --> stopped: runtime cleanup complete
+    stopped --> [*]
+```
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `Session` | owns at runtime | 1 to 0..n |
+| `Plugin` | owns at runtime | 1 to 0..n |
+
+## ServerState
+
+Closed enum: `running`, `shutting_down`, `stopped`. Invalid transitions are refused.
+
+## ShutdownCoordinator
+
+Domain service in Session. Owns the boundary between the protocol acknowledgement and process cleanup. It flushes the successful response, requests the Server transition once, stops new admission, interrupts connection work, closes sessions and plugins within the shutdown budget, closes the listener, then marks shutdown complete so the control connection reaches EOF.
 
 ## Session
 
@@ -1192,6 +1247,8 @@ whenever it holds work: a dirty or ahead placement is opened as is.
 
 ```mermaid
 erDiagram
+    SERVER ||--o{ SESSION : "owns live"
+    SERVER ||--o{ PLUGIN : "owns live"
     SESSION ||--|{ ENTRY : owns
     SESSION ||--o| TURN : "has active"
     SESSION ||--|| WORKSPACE : owns
@@ -1216,6 +1273,13 @@ erDiagram
 
 ```mermaid
 classDiagram
+    class Server {
+        +ULID instanceID
+        +ServerState state
+        +RequestShutdown()
+        +CompleteShutdown()
+        +ShutdownRequested() chan
+    }
     class Session {
         +ULID id
         +Append(Entry) error
@@ -1285,6 +1349,8 @@ classDiagram
         +string name
         +SafetyClass safety
     }
+    Server "1" o-- "0..n" Session
+    Server "1" o-- "0..n" Plugin
     Session "1" *-- "n" Entry
     Entry "1" *-- "0..1" PermissionDecision
     PermissionDecision "1" *-- "1" Matcher

@@ -72,6 +72,9 @@ The box-side process, `rudy bridge`. Not a domain object so much as the runtime'
 - Copies messages both ways until either side closes. ssh closing the bridge's stdin closes
   the socket connection, which is the client detaching as ADR 0014 defines it.
 - `--no-start` makes `ErrNoServer` an exit rather than a start. `hosts check` uses it.
+- `--stop` never starts a daemon. It greets an answering Server, sends `server.shutdown`,
+  waits for the control connection to close after full runtime cleanup, and treats no
+  answering Server as success. It never reads or signals a process id.
 
 ### Sync
 
@@ -156,8 +159,13 @@ host renamed in ssh config leaves no stale remote behind.
 - Automatic install happens on connect in two cases: rudy is not on the host's PATH (bridge
   exit 111), or no daemon is running and the versions differ. A running daemon with a
   different version is left alone: restarting it would end live turns.
-- `rudy hosts install [host]` runs it on demand. It restarts a daemon that has no live
-  session and refuses one that does, unless `--force`.
+- `rudy hosts install [host]` runs it on demand. Without `--force`, an answering daemon is
+  left running and the command reports that the new binary takes effect on its next start.
+  With `--force`, the command keeps the greeted connection it inspected, installs the binary,
+  sends `server.shutdown` on that exact connection, waits for EOF after cleanup, then connects
+  again through the normal bridge start path. The old and new `client.hello.instance_id`
+  values must differ. A legacy daemon without `server.shutdown` fails closed and is never
+  replaced by pid signaling.
 - `make install` on the host needs Go and the memory checkout beside `remote.source`.
   `hosts check` reports each missing piece by name.
 
@@ -216,13 +224,16 @@ does not reconnect: it reports the drop and exits non-zero, and `rudy -p --host 
 - `rudy hosts install [host] [--force]`: version and install, above.
 - `rudy hosts push [host] [--no-verify]`: the sync, on demand.
 - `rudy hosts pull [host]`: the return path, above.
-- `rudy bridge [--no-start]`: the box side. Top-level and verb-shaped, named in the shape
+- `rudy bridge [--no-start|--stop]`: the box side. Top-level and verb-shaped, named in the shape
   test beside `serve`: it is the process the transport is made of, and there is no noun it
   acts on.
 - Config: `remote.host` (string, `""`), `remote.source` (path, `~/projects/rudy`). Two keys,
   each with a default, a catalogue entry, a contracts row and the regenerated example.
-- Protocol: `client.hello` result gains `home`, the server process's home directory. The
-  local client ignores it.
+- Protocol: `client.hello` result gains `home`, the server process's home directory, and
+  `instance_id`, the process-lifetime Server identity. The local client ignores `home`.
+  `server.shutdown {}` is accepted only from a greeted non-plugin connection carrying the
+  same-user marker minted by the unix listener. The success response is sent before cleanup;
+  that connection reaches EOF only after cleanup completes.
 - Status bar: the workspace item reads `box:/home/guy/projects/rudy` when the session is
   remote. A render choice, so `ui.status.host` (bool, `true`) governs it.
 
@@ -257,7 +268,9 @@ push` and `sync: pull` (host, mode git or copy, files). On the box: `bridge: con
   line, the bridge, the daemon start, the mapped placement, the git push and the pull against
   a temp bare checkout, and the reconnect. Every error branch by breaking the shim: exit 111,
   a daemon that refuses to start, a dirty placement, diverged heads.
-- The server suite is unchanged; nothing in the kernel moved.
+- The server suite proves shutdown authorization, response-before-transition ordering,
+  single transition semantics and completion ordering. The real bridge path proves stop with
+  no daemon, stop with a daemon and install replacement with a changed Server identity.
 - One manual run against a real box before any claim of done, reported as what was run.
 
 ## Not in this wave
