@@ -1,8 +1,11 @@
-# The remote runtime: a box runs the agent, the Mac is the control plane
+# The remote workspace: a box runs the agent, the Mac is the control plane
 
-Status: design, approved in conversation 2026-09-13. ADR 0029 records the decisions.
-Contracts pass 7 carries the rows. Companion to `github.com/guygrigsby/sand`, whose
-behaviour this wave brings into rudy for the runtime half and leaves alone for the git ring.
+Status: Hosts placement, sync and install design, approved in conversation 2026-09-13. ADR
+0029 records the original decisions. ADR 0032 and
+`2026-09-14-acp-remote-runtime-design.md` supersede this document's private ssh session carrier
+and bridge lifecycle after compatibility. This document remains normative for Host, Placement,
+Sync and versioned install. Companion to `github.com/guygrigsby/sand`, whose behavior this wave
+brings into Rudy for the workspace half and leaves alone for the git ring.
 
 ## Problem
 
@@ -28,8 +31,9 @@ reach one is this wave, so it ships first and the sandbox gets its own spec afte
   decides, the last asker leaving denies it `no_asker`. Tested over the socket.
 - A turn outlives its client. `session.resume` replays it. A locked session names its socket.
 
-So a remote kernel is a fourth transport and a workspace transfer. The protocol does not
-change except for one field.
+ADR 0029 originally made the remote kernel a fourth private transport plus a workspace
+transfer. ADR 0032 replaces that transport with an ACP edge. The workspace transfer below does
+not change.
 
 ## Domain
 
@@ -59,9 +63,10 @@ Value object. The workspace path on the host for a local cwd.
   directly; without it the command fails naming the flag. `--cwd` without `--host` is refused.
 - Invariant: absolute on the host.
 
-### Bridge
+### Compatibility bridge
 
-The box-side process, `rudy bridge`. Not a domain object so much as the runtime's edge.
+The original box-side process, `rudy bridge`. ADR 0032 replaces it with `rudy acp` after ACP
+parity. These rules remain only for installed binaries during the compatibility phase.
 
 - Dials the host's default socket (`Paths.Socket()` on the host, honouring the host's
   environment) with the attach timeout. `ErrNoServer` starts `rudy serve` detached, stderr to
@@ -161,56 +166,38 @@ host renamed in ssh config leaves no stale remote behind.
   different version is left alone: restarting it would end live turns.
 - `rudy hosts install [host]` runs it on demand. Without `--force`, an answering daemon is
   left running and the command reports that the new binary takes effect on its next start.
-  With `--force`, the command keeps the greeted connection it inspected, installs the binary,
-  sends `server.shutdown` on that exact connection, requires matching `server.stopped` proof
-  followed by EOF after cleanup, then connects
-  again through the normal bridge start path. The old and new `client.hello.instance_id`
-  values must differ. A legacy daemon without `server.shutdown` fails closed and is never
-  replaced by pid signaling.
+  With `--force`, the command keeps the ACP connection it inspected, installs the binary,
+  sends negotiated `_rudy/server_shutdown`, requires its terminal `stopped` result, then waits
+  for adapter EOF and connects again through the normal ACP start path. EOF alone is never
+  cleanup proof. The old and new Server `instanceId` values must differ.
+  Compatibility binaries use `rudy bridge --stop` under ADR 0030. A legacy daemon without
+  protocol-owned shutdown fails closed and is never replaced by pid signaling.
 - `make install` on the host needs Go and the memory checkout beside `remote.source`.
   `hosts check` reports each missing piece by name.
 
 ## Reaching the box
 
-Dial order for every command that opens a client (`rudy`, `rudy -p`, `rudy sessions
-resume|fork`):
+Dial precedence for every command that opens a client (`rudy`, `rudy -p`, `rudy sessions
+resume|fork`) remains:
 
 1. `--socket`: that socket or fail.
 2. `--embed`: this process.
-3. `--host`, else `remote.host`: ssh or fail. No local fallback, for the reason a deaf
-   `--socket` is fatal today: a fallback would run the agent on the wrong machine and say
-   nothing.
+3. `--host`, else `remote.host`: ACP over ssh or fail. No local fallback.
 4. Otherwise the 50ms probe of the local socket, then embed.
 
 `--host` with `--socket` or `--embed` is exit 2.
 
-The remote line, one ssh invocation, sand's shape:
-
-```
-PATH="$HOME/.local/bin:$HOME/bin:$HOME/go/bin:$PATH"; command -v rudy >/dev/null 2>&1 || exit 111; exec rudy bridge
-```
-
-`ssh box '<cmd>'` runs a non-interactive shell with the compiled-in PATH, so the three
-user-local bin directories are prepended. Exit 111 is rudy missing; the client answers it by
-installing (above) and retrying once. Any other non-zero exit shows ssh's and the bridge's
-stderr verbatim, since rudy was there to explain itself.
-
-The client wraps ssh's stdin and stdout in `NewStreamConn` and greets. The greet timeout over
-ssh is 30s rather than 2s: the bridge may be starting a daemon that is loading plugins and
-refreshing its registry.
-
-`RUDY_SSH` names the ssh binary. It exists for the test shim and is not a config key. The
-sync's own git runs with `GIT_SSH_COMMAND` set from it, since a push by URL is the same reach
-as the bridge and an ssh honoured for one and ignored for the other would be two transports.
+The ACP contract, remote command and reconnect behavior live in
+`2026-09-14-acp-remote-runtime-design.md`. Hosts still performs Sync before ACP `session/new`
+and passes the absolute Placement as its cwd. `RUDY_SSH` still names the ssh binary for the
+test shim and Sync's `GIT_SSH_COMMAND`.
 
 ### Disconnect
 
-ssh dropping mid-turn is ADR 0014 unchanged: the turn finishes on the box, entries land in the
-box's log, a standing question is denied `no_asker` when the last asker leaves. The TUI, when
-the connection ends without the operator quitting, redials with backoff (1s doubling to 30s,
-until quit) and sends `session.resume` for the same id, which replays the transcript. `-p`
-does not reconnect: it reports the drop and exits non-zero, and `rudy -p --host box
---continue` picks the session up.
+ssh dropping mid-turn leaves the daemon and Turn running. The ACP adapter detaches; a standing
+question is denied `no_asker` when the last asker leaves. The TUI reconnects and uses ACP
+`session/load` for the same Rudy ULID so missed entries rebuild its view. `-p` reports the drop
+and exits nonzero; `rudy -p --host box --continue` loads the Session.
 
 ## Commands, flags, config
 
@@ -218,16 +205,16 @@ does not reconnect: it reports the drop and exits non-zero, and `rudy -p --host 
   `--embed` on every command that dials. `--cwd` and `--no-sync` require `--host`.
 - `rudy hosts check [host]`: the doctor. Concurrent checks, printed in listed order, each gap
   with the command that fixes it: ssh answers; rudy on PATH over ssh; version against ours;
-  a daemon answering (`bridge --no-start`); `remote.source` is a checkout with the memory
+  a daemon answering through `rudy acp --no-start`; `remote.source` is a checkout with the memory
   sibling and Go; the placement for the current cwd exists and is a git checkout when the
   local one is. Exit 1 on any gap. Sand's `init` without the config prompts, which rudy does
   not need: `remote.host` is one line in `config.toml`.
 - `rudy hosts install [host] [--force]`: version and install, above.
+- `rudy hosts stop [host]`: negotiated ACP shutdown, idempotent when no daemon answers.
 - `rudy hosts push [host] [--no-verify]`: the sync, on demand.
 - `rudy hosts pull [host]`: the return path, above.
-- `rudy bridge [--no-start|--stop]`: the box side. Top-level and verb-shaped, named in the shape
-  test beside `serve`: it is the process the transport is made of, and there is no noun it
-  acts on.
+- `rudy acp [--no-start]`: the box-side ACP v1 agent. Top-level and verb-shaped, named in the
+  shape test beside `serve`. `rudy bridge` remains only during the compatibility phase.
 - Config: `remote.host` (string, `""`), `remote.source` (path, `~/projects/rudy`). Two keys,
   each with a default, a catalogue entry, a contracts row and the regenerated example.
 - Protocol: `client.hello` result gains `home`, the server process's home directory, and
@@ -243,8 +230,8 @@ does not reconnect: it reports the drop and exits non-zero, and `rudy -p --host 
 ## Logging
 
 Records on the client: `host: dial` (host, placement), `host: install` (host, rev), `sync:
-push` and `sync: pull` (host, mode git or copy, files). On the box: `bridge: connect`,
-`bridge: daemon started`, from the bridge process, which uses the host's log file.
+push` and `sync: pull` (host, mode git or copy, files). `rudy acp` writes fixed adapter
+diagnostics and correlation ids to stderr; daemon detail stays in the host's log file.
 
 ## Errors
 
@@ -253,14 +240,14 @@ push` and `sync: pull` (host, mode git or copy, files). On the box: `bridge: con
 | ssh cannot connect | ssh's stderr verbatim, exit 1; no fallback |
 | rudy not on the host's PATH | install, retry once; a second 111 is exit 1 with the install's output |
 | install refused (dirty or dev version) | exit 1, the reason and `rudy hosts install` after a release build |
-| daemon fails to start | bridge's stderr, exit 1 |
+| daemon fails to start | Fixed ACP adapter stderr with a correlation id, exit 1; detail stays in the box log and is never tailed over ssh |
 | placement unmapped (cwd outside home, no `--cwd`) | exit 2 naming `--cwd` |
 | placement exists and is not a git checkout while the local tree is | exit 1 naming the path |
 | diverged branches | exit 1 naming `rudy hosts pull` |
 | dirty box with uncommitted Mac changes | notice; open without copying |
 | version mismatch | notice; connect |
-| ssh drops mid-session (TUI) | reconnect with backoff, `session.resume` |
-| ssh drops mid-session (`-p`) | exit non-zero naming `--continue` |
+| ssh drops mid-session (TUI) | reconnect with backoff, ACP `session/load` |
+| ssh drops mid-session (`-p`) | exit nonzero naming `--continue` |
 
 ## Testing
 
@@ -268,12 +255,12 @@ push` and `sync: pull` (host, mode git or copy, files). On the box: `bridge: con
   heads, the remote line's text.
 - The real path in `go test`: `RUDY_SSH` points at a shim that runs the remote line locally
   under a temp `HOME` with `XDG_RUNTIME_DIR` set, so `rudy -p --host shim '...'` runs the PATH
-  line, the bridge, the daemon start, the mapped placement, the git push and the pull against
-  a temp bare checkout, and the reconnect. Every error branch by breaking the shim: exit 111,
-  a daemon that refuses to start, a dirty placement, diverged heads.
+  line, ACP agent, daemon start, mapped placement, git push and pull against a temp bare
+  checkout, then reconnect by load. Every error branch by breaking the shim: exit 111, a daemon
+  that refuses to start, a dirty placement and diverged heads.
 - The server suite proves shutdown authorization, response-before-transition ordering,
-  single transition semantics and completion ordering. The real bridge path proves stop with
-  no daemon, stop with a daemon and install replacement with a changed Server identity.
+  single transition semantics and completion ordering. The ACP path proves stop with no
+  daemon, stop with a daemon and install replacement with a changed Server identity.
 - One manual run against a real box before any claim of done, reported as what was run.
 
 ## Not in this wave

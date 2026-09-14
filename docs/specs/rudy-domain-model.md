@@ -1,6 +1,10 @@
 # rudy domain model
 
-Pass 3 adds explicit terminal proof to the Server lifecycle for protocol-owned daemon replacement. The model still spans Session (core), Provider, Plugin and Hosts. Client is conformist and renders from the Session protocol; it holds no domain model beyond the transcript view. Memory is an external Go module imported by the memory plugin; nothing in it is modeled here.
+Pass 4 puts stable ACP v1 at the remote client boundary. Pass 3 added explicit terminal proof
+to the Server lifecycle for protocol-owned daemon replacement. The model still spans Session
+(core), Provider, Plugin and Hosts. Client is conformist and renders through SessionClient; the
+local protocol client and remote ACP client are adapters. Memory is an external Go module
+imported by the memory plugin; nothing in it is modeled here.
 
 ## Contexts
 
@@ -26,6 +30,7 @@ flowchart TB
         AgentDefinition
     end
     subgraph CL["Client"]
+        SessionClient
         TranscriptRow
         Editor
         Theme
@@ -35,9 +40,14 @@ flowchart TB
         Host
         Placement
     end
-    CL -.-> Session
+    ACPC["ACP client adapter"] --> SessionClient
+    LOCAL["local protocol adapter"] --> SessionClient
+    SessionClient -.-> Session
     CL --> Placement
-    Host -.-> Server
+    ACP["ACP v1 (external)"] -.-> ACPC
+    ACP -.-> ACPA["ACP agent adapter"]
+    ACPA -.-> Server
+    Host -.-> ACPC
     Placement -.-> Workspace
     MEM[["memory-go<br/>(external module)"]] -.-> Plugin
     Turn --> Provider
@@ -45,7 +55,151 @@ flowchart TB
     Session --> AgentDefinition
 ```
 
-Turn drives a completion through Provider and invokes Tools registered by Plugins. Server owns the process-lifetime Session runtime. Session runs a child Session under an AgentDefinition for a subagent. Hosts reaches Server only through the published protocol and never introduces Host into the kernel. The registry snapshot crosses from Provider into Session as the set of selectable models. Nothing else crosses.
+Turn drives a completion through Provider and invokes Tools registered by Plugins. Server owns
+the process-lifetime Session runtime. Session runs a child Session under an AgentDefinition for
+a subagent. Client reaches Session through SessionClient. ACP types stop at the client and agent
+adapters. Hosts never introduces Host into the kernel. The registry snapshot crosses from
+Provider into Session as the set of selectable models. Nothing else crosses.
+
+## SessionClient
+
+Port owned by Client. It exposes session operations and events in Rudy types without naming a
+transport or wire protocol.
+
+### Operations
+
+- initialize a client and report server version, home and process-lifetime instance identity
+- open, load, resume, list, close and fork Sessions
+- submit, run an operator shell command, steer, cancel and answer permission requests
+- set model, mode, thinking and title
+- compact, run registered slash commands and list or refresh the model registry
+- receive entries, stream parts, turn and tool state, permission requests, status, widgets,
+  plugin state, registry state and notices
+
+### Implementations
+
+- The local implementation wraps the existing internal protocol over in-memory or Unix socket
+  connections.
+- The remote implementation wraps the ACP client adapter over ssh stdio.
+
+### Invariants
+
+- Port values contain no ACP SDK, JSON-RPC, ssh or protocol envelope types.
+- An implementation preserves Rudy session and entry ids exactly.
+- Load replays durable entries and current live state. Resume attaches without replay.
+- One load or resume per Session may run on a connection at a time; other Sessions remain
+  concurrent.
+- A slow event consumer has a bounded queue and is disconnected on overflow. It never grows
+  memory behind a running daemon.
+- Reconnection does not create a Session. It loads or resumes the same ULID.
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `LocalProtocolAdapter` | implemented by | 1 to 1 per local client |
+| `ACPClientAdapter` | implemented by | 1 to 1 per remote client |
+
+## LocalProtocolAdapter
+
+Client edge for embedded and Unix socket operation. It implements SessionClient by calling the
+existing protocol client. Its connection identity, asker bit and replay behavior remain the
+internal contract.
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `SessionClient` | implements | 1 to 1 |
+| `Server` | references through one internal connection | 1 to 1 while connected |
+
+## ACPAgentAdapter
+
+Process edge implemented by `rudy acp`. It serves stable ACP v1 over stdio and translates into
+the internal protocol over a same-user Unix socket. It owns negotiated ACP capabilities,
+request correlation, replay suppression and one bounded connection queue. None is durable.
+
+### Invariants
+
+- The Rudy Session ULID is the ACP `SessionId`; no identity map exists.
+- Standard ACP methods are used when available. `_rudy` methods require version negotiation.
+- ACP types never cross into Session, Provider, Plugin, Hosts or the Client port.
+- The adapter advertises no auth method and never handles provider credentials.
+- The adapter never calls ACP client filesystem or terminal methods.
+- New, load and resume reject client-supplied MCP servers and additional directories. Plugins
+  and the Session's stored Workspace remain authoritative.
+- Session list applies an optional normalized primary Workspace filter before returning metadata.
+- Prompt and Rudy steer use one content translator. Extensions cannot bypass negotiated content
+  capabilities.
+- A gated reader prevents SDK receive until a sanitized logger is installed. Reader and writer
+  wrappers reject ACP frames above 8 MiB. The reader admits 64 unique request ids and the writer
+  releases each slot with its response, disconnecting before another SDK goroutine can start.
+- Internal notices, plugin failure reasons and registry failures cross ACP only through explicit
+  safe text or fixed fallbacks. Raw provider and plugin errors stay in the box log.
+- A generic ACP client makes the internal connection an asker. A negotiated Rudy client sets
+  the asker bit explicitly so headless remains unable to answer permission requests.
+- Disconnect closes only the adapter's internal client connection. Server and Turns continue.
+- `_rudy/server_shutdown` maps to `server.shutdown`; the Unix listener's same-user marker is
+  still the authority. ACP success requires matching internal `server.stopped` followed by EOF.
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> waiting_initialize: process starts
+    waiting_initialize --> connecting_daemon: valid ACP initialize
+    connecting_daemon --> serving: internal hello succeeds
+    connecting_daemon --> closed: daemon connection fails
+    serving --> closed: ACP EOF, framing failure or queue overflow
+    serving --> waiting_shutdown: shutdown accepted internally
+    waiting_shutdown --> closed: matching server.stopped then internal EOF
+    closed --> [*]
+```
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `Server` | references through the internal protocol | 1 to 1 while serving |
+| `ACPClientAdapter` | referenced by an ACP connection | 1 to 1 per process |
+
+## ACPClientAdapter
+
+Client edge used by remote TUI and headless commands. It implements SessionClient, receives a
+bidirectional ssh stdio stream from Hosts and translates standard plus negotiated Rudy events
+into Client values. It does not start ssh or move a workspace.
+
+### Invariants
+
+- ssh owns authentication, encryption and host keys. The adapter adds no token.
+- `--host` failure never falls back to a local Server.
+- Required Rudy capabilities are checked before a Session opens.
+- A TUI reconnect loads the same Session to recover missed entries. Headless reports the drop
+  and exits nonzero.
+- Provider credentials, provider bodies and raw tool payloads never enter client errors.
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> disconnected
+    disconnected --> initializing: local start or ssh connected
+    initializing --> ready: ACP initialize and required capabilities succeed
+    initializing --> closed: initialize fails
+    ready --> reconnecting: unexpected ssh loss in TUI
+    ready --> closed: operator closes or headless connection ends
+    reconnecting --> ready: initialize then session load succeeds
+    reconnecting --> closed: operator quits
+    closed --> [*]
+```
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `SessionClient` | implements | 1 to 1 |
+| `Host` | references | 1 to 1 |
+| `ACPAgentAdapter` | references through one ACP connection | 1 to 1 while connected |
 
 ## Server
 
@@ -1214,6 +1368,7 @@ ssh config resolves it.
 | With | Kind | Cardinality |
 |---|---|---|
 | `Placement` | placed on | 1 to many |
+| `ACPClientAdapter` | reached by | 1 to 0..many over time |
 
 ## Placement
 
@@ -1228,8 +1383,10 @@ Value object, Hosts context. The workspace path on a host for a local cwd.
 
 ### Invariants
 
-- Computed only after `client.hello` returned `home`; a cwd outside the local home with no `--cwd` has no placement and the command fails naming the flag.
-- `session.open` is sent with `path` as `cwd`. The kernel detects the Workspace there; a Placement is never a Workspace.
+- Computed only after ACP initialize returned `_meta._rudy.home`; a cwd outside the local home
+  with no `--cwd` has no placement and the command fails naming the flag.
+- ACP `session/new` is sent with `path` as `cwd`; the ACP agent adapter sends internal
+  `session.open`. The kernel detects the Workspace there; a Placement is never a Workspace.
 
 ### Relationships
 
@@ -1240,14 +1397,22 @@ Value object, Hosts context. The workspace path on a host for a local cwd.
 
 ## Sync
 
-Domain service, Hosts context. Moves the tree between the local cwd and a Placement before
-a new session opens, and back on demand. Decision table in the spec. The box is truth
-whenever it holds work: a dirty or ahead placement is opened as is.
+Domain service, Hosts context. Moves the tree between the local cwd and a Placement over ssh
+sideband before ACP `session/new`, and back on demand. Decision table in the spec. The box is
+truth whenever it holds work: a dirty or ahead placement is opened as is. ACP filesystem and
+terminal methods are never part of Sync.
 
 ## Everything at once
 
 ```mermaid
 erDiagram
+    HOST ||--o{ PLACEMENT : places
+    HOST ||--o{ ACP_CLIENT_ADAPTER : reaches
+    ACP_CLIENT_ADAPTER ||--|| SESSION_CLIENT : implements
+    LOCAL_PROTOCOL_ADAPTER ||--|| SESSION_CLIENT : implements
+    ACP_CLIENT_ADAPTER }o--|| ACP_AGENT_ADAPTER : "ACP v1"
+    ACP_AGENT_ADAPTER }o--|| SERVER : attaches
+    PLACEMENT ||--|| WORKSPACE : "detects at"
     SERVER ||--o{ SESSION : "owns live"
     SERVER ||--o{ PLUGIN : "owns live"
     SESSION ||--|{ ENTRY : owns
@@ -1274,6 +1439,30 @@ erDiagram
 
 ```mermaid
 classDiagram
+    class SessionClient {
+        <<interface>>
+        +Initialize()
+        +Open()
+        +Load()
+        +Resume()
+        +Prompt()
+        +Events()
+    }
+    class ACPClientAdapter {
+        +RemoteStream stream
+        +Capabilities negotiated
+        +Connect()
+        +ReconnectAndLoad()
+    }
+    class LocalProtocolAdapter {
+        +Conn conn
+    }
+    class ACPAgentAdapter {
+        +Capabilities negotiated
+        +Correlation pending
+        +ReplayMode replay
+        +Serve()
+    }
     class Server {
         +ULID instanceID
         +ServerState state
@@ -1351,6 +1540,12 @@ classDiagram
         +string name
         +SafetyClass safety
     }
+    ACPClientAdapter ..|> SessionClient
+    LocalProtocolAdapter ..|> SessionClient
+    ACPClientAdapter --> ACPAgentAdapter : ACP v1 over ssh stdio
+    ACPAgentAdapter --> Server : Rudy protocol over Unix
+    Host --> ACPClientAdapter
+    Placement --> Workspace
     Server "1" o-- "0..n" Session
     Server "1" o-- "0..n" Plugin
     Session "1" *-- "n" Entry

@@ -28,6 +28,9 @@
 | Skill | A `SKILL.md` discovered under a skills root | Plugin |
 | Agent definition | A named profile of prompt, tools and model that a subagent session runs under | Plugin |
 | Request, Notification | What a client sends the server, what the server sends a client; JSON-RPC words | Protocol |
+| SessionClient | The Client port for opening, loading and driving Sessions and receiving their events, expressed only in Rudy types | Client |
+| ACP agent adapter | The box-side anti-corruption layer that serves ACP v1 and drives the Session protocol through a same-user Unix connection | Client edge |
+| ACP client adapter | The Mac-side anti-corruption layer that implements SessionClient by speaking ACP v1 over ssh stdio | Client edge |
 | Server | One process-lifetime instance of the Session runtime, identified only while it is running | Session |
 | Shutdown | The Server's orderly terminal transition: stop admission, interrupt work, close runtime resources, then close its control connection | Session |
 | Same-user connection | A unix socket connection whose peer uid the listener proved equals the server uid; the proof is transport state, never a claim in `client.hello` | Protocol |
@@ -43,9 +46,10 @@
 | Session | core | The process runtime and its lifecycle, the log, the turn loop, the gate, the workspace, subagents as child sessions |
 | Provider | supporting | Endpoints, models, the registry, completions in domain types |
 | Plugin | supporting | How every capability arrives, linked or spawned, plus the hook lifecycle |
-| Client | supporting, conformist | Rendering the protocol: the TUI and the headless printer |
+| Client | supporting, conformist | Rendering Sessions through SessionClient: the TUI and the headless printer |
 | Memory | generic, external | The OKF bundle, reached through the memory-go SDK |
-| Hosts | supporting | Reaching a kernel on another machine over ssh, placing the workspace there and moving the tree in and out; client side only (ADR 0029) |
+| Hosts | supporting | Reaching an ACP agent on another machine over ssh, placing the workspace there and moving the tree in and out; client side only (ADR 0029, ADR 0032) |
+| ACP | generic, external | Stable agent-client methods, capabilities, content and updates; reached only through two anti-corruption layers |
 
 Inside Session, groupings that share one language:
 
@@ -60,7 +64,7 @@ Inside Session, groupings that share one language:
 
 | Upstream | Downstream | Pattern | Notes |
 |----------|-----------|---------|-------|
-| Session | Client | Open Host Service, Published Language | The protocol; clients conform and render from entries plus deltas |
+| Session | Client | Open Host Service, Published Language | The internal protocol; the local SessionClient implementation conforms and renders from entries plus deltas |
 | Provider | Session | Customer/Supplier | Session asks for completions in domain types; never sees a wire shape |
 | Vendor SDK, aperture, local servers | Provider | ACL | The two codecs and the provider plugins are the only packages that speak a wire format |
 | Plugin | Session | Partnership | Plugins contribute tools, commands and hook handlers; Session fires hook points |
@@ -68,8 +72,10 @@ Inside Session, groupings that share one language:
 | MCP servers | Plugin | ACL | The `mcp` plugin adapts go-sdk tools into rudy tools; MCP types stay inside it; servers come from `mcp.toml` |
 | Session (child) | Plugin (subagents) | Open Host Service | The `agent` tool opens a child session over the protocol like any client and reads its outcome back |
 | Memory (memory-go) | Plugin | ACL | The memory plugin is the only importer; fold's model call is a port satisfied from Provider |
-| Hosts | Client | Customer/Supplier | The client asks Hosts for a connection and a placement; Hosts speaks ssh and git and hands back a `Conn` and a path. Session never sees a host |
-| Session | Hosts | Open Host Service, Published Language | Hosts requests `server.shutdown` over the same greeted connection it used to inspect the remote Server, then requires matching `server.stopped` proof and EOF before it starts a replacement. No Host type crosses into Session |
+| ACP | Client | Conformist, ACL | `acpclient` translates ACP v1 into SessionClient. ACP types stop at the adapter |
+| Session | ACP | Open Host Service, ACL | `acpagent` translates ACP v1 into the internal protocol over a same-user Unix connection. Session sees an ACP caller class, never an ACP type |
+| Hosts | Client | Customer/Supplier | Client asks Hosts for a remote stdio stream and Placement; `acpclient` wraps the stream. Hosts speaks ssh and git but imports no ACP type. Session never sees a host |
+| Session | Hosts | Open Host Service, Published Language | Hosts negotiates `_rudy/server_shutdown`; the ACP agent adapter requests `server.shutdown` over the same greeted connection it used to inspect the remote Server and returns success only after matching `server.stopped` plus internal EOF. No Host type crosses into Session |
 | sand | Hosts | Separate Ways | Same box, same checkouts, same ssh alias; rudy takes sand's runtime behaviour (PATH over ssh, the doctor, push by URL, fetch back) and leaves the signing ring to sand |
 | Codex, Claude Code, pi | rudy | Separate Ways | Precedents only; no protocol or format shared |
 
@@ -81,12 +87,12 @@ Inside Session, groupings that share one language:
 | tool | A callable with a safety class and schema | MCP: a server-declared function | rudy `Tool`; the MCP plugin translates |
 | event | would have meant log item, notification and hook lifecycle | | Not a word here: `Entry`, `Notification`, `Hook point` |
 | command | | slash command versus shell command | Always qualified: `SlashCommand`, `ShellCommand` |
-| agent | | pi: the loop; ADK: a framework object; Claude Code: a subagent | No `Agent` object. A subagent is a child Session under an `AgentDefinition` |
+| agent | | pi: the loop; ADK: a framework object; Claude Code: a subagent; ACP: the process serving the agent side of the protocol | No `Agent` object. A subagent is a child Session under an `AgentDefinition`; the external process is always `ACP agent adapter` |
 
 ## Stored and derived
 
 - Stored: entries; config; the registry snapshot with its fetch time; discovered skills and agent definitions as files; provider usage on each `assistant_message`, recorded verbatim as an external fact.
-- Derived, never stored: current model, mode, thinking level and title of a session; the request context; token totals; cost from usage times registry prices; turn state; the list of sessions; Server identity and state. No pid file is a record.
+- Derived, never stored: current model, mode, thinking level and title of a session; the request context; token totals; cost from usage times registry prices; turn state; the list of sessions; Server identity and state; ACP request correlation, negotiated capabilities, replay suppression and list cursors. No pid file or ACP session map is a record.
 
 ## Still open
 

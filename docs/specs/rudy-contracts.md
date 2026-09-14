@@ -1,5 +1,12 @@
 # rudy contracts
 
+Pass 10, 2026-09-14: stable ACP v1 replaces the private remote session carrier (ADR 0032).
+`rudy acp` is an edge adapter over stdio; it translates through a same-user Unix connection
+and leaves the internal protocol, kernel and records unchanged. The Mac client reaches it over
+ssh through a Rudy-typed SessionClient port. Standard ACP methods carry standard behavior;
+versioned `_rudy` methods carry only Rudy parity. Workspace sync remains ssh sideband and
+provider identity remains on the box. Written before the code.
+
 Pass 9, 2026-09-14: daemon shutdown completion gains explicit terminal proof (ADR 0031). After successful cleanup the retained control connection receives `server.stopped {instance_id, state: "stopped"}` before EOF. Bare EOF means crash, transport loss or failed cleanup and never authorizes replacement. A tentative shutdown claim fences work without moving public Server state. Recorded with the security hardening before final verification.
 
 Pass 8, 2026-09-14: protocol-owned Server shutdown replaces pid signaling for daemon upgrades (ADR 0030). `server.shutdown` is confined to greeted non-plugin connections whose same-user identity the unix listener proved. Its response is flushed before cleanup begins, its connection closes only after cleanup completes, and `client.hello.instance_id` proves replacement without a process id. `rudy bridge --stop` exposes the same path. No pid file remains. Written before the code.
@@ -48,14 +55,171 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 
 ## 1. Protocol
 
-JSON-RPC 2.0. Requests carry `id`; notifications do not. Both peers may send requests. Four transports:
+JSON-RPC 2.0. Requests carry `id`; notifications do not. Both peers may send requests. Three
+internal transports:
 
 | transport | who | framing |
 |---|---|---|
 | in-memory | embedded server inside the `rudy` process; the TUI and linked plugins | Go channels; JSON-RPC envelope kept so the same handlers serve every transport |
 | unix socket | `rudy serve` and any client attaching to it | `$XDG_RUNTIME_DIR/rudy/rudy.sock`, or `$TMPDIR/rudy-<uid>/rudy.sock` when `XDG_RUNTIME_DIR` is unset, `--socket` overriding both; directory `0700`, socket `0600`; the server closes a connection whose peer uid is not its own before reading a byte; an accepted same-uid connection carries an unforgeable in-process same-user marker minted by the listener, never by `client.hello`; a socket file that refuses connections is stale and `rudy serve` replaces it; newline-delimited JSON. A client dials an explicit `--socket` or fails, else probes the default with a 50ms timeout and embeds when nothing answers; `--embed` skips the probe; before it connects, the client refuses a socket or a socket directory that is not owned by its uid, is reached through a symlink, or sits in a directory group or other can write, and refuses rather than embedding; its hello is bounded at 2s; `rudy serve` checks an existing socket directory against the same rule and never narrows one it did not create (ADR 0014, ADR 0030) |
 | stdio | spawned plugins; the server is the parent | newline-delimited JSON on the child's stdin and stdout; stderr is captured into the log |
+
+### Compatibility ssh carrier
+
+During ACP parity rollout, the private remote carrier remains:
+
+| transport | who | framing |
+|---|---|---|
 | ssh | a client on another machine reaching `rudy serve` on the host named by `--host` or `remote.host` | the client runs `ssh -- <host> '<PATH prefix>; command -v rudy >/dev/null 2>&1 \|\| exit 111; exec rudy bridge'` and speaks newline-delimited JSON on ssh's stdin and stdout; `rudy bridge` on the host dials the host's default socket under the unix socket rules above, starts `rudy serve` detached when nothing answers (its own session, stdio on `log.file`) and joins it, and copies messages both ways; `--no-start` makes a socket nothing answers exit 1 rather than start one; `--stop` dials without starting, greets, requests `server.shutdown`, requires matching `server.stopped` followed by EOF after full cleanup, and succeeds when no daemon answers; the bridge holds the daemon it started as a child, so a daemon that exits instead of serving is exit 1 naming the exit status and the last 20 lines of `log.file` rather than a wait for the start budget or a stream that closed unexplained; `rudy serve` exits 3 for a socket another server already holds, which is the one exit that means another daemon won rather than that none is coming, so the bridge keeps dialing for the winner until the budget ends and never reports it to a client; once a connection is established no child exit ends it, and a daemon-side close consults the child's exit only to name a reason; exit 111 means rudy is not on the host's PATH and the client installs it once (ADR 0029 decision 4) before retrying; the hello is bounded at 30s since the bridge may be starting a daemon; `--host` with `--socket` or `--embed` is exit 2 and `--host` never falls back to a local server; `RUDY_SSH` names the ssh binary for tests (ADR 0029, ADR 0030, ADR 0031) |
+
+### ACP v1 edge
+
+ACP is not a fourth internal transport. `rudy acp` is an agent-side anti-corruption layer. It
+serves stable ACP v1 as newline-delimited JSON-RPC on stdin and stdout, writes only fixed
+diagnostics to stderr, keeps detailed errors in the box log and drives the internal protocol
+through the host's same-user Unix socket. `acpclient` is the client-side anti-corruption layer
+behind SessionClient. Both use
+`github.com/coder/acp-go-sdk@v0.13.5`. ACP SDK types stay inside those two packages. `make
+vendor-types` refuses that module anywhere else and an ACP contract guard keeps this recorded
+version equal to `go.mod`.
+
+The remote client runs:
+
+```text
+ssh -- <host> 'PATH="$HOME/.local/bin:$HOME/bin:$HOME/go/bin:$PATH"; command -v rudy >/dev/null 2>&1 || exit 111; exec rudy acp'
+```
+
+ssh owns host authentication, encryption and host keys. `rudy acp` starts `rudy serve` through
+the shared daemon dialer when no socket answers, unless passed `--no-start`. It never exposes a
+TCP listener. Each frame is at most 8 MiB, below the selected SDK's fixed 10 MiB scanner
+ceiling. Inbound overflow closes the adapter; each outbound direction has a bounded queue and
+overflow detaches that ACP client without stopping the daemon or Turn.
+
+The SDK starts its receive goroutine in its constructor and otherwise uses the process default
+logger, which can emit a malformed raw line. Both adapters therefore construct it over a gated,
+size-limited reader, install a sanitizer with `SetLogger` and release the reader only after that
+happens. The sanitizer allows only fixed diagnostic messages and bounded numeric fields; it
+drops raw values, ids, request ids and unstructured errors. The reader admits at most 64 active
+inbound requests because the SDK starts a goroutine for each one. Its minimal envelope parser
+records only request ids and methods, never params. It sends one fixed JSON-RPC parse or invalid
+request error and closes before passing a malformed envelope to the SDK; an oversized frame
+closes without a response. The writer releases a slot only after successfully writing the
+matching JSON-RPC response, including an SDK-generated invalid-params response; a duplicate id
+or 65th request closes that adapter as overloaded. The same writer rejects an outbound frame
+above 8 MiB. Either wrapper signals the adapter supervisor on refusal; the supervisor closes the
+peer stream and internal connection instead of relying on the SDK to notice a writer error.
+Tests send malformed secret-bearing input before and after gate release and assert that neither
+stderr nor captured logs contain the payload.
+
+#### Initialize and capabilities
+
+The adapter reads ACP `initialize`, dials the daemon and sends internal
+`client.hello {client: "acp", version, asker}` before answering. A generic ACP client defaults
+to `asker: true` because `session/request_permission` is a standard client method. The Rudy
+client sends `_meta._rudy.asker`: TUI is true and headless is false. The standard initialize
+response advertises protocol version 1, agent name and version, `loadSession: true`, text
+prompts and session capabilities `list`, `resume` and `close`. It accepts ACP's mandatory
+resource-link prompt blocks without fetching them. It does not advertise `delete`, additional
+directories, image, audio, embedded context, MCP transports or an authentication method. It
+never calls ACP filesystem or terminal methods even when a generic client advertises them. SDK
+types and methods marked `Unstable` are unused; Rudy fork stays a negotiated `_rudy` method.
+
+The Rudy client offers `_meta._rudy` with `version: 1`, `asker: bool` and `capabilities`, a set
+of names from the extension table below. The agent returns the same version, the capability
+intersection and values from internal hello: `home`, `instanceId` and `rudyVersion`.
+
+Both objects live under ACP's `_meta`. A generic ACP client omits `_rudy` and receives only the
+standard surface. An `_rudy/` request without negotiated version and capability is
+method-not-found. The Mac client requires the capabilities used by its command before it opens
+a Session. It never falls back to `rudy bridge` or a local daemon.
+
+ACP advertises no auth method because the stdio process boundary already inherits its client
+identity from the operating system. On a remote connection, ssh authenticates a principal and
+maps it to the Unix account that launches `rudy acp`; the daemon's same-user socket check then
+preserves that identity. Every principal or key mapped to that account has the account's full
+plain-client authority, including session history, `mode: off`, operator shell and negotiated
+server shutdown. Provider identity is separate: the daemon resolves provider access on the box
+from an explicit credential, ambient host identity or no authentication. Aperture uses the
+box's tailnet identity and has no provider token. No provider credential crosses ACP.
+
+#### Standard methods
+
+Wire shapes are the stable ACP v1 schema. These rows add Rudy constraints and mappings.
+
+| ACP method | Internal mapping | Rudy rule |
+|---|---|---|
+| `session/new` | `session.open` | `cwd` is an absolute path on the box. `mcpServers` and `additionalDirectories` must be empty. Negotiated `_meta._rudy.open` may carry `model`, `mode`, `thinking`, `agent` and `tools`, never `parent`. Session id in the response is the Rudy ULID unchanged. |
+| `session/load` | `session.resume` | Look up the target through internal `session.list` and validate request cwd against its primary Workspace root before attach. Require empty `mcpServers` and `additionalDirectories`; a client may not spawn a process or widen stored roots on the box. Translate replayed entries and current live state into `session/update` before answering. |
+| `session/resume` | `session.resume` | Perform the same pre-attach lookup and cwd, MCP and additional-directory validation as load. Suppress only replayed `entry.appended` notifications before the internal response. Forward current turn, tool and permission state while the request is open, then forward every live notification; the internal ordering contract puts newly appended entries after the response. |
+| `session/list` | `session.list` | Validate an optional `cwd` as an absolute box path, normalize it and return only Sessions whose normalized primary Workspace root matches it exactly. With no filter, return every Session visible to the same Unix account. Return Rudy ULIDs and workspace roots. Pagination cursors are opaque, connection-scoped and never stored. |
+| `session/close` | `session.interrupt cancel`, then `session.close` | Cancel active work as ACP requires, tolerate no active Turn and detach. The append-only log remains. |
+| `session/prompt` | `session.submit` | Translate text and resource-link blocks through the shared content translator as `source: typed`, keep the request open through the Turn and map the terminal Turn reason to ACP `stopReason`. Unsupported content is invalid params. |
+| `session/cancel` | `session.interrupt cancel` | Best effort and idempotent at the ACP edge. Complete standing ACP permission requests as cancelled. |
+| `session/set_mode` | `session.set_mode` | Advertise and accept `strict`, `permissive` and `off`. |
+| `session/set_config_option` | `session.set_model` or `session.set_thinking` | Model values come from the daemon Registry and thinking values are `off`, `low`, `medium`, `high`. Return the complete current option set. |
+| `session/request_permission` | `permission.requested`, then `session.answer` | Agent-to-client request. Offer `allow_once`, `allow_always` and `reject_once`, mapping to allow once, allow session and deny once. Rudy has no durable deny allowance, so it never offers `reject_always`. First answer wins. Disconnect of the last asker denies `no_asker`. |
+| `session/update` | `entry.appended`, `stream.delta`, `turn.state`, `tool.state` | Standard updates carry assistant text, thought chunks, tool calls, tool updates, mode, config options and Session title metadata. Stored entries remain authoritative. Rudy does not send `available_commands_update`: its command invocation path is `_rudy/command/run`, so advertising commands to a generic client would be dishonest. |
+
+`session/delete` is not advertised or implemented. ACP `session/load` replays history;
+`session/resume` does not. Rudy TUI reconnect uses load because ssh loss may have hidden durable
+entries. The adapter keeps only replay suppression and request correlation for the connection.
+Only one load or resume for a Session may be active on an ACP connection. A concurrent second
+attach for the same ULID is a conflict; different Sessions still attach concurrently.
+
+The adapter never parses raw tool input or a thinking signature and feeds re-marshaled bytes
+back into Session. Standard updates carry display-safe fields. Negotiated `_meta._rudy` may
+carry byte-exact entry fields as base64 for SessionClient without changing the stored bytes.
+
+Prompt and steer share one content translator. ACP text becomes one Rudy text block with the
+same string. An ACP resource link becomes one Rudy text block prefixed `ACP resource link (not
+fetched): ` followed by compact JSON containing `name`, `uri` and any present `title`,
+`description`, `mimeType` and `size` in that order. The adapter ignores annotations and `_meta`
+and never resolves, opens or fetches the URI. It rejects image, audio and embedded-resource
+blocks as invalid params because their capabilities are not advertised. Empty translated
+content is invalid.
+
+#### Rudy extension methods
+
+| Capability | Method | Params | Result | Internal mapping |
+|---|---|---|---|---|
+| `session.fork` | `_rudy/session/fork` | `{sessionId, atEntryId}` | `{sessionId}` plus standard initial Session state | `session.fork` |
+| `session.steer` | `_rudy/session/steer` | `{sessionId, prompt: [ACP prompt ContentBlock]}` | `{turnId}` | Translate content through the exact `session/prompt` translator, then call `session.submit` with `source: steer` |
+| `session.compact` | `_rudy/session/compact` | `{sessionId, instructions?}` | `{entryId}` | `session.compact` |
+| `session.shell` | `_rudy/session/shell` | `{sessionId, command}` | `{entryId, isError}` | `session.shell` |
+| `session.title` | `_rudy/session/set_title` | `{sessionId, title}` | `{entryId}` | `session.set_title` |
+| `command.list` | `_rudy/command/list` | `{}` | `{commands: [{name, description}]}` | `command.list` |
+| `command.run` | `_rudy/command/run` | `{sessionId, name, args}` | `{turnId, notice, sessionId}` | `command.run` |
+| `registry.list` | `_rudy/registry/list` | `{provider?}` | Rudy Registry response | `registry.list` |
+| `registry.refresh` | `_rudy/registry/refresh` | `{provider?}` | `{fetchedAt, models, failures: [{provider, error: "Refresh failed; see box log"}]}` | Call `registry.refresh`; replace every nonempty internal failure error with the fixed public text |
+| `server.shutdown` | `_rudy/server_shutdown` | `{}` | `{instanceId, state: "stopped"}` only after terminal proof | Call `server.shutdown` on the adapter's exact greeted connection, keep the ACP request open, require matching internal `server.stopped` followed by internal EOF, then return and exit. Bare internal or ACP EOF is never proof. |
+| `session.update` | `_rudy/session/update` notification | `{sessionId?, kind, payload}` | none | status, widget, plugin, registry and sanitized notice events |
+
+For `session.update`, `kind` is `status`, `widget`, `plugin_state`, `registry_state` or
+`notice`. Status and widget payloads are already explicit user-facing plugin output. A failed
+plugin state sends `public_reason` or `Plugin failed; see box log`, never raw `reason`. A
+registry state replaces every nonempty provider error with `Refresh failed; see box log`. A
+notice sends only its `public_text`, substituting `Remote notice; see box log` when absent and
+never falling back to `text`. Standard session updates may include `_meta._rudy.entryId`,
+byte-exact entry data and `childSessionId`. Receiving a child id grants no authority to create
+a child or forge `ParentRef`; child creation stays on the internal plugin caller path.
+
+#### Error mapping
+
+| Rudy code | ACP or JSON-RPC code | Public message |
+|---|---|---|
+| `invalid_argument` | `-32602` | validated argument reason |
+| `not_found` | ACP resource not found, `-32002` | sanitized resource and id |
+| `no_asker` | `-32010` | `No permission asker attached` |
+| `conflict` | `-32011` | sanitized conflict reason |
+| `unauthorized` | `-32012` | `Unauthorized` |
+| `refused_by_invariant` | `-32013` | sanitized invariant reason |
+| `unavailable` | `-32014` | sanitized availability reason; internal socket paths are removed |
+| `interrupted` or ACP cancellation | `-32800` | `Request cancelled` |
+| `provider_error`, `plugin_error`, `internal` | `-32603` | `Internal error`; correlated detail only in the box log |
+
+Unknown paths, credentials, provider bodies and raw prompt or tool payloads never enter an ACP
+error or `_rudy` notice. A malformed JSON-RPC envelope uses the standard parse, invalid request
+or method-not-found code.
 
 ### Caller classes
 
@@ -65,7 +229,7 @@ JSON-RPC 2.0. Requests carry `id`; notifications do not. Both peers may send req
 | headless client | in-memory, unix socket | as TUI client | user messages, commands, attach without asker | permission answers; it declares `asker: false` in hello and the Gate treats it as absent |
 | spawned plugin | stdio | spawned by the server from a manifest the user placed in config; identity is the manifest name | registrations under its own name, results for its own tools, hook returns, notes, status and widgets under its own name, child sessions it opens and messages to those | user messages to sessions it did not open, permission answers, items under another plugin's name, entries directly |
 | linked plugin | in-memory Go interface | compiled in; trusted by build | as spawned plugin | as spawned plugin |
-| ACP adapter | unix socket | as TUI client | as TUI client | as TUI client; deferred, not in v1 |
+| ACP adapter | unix socket | same-user marker minted by the listener; the outside ACP client is local to the box or authenticated by ssh, but no ACP claim replaces the marker | user messages, permission answers, model, mode, thinking, title, attach and detach, slash commands and Server shutdown | entries of any other kind, tool results, registrations, registry contents or `ParentRef` |
 
 A port reached by two classes has one authentication story per class, listed above. The authz column below names the class-level rule.
 
@@ -75,15 +239,15 @@ Authn column names the caller class table. Domain column names the aggregate met
 
 | method | caller | authn | authz | request | response | errors | idempotency | domain |
 |---|---|---|---|---|---|---|---|---|
-| `client.hello` | TUI, headless, ACP, plugin | per class | first request on a connection; refused otherwise | `{client, version, asker: bool}` | `{server, version, home, instance_id}`; `home` is the server process's home directory, which a client over ssh uses to place the workspace (`<home>/<cwd relative to the local home>`) and a local client ignores; `instance_id` is the runtime-only Server ULID and lets a reconnect prove replacement; a client whose `version` differs from the server's carries on and shows a notice (ADR 0029, ADR 0030) | `invalid_argument` on protocol mismatch | idempotent per connection; a second hello is `refused_by_invariant` | registers the connection as an asker or not and identifies the Server. A plugin connection may send it (it needs no introduction, so it usually does not) and its `asker` is ignored: the plugin holding a child session is the one waiting on that child's tool call, so its own question must never route back to it |
-| `server.shutdown` | TUI, headless, ACP | unix socket or ssh under the TUI class rule | greeted non-plugin connection carrying the same-user marker minted by the accepting unix listener; the `client.hello.client` string grants nothing | `{}` | `{instance_id, state: "shutting_down"}`; the response is physically written before shutdown is requested | `unauthorized` for a plugin, in-memory connection or connection without the marker; `refused_by_invariant` before hello or after shutdown was reserved | not idempotent on one Server; the first accepted request reserves shutdown and fences later work while public state remains `running`. A failed response releases the reservation. `rudy bridge --stop` treats no answering Server as an idempotent success at the CLI boundary | `Server.RequestShutdown`; the request's connection and writer remain open for terminal proof |
-| `session.open` | TUI, headless, plugin | per class | any; `parent` only from a plugin, and only naming a `tool_use` pending in a live session whose tool that same plugin registered, in a session that is not itself a child, at most once per `tool_use`, and with `cwd` equal to that session's workspace root | `{cwd, model?: string, mode?: PermissionMode, thinking?: ThinkingLevel, agent?: string, tools?: [string], parent?: ParentRef}`; `model` is `provider:id` or a unique bare id; absent `model`, `mode`, `thinking` take the agent definition's values, then the parent's when `parent` is given, then config defaults; absent `agent` means the default agent. A session's tool set is the agent definition's list, intersected with `tools` when given, intersected with the parent's effective set when `parent` is given, minus `agent` for a child. Every term only removes: `tools` names what to keep and cannot name a tool the definition or the parent withheld, so delegation never widens what the caller holds (ADR 0028). Absent `tools` narrows nothing and an explicit empty list narrows to no tools at all, the same distinction the definition file carries. A name in `tools` that no plugin has registered is dropped before the set is persisted, so a session cannot acquire a tool later by having named one that did not exist when it opened | `SessionInfo`, same shape as `session.resume`; the `session_opened` entry is replayed first as `entry.appended`, this response returns once replay finishes | `invalid_argument` root not a directory, `parent` from a non-plugin, or `cwd` not the parent's workspace root; a name in `tools` that the definition or the parent did not hold is dropped rather than refused, since the set is an intersection and a caller asking for less than it is owed is not an error; `not_found` model, agent, parent session or parent tool_use; `unauthorized` the pending `tool_use` is not a tool of the calling plugin; `refused_by_invariant` the parent is itself a child session; `conflict` that `tool_use` has already opened a child; `unavailable` registry unreachable and no cached snapshot | not idempotent; every call opens a session | `Session.Open` factory; appends `session_opened` with `parent_session_id` and `parent_tool_use_id` |
+| `client.hello` | TUI, headless, ACP, plugin | per class | first request on a connection; refused otherwise | `{client, version, asker: bool}` | `{server, version, home, instance_id}`; `home` is the server process's home directory, which the ACP adapter returns in negotiated `_meta._rudy` so a Mac client can place the workspace (`<home>/<cwd relative to the local home>`); `instance_id` is the runtime-only Server ULID and lets a reconnect prove replacement; a client whose `version` differs from the server's carries on and shows a notice (ADR 0029, ADR 0030, ADR 0031, ADR 0032) | `invalid_argument` on protocol mismatch | idempotent per connection; a second hello is `refused_by_invariant` | registers the connection as an asker or not and identifies the Server. A plugin connection may send it (it needs no introduction, so it usually does not) and its `asker` is ignored: the plugin holding a child session is the one waiting on that child's tool call, so its own question must never route back to it |
+| `server.shutdown` | TUI, headless, ACP | Unix socket under the class rule | greeted non-plugin connection carrying the same-user marker minted by the accepting Unix listener; the `client.hello.client` string and ACP metadata grant nothing | `{}` | `{instance_id, state: "shutting_down"}`; the response is physically written before shutdown is requested | `unauthorized` for a plugin, in-memory connection or connection without the marker; `refused_by_invariant` before hello or after shutdown was reserved | not idempotent on one Server; the first accepted request reserves shutdown and fences later work while public state remains `running`. A failed response releases the reservation. `rudy hosts stop` treats no answering Server as an idempotent success at the CLI boundary after ADR 0031 | `Server.RequestShutdown`; the request's connection and writer remain open for terminal proof |
+| `session.open` | TUI, headless, ACP, plugin | per class | any; `parent` only from a plugin, and only naming a `tool_use` pending in a live session whose tool that same plugin registered, in a session that is not itself a child, at most once per `tool_use`, and with `cwd` equal to that session's workspace root | `{cwd, model?: string, mode?: PermissionMode, thinking?: ThinkingLevel, agent?: string, tools?: [string], parent?: ParentRef}`; `model` is `provider:id` or a unique bare id; absent `model`, `mode`, `thinking` take the agent definition's values, then the parent's when `parent` is given, then config defaults; absent `agent` means the default agent. A session's tool set is the agent definition's list, intersected with `tools` when given, intersected with the parent's effective set when `parent` is given, minus `agent` for a child. Every term only removes: `tools` names what to keep and cannot name a tool the definition or the parent withheld, so delegation never widens what the caller holds (ADR 0028). Absent `tools` narrows nothing and an explicit empty list narrows to no tools at all, the same distinction the definition file carries. A name in `tools` that no plugin has registered is dropped before the set is persisted, so a session cannot acquire a tool later by having named one that did not exist when it opened | `SessionInfo`, same shape as `session.resume`; the `session_opened` entry is replayed first as `entry.appended`, this response returns once replay finishes | `invalid_argument` root not a directory, `parent` from a non-plugin, or `cwd` not the parent's workspace root; a name in `tools` that the definition or the parent did not hold is dropped rather than refused, since the set is an intersection and a caller asking for less than it is owed is not an error; `not_found` model, agent, parent session or parent tool_use; `unauthorized` the pending `tool_use` is not a tool of the calling plugin; `refused_by_invariant` the parent is itself a child session; `conflict` that `tool_use` has already opened a child; `unavailable` registry unreachable and no cached snapshot | not idempotent; every call opens a session | `Session.Open` factory; appends `session_opened` with `parent_session_id` and `parent_tool_use_id` |
 | `session.resume` | TUI, headless, ACP | per class | any session on this machine | `{session_id}` | `SessionInfo`: `{session_id, workspace: Workspace, model: ModelRef, mode: PermissionMode, thinking: ThinkingLevel, title: string}`; every entry is replayed first as `entry.appended` notifications, then, when a turn is active, the current `turn.state`, a `tool.state` per call in flight and any standing `permission.requested` to an asker connection, then, for each live child of the session, that child's `session_opened` as `entry.appended` and any question standing on it, then this response | `not_found`; `unavailable` locked by another process, `data.socket` | idempotent; re-attaches | `Session.Load` then attach; `Session.Load` runs recovery |
 | `session.fork` | TUI, headless, ACP | per class | any session | `{session_id, at_entry_id}`; `at_entry_id` empty means the newest entry | `SessionInfo` for the new session, same shape as `session.resume`; its entries are replayed first as `entry.appended`, this response returns once replay finishes | `not_found` session or entry | not idempotent | `Session.Fork(at)`; appends `fork_point` |
 | `session.list` | TUI, headless, ACP | per class | any | `{}` no params | `{sessions: [SessionSummary]}` | none | idempotent | query over `session_opened` and last entries; no mutation |
 | `session.close` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id}` | `{}` | `not_found` | idempotent | detach; fires `session_closed` hook when the last client detaches; appends nothing, except that a last subscriber leaving a turn parked in `TurnSteering` cancels it, which appends `turn_interrupted` |
-| `session.submit` | TUI, headless, plugin | per class | plugin only to sessions it opened; a session whose log records a parent refuses any caller, plugin or not, that is not subscribed to it, whatever it may be subscribed to instead. The test is the recorded parent rather than the live one, so a child resumed cold is still a child (ADR 0028 decision 6: watching a session's parent is not being subscribed to it) | `{session_id, content: [ContentBlock text or image], source: typed or steer}`; `shell` is written by `session.shell`, never submitted; pass 3: not yet implemented, `queued` (refused as `invalid_argument`) and `idempotency_key` | `{turn_id}`; pass 3: not yet reported, `entry_id` and `queued_position`, neither of which exists without a queue | `refused_by_invariant` typed while a turn is active, steer while not steering; `invalid_argument` empty content, a content block the log refuses or a source that is neither typed nor steer; `unauthorized` a plugin submitting to a session it did not open, or any caller submitting to a child session it is not subscribed to | not idempotent; pass 3 ignores `idempotency_key` because it does not accept one | `Turn.Start` for typed on idle, `Turn.Resume` for steer; appends `user_message` |
-| `session.shell` | TUI, headless | per class | any attached | `{session_id, command}` | `{entry_id, is_error}` | `invalid_argument` empty command; `not_found` unknown session or no `bash` tool in this session's view; `conflict` a turn is active | not idempotent | invokes the registered `bash` tool with the command, ungated, and appends one `user_message` with `source: shell` carrying `$ <command>` and its output. Starts no turn: the model reads it with the next message. The Gate does not run, since the operator typed the command themselves (ADR 0023) |
+| `session.submit` | TUI, headless, ACP, plugin | per class | plugin only to sessions it opened; a session whose log records a parent refuses any caller, plugin or not, that is not subscribed to it, whatever it may be subscribed to instead. The test is the recorded parent rather than the live one, so a child resumed cold is still a child (ADR 0028 decision 6: watching a session's parent is not being subscribed to it) | `{session_id, content: [ContentBlock text or image], source: typed or steer}`; `shell` is written by `session.shell`, never submitted; pass 3: not yet implemented, `queued` (refused as `invalid_argument`) and `idempotency_key` | `{turn_id}`; pass 3: not yet reported, `entry_id` and `queued_position`, neither of which exists without a queue | `refused_by_invariant` typed while a turn is active, steer while not steering; `invalid_argument` empty content, a content block the log refuses or a source that is neither typed nor steer; `unauthorized` a plugin submitting to a session it did not open, or any caller submitting to a child session it is not subscribed to | not idempotent; pass 3 ignores `idempotency_key` because it does not accept one | `Turn.Start` for typed on idle, `Turn.Resume` for steer; appends `user_message` |
+| `session.shell` | TUI, headless, ACP | per class | any attached | `{session_id, command}` | `{entry_id, is_error}` | `invalid_argument` empty command; `not_found` unknown session or no `bash` tool in this session's view; `conflict` a turn is active | not idempotent | invokes the registered `bash` tool with the command, ungated, and appends one `user_message` with `source: shell` carrying `$ <command>` and its output. Starts no turn: the model reads it with the next message. The Gate does not run, since the operator typed the command themselves (ADR 0023) |
 | `session.interrupt` | TUI, headless, ACP, plugin (own sessions) | per class | a plugin only a session it opened; a plain client is not checked for attachment at all, which is pre-existing and true of every session method but `submit` (`rudy-jkz`); a session whose log records a parent refuses any caller not subscribed to it, on the same rule and for the same reason as `session.submit`, because routing a child's notifications to its parent's client is what made a running child's id reachable | `{session_id, how: steer or cancel}` | `{turn_id, state: TurnState}` | `refused_by_invariant` no active turn; `unauthorized` a child session from a connection not subscribed to it | idempotent; repeating returns current state | `Turn.Steer` or `Turn.Cancel`; cancel appends `turn_interrupted` |
 | `session.answer` | TUI, ACP | per class | connection declared `asker: true` | `{session_id, tool_use_id, decision: allow or deny, scope: once or session, reason: string}` | `{}` | `unauthorized` not an asker; `not_found` no pending request; `conflict` when another asker answered first | keyed by `tool_use_id`; a second answer is `conflict` | `Turn.Answer` via the Gate; appends `permission_decision` |
 | `session.set_model` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id, model: ModelRef}` | `{entry_id}` | `conflict` a turn is active; `not_found` model not in registry | same value appends nothing and returns the latest `model_change` id | `Session.SetModel`; appends `model_change` |
@@ -137,8 +301,8 @@ Two things this does not claim. Answering is deliberately not gated, because a c
 | `permission.requested` | attached asker clients | `{session_id, turn_id, tool_use_id, tool, input, matcher: {tool, prefix}}` | delivered to every attached asker, to an asker attaching while the question stands, and to an asker attaching to the parent of a live child while a question stands on that child, since the child has no asker of its own and the parent's is who answers for it; the first `session.answer` decides; with no asker attached the Gate denies immediately, and when the last asker detaches while a question stands the Gate denies it with `no_asker` and appends `permission_decision` (ADR 0014) |
 | `status.updated` | every client | `{items: [{owner, key, content: [Span]}]}` full set | latest wins; sent on connect |
 | `widget.updated` | every client | `{owner, key, slot, content: [Span]}` | latest wins per owner and key; all sent on connect |
-| `notice` | every client | `{level: info, warn or error, owner, text}` | best effort; not replayed |
-| `plugin.state` | every client | `{name, origin: linked or spawned, state: loading, ready, failed or stopped, reason: string}`; `reason` empty unless failed | latest wins; all sent on connect |
+| `notice` | every client | `{level: info, warn or error, owner, text, public_text?}`; `text` is for same-process and same-host clients, while `public_text` is a fixed trust-boundary-safe rendering that contains no raw nested error. ACP forwards only `public_text`, substituting `Remote notice; see box log` when absent. Registry refresh failure uses `Registry refresh failed; see box log` and keeps provider detail in the box log. | best effort; not replayed |
+| `plugin.state` | every client | `{name, origin: linked or spawned, state: loading, ready, failed or stopped, reason: string, public_reason?}`; `reason` is empty unless failed and remains same-host detail. ACP sends `public_reason` or `Plugin failed; see box log`. | latest wins; all sent on connect |
 | `registry.updated` | every client | `{fetched_at, providers: [{name, count: int, error: string}]}`; `error` empty on success | latest wins |
 | `server.stopped` | the one connection whose `server.shutdown` request was accepted | `{instance_id, state: stopped}` | sent only after successful runtime and listener cleanup, then followed by EOF. Cleanup failure, process death or transport loss produces no notification, so bare EOF is failure |
 
@@ -518,7 +682,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
 | `log.level` | `debug`, `info`, `warn`, `error` | `info` | the least severe record written; `debug` adds each tool invocation and provider stream error. Any other value is refused at load |
 | `log.file` | path | `""` | empty means `$XDG_CACHE_HOME/rudy/rudy.log`, filled at load the way `sessions.dir` is; `~` expands. The record layer row above says what is written and what happens when the file cannot be opened |
-| `remote.host` | string | `""` | The ssh destination, alias or `user@name`, of the machine that runs the kernel when `--host` is not given; empty means the kernel runs here. A value beginning with `-` is refused at load (ADR 0029) |
+| `remote.host` | string | `""` | The ssh destination, alias or `user@name`, where `rudy acp` reaches the daemon when `--host` is not given; empty means the kernel runs here. A value beginning with `-` is refused at load (ADR 0029, ADR 0032) |
 | `remote.source` | path | `~/projects/rudy` | Where the rudy checkout sits on the host, which `rudy hosts install` checks out at this binary's commit and runs `make install` in; `~` expands on the host (ADR 0029) |
 | `ui.status.host` | bool | `true` | Show `host:` before the workspace path in the status bar when the session runs on a host reached by `--host` or `remote.host` (ADR 0029) |
 | `ui.header.frame` | bool | true | false draws the header's lines with no box around them |
@@ -676,6 +840,7 @@ Every transition traced through protocol, event and record, else a recorded reas
 | PluginRegistry.Register* | `plugin.register_*`, `plugin.set_status` | `CapabilityRegistered`, `CapabilityRejected` | none; capabilities are runtime |
 | Registry.Refresh | `registry.refresh`, implicit on open | `RegistryRefreshed` | `registry.json` |
 | session close | `session.close` | `session_closed` hook | none; closing is a connection fact, not a conversation fact |
+| ACP edge | stable ACP v1 and negotiated `_rudy` methods | none; translates existing Client events | none; capabilities, request correlation, replay suppression and cursors are connection facts |
 
 Invariants and where they are enforced:
 

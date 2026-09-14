@@ -35,8 +35,8 @@ from what the owner had to patch into pi.
   aperture proxy or a local server. Third-party OAuth is a policy violation
   regardless.
 - Allow and deny rule patterns for permissions. Modes only.
-- LSP, tree-sitter, sandboxing, ACP for editors. Each is a plugin slot left
-  open, not a v1 deliverable.
+- LSP, tree-sitter and sandboxing. ACP moved to the post-v1 client edge in ADR 0032; it is not
+  a plugin or an internal kernel seam.
 - WASM plugins. The interface admits them later without change.
 - Postgres. The session log is a file. See ADR 0004.
 
@@ -47,7 +47,7 @@ flowchart LR
     subgraph clients["clients"]
         TUI["rudy (TUI)"]
         P["rudy -p (printer)"]
-        ACP["ACP adapter (later)"]
+        ACP["ACP agent adapter (ADR 0032)"]
     end
     subgraph kernel["kernel"]
         SRV["protocol server"]
@@ -426,6 +426,7 @@ dedicated files and nothing else.
 | providers | `github.com/anthropics/anthropic-sdk-go` 1.71.0; `openai_chat` codec on `net/http` with the SSE reader lifted from the owner's `llm` module |
 | enrichment | `charm.land/catwalk` embedded data |
 | MCP | `github.com/modelcontextprotocol/go-sdk` 1.7.0 |
+| ACP edge | `github.com/coder/acp-go-sdk`, planned by `rudy-4tf.1` and pinned in `go.mod` when implemented |
 | CLI, config | `github.com/spf13/cobra`, `github.com/spf13/viper`, `github.com/pelletier/go-toml/v2` |
 | frontmatter | `github.com/goccy/go-yaml` 1.19.2 |
 | shell classification | `mvdan.cc/sh/v3` 3.14.1 |
@@ -434,9 +435,8 @@ dedicated files and nothing else.
 | vim | `github.com/guygrigsby/vimbubble` ported to v2 |
 | tests | `github.com/charmbracelet/x/exp/teatest/v2` |
 
-Not used: fantasy (retags weekly chasing SDK minors), any ACP Go SDK (none
-tracks the current schema with a community behind it), tree-sitter (cgo,
-stale), Go `plugin` (cgo, dead).
+Not used: fantasy (retags weekly chasing SDK minors), tree-sitter (cgo, stale), Go `plugin`
+(cgo, dead).
 
 ## Sequencing
 
@@ -448,6 +448,8 @@ stale), Go `plugin` (cgo, dead).
 4. TUI: slots, transcript, vimbubble v2, keys, theme, Esc.
 5. `rudy serve`, unix socket, reattach.
 6. Migrations, `rudy models list`, `rudy plugins`.
+7. Remote workspace placement and sync over ssh.
+8. ACP v1 at the remote client boundary.
 
 The implementation plan breaks these into tasks.
 
