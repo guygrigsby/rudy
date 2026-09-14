@@ -5,12 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -40,14 +38,14 @@ const exitSocketBusy = 3
 // instead of an in-process pipe. It takes the same buildFunc every other command does, since
 // there is one wiring and a daemon that built its own would be a second one.
 func newServeCommand(build buildFunc) *cobra.Command {
-	var socket, pidFile string
+	var socket string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "serve the protocol on a unix socket until interrupted",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stderr := cmd.ErrOrStderr()
-			code, err := runServe(cmd.Context(), build, socket, pidFile, cmd.OutOrStdout(), stderr)
+			code, err := runServe(cmd.Context(), build, socket, cmd.OutOrStdout(), stderr)
 			if err != nil {
 				_, _ = fmt.Fprintln(stderr, err)
 				if code == 0 {
@@ -62,23 +60,17 @@ func newServeCommand(build buildFunc) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&socket, "socket", "", "unix socket to serve on (default: rudy.sock under the XDG runtime dir)")
-	// Only a process that started this daemon has anything to do with its pid, so the file is
-	// written on request rather than always: rudy bridge asks for one because rudy hosts
-	// install has to be able to stop an idle daemon it did not start, and a daemon an operator
-	// ran by hand is theirs to signal by the means they already have.
-	cmd.Flags().StringVar(&pidFile, "pidfile", "", "write this process's pid here while it serves (default: write none)")
 	return cmd
 }
 
-// runServe builds a server, listens on socket and serves every connection the transport
-// accepts until the context ends or a signal arrives. It returns the process exit code: 0
-// for a clean shutdown, 1 for a socket another server holds or a shutdown that ran past its
-// budget.
+// runServe builds a server, listens on socket and serves every connection until the context,
+// a signal or an authenticated protocol request starts shutdown. It returns 0 for a clean
+// shutdown, exitSocketBusy when another server owns the socket and 1 for other failures.
 //
 // Everything it prints is a diagnostic, so it all goes to stderr with the prefix Build's own
 // notices use; stdout stays free for a future flag that wants to report the socket to a
 // program rather than to an operator.
-func runServe(ctx context.Context, build buildFunc, socket, pidFile string, _ io.Writer, stderr io.Writer) (int, error) {
+func runServe(ctx context.Context, build buildFunc, socket string, _ io.Writer, stderr io.Writer) (int, error) {
 	// SIGTERM as well as SIGINT: a daemon is stopped by a service manager at least as often
 	// as by a Ctrl-C, and both mean the same thing here.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
@@ -120,15 +112,14 @@ func runServe(ctx context.Context, build buildFunc, socket, pidFile string, _ io
 	// SIGINT back to its default disposition before anything that waits, so an operator who
 	// gives up on the shutdown budget kills the process instead of cancelling a context
 	// nothing is reading any more. See runPrint, which does the same.
-	unwind := func() error {
+	unwind := func(protocolShutdown bool) error {
 		stop()
-		// The pid file goes first and unconditionally: whatever the sessions do on the way out,
-		// a file naming a pid this process no longer has is one a later rudy hosts install
-		// would signal, and the pid is reused by then as often as not.
-		if pidFile != "" {
-			if err := os.Remove(pidFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				notice(err.Error())
-			}
+		if protocolShutdown {
+			// The accepted control request uses connection EOF as proof that every runtime
+			// resource is gone. Keep that connection open past the ordinary exit budget;
+			// the requesting client has its own bound and must not start a replacement on
+			// an EOF produced by abandoned cleanup.
+			return b.Close(context.Background())
 		}
 		shutdownCtx, done := context.WithTimeout(context.Background(), serveShutdownBudget)
 		defer done()
@@ -146,20 +137,6 @@ func runServe(ctx context.Context, build buildFunc, socket, pidFile string, _ io
 	// that dialed on the strength of this line and then waited out a plugin load and a
 	// registry refresh in the backlog would be worse served than one that got no line yet.
 	notice("serving on " + socket)
-	// Written once the daemon is actually serving, so a pid file is evidence of a server and
-	// not of a process that is still deciding whether it can be one. A caller only passes
-	// --pidfile because it means to signal this process later, so failing to write one is
-	// failing to be the daemon that caller asked for: carrying on would leave rudy hosts
-	// install reading no file, concluding there is no daemon and starting a second one that
-	// this socket's lock then refuses.
-	if pidFile != "" {
-		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
-			if cerr := l.Close(); cerr != nil {
-				notice(cerr.Error())
-			}
-			return 1, errors.Join(fmt.Errorf("pid file %s: %w", pidFile, err), unwind())
-		}
-	}
 
 	// Every connection is served under a context of this one, so the signal that ends the
 	// process ends the serve loops too. Shutdown waits for those loops before it closes a
@@ -174,21 +151,37 @@ func runServe(ctx context.Context, build buildFunc, socket, pidFile string, _ io
 		accept(connCtx, l, b.Server, &wg, notice)
 	}()
 
-	<-ctx.Done()
+	protocolShutdown := false
+	select {
+	case <-ctx.Done():
+	case <-b.Server.ShutdownRequested():
+		protocolShutdown = true
+	}
+	if !protocolShutdown {
+		select {
+		case <-b.Server.ShutdownRequested():
+			protocolShutdown = true
+		default:
+		}
+	}
 
-	// Closing the listener first stops new connections and takes the socket off disk, so
-	// nothing dials a server on its way out and the next one finds the path clear. A failure
-	// here is worth saying but not worth failing on: the sessions are what the exit code is
-	// about, and ListenUnix clears a socket left behind anyway.
+	// Stop connection work before Shutdown waits for the serve loops. Keep the listener's
+	// lock through runtime cleanup so another daemon cannot take over the socket before this
+	// one has finished closing its sessions and plugins.
+	endConns()
+	closeErr := unwind(protocolShutdown)
 	if err := l.Close(); err != nil {
 		notice(err.Error())
+		closeErr = errors.Join(closeErr, err)
 	}
-	closeErr := unwind()
-	// The serve loops are already unwinding under connCtx, which ended with ctx above; this
-	// is the wait that makes it true that nothing is still writing to stderr, or to a
-	// session, once runServe has returned. Shutdown waits for the loops it knows about, not
-	// for the accept goroutine or for a connection accepted in the moment it began.
-	endConns()
+	// A server.shutdown caller has already received its response and is waiting on this
+	// boundary. Complete only after successful runtime cleanup and socket removal; the held
+	// writer sends server.stopped before its connection owner produces EOF.
+	if closeErr == nil {
+		b.Server.CompleteShutdown()
+	} else {
+		b.Server.FailShutdown()
+	}
 	wg.Wait()
 	if closeErr != nil {
 		return 1, closeErr
@@ -259,7 +252,7 @@ func accept(ctx context.Context, l *protocol.Listener, srv *server.Server, wg *s
 			err := srv.Serve(ctx, c)
 			// A context that ended and a connection offered mid-shutdown are the shutdown
 			// working, not something an operator needs to read.
-			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, server.ErrShuttingDown) {
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, server.ErrShuttingDown) && !errors.Is(err, server.ErrShutdownRequested) {
 				notice(err.Error())
 			}
 		}()

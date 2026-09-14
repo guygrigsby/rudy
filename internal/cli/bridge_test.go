@@ -3,17 +3,19 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/protocol"
 )
@@ -23,34 +25,26 @@ import (
 // pipes. So these tests build the binary and run it, which costs a compile and a daemon
 // start; -short skips them and gets nothing else about the bridge.
 
-// stopBoxDaemon kills the daemon a bridge started, by the pid file the bridge told it to
-// write. Without it a `go test` run leaves a rudy serve behind holding a socket and a store.
-// It goes through DaemonPID, which is the same helper rudy hosts install stops a daemon
-// with, so the test exercises the check that refuses to signal a stale pid rather than a
-// second copy of it. The socket comes off socketIn, which resolves the box's own environment
-// through the code that resolves it: a path assembled here would be this test's guess.
+// stopBoxDaemon uses the same authenticated protocol path as an operator. The command is
+// idempotent, so cleanup stays safe when a test already stopped its daemon.
 func stopBoxDaemon(t *testing.T, env []string) {
 	t.Helper()
-	// A missing or stale file is a failure, not a nothing-to-do: the bridge passed --pidfile,
-	// so a daemon that served without leaving a usable one is a daemon nobody can stop, here
-	// or in rudy hosts install. The test that leaks it would otherwise pass.
-	pid, err := DaemonPID(socketIn(t, env))
-	if err != nil {
-		t.Errorf("daemon pid: %v", err)
+	home := ""
+	for _, item := range env {
+		if strings.HasPrefix(item, "HOME=") {
+			home = strings.TrimPrefix(item, "HOME=")
+			break
+		}
+	}
+	if home == "" {
+		t.Error("box environment has no HOME")
 		return
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
-		t.Errorf("kill %d: %v", pid, err)
+	cmd := exec.Command(filepath.Join(home, ".local", "bin", "rudy"), "bridge", "--stop")
+	cmd.Env = env
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("bridge --stop: %v\n%s", err, out)
 	}
-	// The daemon unwinds its sessions before it goes; waiting for the pid to clear keeps the
-	// next test from finding the socket still bound.
-	for range 100 {
-		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Errorf("daemon %d still running after SIGTERM", pid)
 }
 
 func TestBridgeNoStartExitsWhenNothingServes(t *testing.T) {
@@ -70,6 +64,186 @@ func TestBridgeNoStartExitsWhenNothingServes(t *testing.T) {
 	if !strings.Contains(string(out), "no server") {
 		t.Fatalf("bridge --no-start said %q, want it to name the missing server", out)
 	}
+}
+
+func TestBridgeStopWithNoDaemonDoesNotLoadConfig(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin := builtRudy(t)
+	home, env := boxHome(t, bin)
+	configDir := filepath.Join(home, ".config", "rudy")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte("[broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "bridge", "--stop")
+	cmd.Env = env
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("bridge --stop with no daemon: %v\n%s", err, out)
+	}
+}
+
+func TestBridgeStopIsIdempotentAndWaitsForSocketCleanup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	bin := builtRudy(t)
+	upstream := fakeOpenAI(t, "ok")
+	_, env := boxWithProvider(t, bin, upstream.URL)
+	start := exec.Command(bin, "bridge")
+	start.Env = env
+	if out, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("start through bridge: %v\n%s", err, out)
+	}
+	stop := exec.Command(bin, "bridge", "--stop")
+	stop.Env = env
+	if out, err := stop.CombinedOutput(); err != nil {
+		t.Fatalf("bridge --stop: %v\n%s", err, out)
+	}
+	if err := protocol.CheckSocketOwner(socketIn(t, env)); !errors.Is(err, protocol.ErrNoServer) {
+		t.Fatalf("socket after bridge --stop = %v, want no server", err)
+	}
+	stop = exec.Command(bin, "bridge", "--stop")
+	stop.Env = env
+	if out, err := stop.CombinedOutput(); err != nil {
+		t.Fatalf("second bridge --stop: %v\n%s", err, out)
+	}
+}
+
+func TestBridgeStopRefusesALegacyDaemonWithoutStoppingIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin := builtRudy(t)
+	home, env := boxHome(t, bin)
+	socket := socketIn(t, env)
+	l, err := protocol.ListenUnix(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	served := make(chan error, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			served <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		raw, err := conn.Recv(context.Background())
+		if err != nil {
+			served <- err
+			return
+		}
+		var hello protocol.Request
+		if err := json.Unmarshal(raw, &hello); err != nil {
+			served <- err
+			return
+		}
+		response, _ := protocol.NewResponse(hello.ID, protocol.ClientHelloResult{Server: "rudy", Version: "old", Home: home})
+		if err := conn.Send(context.Background(), response); err != nil {
+			served <- err
+			return
+		}
+		raw, err = conn.Recv(context.Background())
+		if err != nil {
+			served <- err
+			return
+		}
+		var shutdown protocol.Request
+		if err := json.Unmarshal(raw, &shutdown); err != nil {
+			served <- err
+			return
+		}
+		if shutdown.Method != protocol.MethodServerShutdown {
+			served <- fmt.Errorf("method = %q", shutdown.Method)
+			return
+		}
+		served <- conn.Send(context.Background(), protocol.NewErrorResponse(shutdown.ID, protocol.NewError(protocol.CodeNotFound, "unknown method server.shutdown", nil)))
+	}()
+	cmd := exec.Command(bin, "bridge", "--stop")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		t.Fatalf("bridge --stop against a legacy daemon = %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "unknown method server.shutdown") {
+		t.Fatalf("bridge --stop said %q", out)
+	}
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.CheckSocketOwner(socket); err != nil {
+		t.Fatalf("legacy daemon socket was removed: %v", err)
+	}
+}
+
+func TestBridgeStopRefusesBareEOFAfterShutdownAcceptance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	bin := builtRudy(t)
+	home, env := boxHome(t, bin)
+	socket := socketIn(t, env)
+	l, err := protocol.ListenUnix(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := make(chan error, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err != nil {
+			served <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		raw, err := conn.Recv(context.Background())
+		if err != nil {
+			served <- err
+			return
+		}
+		var hello protocol.Request
+		if err := json.Unmarshal(raw, &hello); err != nil {
+			served <- err
+			return
+		}
+		const instance = "accepted-instance"
+		response, _ := protocol.NewResponse(hello.ID, protocol.ClientHelloResult{Server: "rudy", Version: "old", InstanceID: instance, Home: home})
+		if err := conn.Send(context.Background(), response); err != nil {
+			served <- err
+			return
+		}
+		raw, err = conn.Recv(context.Background())
+		if err != nil {
+			served <- err
+			return
+		}
+		var shutdown protocol.Request
+		if err := json.Unmarshal(raw, &shutdown); err != nil {
+			served <- err
+			return
+		}
+		response, _ = protocol.NewResponse(shutdown.ID, protocol.ServerShutdownResult{InstanceID: instance, State: protocol.ServerStateShuttingDown})
+		served <- conn.Send(context.Background(), response)
+	}()
+	cmd := exec.Command(bin, "bridge", "--stop")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		t.Fatalf("bridge --stop after bare EOF = %v, want exit 1\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "server.stopped") {
+		t.Fatalf("bridge --stop said %q, want missing server.stopped proof", out)
+	}
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
 }
 
 func TestBridgeStartsADaemonAndCarriesTheHello(t *testing.T) {
@@ -104,6 +278,13 @@ func TestBridgeStartsADaemonAndCarriesTheHello(t *testing.T) {
 	if hello.Version != "v0.0.0-1-gtest001" {
 		t.Fatalf("hello.version = %q", hello.Version)
 	}
+	if _, err := ulid.Parse(hello.InstanceID); err != nil {
+		t.Fatalf("hello.instance_id = %q, want a ULID: %v", hello.InstanceID, err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(socketIn(t, env)), "serve.pid")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("serve.pid exists after protocol-owned startup: %v", err)
+	}
+	instanceID := hello.InstanceID
 	_ = c.Close()
 	// The daemon the bridge started outlives the bridge: a second bridge joins it rather
 	// than starting another, which the socket's lock would refuse anyway.
@@ -120,6 +301,9 @@ func TestBridgeStartsADaemonAndCarriesTheHello(t *testing.T) {
 	c2 := protocol.NewClient(protocol.NewStreamConn(sout, sin, sin))
 	if err := c2.Call(ctx, protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0"}, &hello); err != nil {
 		t.Fatalf("second bridge did not join the running daemon: %v\nstderr: %s", err, secondErr.String())
+	}
+	if hello.InstanceID != instanceID {
+		t.Fatalf("second bridge reached instance %s, want the running instance %s", hello.InstanceID, instanceID)
 	}
 	_ = c2.Close()
 }
@@ -269,7 +453,7 @@ func TestBridgeWaitsOutADaemonThatLostTheSocket(t *testing.T) {
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	winner := exec.Command(bin, "serve", "--pidfile", PIDFile(socket))
+	winner := exec.Command(bin, "serve")
 	winner.Env = env
 	winner.Stdout, winner.Stderr = io.Discard, io.Discard
 	if err := winner.Start(); err != nil {
@@ -298,35 +482,6 @@ func readAll(path string) string {
 		return ""
 	}
 	return string(b)
-}
-
-// TestDaemonPIDRefusesAStalePIDFile: unwind removes the pid file on every ordinary exit, but a
-// daemon that was SIGKILLed or panicked leaves one behind, and by the time anyone reads it the
-// kernel has handed that number to something else. A helper that answered with it would be a
-// helper that gets an unrelated process killed, so a pid file with nothing serving the socket
-// is removed and refused. No daemon and no binary here: the point is what happens when there
-// is no daemon.
-func TestDaemonPIDRefusesAStalePIDFile(t *testing.T) {
-	dir := sockDir(t)
-	socket := filepath.Join(dir, "rudy.sock")
-	// This process's own pid: alive, signalable, and nothing to do with rudy. A check that
-	// only looked for a live process would pass it, which is the bug.
-	pidFile := PIDFile(socket)
-	if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pid, err := DaemonPID(socket)
-	if !errors.Is(err, ErrStalePID) {
-		t.Fatalf("DaemonPID = %d, %v; want ErrStalePID with nothing serving %s", pid, err, socket)
-	}
-	if pid != 0 {
-		t.Errorf("DaemonPID returned pid %d alongside its refusal; a caller could still signal it", pid)
-	}
-	// Removed, not merely refused: the next reader has no stale file to reason about, and the
-	// daemon that starts next writes its own.
-	if _, err := os.Stat(pidFile); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("stat %s = %v, want the stale file removed", pidFile, err)
-	}
 }
 
 // TestBridgeReportsADaemonThatCannotServe: a box with no provider cannot build a daemon, and

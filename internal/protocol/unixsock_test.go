@@ -383,6 +383,36 @@ func TestDialReportsNoServer(t *testing.T) {
 	})
 }
 
+func TestAcceptMarksOnlyTheServerSideAsSameUser(t *testing.T) {
+	path := filepath.Join(sockDir(t), "rudy.sock")
+	l, err := ListenUnix(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	accepted := make(chan Conn, 1)
+	go func() {
+		conn, _ := l.Accept()
+		accepted <- conn
+	}()
+	client, err := DialUnix(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	server := <-accepted
+	if server == nil {
+		t.Fatal("listener returned no connection")
+	}
+	defer func() { _ = server.Close() }()
+	if IsSameUser(client) {
+		t.Fatal("dialed side carries the listener's same-user proof")
+	}
+	if !IsSameUser(server) {
+		t.Fatal("accepted side does not carry the listener's same-user proof")
+	}
+}
+
 func TestAcceptAdmitsTheOwner(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

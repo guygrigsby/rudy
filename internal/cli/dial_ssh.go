@@ -27,8 +27,14 @@ var sshGreetTimeout = 30 * time.Second
 var sshExitGrace = 5 * time.Second
 
 // errNoRudyOnHost is the remote line's exit 111: the host answered ssh and has no rudy on
-// its PATH. Task 7 answers it with an install; until then the message names the command.
+// its PATH. dialSSH answers it by installing one and dialing again.
 var errNoRudyOnHost = errors.New("rudy is not on the host's PATH over ssh")
+
+// hostInstallBudget bounds the build on the box. A make install is a go build, which on a
+// cold module cache and a box that is also compiling something else is minutes rather than
+// seconds; the bound is here so a box that has stopped talking mid-build does not hold a
+// client forever, not to hurry the compiler.
+var hostInstallBudget = 15 * time.Minute
 
 // sshProc is the Closer under an ssh connection: ending it is the client detaching on the
 // box. The daemon on the far side is setsid'd and outlives the bridge, so nothing here ends
@@ -94,10 +100,70 @@ func sshTransport(cmd *exec.Cmd) (protocol.Conn, *sshProc, error) {
 	return protocol.NewStreamConn(outR, inW, proc), proc, nil
 }
 
-// dialSSH runs the remote line on host through ssh and greets the bridge. Exit 111 before
+// dialSSH reaches the kernel on host, installing rudy there when the box has none.
+//
+// Exit 111 is the only thing that starts an install, and it starts exactly one: the box said
+// it has no rudy, which is a fact and not a guess, and the answer to it is the same whether
+// the box is new or somebody moved the binary. A daemon already serving an older version is
+// not this: it is a process holding sessions, and ADR 0029 makes that a notice rather than a
+// restart, which dialSSHOnce prints after the hello.
+//
+// The retry is once. A second 111 means the install ran and put rudy somewhere the remote
+// line's PATH does not look, or built nothing at all, and dialing again would just be slower
+// about saying so; the build's own output is what answers that, so it comes back with the
+// error.
+func dialSSH(o BuildOptions, host hosts.Host, d dialOptions, name string, asker bool) (*dialed, int, error) {
+	dialed, code, err := dialSSHOnce(o, host, d, name, asker)
+	if !errors.Is(err, errNoRudyOnHost) {
+		return dialed, code, err
+	}
+	build, ierr := installOnHost(o, host)
+	if ierr != nil {
+		// Still errNoRudyOnHost: the box has no rudy whether the install could not start or
+		// could not finish, and a caller telling that apart from a refused connection is the
+		// reason the sentinel exists.
+		return nil, 1, fmt.Errorf("%w on %s: %w", errNoRudyOnHost, host, ierr)
+	}
+	dialed, code, err = dialSSHOnce(o, host, d, name, asker)
+	if errors.Is(err, errNoRudyOnHost) {
+		return nil, 1, fmt.Errorf("installed rudy on %s and the remote line still cannot find it on $HOME/.local/bin, $HOME/bin or $HOME/go/bin; the install said:\n%s", host, build)
+	}
+	return dialed, code, err
+}
+
+// installOnHost builds this binary's revision on the box and says so. It returns what the
+// build printed, for the caller that has to report a box which still has no rudy afterwards.
+//
+// A version that names no commit stops here rather than at the box: nothing can be checked
+// out from "dev" or from a dirty tree, and the operator needs to hear that about the binary in
+// their hand rather than watch a build fail on a machine they are not looking at.
+func installOnHost(o BuildOptions, host hosts.Host) (string, error) {
+	_, cfg, err := localConfig(o)
+	if err != nil {
+		return "", err
+	}
+	rev, err := hosts.Revision(Version())
+	if err != nil {
+		return "", err
+	}
+	stderr := stderrOf(o)
+	// A context of this call's own, for the reason the greet has one: an interrupt that
+	// arrived before the client got going must not report a cancelled build.
+	ctx, done := context.WithTimeout(context.Background(), hostInstallBudget)
+	defer done()
+	tail := protocol.NewTail(protocol.TailBytes)
+	_, _ = fmt.Fprintf(stderr, "rudy: %s has no rudy; building %s there from %s\n", host, rev, cfg.Remote.Source)
+	if err := hosts.Install(ctx, hosts.SSHRunner(host), cfg.Remote.Source, rev, io.MultiWriter(stderr, tail)); err != nil {
+		return tail.String(), err
+	}
+	_, _ = fmt.Fprintf(stderr, "rudy: installed rudy %s on %s\n", rev, host)
+	return tail.String(), nil
+}
+
+// dialSSHOnce runs the remote line on host through ssh and greets the bridge. Exit 111 before
 // the hello is errNoRudyOnHost; any other exit surfaces ssh's stderr, which is the only
 // thing that says why.
-func dialSSH(o BuildOptions, host hosts.Host, d dialOptions, name string, asker bool) (*dialed, int, error) {
+func dialSSHOnce(o BuildOptions, host hosts.Host, d dialOptions, name string, asker bool) (*dialed, int, error) {
 	paths, cfg, err := localConfig(o)
 	if err != nil {
 		return nil, 1, err
@@ -123,23 +189,31 @@ func dialSSH(o BuildOptions, host hosts.Host, d dialOptions, name string, asker 
 		// Closing waits for ssh, so the exit status below is the one ssh already produced.
 		_ = client.Close()
 		if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == hosts.ExitNoRudy {
-			return nil, 1, fmt.Errorf("%w on %s; run rudy hosts install %s", errNoRudyOnHost, host, host)
+			return nil, 1, fmt.Errorf("%w on %s", errNoRudyOnHost, host)
 		}
 		if text := strings.TrimSpace(stderr.String()); text != "" {
 			return nil, 1, fmt.Errorf("ssh %s: %s", host, text)
 		}
 		return nil, 1, fmt.Errorf("ssh %s: %w", host, err)
 	}
+	// A daemon of another version is a notice and never a restart: it may be holding somebody
+	// else's sessions, and a turn survives its client leaving precisely so that this client is
+	// not the one that decides. The operator gets the two versions and the command that swaps
+	// them when they know nothing is live.
+	if hello.Version != Version() {
+		_, _ = fmt.Fprintf(stderrOf(o), "rudy: host runs rudy %s, this is %s; rudy hosts install %s --force restarts it at this version\n", hello.Version, Version(), host)
+	}
 	slog.Info("host: dial", "host", host.String(), "home", hello.Home)
 	return &dialed{
-		Client:  client,
-		Paths:   paths,
-		Config:  cfg,
-		Version: hello.Version,
-		Close:   func() { _ = client.Close() },
-		Host:    host,
-		Home:    hello.Home,
-		Cwd:     d.Cwd,
-		NoSync:  d.NoSync,
+		Client:     client,
+		Paths:      paths,
+		Config:     cfg,
+		Version:    hello.Version,
+		InstanceID: hello.InstanceID,
+		Close:      func() { _ = client.Close() },
+		Host:       host,
+		Home:       hello.Home,
+		Cwd:        d.Cwd,
+		NoSync:     d.NoSync,
 	}, 0, nil
 }

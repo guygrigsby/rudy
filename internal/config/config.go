@@ -229,7 +229,9 @@ type Config struct {
 		// Host is the ssh destination that runs the kernel when --host is not given. Empty
 		// means the kernel runs here.
 		Host string `mapstructure:"host"`
-		// Source is the rudy checkout on the host, which rudy hosts install builds from.
+		// Source is the rudy checkout on the host, which rudy hosts install builds from. A
+		// path on the host, kept exactly as it was written: a leading ~ is expanded by the
+		// host's shell, since the home it names is the host's.
 		Source string `mapstructure:"source"`
 	} `mapstructure:"remote"`
 	MaxTokens int      `mapstructure:"max_tokens"`
@@ -410,7 +412,9 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 		c.Log.File = filepath.Join(paths.Cache, "rudy.log")
 	}
 	c.Log.File = ExpandHome(c.Log.File, paths.Home)
-	c.Remote.Source = ExpandHome(c.Remote.Source, paths.Home)
+	// remote.source is deliberately not expanded: it is a directory on the host, and the home
+	// a ~ in it means is the host's, not this machine's. The client sends it as written and
+	// the host's own shell expands it (ADR 0029).
 	c.Memory.Dir = ExpandHome(c.Memory.Dir, paths.Home)
 	for i, d := range c.Skills.Dirs {
 		c.Skills.Dirs[i] = ExpandHome(d, paths.Home)

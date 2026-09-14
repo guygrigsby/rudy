@@ -153,6 +153,17 @@ type Listener struct {
 	closeErr  error
 }
 
+// sameUserConn is minted only after Listener.Accept has proved the peer uid. The marker is
+// deliberately unexported so another package cannot turn a client assertion into transport
+// authentication.
+type sameUserConn struct{ Conn }
+
+// IsSameUser reports whether c came from this package's successful listener-side peer check.
+func IsSameUser(c Conn) bool {
+	_, ok := c.(sameUserConn)
+	return ok
+}
+
 // ListenUnix listens on path, creating its directory 0700 and the socket 0600. A directory
 // that was already there is checked rather than narrowed, and refused with ErrSocketNotOurs
 // when it is another uid's or open to a group or other write. A socket left behind by a
@@ -308,7 +319,7 @@ func (l *Listener) Accept() (Conn, error) {
 		_ = c.Close()
 		return nil, fmt.Errorf("%w: peer uid %d, server uid %d", ErrPeerRefused, uid, os.Getuid())
 	}
-	return NewStreamConn(c, c, c), nil
+	return sameUserConn{Conn: NewStreamConn(c, c, c)}, nil
 }
 
 // Addr is the address the listener is bound to, for logging.

@@ -113,6 +113,16 @@ func notices(w io.Writer) func(string) {
 	return func(text string) { _, _ = fmt.Fprintln(w, "rudy:", text) }
 }
 
+// stderrOf is where a caller's diagnostics go: the writer it named, or this process's stderr
+// when it named none. Every path that prints a notice without a Built to read it off goes
+// through here, so a nil Stderr is one decision rather than one per caller.
+func stderrOf(o BuildOptions) io.Writer {
+	if o.Stderr == nil {
+		return os.Stderr
+	}
+	return o.Stderr
+}
+
 // Build wires config, store, plugins, registry, gate and server. It never writes config. A
 // failure after the server exists shuts it back down: it holds a context, loaded plugins and
 // their connections, and a caller that got an error will never call Shutdown itself.
@@ -121,10 +131,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	if err != nil {
 		return nil, err
 	}
-	stderr := o.Stderr
-	if stderr == nil {
-		stderr = os.Stderr
-	}
+	stderr := stderrOf(o)
 	paths := config.XDG(env, home)
 	// A command that named a socket is serving on that one, so that is the socket a locked
 	// session tells the next client to attach through; nobody naming one means the default.

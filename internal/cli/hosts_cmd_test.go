@@ -31,6 +31,81 @@ func TestHostsPullNeedsAHost(t *testing.T) {
 	}
 }
 
+// TestHostsInstallNeedsAHost: the verb builds rudy on a machine, and with none named and no
+// remote.host there is nothing to build on.
+func TestHostsInstallNeedsAHost(t *testing.T) {
+	o := BuildOptions{Stderr: io.Discard, Home: t.TempDir(), Env: func(string) string { return "" }}
+	code, err := runHostsInstall(context.Background(), refuseToBuild(t, "hosts install with no host wired a server"), o, dialOptions{}, false, io.Discard)
+	if code != 2 || err == nil || !strings.Contains(err.Error(), "remote.host") {
+		t.Fatalf("hosts install with no host = %d, %v; want 2 naming remote.host", code, err)
+	}
+}
+
+// TestHostsInstallLeavesARunningDaemonAlone: the box's daemon may be holding somebody's
+// session, and the binary on disk changing does not change the process already running. So
+// the install lands and the operator is told the daemon is still the old one, rather than
+// having it killed under whatever it was doing.
+func TestHostsInstallLeavesARunningDaemonAlone(t *testing.T) {
+	aBoxThatCanInstall(t)
+	build := testBuilder(t, &fakeProvider{})
+	o := BuildOptions{Stderr: io.Discard}
+	var first bytes.Buffer
+	if code, err := runHostsInstall(context.Background(), build, o, dialOptions{Host: "box"}, false, &first); err != nil || code != 0 {
+		t.Fatalf("hosts install = %d, %v\n%s", code, err, first.String())
+	}
+	before, code, err := dial(context.Background(), build, o, dialOptions{Host: "box"}, "test", false)
+	if err != nil || code != 0 {
+		t.Fatalf("dial before second install = %d, %v", code, err)
+	}
+	was := before.InstanceID
+	before.Close()
+	var out bytes.Buffer
+	if code, err := runHostsInstall(context.Background(), build, o, dialOptions{Host: "box"}, false, &out); err != nil || code != 0 {
+		t.Fatalf("second hosts install = %d, %v\n%s", code, err, out.String())
+	}
+	if !strings.Contains(out.String(), "--force") {
+		t.Fatalf("hosts install said %q; it should say what restarts the daemon", out.String())
+	}
+	after, code, err := dial(context.Background(), build, o, dialOptions{Host: "box"}, "test", false)
+	if err != nil || code != 0 {
+		t.Fatalf("dial after second install = %d, %v", code, err)
+	}
+	defer after.Close()
+	if after.InstanceID != was {
+		t.Fatalf("daemon instance %s, want the running instance %s", after.InstanceID, was)
+	}
+}
+
+// TestHostsInstallForceRestartsTheDaemon is the operator's word that nothing is live: the
+// daemon goes and a new one comes up from the binary that was just built.
+func TestHostsInstallForceRestartsTheDaemon(t *testing.T) {
+	aBoxThatCanInstall(t)
+	build := testBuilder(t, &fakeProvider{})
+	o := BuildOptions{Stderr: io.Discard}
+	var first bytes.Buffer
+	if code, err := runHostsInstall(context.Background(), build, o, dialOptions{Host: "box"}, false, &first); err != nil || code != 0 {
+		t.Fatalf("hosts install = %d, %v\n%s", code, err, first.String())
+	}
+	before, code, err := dial(context.Background(), build, o, dialOptions{Host: "box"}, "test", false)
+	if err != nil || code != 0 {
+		t.Fatalf("dial before --force = %d, %v", code, err)
+	}
+	was := before.InstanceID
+	before.Close()
+	var out bytes.Buffer
+	if code, err := runHostsInstall(context.Background(), build, o, dialOptions{Host: "box"}, true, &out); err != nil || code != 0 {
+		t.Fatalf("hosts install --force = %d, %v\n%s", code, err, out.String())
+	}
+	after, code, err := dial(context.Background(), build, o, dialOptions{Host: "box"}, "test", false)
+	if err != nil || code != 0 {
+		t.Fatalf("nothing is serving the box after --force: %d, %v\n%s", code, err, out.String())
+	}
+	defer after.Close()
+	if after.InstanceID == was {
+		t.Fatalf("daemon instance is still %s; --force did not replace it\n%s", was, out.String())
+	}
+}
+
 // TestHostsPullBringsTheBoxsCommitBack is the return path end to end: the tree goes over, the
 // box commits on it, and the verb fast-forwards this checkout onto the box's head. Both legs
 // go through the ssh shim, git's own connection included.

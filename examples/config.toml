@@ -33,7 +33,7 @@ file = ""
 # ssh alias or user@host. Empty means the kernel runs here.
 # e.g. "box"
 host = ""
-# The rudy checkout on the host; rudy hosts install builds from it at this binary's commit.
+# The rudy checkout on the host; rudy hosts install builds from it at this binary's commit. A path on the host: ~ expands there, not here.
 source = "~/projects/rudy"
 
 # The provider and model a new session opens on.

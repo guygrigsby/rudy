@@ -69,7 +69,7 @@ Inside Session, groupings that share one language:
 | Session (child) | Plugin (subagents) | Open Host Service | The `agent` tool opens a child session over the protocol like any client and reads its outcome back |
 | Memory (memory-go) | Plugin | ACL | The memory plugin is the only importer; fold's model call is a port satisfied from Provider |
 | Hosts | Client | Customer/Supplier | The client asks Hosts for a connection and a placement; Hosts speaks ssh and git and hands back a `Conn` and a path. Session never sees a host |
-| Session | Hosts | Open Host Service, Published Language | Hosts requests `server.shutdown` over the same greeted connection it used to inspect the remote Server, then waits for that connection to close before it starts a replacement. No Host type crosses into Session |
+| Session | Hosts | Open Host Service, Published Language | Hosts requests `server.shutdown` over the same greeted connection it used to inspect the remote Server, then requires matching `server.stopped` proof and EOF before it starts a replacement. No Host type crosses into Session |
 | sand | Hosts | Separate Ways | Same box, same checkouts, same ssh alias; rudy takes sand's runtime behaviour (PATH over ssh, the doctor, push by URL, fetch back) and leaves the signing ring to sand |
 | Codex, Claude Code, pi | rudy | Separate Ways | Precedents only; no protocol or format shared |
 

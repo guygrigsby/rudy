@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -363,7 +364,10 @@ func socketFor(t *testing.T, srv *server.Server) string {
 				}
 				continue
 			}
-			go func() { _ = srv.Serve(context.Background(), c) }()
+			go func() {
+				defer func() { _ = c.Close() }()
+				_ = srv.Serve(context.Background(), c)
+			}()
 		}
 	}()
 	t.Cleanup(func() {
@@ -1043,6 +1047,186 @@ func TestTheHelloNamesTheServersHome(t *testing.T) {
 	if !filepath.IsAbs(hello.Home) {
 		t.Fatalf("hello.home = %q, want an absolute path", hello.Home)
 	}
+	if _, err := ulid.Parse(hello.InstanceID); err != nil {
+		t.Fatalf("hello.instance_id = %q, want a ULID: %v", hello.InstanceID, err)
+	}
+	second := protocol.NewClient(dialConn(t, srv))
+	defer func() { _ = second.Close() }()
+	var same protocol.ClientHelloResult
+	if err := second.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0"}, &same); err != nil {
+		t.Fatal(err)
+	}
+	if same.InstanceID != hello.InstanceID {
+		t.Fatalf("two connections reached instances %s and %s on one Server", hello.InstanceID, same.InstanceID)
+	}
+	other, _ := newServerWith(t, testConfig())
+	if other.InstanceID() == hello.InstanceID {
+		t.Fatalf("two Servers share instance %s", hello.InstanceID)
+	}
+}
+
+func TestServerShutdownBeforeHelloIsRefused(t *testing.T) {
+	srv, _ := newServerWith(t, testConfig())
+	conn, err := protocol.DialUnix(context.Background(), socketFor(t, srv), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.NewClient(conn)
+	defer func() { _ = client.Close() }()
+	err = client.Call(context.Background(), protocol.MethodServerShutdown, struct{}{}, &protocol.ServerShutdownResult{})
+	var pe *protocol.Error
+	if !errorsAs(err, &pe) || pe.Code != protocol.CodeRefusedByInvariant {
+		t.Fatalf("server.shutdown before hello = %v, want refused_by_invariant", err)
+	}
+	select {
+	case <-srv.ShutdownRequested():
+		t.Fatal("ungreeted shutdown reached the process owner")
+	default:
+	}
+}
+
+func TestServerShutdownRefusesAnUnprovedConnection(t *testing.T) {
+	srv, _ := newServerWith(t, testConfig())
+	clientConn, serverConn := protocol.Pipe()
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(context.Background(), serverConn) }()
+	client := protocol.NewClient(clientConn)
+	defer func() { _ = client.Close() }()
+	var hello protocol.ClientHelloResult
+	if err := client.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "rudy-hosts", Version: "0"}, &hello); err != nil {
+		t.Fatal(err)
+	}
+	var result protocol.ServerShutdownResult
+	err := client.Call(context.Background(), protocol.MethodServerShutdown, struct{}{}, &result)
+	var pe *protocol.Error
+	if !errorsAs(err, &pe) || pe.Code != protocol.CodeUnauthorized {
+		t.Fatalf("server.shutdown over an unproved connection = %v, want unauthorized", err)
+	}
+	select {
+	case <-srv.ShutdownRequested():
+		t.Fatal("unauthorized shutdown reached the process owner")
+	default:
+	}
+	_ = client.Close()
+	<-served
+}
+
+func TestServerShutdownFlushesItsResponseAndHoldsTheConnectionUntilCleanup(t *testing.T) {
+	srv, _ := newServerWith(t, testConfig())
+	conn, err := protocol.DialUnix(context.Background(), socketFor(t, srv), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.NewClient(conn)
+	defer func() { _ = client.Close() }()
+	var hello protocol.ClientHelloResult
+	if err := client.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "rudy-hosts", Version: "0"}, &hello); err != nil {
+		t.Fatal(err)
+	}
+	var result protocol.ServerShutdownResult
+	if err := client.Call(context.Background(), protocol.MethodServerShutdown, struct{}{}, &result); err != nil {
+		t.Fatalf("server.shutdown: %v", err)
+	}
+	if result.InstanceID != hello.InstanceID || result.State != protocol.ServerStateShuttingDown {
+		t.Fatalf("server.shutdown = %+v, want instance %s shutting_down", result, hello.InstanceID)
+	}
+	select {
+	case <-srv.ShutdownRequested():
+	default:
+		t.Fatal("shutdown response arrived before the process owner was notified")
+	}
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- srv.Shutdown(context.Background()) }()
+	select {
+	case err := <-shutdown:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Server.Shutdown waited on the request handler that asked for shutdown")
+	}
+	select {
+	case _, ok := <-client.Notifications():
+		if !ok {
+			t.Fatal("shutdown control connection closed before cleanup was completed")
+		}
+	default:
+	}
+	srv.CompleteShutdown()
+	if got := srv.State(); got != protocol.ServerStateStopped {
+		t.Fatalf("Server state = %q, want stopped", got)
+	}
+	select {
+	case n, ok := <-client.Notifications():
+		if !ok {
+			t.Fatal("shutdown connection closed without server.stopped proof")
+		}
+		if n.Method != protocol.NotifyServerStopped {
+			t.Fatalf("shutdown notification = %q, want server.stopped", n.Method)
+		}
+		var stopped protocol.ServerStoppedParams
+		if err := json.Unmarshal(n.Params, &stopped); err != nil {
+			t.Fatal(err)
+		}
+		if stopped.InstanceID != hello.InstanceID || stopped.State != protocol.ServerStateStopped {
+			t.Fatalf("server.stopped = %+v, want instance %s stopped", stopped, hello.InstanceID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server.stopped was not sent after cleanup completed")
+	}
+	if err := client.Wait(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("shutdown connection after server.stopped = %v, want EOF", err)
+	}
+}
+
+func TestConcurrentServerShutdownRequestsHaveOneWinner(t *testing.T) {
+	srv, _ := newServerWith(t, testConfig())
+	path := socketFor(t, srv)
+	clients := make([]*protocol.Client, 2)
+	for i := range clients {
+		conn, err := protocol.DialUnix(context.Background(), path, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients[i] = protocol.NewClient(conn)
+		var hello protocol.ClientHelloResult
+		if err := clients[i].Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "test", Version: "0"}, &hello); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := make(chan struct{})
+	results := make(chan error, len(clients))
+	for _, client := range clients {
+		go func() {
+			<-start
+			results <- client.Call(context.Background(), protocol.MethodServerShutdown, struct{}{}, &protocol.ServerShutdownResult{})
+		}()
+	}
+	close(start)
+	succeeded, refused := 0, 0
+	for range clients {
+		err := <-results
+		if err == nil {
+			succeeded++
+			continue
+		}
+		var pe *protocol.Error
+		if errorsAs(err, &pe) && pe.Code == protocol.CodeRefusedByInvariant {
+			refused++
+			continue
+		}
+		t.Fatalf("concurrent server.shutdown = %v", err)
+	}
+	if succeeded != 1 || refused != 1 {
+		t.Fatalf("concurrent server.shutdown: %d succeeded, %d refused", succeeded, refused)
+	}
+	for _, client := range clients {
+		_ = client.Close()
+	}
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	srv.CompleteShutdown()
 }
 
 func errorsAs(err error, target **protocol.Error) bool {

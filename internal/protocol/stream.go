@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // maxLineBytes caps one message. A spawned plugin that writes a line longer than this has
@@ -143,10 +144,62 @@ func (c *streamConn) Send(ctx context.Context, msg any) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// One Write per message, under the mutex: a partial interleaving of two messages is not
-	// something the peer's parser can recover from.
-	_, err = c.w.Write(b)
-	return err
+	return writeContext(ctx, c.w, b)
+}
+
+type writeDeadliner interface {
+	SetWriteDeadline(time.Time) error
+}
+
+// writeContext makes a blocked socket write answer cancellation. Writers without deadline
+// support retain the synchronous behavior they had before; daemon and dialed Unix sockets
+// implement writeDeadliner, which is the trust boundary where bounded shutdown matters.
+func writeContext(ctx context.Context, w io.Writer, b []byte) error {
+	d, ok := w.(writeDeadliner)
+	if !ok {
+		n, err := w.Write(b)
+		if n != len(b) && err == nil {
+			err = io.ErrShortWrite
+		}
+		return err
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	writeDeadline := time.Time{}
+	if hasDeadline {
+		writeDeadline = deadline
+	}
+	if err := d.SetWriteDeadline(writeDeadline); err != nil {
+		n, writeErr := w.Write(b)
+		if n != len(b) && writeErr == nil {
+			writeErr = io.ErrShortWrite
+		}
+		return writeErr
+	}
+	fired := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = d.SetWriteDeadline(time.Now())
+		close(fired)
+	})
+	n, writeErr := w.Write(b)
+	if n != len(b) && writeErr == nil {
+		writeErr = io.ErrShortWrite
+	}
+	if !stop() {
+		<-fired
+	}
+	clearErr := d.SetWriteDeadline(time.Time{})
+	if writeErr == nil {
+		// The complete message reached the transport. A simultaneous cancellation cannot
+		// turn that physical fact back into failure; shutdown commits from this result.
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(writeErr, ctxErr)
+	}
+	if hasDeadline && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return errors.Join(writeErr, clearErr)
 }
 
 func (c *streamConn) Close() error {

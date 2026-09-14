@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"strconv"
 	"testing"
 	"time"
@@ -131,6 +132,43 @@ func TestClientCallAfterPeerClose(t *testing.T) {
 	defer cancel()
 	if err := c.Call(ctx, "anything", nil, nil); err == nil {
 		t.Fatal("Call on a closed peer must fail")
+	}
+}
+
+func TestClientWaitReportsPeerEOF(t *testing.T) {
+	cc, sc := Pipe()
+	c := NewClient(cc)
+	defer func() { _ = c.Close() }()
+	if err := sc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Wait(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("Wait = %v, want EOF", err)
+	}
+}
+
+func TestClientWaitHonorsContext(t *testing.T) {
+	cc, sc := Pipe()
+	defer func() { _ = sc.Close() }()
+	c := NewClient(cc)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.Wait(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait = %v, want context canceled", err)
+	}
+}
+
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestClientWaitReportsTransportFailure(t *testing.T) {
+	want := errors.New("read failed")
+	c := NewClient(NewStreamConn(failingReader{err: want}, io.Discard, nil))
+	defer func() { _ = c.Close() }()
+	if err := c.Wait(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("Wait = %v, want %v", err, want)
 	}
 }
 

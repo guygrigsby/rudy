@@ -22,3 +22,16 @@ func TestRevisionRefusesDirtyAndDev(t *testing.T) {
 		}
 	}
 }
+
+func TestRevisionRefusesShellSyntax(t *testing.T) {
+	for _, in := range []string{
+		"v1;touch${IFS}/tmp/rudy_pwn",
+		"v1$(touch /tmp/rudy_pwn)",
+		"v1`touch /tmp/rudy_pwn`",
+		"v1\nmake install",
+	} {
+		if _, err := Revision(in); err == nil {
+			t.Fatalf("Revision(%q) accepted shell syntax", in)
+		}
+	}
+}

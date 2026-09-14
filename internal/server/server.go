@@ -73,9 +73,20 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	wgMu         sync.Mutex // guards wg.Add against Shutdown's wg.Wait; see spawnTurn
-	wg           sync.WaitGroup
-	shuttingDown bool
+	instanceID        ulid.ULID
+	state             protocol.ServerState
+	shutdownRequested chan struct{}
+	shutdownComplete  chan struct{}
+	shutdownFailed    chan struct{}
+	shutdownOnce      sync.Once
+	completeOnce      sync.Once
+	failOnce          sync.Once
+
+	wgMu              sync.Mutex // guards wg.Add against Shutdown's wg.Wait; see spawnTurn
+	wg                sync.WaitGroup
+	shuttingDown      bool
+	shutdownClaimed   bool
+	shutdownCommitted bool
 
 	mu      sync.Mutex
 	live    map[ulid.ULID]*liveSession
@@ -88,7 +99,12 @@ type Server struct {
 // New wires a Server. Deps must already be fully populated.
 func New(d Deps) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Server{d: d, ctx: ctx, cancel: cancel, live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{}}
+	return &Server{
+		d: d, ctx: ctx, cancel: cancel,
+		instanceID: ulid.Make(), state: protocol.ServerStateRunning,
+		shutdownRequested: make(chan struct{}), shutdownComplete: make(chan struct{}), shutdownFailed: make(chan struct{}),
+		live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{},
+	}
 }
 
 // Serve runs one connection until it closes. client.hello must be its first request.
@@ -132,20 +148,20 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	// Tracked in the same WaitGroup as running turns, and registered under wgMu against
 	// shuttingDown for the same reason spawnTurn is (see spawnTurn): a serve loop can be
 	// dispatching a request against a live session at any moment, so Shutdown must not
-	// close a session until every loop has returned. The Done below is deferred before the
-	// detach, so it fires only after this connection has released its sessions.
+	// close a session until every loop has returned. The Done below happens after detach but
+	// before a shutdown control connection waits for full process cleanup, so the request
+	// that initiated shutdown cannot make Shutdown wait on itself.
 	s.wgMu.Lock()
-	if s.shuttingDown {
+	if s.shuttingDown || s.shutdownClaimed {
 		s.wgMu.Unlock()
 		return ErrShuttingDown
 	}
 	s.wg.Add(1)
 	s.wgMu.Unlock()
-	defer s.wg.Done()
-
 	s.mu.Lock()
 	s.nextID++
 	cn := newConn(s.nextID, c)
+	cn.sameUser = protocol.IsSameUser(c)
 	cn.plugin = name
 	cn.reg = reg
 	cn.hello = name != ""
@@ -153,17 +169,43 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	s.mu.Unlock()
 	slog.Info("server: conn open", "conn", cn.id, "plugin", name)
 
-	pumpCtx, stopPump := context.WithCancel(ctx)
+	pumpCtx, stopPump := context.WithCancel(context.Background())
+	cn.abortPump = stopPump
 	go cn.pump(pumpCtx)
-	defer func() {
-		s.mu.Lock()
-		delete(s.conns, cn.id)
-		s.mu.Unlock()
-		s.detachAll(cn)
+	err := s.serve(ctx, cn)
+	shutdownControl := errors.Is(err, ErrShutdownRequested)
+	s.mu.Lock()
+	delete(s.conns, cn.id)
+	s.mu.Unlock()
+	s.detachAll(cn)
+	if !shutdownControl {
 		stopPump()
+		<-cn.pumpDone
+		s.wg.Done()
 		slog.Info("server: conn closed", "conn", cn.id, "plugin", name)
-	}()
-	return s.serve(ctx, cn)
+		return err
+	}
+
+	// The control loop no longer owns session state, so Shutdown must not wait on it. Its
+	// writer stays alive until the process owner reports success or failure.
+	s.wg.Done()
+	select {
+	case <-s.shutdownComplete:
+		note, noteErr := protocol.NewNotification(protocol.NotifyServerStopped, protocol.ServerStoppedParams{
+			InstanceID: s.instanceID.String(), State: protocol.ServerStateStopped,
+		})
+		if noteErr == nil {
+			flushCtx, cancel := context.WithTimeout(context.Background(), shutdownResponseBudget)
+			noteErr = cn.sendAndWait(flushCtx, note)
+			cancel()
+		}
+		err = errors.Join(err, noteErr)
+	case <-s.shutdownFailed:
+	}
+	stopPump()
+	<-cn.pumpDone
+	slog.Info("server: conn closed", "conn", cn.id, "plugin", name)
+	return err
 }
 
 func (s *Server) serve(ctx context.Context, cn *conn) error {
@@ -195,8 +237,22 @@ func (s *Server) serve(ctx context.Context, cn *conn) error {
 		}
 		resp, merr := protocol.NewResponse(req.ID, result)
 		if merr != nil {
+			if req.Method == protocol.MethodServerShutdown {
+				s.releaseShutdownClaim()
+			}
 			cn.send(protocol.NewErrorResponse(req.ID, perr(protocol.CodeInternal, merr.Error())))
 			continue
+		}
+		if req.Method == protocol.MethodServerShutdown {
+			flushCtx, cancel := context.WithTimeout(ctx, shutdownResponseBudget)
+			err := cn.sendAndWait(flushCtx, resp)
+			cancel()
+			if err != nil {
+				s.releaseShutdownClaim()
+				return err
+			}
+			s.requestShutdown()
+			return ErrShutdownRequested
 		}
 		cn.send(resp)
 		if req.Method == protocol.MethodClientHello {
@@ -210,6 +266,86 @@ func (s *Server) serve(ctx context.Context, cn *conn) error {
 // ErrShuttingDown is returned by Serve for a connection offered after Shutdown has begun.
 var ErrShuttingDown = errors.New("server: shutting down")
 
+// shutdownResponseBudget bounds the physical response flush. A requester that stops reading
+// cannot hold the daemon open, and the process owner is not notified unless acceptance reached
+// the peer.
+const shutdownResponseBudget = 2 * time.Second
+
+// ErrShutdownRequested tells the connection owner to keep this connection open until the
+// process owner calls CompleteShutdown. It is a clean lifecycle transition, not a diagnostic.
+var ErrShutdownRequested = errors.New("server: shutdown requested")
+
+// ShutdownRequested closes when this Server begins its terminal transition. The process
+// owner selects on it beside signals and parent context cancellation.
+func (s *Server) ShutdownRequested() <-chan struct{} { return s.shutdownRequested }
+
+// InstanceID is this process-lifetime Server identity.
+func (s *Server) InstanceID() string { return s.instanceID.String() }
+
+// State reports the Server lifecycle state.
+func (s *Server) State() protocol.ServerState {
+	s.wgMu.Lock()
+	defer s.wgMu.Unlock()
+	return s.state
+}
+
+// CompleteShutdown lets the acknowledged control connection send terminal proof after the
+// process owner has closed every runtime resource, including its listener and plugins.
+func (s *Server) CompleteShutdown() {
+	s.wgMu.Lock()
+	if s.state != protocol.ServerStateShuttingDown {
+		s.wgMu.Unlock()
+		return
+	}
+	s.wgMu.Unlock()
+	s.completeOnce.Do(func() {
+		s.wgMu.Lock()
+		s.state = protocol.ServerStateStopped
+		s.wgMu.Unlock()
+		close(s.shutdownComplete)
+	})
+}
+
+// FailShutdown releases a held shutdown control connection without the terminal success
+// notification. Its resulting bare EOF is deliberately not proof to a client.
+func (s *Server) FailShutdown() {
+	s.failOnce.Do(func() { close(s.shutdownFailed) })
+}
+
+func (s *Server) claimShutdown() bool {
+	s.wgMu.Lock()
+	defer s.wgMu.Unlock()
+	if s.shuttingDown || s.shutdownClaimed {
+		return false
+	}
+	s.shutdownClaimed = true
+	return true
+}
+
+func (s *Server) releaseShutdownClaim() {
+	s.wgMu.Lock()
+	if !s.shutdownCommitted {
+		s.shutdownClaimed = false
+	}
+	s.wgMu.Unlock()
+}
+
+func (s *Server) requestShutdown() {
+	s.wgMu.Lock()
+	s.shuttingDown = true
+	s.shutdownClaimed = true
+	s.shutdownCommitted = true
+	s.state = protocol.ServerStateShuttingDown
+	s.wgMu.Unlock()
+	s.shutdownOnce.Do(func() { close(s.shutdownRequested) })
+}
+
+func (s *Server) isShuttingDown() bool {
+	s.wgMu.Lock()
+	defer s.wgMu.Unlock()
+	return s.shuttingDown || s.shutdownClaimed
+}
+
 // Shutdown cancels every running turn and waits for it to record its turn_interrupted entry
 // (or run to completion), and for every Serve loop to return, before closing every live
 // session, or until ctx ends, whichever comes first. Both waits matter: a turn still writing
@@ -222,9 +358,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// together under the same wgMu, so any spawnTurn call that could still race this is
 	// guaranteed to either see shuttingDown already true (and refuse) or have its Add counted
 	// before the Wait below runs. See spawnTurn.
-	s.wgMu.Lock()
-	s.shuttingDown = true
-	s.wgMu.Unlock()
+	s.requestShutdown()
 
 	s.mu.Lock()
 	lives := make([]*liveSession, 0, len(s.live))
@@ -296,16 +430,24 @@ func decode(raw json.RawMessage, into any) *protocol.Error {
 }
 
 func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (any, *protocol.Error) {
+	if s.isShuttingDown() {
+		return nil, perr(protocol.CodeRefusedByInvariant, "server is shutting down")
+	}
 	if req.Method == protocol.MethodClientHello {
 		return s.handleHello(cn, req.Params)
 	}
 	if !cn.hello {
+		if req.Method == protocol.MethodServerShutdown {
+			return nil, perr(protocol.CodeRefusedByInvariant, "client.hello must precede server.shutdown")
+		}
 		return nil, perr(protocol.CodeUnauthorized, "client.hello must be the first request")
 	}
 	if e := s.authorizePlugin(cn, req); e != nil {
 		return nil, e
 	}
 	switch req.Method {
+	case protocol.MethodServerShutdown:
+		return s.handleServerShutdown(cn, req.Params)
 	case protocol.MethodSessionOpen:
 		var p protocol.SessionOpenParams
 		if e := decode(req.Params, &p); e != nil {
@@ -492,7 +634,21 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// thing about who is an asker.
 	cn.asker = p.Asker
 	cn.asker = cn.isAsker()
-	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, Home: s.d.Home}, nil
+	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home}, nil
+}
+
+func (s *Server) handleServerShutdown(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
+	var p struct{}
+	if e := decode(raw, &p); e != nil {
+		return nil, e
+	}
+	if cn.plugin != "" || !cn.sameUser {
+		return nil, perr(protocol.CodeUnauthorized, "server.shutdown requires a same-user unix socket connection")
+	}
+	if !s.claimShutdown() {
+		return nil, perr(protocol.CodeRefusedByInvariant, "server shutdown already requested")
+	}
+	return protocol.ServerShutdownResult{InstanceID: s.instanceID.String(), State: protocol.ServerStateShuttingDown}, nil
 }
 
 func (s *Server) handleClose(cn *conn, raw json.RawMessage) (any, *protocol.Error) {

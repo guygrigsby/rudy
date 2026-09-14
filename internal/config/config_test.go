@@ -20,8 +20,10 @@ func TestRemoteKeysHaveDefaults(t *testing.T) {
 	if cfg.Remote.Host != "" {
 		t.Fatalf("remote.host default = %q, want empty (no remote runtime)", cfg.Remote.Host)
 	}
-	if want := filepath.Join(paths.Home, "projects", "rudy"); cfg.Remote.Source != want {
-		t.Fatalf("remote.source = %q, want %q: ~ expands at load like every other path", cfg.Remote.Source, want)
+	// Kept verbatim, unlike every other path key: it names a directory on the host, so the
+	// home its ~ means is the host's and expanding it here would send this machine's.
+	if want := "~/projects/rudy"; cfg.Remote.Source != want {
+		t.Fatalf("remote.source = %q, want %q: the host's shell expands it, not this one", cfg.Remote.Source, want)
 	}
 	if !cfg.UI.Status.Host {
 		t.Fatal("ui.status.host default = false, want true")

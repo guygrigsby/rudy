@@ -68,12 +68,13 @@ func registerDialFlags(cmd *cobra.Command, d *dialOptions) {
 // resolved either way, since the theme, the key table and the ui.* settings are the local
 // terminal's business and not the server's.
 type dialed struct {
-	Client  *protocol.Client
-	Paths   config.Paths
-	Config  *config.Config
-	Version string // the server's, from its hello
-	Built   *Built // nil when attached
-	Close   func()
+	Client     *protocol.Client
+	Paths      config.Paths
+	Config     *config.Config
+	Version    string // the server's, from its hello
+	InstanceID string // the process-lifetime server's, from its hello
+	Built      *Built // nil when attached
+	Close      func()
 	// Host is the machine the kernel is running on, zero when it is this one. Everything that
 	// differs about a remote connection hangs off this being set rather than off a flag the
 	// caller still holds, so a command that was handed a dialed does not need the invocation.
@@ -212,7 +213,7 @@ func attach(o BuildOptions, socket string, timeout time.Duration, name string, a
 		}
 		return nil, 1, err
 	}
-	return &dialed{Client: client, Paths: paths, Config: cfg, Version: hello.Version, Close: closeClient}, 0, nil
+	return &dialed{Client: client, Paths: paths, Config: cfg, Version: hello.Version, InstanceID: hello.InstanceID, Close: closeClient}, 0, nil
 }
 
 // embed wires a server in this process and connects to it over the in-memory pipe. Its Close
@@ -239,7 +240,7 @@ func embed(ctx context.Context, build buildFunc, o BuildOptions, name string, as
 		closeConn()
 		shut()
 	}
-	return &dialed{Client: client, Paths: b.Paths, Config: b.Config, Version: b.Version, Built: b, Close: closeAll}, 0, nil
+	return &dialed{Client: client, Paths: b.Paths, Config: b.Config, Version: b.Version, InstanceID: b.Server.InstanceID(), Built: b, Close: closeAll}, 0, nil
 }
 
 // localConfig is the config and the paths a client resolves for itself, the same two steps

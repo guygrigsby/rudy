@@ -74,6 +74,37 @@ func newClientOn(send func(ctx context.Context, msg any) error, closeFn func() e
 // called may never reach this channel. See Close.
 func (c *Client) Notifications() <-chan Notification { return c.notes }
 
+// Wait blocks until the peer ends the connection or ctx ends. An orderly peer close is EOF;
+// a transport failure is returned unchanged. Connection completion already observed wins a
+// simultaneous context cancellation, matching Call's response-first rule.
+func (c *Client) Wait(ctx context.Context) error {
+	select {
+	case <-c.done:
+		return c.endErr()
+	default:
+	}
+	select {
+	case <-c.done:
+		return c.endErr()
+	case <-ctx.Done():
+		select {
+		case <-c.done:
+			return c.endErr()
+		default:
+			return ctx.Err()
+		}
+	}
+}
+
+func (c *Client) endErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return c.err
+	}
+	return io.EOF
+}
+
 // Call sends a request and waits for its response. A JSON-RPC error is returned as
 // *Error. result may be nil.
 func (c *Client) Call(ctx context.Context, method string, params, result any) error {

@@ -78,7 +78,7 @@ var Sections = []Section{
 		},
 		Keys: []Doc{
 			{Key: "remote.host", Comment: "ssh alias or user@host. Empty means the kernel runs here.", Example: `"box"`},
-			{Key: "remote.source", Comment: "The rudy checkout on the host; rudy hosts install builds from it at this binary's commit."},
+			{Key: "remote.source", Comment: "The rudy checkout on the host; rudy hosts install builds from it at this binary's commit. A path on the host: ~ expands there, not here."},
 		},
 	},
 	{

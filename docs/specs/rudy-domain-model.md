@@ -1,6 +1,6 @@
 # rudy domain model
 
-Pass 2 adds the Server lifecycle to Session for protocol-owned daemon replacement. The model still spans Session (core), Provider, Plugin and Hosts. Client is conformist and renders from the Session protocol; it holds no domain model beyond the transcript view. Memory is an external Go module imported by the memory plugin; nothing in it is modeled here.
+Pass 3 adds explicit terminal proof to the Server lifecycle for protocol-owned daemon replacement. The model still spans Session (core), Provider, Plugin and Hosts. Client is conformist and renders from the Session protocol; it holds no domain model beyond the transcript view. Memory is an external Go module imported by the memory plugin; nothing in it is modeled here.
 
 ## Contexts
 
@@ -63,16 +63,17 @@ Entity, aggregate root for one process-lifetime Session runtime. Its identity le
 ### Behaviors
 
 - `RequestShutdown()` moves a running Server to `shutting_down` once and wakes its process owner.
-- `CompleteShutdown()` moves a shutting-down Server to `stopped` and releases clients waiting for full cleanup.
+- `CompleteShutdown()` moves a shutting-down Server to `stopped` and releases the control connection to send terminal proof.
+- `FailShutdown()` releases the control connection without terminal proof when cleanup fails.
 - `ShutdownRequested() <-chan struct{}` lets the process owner react to the transition without a clock or signal guess.
 
 ### Invariants
 
 - `server.shutdown` is accepted only after `client.hello`, from a non-plugin connection whose same-user identity the unix listener proved.
 - The successful `server.shutdown` response is physically written before `RequestShutdown` begins the transition.
-- The first accepted request starts shutdown. Repeats cannot start a second transition.
+- The first accepted request reserves shutdown and fences new work. The Server remains `running` until its response is physically written, then starts the one-way transition. Repeats cannot reserve a second transition.
 - A Server in `shutting_down` admits no new work.
-- The control connection closes only after the listener, client connections, turns, sessions and plugins have completed cleanup.
+- The control connection sends `server.stopped` for this instance only after the listener, client connections, turns, sessions and plugins have completed cleanup, then closes. Bare EOF proves nothing.
 - Server identity and state are runtime facts. Neither is written to a pid file or another durable record.
 
 ### States
@@ -98,7 +99,7 @@ Closed enum: `running`, `shutting_down`, `stopped`. Invalid transitions are refu
 
 ## ShutdownCoordinator
 
-Domain service in Session. Owns the boundary between the protocol acknowledgement and process cleanup. It flushes the successful response, requests the Server transition once, stops new admission, interrupts connection work, closes sessions and plugins within the shutdown budget, closes the listener, then marks shutdown complete so the control connection reaches EOF.
+Domain service in Session. Owns the boundary between the protocol acknowledgement and process cleanup. It reserves admission, flushes the successful response, requests the Server transition once, interrupts connection work, closes sessions and plugins, and closes the listener. Success marks shutdown complete so the retained control writer sends `server.stopped` before EOF. Failure releases the connection without that proof.
 
 ## Session
 
@@ -1278,6 +1279,7 @@ classDiagram
         +ServerState state
         +RequestShutdown()
         +CompleteShutdown()
+        +FailShutdown()
         +ShutdownRequested() chan
     }
     class Session {

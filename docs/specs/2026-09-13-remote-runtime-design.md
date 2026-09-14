@@ -73,7 +73,7 @@ The box-side process, `rudy bridge`. Not a domain object so much as the runtime'
   the socket connection, which is the client detaching as ADR 0014 defines it.
 - `--no-start` makes `ErrNoServer` an exit rather than a start. `hosts check` uses it.
 - `--stop` never starts a daemon. It greets an answering Server, sends `server.shutdown`,
-  waits for the control connection to close after full runtime cleanup, and treats no
+  requires matching `server.stopped` proof followed by EOF after full runtime cleanup, and treats no
   answering Server as success. It never reads or signals a process id.
 
 ### Sync
@@ -162,7 +162,8 @@ host renamed in ssh config leaves no stale remote behind.
 - `rudy hosts install [host]` runs it on demand. Without `--force`, an answering daemon is
   left running and the command reports that the new binary takes effect on its next start.
   With `--force`, the command keeps the greeted connection it inspected, installs the binary,
-  sends `server.shutdown` on that exact connection, waits for EOF after cleanup, then connects
+  sends `server.shutdown` on that exact connection, requires matching `server.stopped` proof
+  followed by EOF after cleanup, then connects
   again through the normal bridge start path. The old and new `client.hello.instance_id`
   values must differ. A legacy daemon without `server.shutdown` fails closed and is never
   replaced by pid signaling.
@@ -232,8 +233,10 @@ does not reconnect: it reports the drop and exits non-zero, and `rudy -p --host 
 - Protocol: `client.hello` result gains `home`, the server process's home directory, and
   `instance_id`, the process-lifetime Server identity. The local client ignores `home`.
   `server.shutdown {}` is accepted only from a greeted non-plugin connection carrying the
-  same-user marker minted by the unix listener. The success response is sent before cleanup;
-  that connection reaches EOF only after cleanup completes.
+  same-user marker minted by the unix listener. Its tentative claim fences new work without
+  changing lifecycle state. The success response is sent before the Server transitions;
+  successful cleanup sends `server.stopped {instance_id, state: "stopped"}` on the retained
+  connection before EOF. Bare EOF is failure.
 - Status bar: the workspace item reads `box:/home/guy/projects/rudy` when the session is
   remote. A render choice, so `ui.status.host` (bool, `true`) governs it.
 

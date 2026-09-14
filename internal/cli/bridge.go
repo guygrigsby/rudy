@@ -2,15 +2,14 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,14 +34,14 @@ const daemonLogTailLines = 20
 // and copies messages between ssh's stdio and the socket. A top-level verb like serve,
 // for the same reason: it is the process the transport is made of.
 func newBridgeCommand(build buildFunc) *cobra.Command {
-	var noStart bool
+	var noStart, stopBridge bool
 	cmd := &cobra.Command{
 		Use:    "bridge",
 		Short:  "carry the protocol between stdio and the local daemon, starting one if needed",
 		Args:   cobra.NoArgs,
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			code, err := runBridge(cmd.Context(), BuildOptions{Stderr: cmd.ErrOrStderr()}, noStart, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
+			code, err := runBridge(cmd.Context(), BuildOptions{Stderr: cmd.ErrOrStderr()}, noStart, stopBridge, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr())
 			if err != nil {
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), err)
 				if code == 0 {
@@ -56,6 +55,7 @@ func newBridgeCommand(build buildFunc) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&noStart, "no-start", false, "fail when no daemon answers instead of starting one")
+	cmd.Flags().BoolVar(&stopBridge, "stop", false, "stop an answering daemon through the protocol")
 	return cmd
 }
 
@@ -63,7 +63,13 @@ func newBridgeCommand(build buildFunc) *cobra.Command {
 // noStart) and then copies messages both ways until either side ends. It never reads or
 // interprets a message: the daemon's peer-uid check and the client's hello both happen
 // through it, not in it.
-func runBridge(ctx context.Context, o BuildOptions, noStart bool, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+func runBridge(ctx context.Context, o BuildOptions, noStart, stop bool, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	if noStart && stop {
+		return 2, errors.New("--no-start and --stop are mutually exclusive")
+	}
+	if stop {
+		return runBridgeStop(ctx, o)
+	}
 	paths, cfg, err := localConfig(o)
 	if err != nil {
 		return 1, err
@@ -77,6 +83,80 @@ func runBridge(ctx context.Context, o BuildOptions, noStart bool, stdin io.Reade
 	slog.Info("bridge: connect", "socket", socket)
 	up := protocol.NewStreamConn(stdin, stdout, nil)
 	return copyBoth(ctx, up, conn, exited, cfg.Log.File, stderr)
+}
+
+func runBridgeStop(ctx context.Context, o BuildOptions) (int, error) {
+	stopCtx, cancel := context.WithTimeout(ctx, bridgeStartBudget)
+	defer cancel()
+	socket, err := serveSocket("", o)
+	if err != nil {
+		return 1, err
+	}
+	if err := protocol.CheckSocketOwner(socket); err != nil {
+		if errors.Is(err, protocol.ErrNoServer) {
+			return 0, nil
+		}
+		return 1, err
+	}
+	conn, err := protocol.DialUnix(stopCtx, socket, attachTimeout)
+	if err != nil {
+		if errors.Is(err, protocol.ErrNoServer) {
+			return 0, nil
+		}
+		return 1, err
+	}
+	client := protocol.NewClient(conn)
+	defer func() { _ = client.Close() }()
+	helloCtx, cancelHello := context.WithTimeout(stopCtx, greetTimeout)
+	hello, err := greet(helloCtx, client, "rudy-bridge-stop", Version(), false)
+	cancelHello()
+	if err != nil {
+		return 1, err
+	}
+	if err := requestDaemonShutdown(stopCtx, client, hello.InstanceID); err != nil {
+		return 1, fmt.Errorf("stop daemon: %w", err)
+	}
+	return 0, nil
+}
+
+func requestDaemonShutdown(ctx context.Context, client *protocol.Client, instanceID string) error {
+	var result protocol.ServerShutdownResult
+	if err := client.Call(ctx, protocol.MethodServerShutdown, struct{}{}, &result); err != nil {
+		return err
+	}
+	if result.InstanceID != instanceID || result.State != protocol.ServerStateShuttingDown {
+		return fmt.Errorf("server answered for instance %q in state %q, want instance %q shutting_down", result.InstanceID, result.State, instanceID)
+	}
+	return waitForDaemonStop(ctx, client, instanceID)
+}
+
+// waitForDaemonStop requires an explicit terminal proof before EOF. EOF alone can be a
+// process crash, transport loss or failed cleanup and must never authorize a replacement.
+func waitForDaemonStop(ctx context.Context, client *protocol.Client, instanceID string) error {
+	for {
+		select {
+		case note, ok := <-client.Notifications():
+			if !ok {
+				return errors.New("daemon connection reached EOF without server.stopped proof")
+			}
+			if note.Method != protocol.NotifyServerStopped {
+				continue
+			}
+			var stopped protocol.ServerStoppedParams
+			if err := json.Unmarshal(note.Params, &stopped); err != nil {
+				return fmt.Errorf("decode server.stopped: %w", err)
+			}
+			if stopped.InstanceID != instanceID || stopped.State != protocol.ServerStateStopped {
+				return fmt.Errorf("server.stopped answered for instance %q in state %q, want instance %q stopped", stopped.InstanceID, stopped.State, instanceID)
+			}
+			if err := client.Wait(ctx); err != nil && !errors.Is(err, io.EOF) {
+				return err
+			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // dialOrStart is the attach-or-spawn step. ErrNoServer is the one error that means start;
@@ -156,46 +236,6 @@ func exitCodeOf(err error) int {
 	return -1
 }
 
-// ErrStalePID means a pid file named a daemon that is not there any more. The file is gone by
-// the time a caller sees this: a pid nobody is serving behind is a number the kernel has since
-// handed to something else, and signalling it is how a stale file becomes a killed process
-// that had nothing to do with rudy.
-var ErrStalePID = errors.New("cli: the pid file is stale")
-
-// PIDFile is where the daemon serving socket leaves its pid, which is beside the socket and
-// inside the same 0700 directory. One definition, because the bridge tells rudy serve to write
-// it here and rudy hosts install has to look for it in the same place.
-func PIDFile(socket string) string { return filepath.Join(filepath.Dir(socket), "serve.pid") }
-
-// DaemonPID is the pid of the daemon serving socket, and nothing at all when the socket does
-// not answer. The socket is the proof, not the file: unwind removes the pid file on every
-// ordinary path, but a daemon that was SIGKILLed or panicked leaves one behind, and the number
-// in it belongs to whatever the kernel has given it to since. So a file with nothing serving
-// is removed and reported as ErrStalePID rather than handed to a caller that means to signal
-// it. Callers that stop a daemon (rudy hosts install, the tests) go through this.
-func DaemonPID(socket string) (int, error) {
-	path := PIDFile(socket)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, fmt.Errorf("pid file %s holds %q: %w", path, data, err)
-	}
-	ctx, done := context.WithTimeout(context.Background(), attachTimeout)
-	defer done()
-	conn, derr := protocol.DialUnix(ctx, socket, attachTimeout)
-	if derr != nil {
-		if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-			return 0, rerr
-		}
-		return 0, fmt.Errorf("%w: %s named pid %d but nothing serves %s: %w", ErrStalePID, path, pid, socket, derr)
-	}
-	_ = conn.Close()
-	return pid, nil
-}
-
 // daemonStatus takes the exit of a daemon this process started, or reports that none arrived
 // within grace. A nil channel is a daemon this process attached to rather than started, and
 // it never has an exit to report, so it does not wait at all.
@@ -268,13 +308,6 @@ func spawnDaemon(socket, logFile string) (<-chan error, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Nothing answered the socket or this call would not have been made, so a pid file here is
-	// one a daemon that died without unwinding left behind. Clearing it now means the next
-	// reader sees the child's own pid or no file, never a dead one; DaemonPID's own check is
-	// the same rule from the reading side.
-	if _, err := DaemonPID(socket); err != nil && !errors.Is(err, ErrStalePID) && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
 	if err := os.MkdirAll(filepath.Dir(logFile), 0o700); err != nil {
 		return nil, err
 	}
@@ -283,7 +316,7 @@ func spawnDaemon(socket, logFile string) (<-chan error, error) {
 		return nil, err
 	}
 	defer func() { _ = out.Close() }()
-	cmd := exec.Command(self, "serve", "--socket", socket, "--pidfile", PIDFile(socket))
+	cmd := exec.Command(self, "serve", "--socket", socket)
 	cmd.Stdout = out
 	cmd.Stderr = out
 	// Not this process's stdin: that is the protocol stream from the client, and a daemon

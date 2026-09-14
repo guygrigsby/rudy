@@ -21,6 +21,36 @@ import (
 	"github.com/guygrigsby/rudy/internal/turn"
 )
 
+func TestShutdownClaimFencesNewWorkBeforeTheResponseIsSent(t *testing.T) {
+	store, err := session.OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(Deps{Version: "test", Store: store})
+	if !srv.claimShutdown() {
+		t.Fatal("first shutdown claim was refused")
+	}
+	if got := srv.State(); got != protocol.ServerStateRunning {
+		t.Fatalf("state during tentative shutdown claim = %q, want running", got)
+	}
+	cn := newConn(1, nil)
+	cn.hello = true
+	_, pe := srv.dispatch(context.Background(), cn, protocol.Request{
+		JSONRPC: protocol.Version,
+		Method:  protocol.MethodSessionList,
+	})
+	if pe == nil || pe.Code != protocol.CodeRefusedByInvariant {
+		t.Fatalf("work after shutdown claim = %v, want refused_by_invariant", pe)
+	}
+
+	// A response that could not be delivered releases the claim. The client can retry
+	// shutdown, and ordinary work must resume because the process owner was never notified.
+	srv.releaseShutdownClaim()
+	if srv.isShuttingDown() {
+		t.Fatal("released shutdown claim kept the admission fence closed")
+	}
+}
+
 // TestToolStateVocabularyMatchesTheProtocol is the drift guard on the two copies of the tool
 // state vocabulary. fanout.ToolStateChanged sends turn.ToolState straight onto the wire as a
 // string, so a value renamed on one side and not the other would be a notification no client
@@ -385,7 +415,7 @@ func (ls *liveSession) subscribeAsker(t *testing.T, fn func(protocol.PermissionR
 					cn.mu.Unlock()
 					break
 				}
-				msg := cn.queue[0]
+				msg := cn.queue[0].msg
 				cn.queue = cn.queue[1:]
 				cn.mu.Unlock()
 				req, ok := msg.(protocol.Request)

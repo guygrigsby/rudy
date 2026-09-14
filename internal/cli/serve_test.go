@@ -17,6 +17,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -86,7 +87,7 @@ func startServe(t *testing.T, ctx context.Context, build buildFunc, socket strin
 	w := newWatcher("serving on " + socket)
 	done := make(chan served, 1)
 	go func() {
-		code, err := runServe(ctx, build, socket, "", io.Discard, w)
+		code, err := runServe(ctx, build, socket, io.Discard, w)
 		done <- served{code, err}
 	}()
 	select {
@@ -219,6 +220,42 @@ func TestServeListensAndServesAClient(t *testing.T) {
 	}
 }
 
+func TestServeStopsOnProtocolShutdown(t *testing.T) {
+	t.Chdir(t.TempDir())
+	build := testBuilder(t, &fakeProvider{})
+	socket := filepath.Join(sockDir(t), "s")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done, w := startServe(t, ctx, build, socket)
+	conn, err := protocol.DialUnix(context.Background(), socket, serveTestBudget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.NewClient(conn)
+	defer func() { _ = client.Close() }()
+	var hello protocol.ClientHelloResult
+	if err := client.Call(callCtx(t), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "serve-test", Version: "test"}, &hello); err != nil {
+		t.Fatal(err)
+	}
+	var result protocol.ServerShutdownResult
+	if err := client.Call(callCtx(t), protocol.MethodServerShutdown, struct{}{}, &result); err != nil {
+		t.Fatalf("server.shutdown: %v", err)
+	}
+	if result.InstanceID != hello.InstanceID || result.State != protocol.ServerStateShuttingDown {
+		t.Fatalf("server.shutdown = %+v, want instance %s shutting_down", result, hello.InstanceID)
+	}
+	if err := waitForDaemonStop(callCtx(t), client, hello.InstanceID); err != nil {
+		t.Fatalf("wait for shutdown proof = %v", err)
+	}
+	if s := waitServed(t, done, w); s.code != 0 || s.err != nil {
+		t.Fatalf("runServe = %d, %v; stderr %q", s.code, s.err, w.String())
+	}
+	if _, err := os.Stat(socket); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the socket is still there after protocol shutdown: %v", err)
+	}
+}
+
 // TestServeCommandServesTheSocketFlag: the command is registered on the root and its
 // --socket is the path it serves on, which is the whole difference between a daemon an
 // operator can place where they like and one that only ever binds the default.
@@ -325,6 +362,117 @@ func TestServeOverBudgetShutdownExitsOne(t *testing.T) {
 	}
 }
 
+type blockingServePlugin struct {
+	release chan struct{}
+	closing chan struct{}
+	once    sync.Once
+}
+
+func (*blockingServePlugin) Name() string { return "blocking-close" }
+
+func (*blockingServePlugin) Init(context.Context, plugin.Host) error { return nil }
+
+func (p *blockingServePlugin) CloseContext(ctx context.Context) error {
+	p.once.Do(func() { close(p.closing) })
+	select {
+	case <-p.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestProtocolShutdownDoesNotProveCleanupThatTimedOut(t *testing.T) {
+	t.Chdir(t.TempDir())
+	_ = shrinkShutdownBudget(t)
+	p := &blockingServePlugin{release: make(chan struct{}), closing: make(chan struct{})}
+	build := testBuilder(t, &fakeProvider{}, p)
+	socket := filepath.Join(sockDir(t), "s")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done, w := startServe(t, ctx, build, socket)
+	conn, err := protocol.DialUnix(context.Background(), socket, serveTestBudget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.NewClient(conn)
+	defer func() { _ = client.Close() }()
+	var hello protocol.ClientHelloResult
+	if err := client.Call(callCtx(t), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "serve-test", Version: "test"}, &hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Call(callCtx(t), protocol.MethodServerShutdown, struct{}{}, &protocol.ServerShutdownResult{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.closing:
+	case <-time.After(time.Second):
+		t.Fatal("protocol shutdown did not begin plugin cleanup")
+	}
+
+	waited := make(chan error, 1)
+	go func() { waited <- waitForDaemonStop(context.Background(), client, hello.InstanceID) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("shutdown connection ended before cleanup completed: %v", err)
+	case s := <-done:
+		t.Fatalf("runServe returned %d, %v before cleanup completed; stderr %q", s.code, s.err, w.String())
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(p.release)
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("wait for completed cleanup = %v", err)
+		}
+	case <-time.After(serveTestBudget):
+		t.Fatal("shutdown connection stayed open after cleanup completed")
+	}
+	if s := waitServed(t, done, w); s.code != 0 || s.err != nil {
+		t.Fatalf("runServe = %d, %v; stderr %q", s.code, s.err, w.String())
+	}
+}
+
+type failingServePlugin struct{}
+
+func (failingServePlugin) Name() string { return "failing-close" }
+
+func (failingServePlugin) Init(context.Context, plugin.Host) error { return nil }
+
+func (failingServePlugin) CloseContext(context.Context) error {
+	return errors.New("cleanup failed")
+}
+
+func TestProtocolShutdownDoesNotMarkFailedCleanupComplete(t *testing.T) {
+	t.Chdir(t.TempDir())
+	build := testBuilder(t, &fakeProvider{}, failingServePlugin{})
+	socket := filepath.Join(sockDir(t), "s")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done, w := startServe(t, ctx, build, socket)
+	conn, err := protocol.DialUnix(context.Background(), socket, serveTestBudget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := protocol.NewClient(conn)
+	defer func() { _ = client.Close() }()
+	var hello protocol.ClientHelloResult
+	if err := client.Call(callCtx(t), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "serve-test", Version: "test"}, &hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Call(callCtx(t), protocol.MethodServerShutdown, struct{}{}, &protocol.ServerShutdownResult{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForDaemonStop(callCtx(t), client, hello.InstanceID); err == nil || !strings.Contains(err.Error(), "server.stopped") {
+		t.Fatalf("failed cleanup proof = %v, want missing server.stopped", err)
+	}
+	if s := waitServed(t, done, w); s.code != 1 || s.err == nil || !strings.Contains(s.err.Error(), "cleanup failed") {
+		t.Fatalf("runServe = %d, %v; stderr %q", s.code, s.err, w.String())
+	}
+}
+
 // TestServeReleasesTheSocketWhenTheBuildFails: the listen now happens first, so a build that
 // fails after it leaves a bound socket and a held lock behind unless the failure path gives
 // them back. Nothing would serve that socket, and the next rudy would find the path busy for
@@ -335,7 +483,7 @@ func TestServeReleasesTheSocketWhenTheBuildFails(t *testing.T) {
 		return nil, errors.New("no provider reachable")
 	}
 	var errb bytes.Buffer
-	code, err := runServe(context.Background(), fail, socket, "", io.Discard, &errb)
+	code, err := runServe(context.Background(), fail, socket, io.Discard, &errb)
 	if code != 1 || err == nil {
 		t.Fatalf("runServe = %d, %v; want 1 and the build error", code, err)
 	}
@@ -401,7 +549,7 @@ func TestServeRefusesABusySocket(t *testing.T) {
 	var errb bytes.Buffer
 	// exitSocketBusy, not 1: a bridge that started this daemon reads the code to tell the one
 	// failure that means another daemon won from every failure that means none is coming.
-	code, err := runServe(context.Background(), refuse, socket, "", io.Discard, &errb)
+	code, err := runServe(context.Background(), refuse, socket, io.Discard, &errb)
 	if code != exitSocketBusy || err != nil {
 		t.Fatalf("second runServe = %d, %v; want %d; stderr %q", code, err, exitSocketBusy, errb.String())
 	}

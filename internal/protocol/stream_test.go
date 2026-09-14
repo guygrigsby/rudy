@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,19 @@ import (
 type nopCloser struct{}
 
 func (nopCloser) Close() error { return nil }
+
+type cancelAfterWrite struct {
+	cancel context.CancelFunc
+	buf    bytes.Buffer
+}
+
+func (w *cancelAfterWrite) SetWriteDeadline(time.Time) error { return nil }
+
+func (w *cancelAfterWrite) Write(p []byte) (int, error) {
+	n, err := w.buf.Write(p)
+	w.cancel()
+	return n, err
+}
 
 func TestStreamConnRoundTrip(t *testing.T) {
 	toServer, fromClient := io.Pipe()
@@ -91,5 +105,40 @@ func TestStreamConnCloseStopsRecvAndSend(t *testing.T) {
 	}
 	if err := conn.Send(context.Background(), Request{JSONRPC: Version, Method: "m"}); !errors.Is(err, ErrConnClosed) {
 		t.Fatalf("send after close = %v, want ErrConnClosed", err)
+	}
+}
+
+func TestStreamConnSendHonorsContextWhileWriteIsBlocked(t *testing.T) {
+	left, right := net.Pipe()
+	t.Cleanup(func() { _ = right.Close() })
+	conn := NewStreamConn(left, left, left)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- conn.Send(ctx, Request{JSONRPC: Version, Method: "blocked"})
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("blocked Send = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Send ignored its context")
+	}
+}
+
+func TestStreamConnSendPrefersACompletedWriteOverSimultaneousCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	w := &cancelAfterWrite{cancel: cancel}
+	conn := NewStreamConn(strings.NewReader(""), w, nopCloser{})
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.Send(ctx, Request{JSONRPC: Version, Method: "written"}); err != nil {
+		t.Fatalf("Send after a complete physical write = %v, want success", err)
+	}
+	if !strings.Contains(w.buf.String(), `"method":"written"`) {
+		t.Fatalf("writer received %q", w.buf.String())
 	}
 }

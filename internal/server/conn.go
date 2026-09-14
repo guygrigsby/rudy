@@ -21,9 +21,10 @@ type conn struct {
 	// connection starts true: the server handed it out itself, so there is nothing to
 	// introduce. greeted is whether a client.hello has actually been answered, which is
 	// what makes a second one a refusal.
-	hello   bool
-	greeted bool
-	asker   bool
+	hello    bool
+	greeted  bool
+	asker    bool
+	sameUser bool
 	// plugin is the caller class: the plugin's name on a connection the server itself
 	// handed out through Host.Connect, or a spawned plugin's stdio peer, empty on every
 	// client connection. Only a plugin may append a note or name a parent session.
@@ -35,21 +36,61 @@ type conn struct {
 	// before the serve loop starts.
 	reg plugin.Registrar
 
-	mu    sync.Mutex
-	queue []any
-	wake  chan struct{}
-	subs  map[ulid.ULID]*liveSession
+	mu        sync.Mutex
+	queue     []outbound
+	wake      chan struct{}
+	pumpDone  chan struct{}
+	abortPump context.CancelFunc
+	pumpErr   error
+	stopped   bool
+	subs      map[ulid.ULID]*liveSession
+}
+
+type outbound struct {
+	msg  any
+	sent chan error
 }
 
 func newConn(id int, c protocol.Conn) *conn {
-	return &conn{id: id, c: c, wake: make(chan struct{}, 1), subs: map[ulid.ULID]*liveSession{}}
+	return &conn{id: id, c: c, wake: make(chan struct{}, 1), pumpDone: make(chan struct{}), subs: map[ulid.ULID]*liveSession{}}
 }
 
 // send enqueues msg without blocking.
 func (cn *conn) send(msg any) {
 	cn.mu.Lock()
-	cn.queue = append(cn.queue, msg)
+	if cn.stopped {
+		cn.mu.Unlock()
+		return
+	}
+	cn.queue = append(cn.queue, outbound{msg: msg})
 	cn.mu.Unlock()
+	cn.wakePump()
+}
+
+// sendAndWait enqueues msg in order with every other response and notification, then waits
+// until the transport has physically accepted it. Shutdown uses this barrier before it
+// cancels anything that could stop the pump.
+func (cn *conn) sendAndWait(ctx context.Context, msg any) error {
+	sent := make(chan error, 1)
+	cn.mu.Lock()
+	if cn.stopped {
+		err := cn.pumpErr
+		cn.mu.Unlock()
+		return err
+	}
+	cn.queue = append(cn.queue, outbound{msg: msg, sent: sent})
+	cn.mu.Unlock()
+	cn.wakePump()
+	stopAbort := context.AfterFunc(ctx, func() {
+		if cn.abortPump != nil {
+			cn.abortPump()
+		}
+	})
+	defer stopAbort()
+	return <-sent
+}
+
+func (cn *conn) wakePump() {
 	select {
 	case cn.wake <- struct{}{}:
 	default:
@@ -90,9 +131,12 @@ func (cn *conn) subscribed(sid ulid.ULID) bool {
 
 // pump drains the outbox to the transport, in order, until ctx ends or a send fails.
 func (cn *conn) pump(ctx context.Context) {
+	var stopErr error
+	defer func() { cn.stopPump(stopErr) }()
 	for {
 		select {
 		case <-ctx.Done():
+			stopErr = ctx.Err()
 			return
 		case <-cn.wake:
 		}
@@ -102,12 +146,32 @@ func (cn *conn) pump(ctx context.Context) {
 				cn.mu.Unlock()
 				break
 			}
-			msg := cn.queue[0]
+			item := cn.queue[0]
 			cn.queue = cn.queue[1:]
 			cn.mu.Unlock()
-			if err := cn.c.Send(ctx, msg); err != nil {
+			err := cn.c.Send(ctx, item.msg)
+			if item.sent != nil {
+				item.sent <- err
+			}
+			if err != nil {
+				stopErr = err
 				return
 			}
 		}
 	}
+}
+
+func (cn *conn) stopPump(err error) {
+	cn.mu.Lock()
+	cn.stopped = true
+	cn.pumpErr = err
+	pending := cn.queue
+	cn.queue = nil
+	cn.mu.Unlock()
+	for _, item := range pending {
+		if item.sent != nil {
+			item.sent <- err
+		}
+	}
+	close(cn.pumpDone)
 }

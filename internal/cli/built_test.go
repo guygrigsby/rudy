@@ -13,12 +13,28 @@ import (
 	"testing"
 )
 
+// builtVersion is what builtRudy compiles into the binary, in the shape make produces:
+// git describe's tag, distance and hash. Its revision is test001, which is the ref name a
+// fixture checkout has to carry for the install path to find anything to check out.
+const builtVersion = "v0.0.0-1-gtest001"
+
 var (
 	builtOnce sync.Once
 	builtDir  string
 	builtPath string
 	builtErr  error
 )
+
+// pinVersion makes this process report the version builtRudy compiled. The test binary is
+// built without the linker flag, so Version() is "dev" in here and the box's rudy is not:
+// every test of the install path would otherwise be testing the refusal to install a dev
+// build rather than the install.
+func pinVersion(t *testing.T, v string) {
+	t.Helper()
+	old := version
+	version = v
+	t.Cleanup(func() { version = old })
+}
 
 // TestMain removes the binary builtRudy compiled. t.TempDir is per test and the binary is
 // per package run, so the directory is this package's to clean and nothing else's: without
@@ -48,9 +64,9 @@ func builtRudy(t *testing.T) string {
 		builtDir = dir // TestMain removes it once every test that runs the binary is done
 		builtPath = filepath.Join(dir, "rudy")
 		// The version is pinned rather than left at "dev" because the tests assert on it: the
-		// bridge test reads it back out of the hello, and task 7's install check compares it
+		// bridge test reads it back out of the hello, and the install path compares it
 		// against what the box reports.
-		cmd := exec.Command("go", "build", "-ldflags", "-X github.com/guygrigsby/rudy/internal/cli.version=v0.0.0-1-gtest001", "-o", builtPath, "../../cmd/rudy")
+		cmd := exec.Command("go", "build", "-ldflags", "-X github.com/guygrigsby/rudy/internal/cli.version="+builtVersion, "-o", builtPath, "../../cmd/rudy")
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			builtErr = fmt.Errorf("go build: %v\n%s", err, out)

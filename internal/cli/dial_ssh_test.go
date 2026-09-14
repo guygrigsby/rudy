@@ -118,6 +118,9 @@ func TestTheBoxsLastFrameSurvivesSshExiting(t *testing.T) {
 	}
 }
 
+// TestExit111NamesTheInstall: a box with no rudy and nothing this client can install from.
+// The version here is "dev", which names no commit, so the install cannot run and the
+// operator is told what is missing rather than watched a build that could never start.
 func TestExit111NamesTheInstall(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary")
@@ -132,6 +135,111 @@ func TestExit111NamesTheInstall(t *testing.T) {
 	if code != 1 || !errors.Is(err, errNoRudyOnHost) {
 		t.Fatalf("dial to a box without rudy = %d, %v; want errNoRudyOnHost", code, err)
 	}
+	if !strings.Contains(err.Error(), "make") {
+		t.Fatalf("dial from a dev build said %q; it should say why it could not install", err)
+	}
+}
+
+// TestExit111InstallsAndRetries is the whole install path on the real binary: a box that
+// answers ssh, holds rudy's source and has no rudy on its PATH. The remote line exits 111,
+// the client builds rudy there at its own revision and dials again, and the session it opens
+// is on the box.
+func TestExit111InstallsAndRetries(t *testing.T) {
+	home, _ := aBoxThatCanInstall(t)
+	if err := os.Remove(filepath.Join(home, ".local", "bin", "rudy")); err != nil { // a box with no rudy
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	d, code, err := dial(context.Background(), testBuilder(t, &fakeProvider{}), BuildOptions{Stderr: &stderr}, dialOptions{Host: "box"}, "t", false)
+	if err != nil || code != 0 {
+		t.Fatalf("dial = %d, %v\n%s", code, err, stderr.String())
+	}
+	d.Close()
+	if !strings.Contains(stderr.String(), "installed rudy") {
+		t.Fatalf("no install notice: %q", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", "rudy")); err != nil {
+		t.Fatalf("the install did not put rudy on the box: %v", err)
+	}
+}
+
+// TestAVersionMismatchIsANoticeNotARestart: the box's daemon is serving somebody's session
+// and the operator's Mac has moved on a commit. Restarting it under them would end whatever
+// it is running, so the dial goes through and says what the difference is and what to type.
+func TestAVersionMismatchIsANoticeNotARestart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	bin := builtRudy(t)
+	upstream := fakeOpenAI(t, "unused")
+	_, env := boxWithProvider(t, bin, upstream.URL)
+	t.Cleanup(func() { stopBoxDaemon(t, env) })
+	t.Setenv("RUDY_SSH", sshShim(t, env))
+	hermeticLocalConfig(t)
+	pinVersion(t, "v0.9.9-2-gother99") // a Mac ahead of the box
+
+	var stderr bytes.Buffer
+	d, code, err := dial(context.Background(), testBuilder(t, &fakeProvider{}), BuildOptions{Stderr: &stderr}, dialOptions{Host: "box"}, "t", false)
+	if err != nil || code != 0 {
+		t.Fatalf("dial = %d, %v\n%s", code, err, stderr.String())
+	}
+	d.Close()
+	for _, want := range []string{"host runs rudy " + builtVersion, "this is v0.9.9-2-gother99", "rudy hosts install box --force"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("the mismatch notice %q lacks %q", stderr.String(), want)
+		}
+	}
+}
+
+// aBoxThatCanInstall is a box serving turns whose ~/projects/rudy is a checkout carrying a
+// ref named for this client's revision, and whose make install puts the built binary where
+// the remote line's PATH looks. That is what a real box's make install does through go
+// install; building rudy for real inside a test would cost a minute per case.
+func aBoxThatCanInstall(t *testing.T) (home string, env []string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	requireBoxGit(t)
+	requireBoxMake(t)
+	bin := builtRudy(t)
+	upstream := fakeOpenAI(t, "unused")
+	home, env = boxWithProvider(t, bin, upstream.URL)
+	source := filepath.Join(home, "projects", "rudy")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "Makefile"), []byte("install:\n\tmkdir -p $$HOME/.local/bin && ln -sf "+bin+" $$HOME/.local/bin/rudy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRepoAt(t, source)
+	// Revision(builtVersion) is test001, and a tag by that name is a checkout target.
+	gitAt(t, source, "update-ref", "refs/tags/test001", "HEAD")
+	t.Cleanup(func() { stopBoxDaemon(t, env) })
+	t.Setenv("RUDY_SSH", sshShim(t, env))
+	hermeticLocalConfig(t)
+	pinVersion(t, builtVersion)
+	return home, env
+}
+
+// requireBoxMake skips unless make is where the box fixture's PATH can find it.
+func requireBoxMake(t *testing.T) {
+	t.Helper()
+	if _, err := os.Stat("/usr/bin/make"); err != nil {
+		t.Skip("the box fixture's PATH is /usr/bin:/bin and make is not there")
+	}
+}
+
+// hermeticLocalConfig gives this process a home and a config directory of its own. The keys
+// the client reads on its way to a box (remote.host, remote.source) then come from the
+// shipped defaults rather than from whatever config the developer running the tests has,
+// and the default remote.source is the ~/projects/rudy the box expands against its own home.
+func hermeticLocalConfig(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	return home
 }
 
 // TestResumeByIDNeedsNoPlacement: a --resume names its session outright, and the session

@@ -15,6 +15,7 @@ const ProtocolVersion = 1
 // Methods, client to server.
 const (
 	MethodClientHello        = "client.hello"
+	MethodServerShutdown     = "server.shutdown"
 	MethodSessionOpen        = "session.open"
 	MethodSessionResume      = "session.resume"
 	MethodSessionFork        = "session.fork"
@@ -77,6 +78,7 @@ const (
 	NotifyStatusUpdated       = "status.updated"
 	NotifyWidgetUpdated       = "widget.updated"
 	NotifyPluginState         = "plugin.state"
+	NotifyServerStopped       = "server.stopped"
 )
 
 // Span is one run of text with a theme role, the only thing a plugin may put in a status
@@ -148,9 +150,29 @@ type ClientHelloParams struct {
 type ClientHelloResult struct {
 	Server  string `json:"server"`
 	Version string `json:"version"`
+	// InstanceID identifies this process-lifetime server. It is never persisted.
+	InstanceID string `json:"instance_id"`
 	// Home is the server process's home directory. A client on another machine places the
 	// workspace under it (<home>/<cwd relative to its own home>); a local client ignores it.
 	Home string `json:"home"`
+}
+
+type ServerState string
+
+const (
+	ServerStateRunning      ServerState = "running"
+	ServerStateShuttingDown ServerState = "shutting_down"
+	ServerStateStopped      ServerState = "stopped"
+)
+
+type ServerShutdownResult struct {
+	InstanceID string      `json:"instance_id"`
+	State      ServerState `json:"state"`
+}
+
+type ServerStoppedParams struct {
+	InstanceID string      `json:"instance_id"`
+	State      ServerState `json:"state"`
 }
 
 type SessionOpenParams struct {
