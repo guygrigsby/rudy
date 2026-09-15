@@ -92,6 +92,15 @@ transport or wire protocol.
 - A slow event consumer has a bounded queue and is disconnected on overflow. It never grows
   memory behind a running daemon.
 - Reconnection does not create a Session. It loads or resumes the same ULID.
+- Negotiated remote events carry the originating Session id and byte-exact Entry or `provider.Part`
+  JSON in the versioned Rudy metadata union. The remote implementation rejects missing,
+  inconsistent or malformed metadata instead of reconstructing raw values from display fields.
+- A remote `turn_failed` event preserves identity, class and retry count but replaces the raw
+  message with fixed public text and marks the event redacted. Provider bodies and nested errors
+  remain in the box log and local durable entry.
+- Every remote assistant event and streamed stop Part clears the provider's raw stop reason and
+  marks the carrier redacted when a raw value existed. Provider-controlled terminal metadata
+  never crosses by default.
 
 ### Relationships
 
@@ -123,12 +132,17 @@ request correlation, replay suppression and one bounded connection queue. None i
 
 - The Rudy Session ULID is the ACP `SessionId`; no identity map exists.
 - Standard ACP methods are used when available. `_rudy` methods require version negotiation.
+- Exactly one standard update carries each negotiated Rudy event. An event with no honest ACP
+  projection uses an otherwise empty session-info update, preventing silent loss without
+  inventing a standard meaning.
 - ACP types never cross into Session, Provider, Plugin, Hosts or the Client port.
 - The adapter advertises no auth method and never handles provider credentials.
 - The adapter never calls ACP client filesystem or terminal methods.
 - New, load and resume reject client-supplied MCP servers and additional directories. Plugins
   and the Session's stored Workspace remain authoritative.
-- Session list applies an optional normalized primary Workspace filter before returning metadata.
+- Session list applies an optional normalized primary Workspace filter before bounded keyset
+  pagination over descending Session ULIDs. Authenticated cursors are connection-scoped and
+  bound to the filter.
 - Prompt and Rudy steer use one content translator. Extensions cannot bypass negotiated content
   capabilities.
 - A gated reader prevents SDK receive until a sanitized logger is installed. Reader and writer

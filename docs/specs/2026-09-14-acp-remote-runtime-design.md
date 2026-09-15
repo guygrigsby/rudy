@@ -162,7 +162,9 @@ kernel. Stored bytes remain authoritative. Standard ACP updates carry display-sa
 Negotiated Rudy metadata may carry byte-exact values encoded as base64 when the Rudy client
 needs them. `session/list` applies ACP's optional absolute `cwd` filter before returning any
 Session metadata. An omitted filter intentionally exposes every Session owned by the same Unix
-account.
+account. Listing uses bounded keyset pagination over descending Session ULIDs. Cursors are
+connection-scoped authenticated tokens bound to the normalized filter, never persisted or
+logged.
 
 ## Rudy extensions
 
@@ -175,13 +177,20 @@ The extension catalogue and every request and result shape live once in
 titles, slash commands, registry access, Rudy UI events and server-owned shutdown. A generated
 Go catalogue and a contract guard will keep code and that table equal in both directions.
 
-Rudy-specific fields on standard `session/update` use `_meta._rudy`: entry id, byte-exact entry
-data when the Client port needs it and exact child session id. Status items, widgets, plugin
-state, registry state and notices use `_rudy/session/update` because they have no honest
-standard update shape. Notices and plugin failure reasons cross only through explicit public
-text with fixed fallbacks. Registry errors become fixed provider failure text. The adapter never
-forwards a nested error through these successful update channels. A standard client may ignore
-all of them.
+Rudy-specific fields on standard `session/update` use the closed `_meta._rudy.event` union in
+the contracts. Exactly one standard update carries each internal event, using a metadata-only
+session-info update when the event has no honest standard projection. The metadata names the
+originating Session and carries complete Entry or `provider.Part` JSON as padded base64 when
+byte fidelity matters. A `turn_failed` Entry is the exception: its failure message is replaced
+with fixed public text and marked redacted before crossing ACP. Every assistant Entry and
+streamed stop Part clears the provider's raw stop reason and marks the carrier redacted when a
+raw value existed. Permission requests carry their exact input bytes the same way. The Rudy
+client rejects missing or inconsistent negotiated metadata instead of reconstructing state from
+ACP's display-safe form. Status items, widgets, plugin state, registry state and notices use the
+exact `_rudy/session/update` union because they have no honest standard update shape. Notices
+and plugin failure reasons cross only through explicit public text with fixed fallbacks.
+Registry errors become fixed provider failure text. The adapter never forwards a nested error
+through these successful update channels. A standard client may ignore all of them.
 
 Thinking and model selection are not extensions. Stable ACP v1 session config options cover
 them. Child sessions are still opened by the daemon's subagent plugin through the internal
@@ -238,6 +247,14 @@ Each direction has a bounded queue and each adapter admits at most 64 concurrent
 requests. A client that exceeds either bound is disconnected. The daemon continues, its log
 remains authoritative and `session/load` recovers the view. No unbounded goroutine or byte queue
 follows a slow ssh connection.
+
+The framed reader orders cancellation intent before the SDK sees the frame. It records only
+prompt and cancel routing fields, marking `session/cancel` as semantic Turn cancellation and
+`$/cancel_request` as request-scoped cancellation. The SDK collapses both into the same cancelled
+prompt context and calls its cancel hook after cancellation, so callback arrival order cannot be
+the discriminator. The reader rejects duplicate JSON object keys and gives classification and
+SDK dispatch the same validated routing values, preventing an ambiguous frame from selecting
+different Sessions or request ids at the two layers.
 
 | Failure | Behavior |
 |---|---|

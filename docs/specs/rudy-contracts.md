@@ -101,15 +101,29 @@ size-limited reader, install a sanitizer with `SetLogger` and release the reader
 happens. The sanitizer allows only fixed diagnostic messages and bounded numeric fields; it
 drops raw values, ids, request ids and unstructured errors. The reader admits at most 64 active
 inbound requests because the SDK starts a goroutine for each one. Its minimal envelope parser
-records only request ids and methods, never params. It sends one fixed JSON-RPC parse or invalid
-request error and closes before passing a malformed envelope to the SDK; an oversized frame
-closes without a response. The writer releases a slot only after successfully writing the
-matching JSON-RPC response, including an SDK-generated invalid-params response; a duplicate id
-or 65th request closes that adapter as overloaded. The same writer rejects an outbound frame
-above 8 MiB. Either wrapper signals the adapter supervisor on refusal; the supervisor closes the
-peer stream and internal connection instead of relying on the SDK to notice a writer error.
-Tests send malformed secret-bearing input before and after gate release and assert that neither
-stderr nor captured logs contain the payload.
+records request ids and methods. It decodes and retains only the routing fields needed to order
+cancellation: `sessionId` from `session/prompt` and `session/cancel`, and `requestId` from
+`$/cancel_request`. It rejects any duplicate JSON object key in the full frame before the SDK
+sees it, then gives the classifier and SDK the same validated routing value; adversarial
+duplicate `sessionId` or `requestId` fields cannot select different targets at the two layers.
+Accepted `session/cancel` and `$/cancel_request` frames are re-encoded from that validated
+structure before SDK dispatch; a valid prompt frame is passed unchanged after its routing value
+is recorded. The reader never retains prompt content or other params. Before releasing a
+`session/cancel` frame to the SDK it marks that Session's standing prompt as semantic Turn
+cancellation. Before releasing `$/cancel_request` it marks the named request as request-scoped
+cancellation. This ordering is required because the selected SDK cancels the same prompt
+context for both paths and invokes the agent's `Cancel` callback only afterwards; a timer or the
+order in which callbacks happen cannot distinguish them safely.
+
+The reader sends one fixed JSON-RPC parse or invalid-request error and closes before passing a
+malformed envelope to the SDK; an oversized frame closes without a response. The writer releases
+a slot only after successfully writing the matching JSON-RPC response, including an
+SDK-generated invalid-params response; a duplicate id or 65th request closes that adapter as
+overloaded. The same writer rejects an outbound frame above 8 MiB. Either wrapper signals the
+adapter supervisor on refusal; the supervisor closes the peer stream and internal connection
+instead of relying on the SDK to notice a writer error. Tests send malformed secret-bearing
+input before and after gate release and assert that neither stderr nor captured logs contain the
+payload.
 
 #### Initialize and capabilities
 
@@ -124,9 +138,29 @@ directories, image, audio, embedded context, MCP transports or an authentication
 never calls ACP filesystem or terminal methods even when a generic client advertises them. SDK
 types and methods marked `Unstable` are unused; Rudy fork stays a negotiated `_rudy` method.
 
-The Rudy client offers `_meta._rudy` with `version: 1`, `asker: bool` and `capabilities`, a set
-of names from the extension table below. The agent returns the same version, the capability
-intersection and values from internal hello: `home`, `instanceId` and `rudyVersion`.
+The Rudy client offers this exact initialize metadata shape:
+
+```json
+{"_rudy":{"version":1,"asker":true,"capabilities":["session.update"]}}
+```
+
+`asker` is false for a headless client. `capabilities` is a set of names from the extension
+table below; `session.update` also enables the versioned event metadata defined below. The
+agent returns this exact shape, with the requested and supported capability intersection:
+
+```json
+{"_rudy":{"version":1,"capabilities":["session.update"],"home":"/home/guy","instanceId":"01K...","rudyVersion":"v0.1.0"}}
+```
+
+All extension fields use lower camel case. Capability arrays are sorted and contain no
+duplicates. The agent's `home`, `instanceId` and `rudyVersion` come unchanged from internal
+hello. Negotiated `_meta._rudy.open` has the exact shape below; absent fields take the daemon's
+normal defaults. Absent or null `tools` adds no caller narrowing while `tools: []` narrows to no
+tools.
+
+```json
+{"_rudy":{"open":{"model":"aperture:model","mode":"strict","thinking":"medium","agent":"default","tools":null}}}
+```
 
 Both objects live under ACP's `_meta`. A generic ACP client omits `_rudy` and receives only the
 standard surface. An `_rudy/` request without negotiated version and capability is
@@ -151,7 +185,7 @@ Wire shapes are the stable ACP v1 schema. These rows add Rudy constraints and ma
 | `session/new` | `session.open` | `cwd` is an absolute path on the box. `mcpServers` and `additionalDirectories` must be empty. Negotiated `_meta._rudy.open` may carry `model`, `mode`, `thinking`, `agent` and `tools`, never `parent`. Session id in the response is the Rudy ULID unchanged. |
 | `session/load` | `session.resume` | Look up the target through internal `session.list` and validate request cwd against its primary Workspace root before attach. Require empty `mcpServers` and `additionalDirectories`; a client may not spawn a process or widen stored roots on the box. Translate replayed entries and current live state into `session/update` before answering. |
 | `session/resume` | `session.resume` | Perform the same pre-attach lookup and cwd, MCP and additional-directory validation as load. Suppress only replayed `entry.appended` notifications before the internal response. Forward current turn, tool and permission state while the request is open, then forward every live notification; the internal ordering contract puts newly appended entries after the response. |
-| `session/list` | `session.list` | Validate an optional `cwd` as an absolute box path, normalize it and return only Sessions whose normalized primary Workspace root matches it exactly. With no filter, return every Session visible to the same Unix account. Return Rudy ULIDs and workspace roots. Pagination cursors are opaque, connection-scoped and never stored. |
+| `session/list` | `session.list` | Validate an optional `cwd` as an absolute box path, normalize it and filter before pagination. With no filter, expose every Session visible to the same Unix account. Sort Rudy ULIDs descending and return at most 100 Sessions while keeping encoded response bytes below 7 MiB. Omit an individual title before allowing it to exceed the page budget. An absent cursor starts the listing. Mint `nextCursor` only when another match exists. A cursor is an unpadded base64url token authenticated by HMAC-SHA-256 under a random per-connection key and carries version, last ULID and a SHA-256 digest of the normalized cwd filter. Continue strictly below that ULID. Reject an empty, malformed, modified, cross-connection or filter-mismatched cursor as invalid params. Never persist or log cursor or key material. |
 | `session/close` | `session.interrupt cancel`, then `session.close` | Cancel active work as ACP requires, tolerate no active Turn and detach. The append-only log remains. |
 | `session/prompt` | `session.submit` | Translate text and resource-link blocks through the shared content translator as `source: typed`, keep the request open through the Turn and map the terminal Turn reason to ACP `stopReason`. Unsupported content is invalid params. |
 | `session/cancel` | `session.interrupt cancel` | Best effort and idempotent at the ACP edge. Complete standing ACP permission requests as cancelled. |
@@ -167,8 +201,55 @@ Only one load or resume for a Session may be active on an ACP connection. A conc
 attach for the same ULID is a conflict; different Sessions still attach concurrently.
 
 The adapter never parses raw tool input or a thinking signature and feeds re-marshaled bytes
-back into Session. Standard updates carry display-safe fields. Negotiated `_meta._rudy` may
-carry byte-exact entry fields as base64 for SessionClient without changing the stored bytes.
+back into Session. Standard updates carry display-safe fields. When `session.update` was
+negotiated, every internal event produces exactly one carrier `session/update` whose params
+carry this exact outer metadata shape, never metadata on the nested update variant:
+
+```json
+{"_rudy":{"version":1,"event":{"kind":"entry.appended","sessionId":"01K...","entryId":"01K...","entryJsonBase64":"eyJ...=","redacted":false}}}
+```
+
+`event.kind` selects one of these closed variants:
+
+| kind | required fields after `kind` and `sessionId` | meaning |
+|---|---|---|
+| `entry.appended` | `entryId`, `entryJsonBase64`, `redacted` | Normally `entryJsonBase64` is the padded RFC 4648 base64 encoding of the complete UTF-8 Rudy Entry JSON object and `redacted` is false. For `turn_failed`, it instead encodes a public Entry projection with the same id, time, kind, turn id, class and retries, fixed `message: "Turn failed; see box log"`, and `redacted: true`. For every `assistant_message`, it preserves the Entry except that `stop_reason_raw` is empty; `redacted` is true when the local value was nonempty. Its decoded `id` must equal `entryId` |
+| `stream.delta` | `turnId`, `partJsonBase64`, `redacted` | Normally `partJsonBase64` is the padded RFC 4648 base64 encoding of the complete UTF-8 Rudy `provider.Part` JSON object and `redacted` is false. For every `PartStop`, it encodes the Part with empty `stop_reason_raw`; `redacted` is true when the local value was nonempty |
+| `turn.state` | `turnId`, `state` | exact Rudy Turn state: `idle`, `streaming`, `running_tool`, `awaiting_permission`, `steering`, `completed` or `failed` |
+| `tool.state` | `turnId`, `toolUseId`, `name`, `state` | exact Rudy tool state: `running`, `awaiting_permission` or `done` |
+
+`sessionId` is always the originating Rudy Session, including a live child whose update is
+routed through its parent. The outer ACP `sessionId` remains the attached Session the ACP
+client is driving. The Rudy client treats missing metadata, an unknown variant, invalid base64,
+invalid decoded JSON or an id mismatch as a protocol failure. It decodes the JSON through Rudy
+types and never reconstructs a raw value from the display-safe ACP update.
+
+One Rudy event may have several honest ACP projections. The first is its carrier; later
+projections carry only `_meta._rudy.version: 1` and no `event`. When an event has no honest
+projection, its carrier is a standard `session_info_update` with both `title` and `updatedAt`
+absent, which ACP v1 permits. A negotiated Rudy client consumes only the one `event` and ignores
+display projections, so fan-out neither duplicates nor drops its event stream.
+
+An ACP `session/request_permission` for a negotiated Rudy client carries this exact metadata;
+the standard tool call remains the generic-client view:
+
+```json
+{"_rudy":{"version":1,"event":{"kind":"permission.requested","sessionId":"01K...","turnId":"01K...","toolUseId":"toolu_01","tool":"bash","inputJsonBase64":"eyJ...=","matcher":{"tool":"bash","prefix":"go test"}}}}
+```
+
+`inputJsonBase64` uses padded RFC 4648 base64 over the exact valid JSON input bytes. Its
+`toolUseId` must equal the standard ACP tool call id and `matcher.tool` must equal `tool`.
+Invalid base64, invalid decoded JSON or inconsistent metadata is a protocol failure at the Rudy
+client edge. It never compares re-marshaled ACP `rawInput` bytes. A generic ACP client receives
+no Rudy metadata and answers the standard permission request normally.
+
+Permission option ids are exactly `allow_once`, `allow_always` and `reject_once`, with matching
+ACP kinds. Only an option offered on that exact pending request is accepted. `allow_once` maps
+to allow once, `allow_always` to allow Session and `reject_once` to deny once. A `cancelled`
+outcome sends no `session.answer` and idempotently cancels the Turn; it is never authorization.
+An empty outcome or unknown, unoffered or stale option id sends no answer, cancels the Turn and
+closes the faulty ACP adapter. A late response after that exact request already resolved is an
+idempotent no-op. No malformed outcome defaults to allow.
 
 Prompt and steer share one content translator. ACP text becomes one Rudy text block with the
 same string. An ACP resource link becomes one Rudy text block prefixed `ACP resource link (not
@@ -192,16 +273,63 @@ content is invalid.
 | `registry.list` | `_rudy/registry/list` | `{provider?}` | Rudy Registry response | `registry.list` |
 | `registry.refresh` | `_rudy/registry/refresh` | `{provider?}` | `{fetchedAt, models, failures: [{provider, error: "Refresh failed; see box log"}]}` | Call `registry.refresh`; replace every nonempty internal failure error with the fixed public text |
 | `server.shutdown` | `_rudy/server_shutdown` | `{}` | `{instanceId, state: "stopped"}` only after terminal proof | Call `server.shutdown` on the adapter's exact greeted connection, keep the ACP request open, require matching internal `server.stopped` followed by internal EOF, then return and exit. Bare internal or ACP EOF is never proof. |
-| `session.update` | `_rudy/session/update` notification | `{sessionId?, kind, payload}` | none | status, widget, plugin, registry and sanitized notice events |
+| `session.update` | `_rudy/session/update` notification | exact closed union below | none | status, widget, plugin, registry and sanitized notice events; also enables versioned metadata on standard updates and permission requests |
 
-For `session.update`, `kind` is `status`, `widget`, `plugin_state`, `registry_state` or
-`notice`. Status and widget payloads are already explicit user-facing plugin output. A failed
-plugin state sends `public_reason` or `Plugin failed; see box log`, never raw `reason`. A
-registry state replaces every nonempty provider error with `Refresh failed; see box log`. A
-notice sends only its `public_text`, substituting `Remote notice; see box log` when absent and
-never falling back to `text`. Standard session updates may include `_meta._rudy.entryId`,
-byte-exact entry data and `childSessionId`. Receiving a child id grants no authority to create
-a child or forge `ParentRef`; child creation stays on the internal plugin caller path.
+Every `_rudy/session/update` has params from this closed union. External field names use lower
+camel case. These v1 events mirror the existing process-wide client shapes and carry no
+`sessionId`.
+
+| kind | exact params shape |
+|---|---|
+| `status` | `{_meta: {_rudy: {version: 1}}, kind: "status", payload: {items: [{owner, key, content: [{text, role}]}]}}` |
+| `widget` | `{_meta: {_rudy: {version: 1}}, kind: "widget", payload: {owner, key, slot, content: [{text, role}]}}` |
+| `plugin_state` | `{_meta: {_rudy: {version: 1}}, kind: "plugin_state", payload: {name, origin, state, reason}}` |
+| `registry_state` | `{_meta: {_rudy: {version: 1}}, kind: "registry_state", payload: {fetchedAt, providers: [{name, count, error}]}}` |
+| `notice` | `{_meta: {_rudy: {version: 1}}, kind: "notice", payload: {level, text}}` |
+
+Status and widget payloads are already explicit user-facing plugin output. A failed plugin
+state sets `reason` to internal `public_reason` or `Plugin failed; see box log`, never raw
+`reason`; other states set it to the empty string. A registry state replaces every nonempty
+provider error with `Refresh failed; see box log`. A notice sets `text` only from
+`public_text`, substituting `Remote notice; see box log` when absent and never falling back to
+internal `text`. Receiving a child Session id grants no authority to create a child or forge
+`ParentRef`; child creation stays on the internal plugin caller path.
+
+#### Prompt completion
+
+`session/prompt` does not finish at an assistant `tool_use`: tool execution and subsequent
+model calls remain inside the standing request. The terminal mapping is exact:
+
+| Rudy terminal condition | ACP result |
+|---|---|
+| `end_turn` | `PromptResponse{stopReason: "end_turn"}` |
+| `max_tokens` | `PromptResponse{stopReason: "max_tokens"}` |
+| `refused` | JSON-RPC `-32603`, `Internal error`; the redacted terminal Entry still reports normalized Rudy reason `refused` to a negotiated client |
+| `interrupted` caused by `session/cancel` | `PromptResponse{stopReason: "cancelled"}` |
+| `interrupted` caused by Rudy steer | not terminal; the standing prompt continues through the steered model call |
+| `other` | JSON-RPC `-32603`, `Internal error`; negotiated metadata still carries the terminal Entry before the error |
+| `tool_use` while the Turn remains active | not terminal; no ACP response yet |
+| completed Turn whose final reason is `tool_use`, or completed Turn with no terminal assistant Entry | JSON-RPC `-32603`, `Internal error`; this is a Rudy invariant failure |
+| `turn_failed` class `provider`, `transport`, `plugin` or `internal` | JSON-RPC `-32603`, `Internal error`; the raw message and provider detail remain in the box log and durable Rudy entry |
+
+ACP `refusal` is deliberately not emitted. Stable ACP says a refusal causes the user's prompt
+and everything after it to be excluded from the next model request, while Rudy currently keeps
+a provider refusal in Session context. Returning `refusal` would make the generic client's view
+disagree with the daemon; returning `end_turn` would report a safety refusal as successful.
+ACP `max_turn_requests` is also not emitted: Rudy's current
+`max_turns` path is an internal `turn_failed`, not a typed terminal condition, and the adapter
+must not infer one by matching failure text. `other` is an error because built-in codecs use it
+for unknown terminal reasons and context-window exhaustion; reporting success could make a
+generic client act on incomplete output.
+
+ACP `session/cancel` is the semantic Turn cancellation and yields the `cancelled` prompt
+result above. JSON-RPC `$/cancel_request` aborts only the named request; when it names the
+standing prompt it also cancels the internal Turn so work is not orphaned, then returns
+`-32800`, `Request cancelled`. Connection loss or cancellation of a non-prompt request uses the
+same request-cancel result when a response channel still exists. Ingress order decides if both
+cancellation forms arrive: a prior semantic cancel converts a racing lower-layer failure into a
+successful `cancelled`, while a prior request cancel keeps `-32800`; the later cancellation only
+performs idempotent cleanup. A cancellation after any terminal prompt result is a no-op.
 
 #### Error mapping
 
@@ -214,8 +342,8 @@ a child or forge `ParentRef`; child creation stays on the internal plugin caller
 | `unauthorized` | `-32012` | `Unauthorized` |
 | `refused_by_invariant` | `-32013` | sanitized invariant reason |
 | `unavailable` | `-32014` | sanitized availability reason; internal socket paths are removed |
-| `interrupted` or ACP cancellation | `-32800` | `Request cancelled` |
-| `provider_error`, `plugin_error`, `internal` | `-32603` | `Internal error`; correlated detail only in the box log |
+| JSON-RPC request cancellation | `-32800` | `Request cancelled` |
+| `provider_error`, `transport_error`, `plugin_error`, `internal` | `-32603` | `Internal error`; correlated detail only in the box log |
 
 Unknown paths, credentials, provider bodies and raw prompt or tool payloads never enter an ACP
 error or `_rudy` notice. A malformed JSON-RPC envelope uses the standard parse, invalid request
