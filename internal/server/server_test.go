@@ -1044,6 +1044,12 @@ func TestTheHelloNamesTheServersHome(t *testing.T) {
 	if hello.Home == "" {
 		t.Fatal("hello.home is empty; a client over ssh places the workspace under it")
 	}
+	if len(hello.Capabilities) != 0 {
+		t.Fatalf("initial Server advertised unimplemented guarantees %q", hello.Capabilities)
+	}
+	if hello.Capabilities == nil {
+		t.Fatal("hello.capabilities encoded null, want an empty array")
+	}
 	if !filepath.IsAbs(hello.Home) {
 		t.Fatalf("hello.home = %q, want an absolute path", hello.Home)
 	}

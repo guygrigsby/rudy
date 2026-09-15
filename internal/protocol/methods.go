@@ -148,8 +148,9 @@ type ClientHelloParams struct {
 }
 
 type ClientHelloResult struct {
-	Server  string `json:"server"`
-	Version string `json:"version"`
+	Server       string   `json:"server"`
+	Version      string   `json:"version"`
+	Capabilities []string `json:"capabilities"`
 	// InstanceID identifies this process-lifetime server. It is never persisted.
 	InstanceID string `json:"instance_id"`
 	// Home is the server process's home directory. A client on another machine places the

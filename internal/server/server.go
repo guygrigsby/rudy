@@ -634,7 +634,7 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// thing about who is an asker.
 	cn.asker = p.Asker
 	cn.asker = cn.isAsker()
-	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home}, nil
+	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home, Capabilities: []string{}}, nil
 }
 
 func (s *Server) handleServerShutdown(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
