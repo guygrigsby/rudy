@@ -37,6 +37,78 @@ func TestACPPlanDependenciesAgreeEverywhere(t *testing.T) {
 	compareEdges(t, "task declarations", declared, "Beads blocks", beads)
 }
 
+func TestMermaidDependenciesExpandsChainedEdges(t *testing.T) {
+	plan := "```mermaid\n" +
+		"flowchart LR\n" +
+		"    B[4tf.1.2 wire] --> A[4tf.1.1 catalogue] --> J[4tf.1.11 durability]\n" +
+		"```\n"
+	tasks := []string{"rudy-4tf.1.1", "rudy-4tf.1.2", "rudy-4tf.1.11"}
+
+	got := mermaidDependencies(t, plan, tasks)
+	want := []dependencyEdge{
+		{From: "rudy-4tf.1.1", To: "rudy-4tf.1.11"},
+		{From: "rudy-4tf.1.2", To: "rudy-4tf.1.1"},
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("chained Mermaid edges = %v, want %v", got, want)
+	}
+}
+
+func TestMermaidDependenciesIgnoresEdgesOutsideDependencyDiagram(t *testing.T) {
+	plan := "A --> J\n\n" +
+		"```mermaid\n" +
+		"flowchart LR\n" +
+		"    A[4tf.1.1 catalogue] --> B[4tf.1.2 wire]\n" +
+		"    J[4tf.1.11 durability]\n" +
+		"```\n"
+	tasks := []string{"rudy-4tf.1.1", "rudy-4tf.1.2", "rudy-4tf.1.11"}
+
+	got := mermaidDependencies(t, plan, tasks)
+	want := []dependencyEdge{{From: "rudy-4tf.1.1", To: "rudy-4tf.1.2"}}
+	if !slices.Equal(got, want) {
+		t.Fatalf("dependency diagram edges = %v, want %v", got, want)
+	}
+}
+
+func TestBeadDependenciesRejectsUndeclaredSiblingEndpoints(t *testing.T) {
+	if probe := os.Getenv("RUDY_ACP_BEAD_DEPENDENCY_PROBE"); probe != "" {
+		beadDependencies(t, probe, []string{"rudy-4tf.1.1"})
+		return
+	}
+
+	cases := []struct {
+		name    string
+		records string
+	}{
+		{
+			name:    "declared task blocked by undeclared sibling",
+			records: "{\"id\":\"rudy-4tf.1.1\",\"dependencies\":[{\"depends_on_id\":\"rudy-4tf.1.99\",\"type\":\"blocks\"}]}\n",
+		},
+		{
+			name: "extra sibling issue carries blocking edge",
+			records: "{\"id\":\"rudy-4tf.1.1\",\"dependencies\":[]}\n" +
+				"{\"id\":\"rudy-4tf.1.99\",\"dependencies\":[{\"depends_on_id\":\"rudy-4tf.1.1\",\"type\":\"blocks\"}]}\n",
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "issues.jsonl")
+			if err := os.WriteFile(path, []byte(test.records), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestBeadDependenciesRejectsUndeclaredSiblingEndpoints$")
+			cmd.Env = append(os.Environ(), "RUDY_ACP_BEAD_DEPENDENCY_PROBE="+path)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("accepted undeclared sibling endpoint:\n%s", output)
+			}
+			if !strings.Contains(string(output), "undeclared sibling") {
+				t.Fatalf("wrong undeclared sibling failure:\n%s", output)
+			}
+		})
+	}
+}
+
 func TestVendorTypesRejectsACPImportOutsideAdapters(t *testing.T) {
 	root := repositoryRoot(t)
 	assertVendorTypesRejects(t, root, filepath.Join(root, "internal"))
@@ -148,9 +220,23 @@ func mermaidDependencies(t *testing.T, plan string, tasks []string) []dependency
 	t.Helper()
 	nodePattern := regexp.MustCompile(`\b([A-Z]+)\[([^]]*?4tf\.1\.[0-9]+)[^]]*\]`)
 	shortTask := regexp.MustCompile(`4tf\.1\.[0-9]+`)
-	edgePattern := regexp.MustCompile(`^\s*([A-Z]+)(?:\[[^]]+\])?\s*-->\s*([A-Z]+)(?:\[[^]]+\])?\s*$`)
+	diagramPattern := regexp.MustCompile("(?s)```mermaid[^\\n]*\\n(.*?)\\n```")
+	var diagram string
+	for _, match := range diagramPattern.FindAllStringSubmatch(plan, -1) {
+		if !shortTask.MatchString(match[1]) {
+			continue
+		}
+		if diagram != "" {
+			t.Fatal("implementation plan has more than one sibling dependency diagram")
+		}
+		diagram = match[1]
+	}
+	if diagram == "" {
+		t.Fatal("implementation plan has no sibling dependency diagram")
+	}
+	edgeNodePattern := regexp.MustCompile(`^\s*([A-Z]+)(?:\[[^]]+\])?\s*$`)
 	nodes := make(map[string]string)
-	for _, match := range nodePattern.FindAllStringSubmatch(plan, -1) {
+	for _, match := range nodePattern.FindAllStringSubmatch(diagram, -1) {
 		nodes[match[1]] = "rudy-" + shortTask.FindString(match[2])
 	}
 	for _, task := range tasks {
@@ -166,27 +252,25 @@ func mermaidDependencies(t *testing.T, plan string, tasks []string) []dependency
 		}
 	}
 	var edges []dependencyEdge
-	for _, line := range strings.Split(plan, "\n") {
+	for _, line := range strings.Split(diagram, "\n") {
 		if !strings.Contains(line, "-->") {
 			continue
 		}
-		match := edgePattern.FindStringSubmatch(line)
-		if len(match) != 3 {
-			if shortTask.MatchString(line) {
+		parts := strings.Split(line, "-->")
+		tasksInChain := make([]string, 0, len(parts))
+		for _, part := range parts {
+			match := edgeNodePattern.FindStringSubmatch(part)
+			if len(match) != 2 {
 				t.Fatalf("malformed sibling Mermaid edge %q", line)
 			}
-			continue
-		}
-		from, fromOK := nodes[match[1]]
-		to, toOK := nodes[match[2]]
-		if !fromOK || !toOK {
-			if shortTask.MatchString(line) {
+			task, ok := nodes[match[1]]
+			if !ok {
 				t.Fatalf("Mermaid edge has undeclared task node %q", line)
 			}
-			continue
+			tasksInChain = append(tasksInChain, task)
 		}
-		if slices.Contains(tasks, from) && slices.Contains(tasks, to) {
-			edges = append(edges, dependencyEdge{From: from, To: to})
+		for i := range len(tasksInChain) - 1 {
+			edges = append(edges, dependencyEdge{From: tasksInChain[i], To: tasksInChain[i+1]})
 		}
 	}
 	return canonicalEdges(t, edges)
@@ -203,6 +287,7 @@ func beadDependencies(t *testing.T, path string, tasks []string) []dependencyEdg
 	for _, task := range tasks {
 		taskSet[task] = true
 	}
+	siblingPattern := regexp.MustCompile(`^` + regexp.QuoteMeta(siblingPrefix) + `[0-9]+$`)
 	var edges []dependencyEdge
 	seenTasks := make(map[string]bool, len(tasks))
 	scanner := bufio.NewScanner(f)
@@ -219,7 +304,7 @@ func beadDependencies(t *testing.T, path string, tasks []string) []dependencyEdg
 		if err := json.Unmarshal(scanner.Bytes(), &issue); err != nil {
 			t.Fatalf("decode %s: %v", path, err)
 		}
-		if !taskSet[issue.ID] {
+		if !siblingPattern.MatchString(issue.ID) {
 			continue
 		}
 		if seenTasks[issue.ID] {
@@ -227,13 +312,23 @@ func beadDependencies(t *testing.T, path string, tasks []string) []dependencyEdg
 		}
 		seenTasks[issue.ID] = true
 		for _, dependency := range issue.Dependencies {
-			if dependency.Type == "blocks" && taskSet[dependency.DependsOnID] {
+			if dependency.Type == "blocks" && siblingPattern.MatchString(dependency.DependsOnID) {
 				edges = append(edges, dependencyEdge{From: dependency.DependsOnID, To: issue.ID})
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
+	}
+	for sibling := range seenTasks {
+		if !taskSet[sibling] {
+			t.Fatalf("Beads export has undeclared sibling issue %s", sibling)
+		}
+	}
+	for _, edge := range edges {
+		if !taskSet[edge.From] || !taskSet[edge.To] {
+			t.Fatalf("Beads blocks edge %s has undeclared sibling endpoint", edge)
+		}
 	}
 	for _, task := range tasks {
 		if !seenTasks[task] {
