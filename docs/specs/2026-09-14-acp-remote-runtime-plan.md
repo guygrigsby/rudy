@@ -52,7 +52,7 @@ for tasks 3 and 6 because it consumes the bounded internal listing and replay AP
 the Client port. Task 5 also waits for the Tool scheduler. Task 8 waits for tasks 6 and 7. The
 remaining dependencies are real protocol or API dependencies and stay ordered.
 
-## 1. Pin the ACP boundary and generate the extension catalogue
+## Task 1: Pin the ACP boundary and generate the extension catalogue
 
 Bead: `rudy-4tf.1.1`
 
@@ -112,7 +112,7 @@ make fmt-check
 
 Commit: `remote: pin ACP boundary`
 
-## Safety prerequisite. Enforce terminal Turn durability
+## Task 11: Enforce terminal Turn durability
 
 Bead: `rudy-4tf.1.11`
 
@@ -168,7 +168,7 @@ RUDY_TEST_TRANSPORT=socket go test -race ./internal/server -count=1
 
 Commit: `turn: require durable terminal state`
 
-## Safety prerequisite. Bound internal event transport
+## Task 13: Bound internal event transport
 
 Bead: `rudy-4tf.1.13`
 
@@ -337,7 +337,7 @@ go test -race ./internal/cli ./internal/tui/... -count=1
 
 Commit: `session: bound event transport`
 
-## Safety prerequisite. Bound tool execution concurrency
+## Task 12: Bound tool execution concurrency
 
 Bead: `rudy-4tf.1.12`
 
@@ -421,7 +421,7 @@ RUDY_TEST_TRANSPORT=socket go test -race ./internal/server -count=1
 
 Commit: `turn: bound tool scheduling`
 
-## 2. Harden framing, request admission and cancellation ordering
+## Task 2: Harden framing, request admission and cancellation ordering
 
 Bead: `rudy-4tf.1.2`
 
@@ -517,7 +517,7 @@ make fmt-check
 
 Commit: `remote: harden ACP framing`
 
-## 3. Extract daemon connection logic and bootstrap the ACP agent
+## Task 3: Extract daemon connection logic and bootstrap the ACP agent
 
 Bead: `rudy-4tf.1.3`
 
@@ -604,7 +604,7 @@ go test -race ./internal/acpagent -count=1
 
 Commit: `remote: prepare the ACP agent`
 
-## 4. Implement the standard ACP Session lifecycle
+## Task 4: Implement the standard ACP Session lifecycle
 
 Bead: `rudy-4tf.1.4`
 
@@ -689,7 +689,7 @@ RUDY_TEST_TRANSPORT=socket go test -race ./internal/server -count=1
 
 Commit: `remote: add ACP session lifecycle`
 
-## 5. Map prompts, updates, permissions and configuration
+## Task 5: Map prompts, updates, permissions and configuration
 
 Bead: `rudy-4tf.1.5`
 
@@ -902,7 +902,7 @@ RUDY_TEST_TRANSPORT=socket go test -race ./internal/server -count=1
 
 Commit: `remote: map ACP turns`
 
-## 6. Introduce `SessionClient` and adapt local clients
+## Task 6: Introduce `SessionClient` and adapt local clients
 
 Bead: `rudy-4tf.1.6`
 
@@ -1023,7 +1023,7 @@ go test -race ./internal/cli -run TestHostsInstallForceRestartsTheDaemon -count=
 
 Commit: `tui: add the SessionClient port`
 
-## 7. Implement negotiated Rudy extensions and terminal shutdown
+## Task 7: Implement negotiated Rudy extensions and terminal shutdown
 
 Bead: `rudy-4tf.1.10`
 
@@ -1118,7 +1118,7 @@ go test -race ./internal/cli -count=1
 
 Commit: `remote: add Rudy ACP extensions`
 
-## 8. Add the ACP client and switch remote Session traffic
+## Task 8: Add the ACP client and switch remote Session traffic
 
 Bead: `rudy-4tf.1.7`
 
@@ -1248,7 +1248,7 @@ go test -race ./internal/cli -count=1
 
 Commit: `remote: speak ACP over SSH`
 
-## 9. Add host checks, stop and forced ACP replacement
+## Task 9: Add host checks, stop and forced ACP replacement
 
 Bead: `rudy-4tf.1.8`
 
@@ -1301,7 +1301,7 @@ go test -race ./internal/acpclient ./internal/acpagent -count=1
 
 Commit: `remote: manage ACP hosts`
 
-## 10. Cross the compatibility release gate and retire bridge
+## Task 10: Cross the compatibility release gate and retire bridge
 
 Bead: `rudy-4tf.1.9`
 
