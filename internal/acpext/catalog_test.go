@@ -25,8 +25,8 @@ func TestGeneratedCatalogueMatchesContract(t *testing.T) {
 			t.Errorf("contract capability %q is missing from catalogue", capability)
 			continue
 		}
-		if entry.Method != contract.method || entry.Notification != contract.notification {
-			t.Errorf("capability %q = {%q, notification:%t}, want {%q, notification:%t}", capability, entry.Method, entry.Notification, contract.method, contract.notification)
+		if entry.Method != contract.method || entry.Notification != contract.notification || entry.Side != contract.side {
+			t.Errorf("capability %q = {%q, notification:%t, side:%q}, want {%q, notification:%t, side:%q}", capability, entry.Method, entry.Notification, entry.Side, contract.method, contract.notification, contract.side)
 		}
 	}
 	for _, entry := range got {
@@ -35,8 +35,8 @@ func TestGeneratedCatalogueMatchesContract(t *testing.T) {
 			t.Errorf("catalogue capability %q is absent from contract", entry.Capability)
 			continue
 		}
-		if entry.Method != contract.method || entry.Notification != contract.notification {
-			t.Errorf("catalogue entry for %q = {%q, notification:%t}, contract has {%q, notification:%t}", entry.Capability, entry.Method, entry.Notification, contract.method, contract.notification)
+		if entry.Method != contract.method || entry.Notification != contract.notification || entry.Side != contract.side {
+			t.Errorf("catalogue entry for %q = {%q, notification:%t, side:%q}, contract has {%q, notification:%t, side:%q}", entry.Capability, entry.Method, entry.Notification, entry.Side, contract.method, contract.notification, contract.side)
 		}
 	}
 }
@@ -82,6 +82,7 @@ func TestCanonicalCapabilitiesSortsAndRemovesDuplicates(t *testing.T) {
 type contractEntry struct {
 	method       string
 	notification bool
+	side         string
 }
 
 func parseExtensionTable(t *testing.T, path string) map[string]contractEntry {
@@ -121,6 +122,10 @@ func parseExtensionTable(t *testing.T, path string) map[string]contractEntry {
 		}
 		method := methodColumn[1 : methodEnd+1]
 		notification := strings.Contains(methodColumn[methodEnd+2:], "notification")
+		side := strings.TrimSpace(columns[3])
+		if side != "agent" && side != "client" {
+			t.Fatalf("extension row %q has side %q, want agent or client", capability, side)
+		}
 		inTable = true
 		if capability == "" || method == "" {
 			t.Fatalf("malformed extension row %q", line)
@@ -128,7 +133,7 @@ func parseExtensionTable(t *testing.T, path string) map[string]contractEntry {
 		if old, exists := rows[capability]; exists {
 			t.Fatalf("duplicate capability %q maps to %q and %q", capability, old.method, method)
 		}
-		rows[capability] = contractEntry{method: method, notification: notification}
+		rows[capability] = contractEntry{method: method, notification: notification, side: side}
 	}
 	if len(rows) == 0 {
 		t.Fatal("Rudy extension table is empty")

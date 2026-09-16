@@ -17,6 +17,7 @@ type entry struct {
 	capability   string
 	method       string
 	notification bool
+	side         string
 }
 
 func main() {
@@ -74,6 +75,10 @@ func parseTable(contract string) ([]entry, error) {
 		if capability == "" || method == "" {
 			return nil, fmt.Errorf("malformed extension row %q", line)
 		}
+		side := strings.TrimSpace(columns[3])
+		if side != "agent" && side != "client" {
+			return nil, fmt.Errorf("extension row %q has side %q, want agent or client", capability, side)
+		}
 		if seenCapabilities[capability] {
 			return nil, fmt.Errorf("duplicate capability %q", capability)
 		}
@@ -87,6 +92,7 @@ func parseTable(contract string) ([]entry, error) {
 			capability:   capability,
 			method:       method,
 			notification: strings.Contains(methodColumn, "notification"),
+			side:         side,
 		})
 	}
 	if len(entries) == 0 {
@@ -135,7 +141,7 @@ func render(entries []entry) ([]byte, error) {
 	b.WriteString("}\n\n")
 	b.WriteString("var catalogue = [...]Entry{\n")
 	for _, entry := range entries {
-		fmt.Fprintf(&b, "\t{Capability: string(Capability%s), Method: string(Method%s), Notification: %t},\n", identifier(entry.capability), identifier(entry.capability), entry.notification)
+		fmt.Fprintf(&b, "\t{Capability: string(Capability%s), Method: string(Method%s), Notification: %t, Side: %q},\n", identifier(entry.capability), identifier(entry.capability), entry.notification, entry.side)
 	}
 	b.WriteString("}\n")
 	return format.Source(b.Bytes())

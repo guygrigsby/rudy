@@ -373,6 +373,19 @@ func TestEachSideReceivesItsOwnNotifications(t *testing.T) {
 	}
 }
 
+// The ledger charges what the SDK is handed, not what the peer sent. A session/cancel is
+// re-encoded from its validated fields, and json.Marshal escapes <, > and & to six bytes each,
+// so charging the frame as it arrived lets the ingress queue hold several times what the
+// ledger says it does.
+func TestReEncodedCancelIsChargedAsDelivered(t *testing.T) {
+	frame := `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"` + strings.Repeat("<", 4096) + `"}}`
+	w, r, _ := newTestWire(t, frame+"\n", Options{})
+	delivered := len(readLine(t, r)) - 1
+	if u := w.Usage(); u.InboundBytes < delivered {
+		t.Fatalf("charged %d bytes for a frame delivered at %d", u.InboundBytes, delivered)
+	}
+}
+
 func TestSeparateCountsAndSharedBytes(t *testing.T) {
 	var raw strings.Builder
 	for i := range MaxItems {

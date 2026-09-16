@@ -59,15 +59,15 @@ var methodNames = [...]string{
 }
 
 var catalogue = [...]Entry{
-	{Capability: string(CapabilityCommandList), Method: string(MethodCommandList), Notification: false},
-	{Capability: string(CapabilityCommandRun), Method: string(MethodCommandRun), Notification: false},
-	{Capability: string(CapabilityRegistryList), Method: string(MethodRegistryList), Notification: false},
-	{Capability: string(CapabilityRegistryRefresh), Method: string(MethodRegistryRefresh), Notification: false},
-	{Capability: string(CapabilityServerShutdown), Method: string(MethodServerShutdown), Notification: false},
-	{Capability: string(CapabilitySessionCompact), Method: string(MethodSessionCompact), Notification: false},
-	{Capability: string(CapabilitySessionFork), Method: string(MethodSessionFork), Notification: false},
-	{Capability: string(CapabilitySessionShell), Method: string(MethodSessionShell), Notification: false},
-	{Capability: string(CapabilitySessionSteer), Method: string(MethodSessionSteer), Notification: false},
-	{Capability: string(CapabilitySessionTitle), Method: string(MethodSessionTitle), Notification: false},
-	{Capability: string(CapabilitySessionUpdate), Method: string(MethodSessionUpdate), Notification: true},
+	{Capability: string(CapabilityCommandList), Method: string(MethodCommandList), Notification: false, Side: "agent"},
+	{Capability: string(CapabilityCommandRun), Method: string(MethodCommandRun), Notification: false, Side: "agent"},
+	{Capability: string(CapabilityRegistryList), Method: string(MethodRegistryList), Notification: false, Side: "agent"},
+	{Capability: string(CapabilityRegistryRefresh), Method: string(MethodRegistryRefresh), Notification: false, Side: "agent"},
+	{Capability: string(CapabilityServerShutdown), Method: string(MethodServerShutdown), Notification: false, Side: "agent"},
+	{Capability: string(CapabilitySessionCompact), Method: string(MethodSessionCompact), Notification: false, Side: "agent"},
+	{Capability: string(CapabilitySessionFork), Method: string(MethodSessionFork), Notification: false, Side: "agent"},
+	{Capability: string(CapabilitySessionShell), Method: string(MethodSessionShell), Notification: false, Side: "agent"},
+	{Capability: string(CapabilitySessionSteer), Method: string(MethodSessionSteer), Notification: false, Side: "agent"},
+	{Capability: string(CapabilitySessionTitle), Method: string(MethodSessionTitle), Notification: false, Side: "agent"},
+	{Capability: string(CapabilitySessionUpdate), Method: string(MethodSessionUpdate), Notification: true, Side: "client"},
 }

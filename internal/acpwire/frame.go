@@ -114,11 +114,9 @@ var stableMethods = sync.OnceValue(func() map[string]stableMethod {
 })
 
 // notificationSide reports which side handles a notification and whether it is directed at
-// all. $/cancel_request is JSON-RPC's own and belongs to both. Stable methods carry x-side in
-// the pinned schema. Every _rudy notification is an agent-to-client event, which is what the
-// catalogue's one notification is and what the extension contract describes; the day that
-// stops holding, the side belongs in the normative table and the generated catalogue beside
-// Notification, not here (rudy-azz).
+// all. $/cancel_request is JSON-RPC's own and belongs to both. Every other method names its
+// side in the contract it comes from: x-side in the pinned ACP schema for the stable half,
+// the normative extension table for the _rudy half.
 func notificationSide(method string) (Side, bool) {
 	if method == "$/cancel_request" {
 		return AgentSide, false
@@ -128,10 +126,20 @@ func notificationSide(method string) (Side, bool) {
 	}
 	for _, e := range acpext.All() {
 		if e.Method == method && e.Notification {
-			return ClientSide, true
+			return sideNamed(e.Side), true
 		}
 	}
 	return AgentSide, false
+}
+
+// sideNamed reads the side vocabulary the two contracts share. Anything it does not recognize
+// stays on the agent, the side facing the peer, so a vocabulary that grows a third value
+// refuses a notification rather than admitting one nothing here can release.
+func sideNamed(name string) Side {
+	if name == "client" {
+		return ClientSide
+	}
+	return AgentSide
 }
 
 func parseEnvelope(raw []byte, methods map[string]Kind) (envelope, error) {

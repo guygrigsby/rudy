@@ -228,7 +228,18 @@ func (w *Wire) scanFrame() (ingressFrame, error) {
 			w.fail(ErrEnvelope)
 			return ingressFrame{}, ErrEnvelope
 		}
-		dispatch, drop, err := w.admit(e, len(raw))
+		// Charge the larger of what the peer sent and what the SDK is handed. The sent size
+		// is what the budget is for, since every frame costs the read whatever becomes of
+		// it, but a session/cancel is rebuilt from its validated fields and json.Marshal
+		// escapes <, > and & to six bytes each, so a 4 KiB frame is delivered at 24 KiB and
+		// charging it as it arrived would let the queue hold what the ledger denies. The id
+		// swaps further down change a frame by a bounded constant and are charged as sent.
+		charged := len(raw)
+		if e.method == "session/cancel" {
+			raw = cancelFrame(e)
+			charged = max(charged, len(raw))
+		}
+		dispatch, drop, err := w.admit(e, charged)
 		if err != nil {
 			w.fail(err)
 			return ingressFrame{}, err
@@ -273,9 +284,6 @@ func (w *Wire) scanFrame() (ingressFrame, error) {
 			// Retain only the exact validated request handle. Encoding waits for
 			// SDK exposure and duplicate intents are coalesced during admission.
 			return ingressFrame{dispatch: dispatch}, nil
-		}
-		if e.method == "session/cancel" {
-			raw = cancelFrame(e)
 		}
 		if e.kind == RequestFrame && e.id.Kind == NullID {
 			raw = replaceID(raw, []byte(sdkNullID))
