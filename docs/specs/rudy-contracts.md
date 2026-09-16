@@ -893,19 +893,19 @@ catalogue byte and outer-structural bounds above apply before the complete inter
 acquire their large construction reservation before issuing the internal request and never first
 decode an unbounded array.
 
-| Capability | Method | Params | Result | Internal mapping |
-|---|---|---|---|---|
-| `session.fork` | `_rudy/session/fork` | `{sessionId, atEntryId}` | `InitialSessionState` | `session.fork` |
-| `session.steer` | `_rudy/session/steer` | `{sessionId, prompt: [ACP prompt ContentBlock]}` | `{turnId}` | Translate content through the exact `session/prompt` translator, then call `session.submit` with `source: steer` |
-| `session.compact` | `_rudy/session/compact` | `{sessionId, instructions?}` | `{entryId}` | `session.compact` |
-| `session.shell` | `_rudy/session/shell` | `{sessionId, command}` | `{entryId, isError}` | `session.shell` |
-| `session.title` | `_rudy/session/set_title` | `{sessionId, title}` | `{entryId}` | `session.set_title` |
-| `command.list` | `_rudy/command/list` | `{}` | `{commands: [{name, description}]}` | `command.list` |
-| `command.run` | `_rudy/command/run` | `{sessionId, name, args}` | `{turnId, notice, sessionId, stopReason?}`; returns immediately without `stopReason` when `turnId` is empty. When `turnId` is nonempty, keeps the request open through that Turn's terminal Entry and state, then requires normalized `stopReason` or the same fixed failure used by Prompt | `command.run`, then the Prompt completion barrier when it starts a Turn |
-| `registry.list` | `_rudy/registry/list` | `{provider?}` | `RegistryResult` | `registry.list` |
-| `registry.refresh` | `_rudy/registry/refresh` | `{provider?}` | `RegistryResult` plus required `failures: [{provider, error: "Refresh failed; see box log"}]` | Call `registry.refresh`; replace every nonempty internal failure error with the fixed public text |
-| `server.shutdown` | `_rudy/server_shutdown` | `{}` | `{instanceId, state: "stopped"}` only after terminal proof | Before forwarding internal `server.shutdown`, request cancellation may reserve `-32800`. After forwarding, record cancellation intent but await the internal response: rejection may still return cancellation, while accepted `shutting_down` proves the one-way shutdown committed and makes the ACP request non-cancellable. Keep it open, require matching internal `server.stopped` followed by internal EOF, then return and exit. Bare internal or ACP EOF is never proof. |
-| `session.update` | `_rudy/session/update` notification | exact closed union below | none | status, widget, plugin, registry and sanitized notice events; also enables versioned metadata on standard updates and permission requests |
+| Capability | Method | Side | Params | Result | Internal mapping |
+|---|---|---|---|---|---|
+| `session.fork` | `_rudy/session/fork` | agent | `{sessionId, atEntryId}` | `InitialSessionState` | `session.fork` |
+| `session.steer` | `_rudy/session/steer` | agent | `{sessionId, prompt: [ACP prompt ContentBlock]}` | `{turnId}` | Translate content through the exact `session/prompt` translator, then call `session.submit` with `source: steer` |
+| `session.compact` | `_rudy/session/compact` | agent | `{sessionId, instructions?}` | `{entryId}` | `session.compact` |
+| `session.shell` | `_rudy/session/shell` | agent | `{sessionId, command}` | `{entryId, isError}` | `session.shell` |
+| `session.title` | `_rudy/session/set_title` | agent | `{sessionId, title}` | `{entryId}` | `session.set_title` |
+| `command.list` | `_rudy/command/list` | agent | `{}` | `{commands: [{name, description}]}` | `command.list` |
+| `command.run` | `_rudy/command/run` | agent | `{sessionId, name, args}` | `{turnId, notice, sessionId, stopReason?}`; returns immediately without `stopReason` when `turnId` is empty. When `turnId` is nonempty, keeps the request open through that Turn's terminal Entry and state, then requires normalized `stopReason` or the same fixed failure used by Prompt | `command.run`, then the Prompt completion barrier when it starts a Turn |
+| `registry.list` | `_rudy/registry/list` | agent | `{provider?}` | `RegistryResult` | `registry.list` |
+| `registry.refresh` | `_rudy/registry/refresh` | agent | `{provider?}` | `RegistryResult` plus required `failures: [{provider, error: "Refresh failed; see box log"}]` | Call `registry.refresh`; replace every nonempty internal failure error with the fixed public text |
+| `server.shutdown` | `_rudy/server_shutdown` | agent | `{}` | `{instanceId, state: "stopped"}` only after terminal proof | Before forwarding internal `server.shutdown`, request cancellation may reserve `-32800`. After forwarding, record cancellation intent but await the internal response: rejection may still return cancellation, while accepted `shutting_down` proves the one-way shutdown committed and makes the ACP request non-cancellable. Keep it open, require matching internal `server.stopped` followed by internal EOF, then return and exit. Bare internal or ACP EOF is never proof. |
+| `session.update` | `_rudy/session/update` notification | client | exact closed union below | none | status, widget, plugin, registry and sanitized notice events; also enables versioned metadata on standard updates and permission requests |
 
 Every `_rudy/session/update` has params from this closed union. External field names use lower
 camel case. These v1 events mirror the existing process-wide client shapes, carry no

@@ -21,6 +21,10 @@ type Entry struct {
 	Capability   string
 	Method       string
 	Notification bool
+	// Side names the half of the connection that handles the method, in the pinned ACP
+	// schema's own vocabulary: "agent" or "client". It is what decides which side may be
+	// sent the method, so a wire admits only the half of the catalogue it owns.
+	Side string
 }
 
 // All returns the extension catalogue sorted by capability.
