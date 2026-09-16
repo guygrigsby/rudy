@@ -161,6 +161,18 @@ func (cn *conn) pump(ctx context.Context) {
 	}
 }
 
+// closeNow tears this connection down: the pump stops and the transport closes, so whatever
+// the client had in flight fails and its next read is EOF. It is what a Session quarantine
+// does to every connection that held the Session (ADR 0037), and it says nothing about why:
+// the cause is the Server log's. abortPump is written before the connection is reachable from
+// s.conns or any subscriber list (see serveConn), which is what makes reading it here safe.
+func (cn *conn) closeNow() {
+	if cn.abortPump != nil {
+		cn.abortPump()
+	}
+	_ = cn.c.Close()
+}
+
 func (cn *conn) stopPump(err error) {
 	cn.mu.Lock()
 	cn.stopped = true

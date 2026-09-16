@@ -94,6 +94,12 @@ type Server struct {
 	closing map[ulid.ULID]chan struct{} // sids detach is closing; see detach, loadCold
 	conns   map[int]*conn               // every live connection, for the status and widget broadcasts
 	nextID  int
+
+	// admMu guards admissions alone and is an independent leaf: see sessionAdmission for the
+	// order the fences themselves hold. The map is one fence per Session ULID this process has
+	// committed anything for, retained after the session unloads, and empty in a new process.
+	admMu      sync.Mutex
+	admissions map[ulid.ULID]*sessionAdmission
 }
 
 // New wires a Server. Deps must already be fully populated.
@@ -104,6 +110,7 @@ func New(d Deps) *Server {
 		instanceID: ulid.Make(), state: protocol.ServerStateRunning,
 		shutdownRequested: make(chan struct{}), shutdownComplete: make(chan struct{}), shutdownFailed: make(chan struct{}),
 		live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{},
+		admissions: map[ulid.ULID]*sessionAdmission{},
 	}
 }
 
@@ -158,6 +165,7 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	}
 	s.wg.Add(1)
 	s.wgMu.Unlock()
+	pumpCtx, stopPump := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.nextID++
 	cn := newConn(s.nextID, c)
@@ -165,12 +173,13 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	cn.plugin = name
 	cn.reg = reg
 	cn.hello = name != ""
+	// Before the conn is reachable from s.conns or a session's subscriber list: a quarantine
+	// closing this connection reads abortPump from another goroutine (see conn.closeNow).
+	cn.abortPump = stopPump
 	s.conns[cn.id] = cn
 	s.mu.Unlock()
 	slog.Info("server: conn open", "conn", cn.id, "plugin", name)
 
-	pumpCtx, stopPump := context.WithCancel(context.Background())
-	cn.abortPump = stopPump
 	go cn.pump(pumpCtx)
 	err := s.serve(ctx, cn)
 	shutdownControl := errors.Is(err, ErrShutdownRequested)
@@ -634,7 +643,7 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// thing about who is an asker.
 	cn.asker = p.Asker
 	cn.asker = cn.isAsker()
-	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home, Capabilities: []string{}}, nil
+	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home, Capabilities: s.capabilities()}, nil
 }
 
 func (s *Server) handleServerShutdown(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
@@ -837,9 +846,9 @@ func (s *Server) setModel(ls *liveSession, spec string) (provider.Model, EntryID
 	if m.Ref == view.Model {
 		return m, EntryIDResult{EntryID: ls.latestEntryID(session.KindModelChange, session.KindSessionOpened)}, nil
 	}
-	e2, err := ls.appendAndBroadcastLocked(session.ModelChange{Model: m.Ref})
+	e2, err := s.appendEntry(ls, session.ModelChange{Model: m.Ref})
 	if err != nil {
-		return provider.Model{}, EntryIDResult{}, protocol.ErrorFrom(err)
+		return provider.Model{}, EntryIDResult{}, sessionErr(err)
 	}
 	ls.model = m
 	return m, EntryIDResult{EntryID: e2.ID.String()}, nil
@@ -986,6 +995,7 @@ func (s *Server) compactorLocked(prov provider.Provider, ls *liveSession) *turn.
 		Provider:  prov,
 		Model:     ls.model,
 		Hooks:     s.hookFirer(),
+		Commit:    s.sessionCommit(ls),
 		MaxTokens: s.d.Config.MaxTokens,
 		Overrides: ls.overrides,
 	}
@@ -1011,7 +1021,7 @@ func (s *Server) handleAppendNote(cn *conn, raw json.RawMessage) (any, *protocol
 	case errors.Is(aerr, errSessionNotOpen):
 		return nil, perr(protocol.CodeNotFound, aerr.Error())
 	case aerr != nil:
-		return nil, protocol.ErrorFrom(aerr)
+		return nil, sessionErr(aerr)
 	}
 	return EntryIDResult{EntryID: e.ID.String()}, nil
 }
@@ -1134,9 +1144,9 @@ func (s *Server) handleShell(ctx context.Context, raw json.RawMessage) (any, *pr
 	if ls.closed {
 		return nil, perr(protocol.CodeNotFound, "session closed")
 	}
-	entry, err := ls.appendAndBroadcastLocked(msg)
+	entry, err := s.appendEntry(ls, msg)
 	if err != nil {
-		return nil, protocol.ErrorFrom(err)
+		return nil, sessionErr(err)
 	}
 	return protocol.SessionShellResult{EntryID: entry.ID.String(), IsError: res.IsError}, nil
 }
@@ -1249,10 +1259,17 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 	}
 }
 
+// lookup resolves a session id to the live session it names. A quarantined Session is
+// unavailable here whether or not it is still live: the guard is what makes every later
+// operation on it, including the ones that would only read, refuse until a new Server process
+// recovers the log (ADR 0037).
 func (s *Server) lookup(id string) (*liveSession, *protocol.Error) {
 	sid, err := ulid.Parse(id)
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, "bad session id")
+	}
+	if e := s.sessionQuarantined(sid); e != nil {
+		return nil, e
 	}
 	s.mu.Lock()
 	ls, ok := s.live[sid]
@@ -1285,9 +1302,9 @@ func (s *Server) setEntry(id string, kind session.Kind, f func(view protocol.Ses
 	if same {
 		return EntryIDResult{EntryID: ls.latestEntryID(kind, session.KindSessionOpened)}, nil
 	}
-	e2, err := ls.appendAndBroadcastLocked(p)
+	e2, err := s.appendEntry(ls, p)
 	if err != nil {
-		return nil, protocol.ErrorFrom(err)
+		return nil, sessionErr(err)
 	}
 	return EntryIDResult{EntryID: e2.ID.String()}, nil
 }
@@ -1370,7 +1387,7 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	}
 	s.applyAgent(ls, def, allow)
 	s.fireSessionOpened(s.ctx, ls, false)
-	return s.installAndAttach(cn, ls), nil
+	return s.installAndAttach(cn, ls)
 }
 
 // firstNonEmpty is the first non-empty of vs, or "" when there is none: the resolution order
@@ -1608,7 +1625,10 @@ func (s *Server) resume(cn *conn, p protocol.SessionResumeParams) (any, *protoco
 	if _, lerr := s.loadCold(cn, sid); lerr != nil {
 		return nil, lerr
 	}
-	info, ok := s.attachIfLive(cn, sid)
+	info, ok, aerr := s.attachIfLive(cn, sid)
+	if aerr != nil {
+		return nil, aerr
+	}
 	if !ok {
 		// Vanishingly rare: the session was detached and closed by someone else between
 		// loadCold returning and this attach (or the server is shutting down). Ask the client
@@ -1684,7 +1704,7 @@ func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.Sess
 	// no step limit.
 	ls := newLive(child, m)
 	s.applyAgentFromLog(cn, ls)
-	return s.installAndAttach(cn, ls), nil
+	return s.installAndAttach(cn, ls)
 }
 
 // loadCold returns the live session for sid, loading it from disk first if it is not already
@@ -1700,6 +1720,13 @@ func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.Sess
 // released the flock, so a cold load that only checked s.live could still lose to that flock,
 // seeing session.ErrLocked for a session nobody has held live for a while.
 func (s *Server) loadCold(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Error) {
+	// Before the live map, the load single-flight and the disk: a quarantined Session stays
+	// quarantined for this process however it is reached for, and reading its log back in
+	// would be exactly the fresh in-memory aggregate ADR 0037 refuses until a new process
+	// recovers it.
+	if e := s.sessionQuarantined(sid); e != nil {
+		return nil, e
+	}
 	for {
 		s.mu.Lock()
 		if ls, ok := s.live[sid]; ok {
@@ -1826,15 +1853,27 @@ func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
 // subscribes cn to it in one critical section. Used by open, fork's child and resume's cold
 // load. Safe unconditionally: the session is not yet visible to any other goroutine before this
 // call, so there is no id to race.
-func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInfo {
+func (s *Server) installAndAttach(cn *conn, ls *liveSession) (protocol.SessionInfo, *protocol.Error) {
 	s.mu.Lock()
-	s.live[ls.sess.ID()] = ls
-	at := ls.subscribeLocked(cn)
-	at.children = s.childAttachmentsLocked(cn, ls)
+	var at attachment
+	// The install and the attachment are one commit, and it takes the same fence every other
+	// commit on this session takes. A session reaching here was just opened, forked or loaded
+	// by this caller, and loadCold refuses a quarantined id before it gets that far, so the
+	// refusal is not reachable today; it is answered rather than ignored because a caller
+	// that is told a session opened has to be able to use it.
+	err := s.withSessionOperation(ls, func() error {
+		s.live[ls.sess.ID()] = ls
+		at = ls.subscribeLocked(cn)
+		at.children = s.childAttachmentsLocked(cn, ls)
+		return nil
+	})
 	s.mu.Unlock()
+	if err != nil {
+		return protocol.SessionInfo{}, sessionErr(err)
+	}
 	deliverAttach(cn, ls.sess.ID(), at)
 	slog.Info("session: open", "session", ls.sess.ID(), "agent", ls.sess.Agent(), "conn", cn.id)
-	return at.info
+	return at.info, nil
 }
 
 // childAttachmentsLocked is what cn is owed about the children of ls that are live right now
@@ -1873,19 +1912,32 @@ func (s *Server) childAttachmentsLocked(cn *conn, ls *liveSession) []childAttach
 // Server.mu across both is what keeps this from ever racing detach's decide-and-remove into
 // subscribing to a session that is concurrently being closed (see detach). ok is false when
 // sid is not currently live.
-func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bool) {
+//
+// The subscription itself is an attachment commit, so it goes through the Session's admission
+// fence: an attach either lands in the subscriber set a quarantine closes or observes the cause
+// and subscribes to nothing, which is the third outcome ADR 0037 removes. The refusal is
+// returned rather than reported as "not live", because a quarantined session is there and
+// unavailable, not gone.
+func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bool, *protocol.Error) {
 	s.mu.Lock()
 	ls, ok := s.live[sid]
 	if !ok {
 		s.mu.Unlock()
-		return protocol.SessionInfo{}, false
+		return protocol.SessionInfo{}, false, s.sessionQuarantined(sid)
 	}
-	at := ls.subscribeLocked(cn)
-	at.children = s.childAttachmentsLocked(cn, ls)
+	var at attachment
+	err := s.withSessionOperation(ls, func() error {
+		at = ls.subscribeLocked(cn)
+		at.children = s.childAttachmentsLocked(cn, ls)
+		return nil
+	})
 	s.mu.Unlock()
+	if err != nil {
+		return protocol.SessionInfo{}, false, s.sessionQuarantined(sid)
+	}
 	deliverAttach(cn, sid, at)
 	slog.Info("session: resume", "session", sid, "conn", cn.id)
-	return at.info, true
+	return at.info, true, nil
 }
 
 func replay(cn *conn, sid ulid.ULID, entries []session.Entry) {
@@ -1940,18 +1992,24 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 
 	s.mu.Lock()
 
-	ls.obsMu.Lock()
-	kept := ls.conns[:0]
-	for _, c := range ls.conns {
-		if c != cn {
-			kept = append(kept, c)
+	var empty, steering, standing bool
+	// A detachment commit, so it is ordered against a quarantine's subscriber snapshot the
+	// same way an attachment is, and it runs whether or not this session is quarantined: the
+	// connection is already gone either way (see withSessionTeardown).
+	s.withSessionTeardown(ls, func() {
+		ls.obsMu.Lock()
+		kept := ls.conns[:0]
+		for _, c := range ls.conns {
+			if c != cn {
+				kept = append(kept, c)
+			}
 		}
-	}
-	ls.conns = kept
-	empty := len(ls.conns) == 0
-	steering := ls.state == turn.Steering
-	standing := len(ls.standing) > 0
-	ls.obsMu.Unlock()
+		ls.conns = kept
+		empty = len(ls.conns) == 0
+		steering = ls.state == turn.Steering
+		standing = len(ls.standing) > 0
+		ls.obsMu.Unlock()
+	})
 
 	s.closeIfUnusedLocked(ls)
 	if standing {
@@ -2111,7 +2169,12 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	// prompt describes, and the template is whatever the operator's prompt file said.
 	base := s.renderPrompt(ls, view.Workspace, tools.Tools())
 	r := turn.NewRunner(turn.Config{
-		Session:     ls.sess,
+		Session: ls.sess,
+		// Every Entry this turn appends, and the terminal sync that publishes its state,
+		// commits through the Session's admission fence: a Turn append is a Session commit
+		// like any other, and a terminal sync failure has to install its cause there before
+		// anything else reads the Session (ADR 0037).
+		Commit:      s.sessionCommit(ls),
 		Provider:    prov,
 		Model:       ls.model,
 		Tools:       tools,
@@ -2183,6 +2246,11 @@ func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessag
 	defer s.wg.Done()
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
+	// A quarantine cancels the work still running on the session it fenced, and this turn is
+	// that work. A turn offered to a session already quarantined is cancelled before its
+	// first request rather than left to discover the refusal at its first append.
+	release := s.registerSessionWork(ls, cancel)
+	defer release()
 	_ = r.Run(ctx, msg) // failures are already recorded as turn_failed entries by the runner
 	// Whatever Run made of it, the turn is over: anyone still waiting to learn its id learns
 	// here that no id is coming.
