@@ -439,6 +439,16 @@ func (o *Outbound) Written() *Receipt { return o.written }
 // Invoke serializes only SDK initiation through its first Output write. The
 // callback and response remain concurrent. Its context advances cancellation
 // classification before the SDK can delete its callback.
+//
+// The callback must issue exactly one SDK request, and it is the caller's to
+// guarantee: the wire cannot check it. Initiation is released at the first bind
+// so another Invoke can start while this callback waits for its response, which
+// means a second request written from inside this callback finds whichever
+// Outbound that other Invoke left pending and binds to it. Both frames then carry
+// that one's wire id, a response for it completes this call, and cancelling it
+// cancels this call instead. The only guard is the method comparison in sendSDK,
+// so two different methods fail closed and two of the same mis-bind in silence
+// (rudy-gl7). An adapter needing a second request takes a second Outbound.
 func (o *Outbound) Invoke(ctx context.Context, call func(context.Context) error) error {
 	w := o.wire
 	select {

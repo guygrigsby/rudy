@@ -257,7 +257,13 @@ func (w *Wire) writeLoop() {
 				if r := item.request; r != nil && w.inbound[r.id] == r {
 					delete(w.inbound, r.id)
 					r.retired = true
+					// Retiring a request can drop the cancels that named it, which is a
+					// change in what the ingress queue has to hand over, so a reader
+					// waiting on that queue is told. Every other path that changes
+					// deliverability signals; this one now sits on the end-of-input
+					// return, which is reached by observing an empty queue.
 					w.pruneCancels()
+					w.signalIngress()
 					w.usage.Requests--
 					w.usage.InboundBytes -= r.bytes
 					if r.reservation != nil {
