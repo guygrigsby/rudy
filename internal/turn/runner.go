@@ -114,7 +114,11 @@ type Compactor interface {
 
 // Config wires one Runner.
 type Config struct {
-	Session     *session.Session
+	Session *session.Session
+	// Commit enters the owning Server's Session admission fence. It must retain a
+	// durability failure before releasing admission. No provider or hook waits belong here.
+	Commit      func(func() error) error
+	Sync        func() error // nil uses Session.Sync
 	Provider    provider.Provider
 	Model       provider.Model
 	Tools       Tools
@@ -217,23 +221,20 @@ func (r *Runner) State() State {
 // lock Run takes to claim its resume out of Steering (see Run), so the two calls still
 // serialize correctly against each other: whichever acquires r.mu first decides the
 // outcome, and the other observes the state the first one left behind.
-func (r *Runner) Interrupt(how session.Interrupt) {
+func (r *Runner) Interrupt(how session.Interrupt) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch r.state {
 	case Idle, Completed, Failed:
-		return
+		return nil
 	case Steering:
 		if how == session.InterruptCancel {
-			r.appendLocked(session.TurnInterrupted{TurnID: r.turn, How: session.InterruptCancel})
-			// This ends the turn, so sync it here as rest does elsewhere. A failure can
-			// only be logged: fail takes r.mu, which this branch already holds.
-			if err := r.cfg.Session.Sync(); err != nil {
-				slog.Error("turn: sync session log at turn_interrupted", "err", err)
+			if _, err := r.appendTerminal(session.TurnInterrupted{TurnID: r.turn, How: session.InterruptCancel}); err != nil {
+				return err
 			}
 			r.setStateLocked(Idle)
 		}
-		return
+		return nil
 	}
 	if r.interrupt != session.InterruptCancel {
 		r.interrupt = how
@@ -247,6 +248,7 @@ func (r *Runner) Interrupt(how session.Interrupt) {
 	// interrupt to explain it. Nothing in a context's cancel func waits on this runner, so
 	// holding mu over them costs only the wakeups the cancellation was for.
 	r.calls.cancelAll()
+	return nil
 }
 
 // Run appends msg and drives the loop until Completed, Failed, Steering or Idle after a
@@ -383,7 +385,9 @@ func (r *Runner) loop(ctx context.Context) error {
 				if _, aerr := r.appendAssistant(ctx, am); aerr != nil {
 					return r.fail(session.ErrInternal, aerr)
 				}
-				_ = r.finishInterrupt(ctx, session.InterruptCancel)
+				if err := r.finishInterrupt(ctx, session.InterruptCancel); err != nil {
+					return err
+				}
 				return ctx.Err()
 			}
 			var pe *provider.Error
@@ -888,8 +892,8 @@ func (r *Runner) finishInterrupt(ctx context.Context, how session.Interrupt) err
 	r.mu.Lock()
 	turn := r.turn
 	r.mu.Unlock()
-	if _, err := r.append(session.TurnInterrupted{TurnID: turn, How: how}); err != nil {
-		return r.fail(session.ErrInternal, err)
+	if _, err := r.appendTerminal(session.TurnInterrupted{TurnID: turn, How: how}); err != nil {
+		return err
 	}
 	return r.rest(ctx, Idle)
 }
@@ -901,8 +905,13 @@ func (r *Runner) finishInterrupt(ctx context.Context, how session.Interrupt) err
 // the turn's failure and is recorded as a turn_failed; the failing paths sync in fail
 // instead, where the error can only be logged.
 func (r *Runner) rest(ctx context.Context, s State) error {
-	if err := r.cfg.Session.Sync(); err != nil {
-		return r.fail(session.ErrInternal, fmt.Errorf("sync session log: %w", err))
+	if err := r.commit(func() error {
+		if err := r.sync(); err != nil {
+			return DurabilityError(err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if s == Completed {
 		sid, tid := r.ids()
@@ -934,6 +943,9 @@ func invokeTool(t tool.Tool, ctx context.Context, call tool.Call) (res tool.Resu
 // outcome error, not a failure; ErrPlugin is reserved for a panic or a nil Invoke, which
 // are programming faults in a plugin.
 func (r *Runner) fail(class session.ErrorClass, err error) error {
+	if errors.Is(err, ErrTerminalDurability) {
+		return err
+	}
 	retries := 0
 	msg := err.Error()
 	var pe *provider.Error
@@ -945,14 +957,8 @@ func (r *Runner) fail(class session.ErrorClass, err error) error {
 	turn := r.turn
 	r.mu.Unlock()
 	slog.Error("turn: failed", "turn", turn, "class", class, "err", msg, "retries", retries)
-	if e, aerr := r.cfg.Session.Append(session.TurnFailed{TurnID: turn, Class: class, Message: msg, Retries: retries}); aerr == nil {
-		r.cfg.Observer.EntryAppended(e)
-	}
-	// The turn is already failing, so a sync failure here is only logged: err, which the
-	// caller is about to receive, says more about what went wrong than a write error on
-	// the record of it would.
-	if serr := r.cfg.Session.Sync(); serr != nil {
-		slog.Error("turn: sync session log at turn_failed", "err", serr)
+	if _, aerr := r.appendTerminal(session.TurnFailed{TurnID: turn, Class: class, Message: msg, Retries: retries}); aerr != nil {
+		return aerr
 	}
 	r.clearInterrupt()
 	r.setState(Failed)
@@ -960,21 +966,47 @@ func (r *Runner) fail(class session.ErrorClass, err error) error {
 }
 
 func (r *Runner) append(p session.Payload) (session.Entry, error) {
-	e, err := r.cfg.Session.Append(p)
-	if err != nil {
-		return e, err
-	}
-	r.cfg.Observer.EntryAppended(e)
-	return e, nil
+	var e session.Entry
+	err := r.commit(func() error {
+		var err error
+		e, err = r.cfg.Session.Append(p)
+		if err == nil {
+			r.cfg.Observer.EntryAppended(e)
+		}
+		return err
+	})
+	return e, err
 }
 
-// appendLocked is append for callers holding r.mu; it is only called from the Steering
-// branch of Interrupt, which is safe because no Run is executing while the runner is
-// Steering.
-func (r *Runner) appendLocked(p session.Payload) {
-	if e, err := r.cfg.Session.Append(p); err == nil {
+func (r *Runner) appendTerminal(p session.Payload) (session.Entry, error) {
+	var e session.Entry
+	err := r.commit(func() error {
+		var err error
+		e, err = r.cfg.Session.Append(p)
+		if err != nil {
+			return DurabilityError(err)
+		}
+		if err = r.sync(); err != nil {
+			return DurabilityError(err)
+		}
 		r.cfg.Observer.EntryAppended(e)
+		return nil
+	})
+	return e, err
+}
+
+func (r *Runner) commit(f func() error) error {
+	if r.cfg.Commit != nil {
+		return r.cfg.Commit(f)
 	}
+	return f()
+}
+
+func (r *Runner) sync() error {
+	if r.cfg.Sync != nil {
+		return r.cfg.Sync()
+	}
+	return r.cfg.Session.Sync()
 }
 
 func (r *Runner) setState(s State) {
