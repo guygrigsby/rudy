@@ -20,3 +20,13 @@ func DurabilityError(cause error) error {
 	}
 	return &durabilityError{cause: cause}
 }
+
+// Cause is the failure behind a durability error, for the Server's own log. The error itself
+// says only the fixed text, which is what a client is owed; an operator chasing a quarantined
+// session needs the path, the errno and the state of the file under it.
+func Cause(err error) error {
+	if u := errors.Unwrap(err); u != nil {
+		return u
+	}
+	return err
+}

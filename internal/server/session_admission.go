@@ -56,7 +56,28 @@ func (a *sessionAdmission) installLocked(ls *liveSession, cause error) (fired bo
 	}
 	a.cancels = nil
 	ls.obsMu.Lock()
-	conns = append(conns, ls.conns...)
+	for _, c := range ls.conns {
+		// A plugin connection is not a subscriber being told a story about this session: it
+		// is the plugin's whole runtime. Closing it withdraws every tool, command, provider
+		// and hook that plugin registered, for every session in the process, which is the
+		// opposite of ADR 0037's "quarantine affects only the failed Session". The plugin
+		// learns the same way the contract already lets it: the child's turn is cancelled
+		// under it and every later Host call on this session is unavailable. Every other
+		// fan-out here filters plugin connections out for the same kind of reason (see
+		// liveSession.watchers, clientConns).
+		if c.plugin != "" {
+			continue
+		}
+		// The connection that asked for shutdown owes the process its terminal proof (ADR
+		// 0031), and shutdown is exactly when a cancelled turn writes the terminal Entry
+		// that can fail. Closing it would swallow server.stopped and leave a caller unable
+		// to tell a completed shutdown from a dead daemon. It is on its way out with the
+		// process, which is this quarantine's recovery boundary anyway.
+		if c.keepsShutdownProof() {
+			continue
+		}
+		conns = append(conns, c)
+	}
 	ls.obsMu.Unlock()
 	return true, conns, cancels
 }
@@ -149,7 +170,10 @@ func (s *Server) quarantine(ls *liveSession, cause error) {
 // cause itself is logged here and never sent: a client is told the fixed text and nothing about
 // the log underneath it.
 func (s *Server) enforceQuarantine(ls *liveSession, cause error, conns []*conn, cancels []context.CancelFunc) {
-	slog.Error("server: session quarantined", "session", ls.sess.ID(), "err", cause, "subscribers", len(conns), "cancelled", len(cancels))
+	// turn.Cause, not the error itself: a durability error's own text is the fixed one the
+	// client gets, and a log line that says only that tells an operator nothing about the
+	// disk that failed.
+	slog.Error("server: session quarantined", "session", ls.sess.ID(), "err", turn.Cause(cause), "subscribers", len(conns), "cancelled", len(cancels))
 	for _, cancel := range cancels {
 		cancel()
 	}

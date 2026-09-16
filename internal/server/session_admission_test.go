@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -119,6 +120,17 @@ func (f *fixture) open() *liveSession {
 	return ls
 }
 
+// attach installs ls and subscribes a fresh connection to it, the way an open or a resume
+// does, and fails the test if the session refuses.
+func (f *fixture) attach(ls *liveSession, asker bool) *testConn {
+	f.t.Helper()
+	tc := f.conn(asker)
+	if _, e := f.srv.installAndAttach(tc.cn, ls); e != nil {
+		f.t.Fatalf("attach: %v", e)
+	}
+	return tc
+}
+
 // testConn is one connection wired the way serveConn wires it, with a reader draining the
 // client end so the pump never blocks and the test can see what the client was told.
 type testConn struct {
@@ -221,8 +233,7 @@ func TestTerminalFailureQuarantinesTheSessionAndClosesItsSubscribers(t *testing.
 	f := newFixture(t)
 	ls := f.open()
 	sid := ls.sess.ID()
-	tc := f.conn(true)
-	f.srv.installAndAttach(tc.cn, ls)
+	tc := f.attach(ls, true)
 
 	f.runTerminalFailure(ls)
 
@@ -247,8 +258,7 @@ func TestQuarantineSurvivesDetachAndReload(t *testing.T) {
 	f := newFixture(t)
 	ls := f.open()
 	sid := ls.sess.ID()
-	tc := f.conn(true)
-	f.srv.installAndAttach(tc.cn, ls)
+	tc := f.attach(ls, true)
 	f.runTerminalFailure(ls)
 
 	f.srv.detach(tc.cn, ls)
@@ -263,12 +273,14 @@ func TestQuarantineSurvivesDetachAndReload(t *testing.T) {
 func TestQuarantineLeavesAnotherSessionAlone(t *testing.T) {
 	f := newFixture(t)
 	bad, good := f.open(), f.open()
-	tcBad, tcGood := f.conn(true), f.conn(true)
-	f.srv.installAndAttach(tcBad.cn, bad)
-	f.srv.installAndAttach(tcGood.cn, good)
+	f.attach(bad, true)
+	tcGood := f.attach(good, true)
 
 	f.runTerminalFailure(bad)
 
+	if _, e := f.srv.lookup(bad.sess.ID().String()); e == nil || e.Code != protocol.CodeUnavailable {
+		t.Fatalf("the session whose log failed = %v, want unavailable; the rest of this test proves nothing without it", e)
+	}
 	if _, e := f.srv.lookup(good.sess.ID().String()); e != nil {
 		t.Errorf("an unrelated session became %v", e)
 	}
@@ -283,8 +295,7 @@ func TestQuarantineLeavesAnotherSessionAlone(t *testing.T) {
 func TestQuarantineCancelsTheTurnStillRunning(t *testing.T) {
 	f := newFixture(t)
 	ls := f.open()
-	tc := f.conn(true)
-	f.srv.installAndAttach(tc.cn, ls)
+	tc := f.attach(ls, true)
 	if _, e := f.srv.startTurn(ls, typed("go")); e != nil {
 		t.Fatalf("startTurn: %v", e)
 	}
@@ -458,8 +469,7 @@ func TestTerminalDurabilityCapabilityMeansTheWholeGuarantee(t *testing.T) {
 	}
 	ls := f.open()
 	sid := ls.sess.ID()
-	tc := f.conn(true)
-	f.srv.installAndAttach(tc.cn, ls)
+	tc := f.attach(ls, true)
 
 	f.runTerminalFailure(ls)
 
@@ -487,5 +497,125 @@ func TestTerminalDurabilityCapabilityIsAbsentWithoutItsHooks(t *testing.T) {
 				t.Errorf("capabilities = %q, want none from a Server missing a hook", got)
 			}
 		})
+	}
+}
+
+// syncWriter serializes the log lines every goroutine in a fixture writes.
+type syncWriter struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
+}
+
+// captureLog sends the process log into a buffer for the length of one test.
+func captureLog(t *testing.T) *syncWriter {
+	t.Helper()
+	w := &syncWriter{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return w
+}
+
+// TestQuarantineLogsTheCauseItWillNotSend is the other half of the refusal text: the client is
+// told the fixed sentence, and the operator is told which disk failed. A durability error
+// renders as the fixed text through %v, so logging the error itself says nothing at all.
+func TestQuarantineLogsTheCauseItWillNotSend(t *testing.T) {
+	log := captureLog(t)
+	f := newFixture(t)
+	ls := f.open()
+	f.srv.quarantine(ls, turn.DurabilityError(errors.New("no space left on device")))
+	if got := log.String(); !strings.Contains(got, "no space left on device") {
+		t.Errorf("the quarantine log carries no cause:\n%s", got)
+	}
+}
+
+// TestQuarantineSparesThePluginConnectionThatOpenedTheChild holds quarantine to ADR 0037's
+// "affects only the failed Session". A plugin connection is that plugin's whole runtime, so
+// closing it would withdraw its tools, commands and providers from every session in the
+// process because one child session lost its log.
+func TestQuarantineSparesThePluginConnectionThatOpenedTheChild(t *testing.T) {
+	f := newFixture(t)
+	child := f.open()
+	pluginConn := f.conn(false)
+	pluginConn.cn.plugin = "fake"
+	if _, e := f.srv.installAndAttach(pluginConn.cn, child); e != nil {
+		t.Fatalf("attach the plugin connection: %v", e)
+	}
+	clientConn := f.attach(child, true)
+
+	f.srv.quarantine(child, turn.DurabilityError(errors.New("private cause")))
+
+	if !clientConn.closed(2 * time.Second) {
+		t.Error("the subscribed client was not closed")
+	}
+	if pluginConn.closed(200 * time.Millisecond) {
+		t.Error("the plugin connection that opened the child was closed with it")
+	}
+}
+
+// TestQuarantineSparesTheShutdownControlConnection keeps ADR 0031's terminal proof. Shutdown
+// is when cancelled turns write the terminal Entries that can fail, so the connection waiting
+// to send server.stopped is exactly the one a quarantine could silence.
+func TestQuarantineSparesTheShutdownControlConnection(t *testing.T) {
+	f := newFixture(t)
+	ls := f.open()
+	control := f.conn(false)
+	control.cn.claimShutdownProof()
+	if _, e := f.srv.installAndAttach(control.cn, ls); e != nil {
+		t.Fatalf("attach the control connection: %v", e)
+	}
+
+	f.srv.quarantine(ls, turn.DurabilityError(errors.New("private cause")))
+
+	if control.closed(200 * time.Millisecond) {
+		t.Error("the shutdown control connection was closed, so server.stopped can never be sent")
+	}
+}
+
+// TestQuarantinedSubmitIsUnavailableNotInternal covers the window between a handler's lookup
+// and the runner's first append: the turn dies on a refusal, and a refusal is unavailable
+// however late it lands (rudy-contracts.md, "Requests, client to server").
+func TestQuarantinedSubmitIsUnavailableNotInternal(t *testing.T) {
+	f := newFixture(t)
+	ls := f.open()
+	f.srv.quarantine(ls, turn.DurabilityError(errors.New("private cause")))
+	_, e := f.srv.startTurn(ls, typed("go"))
+	if e == nil || e.Code != protocol.CodeUnavailable {
+		t.Fatalf("submit on a quarantined session = %v, want unavailable", e)
+	}
+	if e.Message != turn.ErrTerminalDurability.Error() {
+		t.Errorf("refusal text = %q, want the fixed %q", e.Message, turn.ErrTerminalDurability.Error())
+	}
+}
+
+// TestQuarantinedCompactIsUnavailableNotInternal is the same window on session.compact, whose
+// commit reaches the fence through ModelCompactor.
+func TestQuarantinedCompactIsUnavailableNotInternal(t *testing.T) {
+	f := newFixture(t)
+	ls := f.open()
+	f.attach(ls, true)
+	if _, e := f.srv.startTurn(ls, typed("go")); e != nil {
+		t.Fatalf("startTurn: %v", e)
+	}
+	<-f.prov.entered
+	close(f.prov.release)
+	f.waitIdle(ls)
+	f.srv.quarantine(ls, turn.DurabilityError(errors.New("private cause")))
+	_, _, e := f.srv.compact(context.Background(), ls, "")
+	if e == nil || e.Code != protocol.CodeUnavailable {
+		t.Fatalf("compact on a quarantined session = %v, want unavailable", e)
 	}
 }

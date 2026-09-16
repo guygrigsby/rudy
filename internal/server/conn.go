@@ -43,7 +43,10 @@ type conn struct {
 	abortPump context.CancelFunc
 	pumpErr   error
 	stopped   bool
-	subs      map[ulid.ULID]*liveSession
+	// shutdownProof is set on the connection whose server.shutdown was accepted: its writer
+	// stays open past its serve loop to send server.stopped, so nothing else may close it.
+	shutdownProof bool
+	subs          map[ulid.ULID]*liveSession
 }
 
 type outbound struct {
@@ -127,6 +130,22 @@ func (cn *conn) subscribed(sid ulid.ULID) bool {
 	defer cn.mu.Unlock()
 	_, ok := cn.subs[sid]
 	return ok
+}
+
+// claimShutdownProof marks this connection as the one that asked for shutdown and is holding
+// its writer open for server.stopped. Set once the shutdown claim is won, before the response
+// is written, which is the moment from which the proof is owed (ADR 0031).
+func (cn *conn) claimShutdownProof() {
+	cn.mu.Lock()
+	cn.shutdownProof = true
+	cn.mu.Unlock()
+}
+
+// keepsShutdownProof reports whether this connection owes the process its shutdown proof.
+func (cn *conn) keepsShutdownProof() bool {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	return cn.shutdownProof
 }
 
 // pump drains the outbox to the transport, in order, until ctx ends or a send fails.

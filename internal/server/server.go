@@ -657,6 +657,9 @@ func (s *Server) handleServerShutdown(cn *conn, raw json.RawMessage) (any, *prot
 	if !s.claimShutdown() {
 		return nil, perr(protocol.CodeRefusedByInvariant, "server shutdown already requested")
 	}
+	// From here this connection owes the process its terminal proof, so nothing may close it
+	// out from under that duty (see conn.claimShutdownProof).
+	cn.claimShutdownProof()
 	return protocol.ServerShutdownResult{InstanceID: s.instanceID.String(), State: protocol.ServerStateShuttingDown}, nil
 }
 
@@ -765,7 +768,7 @@ func (s *Server) handleInterrupt(cn *conn, raw json.RawMessage) (any, *protocol.
 	// durable prefix would be the false success ADR 0037 exists to refuse.
 	if err := r.Interrupt(p.How); err != nil {
 		if errors.Is(err, turn.ErrTerminalDurability) {
-			return nil, perr(protocol.CodeUnavailable, err.Error())
+			return nil, sessionErr(err)
 		}
 		slog.Error("server: interrupt", "session", p.SessionID, "how", p.How, "err", err)
 		return nil, perr(protocol.CodeInternal, "interrupt failed")
@@ -970,7 +973,7 @@ func (s *Server) compactHoldingSession(ctx context.Context, ls *liveSession, ins
 	n := len(turn.Cover(ls.sess, ulid.ULID{}))
 	e, err := s.compactorLocked(prov, ls).Compact(cctx, ls.sess, ulid.ULID{}, instructions)
 	if err != nil {
-		return session.Entry{}, 0, protocol.ErrorFrom(err)
+		return session.Entry{}, 0, sessionErr(err)
 	}
 	if e.ID.IsZero() {
 		return session.Entry{}, 0, nil
@@ -2218,8 +2221,12 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		return e.ID.String(), nil
 	case <-first.failed:
 		// The runner failed before it appended anything, so there is no turn id to report
-		// and no turn_failed entry naming one either (see firstAppendSignal). Answering
-		// the caller is what matters; the runner has already logged what went wrong.
+		// and no turn_failed entry naming one either (see firstAppendSignal). A first
+		// append the fence refused is the ordinary quarantine refusal and says so;
+		// anything else is this server's own failure and is answered as one.
+		if e := s.sessionQuarantined(ls.sess.ID()); e != nil {
+			return "", e
+		}
 		return "", perr(protocol.CodeInternal, "the turn failed before it started")
 	case <-s.ctx.Done():
 		return "", perr(protocol.CodeUnavailable, "server is shutting down")
