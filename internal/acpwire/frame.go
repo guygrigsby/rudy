@@ -64,8 +64,19 @@ func MethodKinds() map[string]Kind {
 	return m
 }
 
+// Side is the half of an ACP connection a wire runs as. It is what decides which half of the
+// vocabulary this wire may be sent, so the zero value is the agent: that is the side facing an
+// untrusted peer, and a wire nobody told must not admit the half it cannot answer.
+type Side uint8
+
+const (
+	AgentSide Side = iota
+	ClientSide
+)
+
 type stableMethod struct {
 	kind       Kind
+	side       Side
 	definition string
 }
 
@@ -73,6 +84,7 @@ var stableMethods = sync.OnceValue(func() map[string]stableMethod {
 	var schema struct {
 		Defs map[string]struct {
 			Method string `json:"x-method"`
+			Side   string `json:"x-side"`
 		} `json:"$defs"`
 	}
 	// The embedded schema is pinned and verified by acpschema's tests. An invalid
@@ -85,15 +97,42 @@ var stableMethods = sync.OnceValue(func() map[string]stableMethod {
 		if def.Method == "" {
 			continue
 		}
+		// x-side names the side that handles the method, which is the side that may be
+		// sent it. Anything the schema leaves undirected stays on the default.
+		side := AgentSide
+		if def.Side == "client" {
+			side = ClientSide
+		}
 		switch {
 		case strings.HasSuffix(name, "Request"):
-			methods[def.Method] = stableMethod{RequestFrame, name}
+			methods[def.Method] = stableMethod{RequestFrame, side, name}
 		case strings.HasSuffix(name, "Notification"):
-			methods[def.Method] = stableMethod{NotificationFrame, name}
+			methods[def.Method] = stableMethod{NotificationFrame, side, name}
 		}
 	}
 	return methods
 })
+
+// notificationSide reports which side handles a notification and whether it is directed at
+// all. $/cancel_request is JSON-RPC's own and belongs to both. Stable methods carry x-side in
+// the pinned schema. Every _rudy notification is an agent-to-client event, which is what the
+// catalogue's one notification is and what the extension contract describes; the day that
+// stops holding, the side belongs in the normative table and the generated catalogue beside
+// Notification, not here (rudy-azz).
+func notificationSide(method string) (Side, bool) {
+	if method == "$/cancel_request" {
+		return AgentSide, false
+	}
+	if entry, ok := stableMethods()[method]; ok {
+		return entry.side, true
+	}
+	for _, e := range acpext.All() {
+		if e.Method == method && e.Notification {
+			return ClientSide, true
+		}
+	}
+	return AgentSide, false
+}
 
 func parseEnvelope(raw []byte, methods map[string]Kind) (envelope, error) {
 	var e envelope

@@ -21,6 +21,9 @@ type Options struct {
 	RequestGate          func(string) Admission
 	// Required for SDK adapters: claim in the callback before any handler work.
 	RequireRequestClaims bool
+	// Side this wire runs as, which decides the half of the vocabulary it admits. The zero
+	// value is AgentSide; a client adapter has to say so.
+	Side Side
 }
 type Admission uint8
 
@@ -193,6 +196,14 @@ func (w *Wire) scanFrame() (ingressFrame, error) {
 		}
 		if e.kind == NotificationFrame {
 			if _, known := w.methods[e.method]; !known {
+				continue
+			}
+			// A notification belongs to the side that handles it, and one addressed to the
+			// other side reaches no callback here, so nothing would ever release the slot
+			// it was charged. MaxItems of them would end the connection, which would make
+			// the half of the vocabulary this side does not own a denial of service on it.
+			// It is as unknown here as a method nobody named, so it is dropped like one.
+			if side, directed := notificationSide(e.method); directed && side != w.options.Side {
 				continue
 			}
 			validate := w.options.ValidateNotification

@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/guygrigsby/rudy/internal/acpext"
 	"github.com/guygrigsby/rudy/internal/acpschema"
 	"github.com/guygrigsby/rudy/internal/acptest"
 )
@@ -314,6 +315,61 @@ func TestClaimGateDrainsBeforeTheEndOfInput(t *testing.T) {
 	}
 	if !w.closed() {
 		t.Fatal("the wire outlived its drained ingress")
+	}
+}
+
+// MethodKinds is the whole ACP vocabulary, but every method belongs to the side that handles
+// it. session/update is the client's, so an agent wire receiving one has a frame no agent
+// adapter has a callback for: nothing would ever run HandleNotification and the slot it was
+// charged would never come back. MaxItems of them would end the connection, which makes the
+// whole vocabulary a remote denial of service on the side that does not own half of it.
+func TestNotificationForTheOtherSideIsDropped(t *testing.T) {
+	rudyUpdate := []byte(`{"jsonrpc":"2.0","method":"` + string(acpext.MethodSessionUpdate) + `","params":{}}`)
+	for _, tc := range []struct {
+		name  string
+		side  Side
+		wrong []byte
+	}{
+		{"agent is sent the client's update", AgentSide, acptest.UpdateNotification},
+		{"agent is sent the client's Rudy update", AgentSide, rudyUpdate},
+		{"client is sent the agent's cancel", ClientSide, acptest.CancelNotification},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw strings.Builder
+			for range MaxItems {
+				raw.Write(tc.wrong)
+				raw.WriteByte('\n')
+			}
+			raw.Write(acptest.InitializeRequest)
+			raw.WriteByte('\n')
+			w, r, _ := newTestWire(t, raw.String(), Options{Side: tc.side})
+			if line := readLine(t, r); !strings.Contains(line, "initialize") {
+				t.Fatalf("delivered the other side's notification: %q", line)
+			}
+			if u := w.Usage(); u.Notifications != 0 {
+				t.Fatalf("charged a slot nothing can release: %+v", u)
+			}
+		})
+	}
+}
+
+// The mirror of the rule: each side still receives the notifications that are its own.
+func TestEachSideReceivesItsOwnNotifications(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		side  Side
+		frame []byte
+	}{
+		{"agent is sent a cancel", AgentSide, acptest.CancelNotification},
+		{"client is sent an update", ClientSide, acptest.UpdateNotification},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, r, _ := newTestWire(t, string(tc.frame)+"\n", Options{Side: tc.side})
+			readLine(t, r)
+			if u := w.Usage(); u.Notifications != 1 {
+				t.Fatalf("dropped a notification this side owns: %+v", u)
+			}
+		})
 	}
 }
 
