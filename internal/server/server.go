@@ -1877,20 +1877,21 @@ func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
 // load. Safe unconditionally: the session is not yet visible to any other goroutine before this
 // call, so there is no id to race.
 func (s *Server) installAndAttach(cn *conn, ls *liveSession) (protocol.SessionInfo, *protocol.Error) {
-	s.mu.Lock()
 	var at attachment
 	// The install and the attachment are one commit, and it takes the same fence every other
-	// commit on this session takes. A session reaching here was just opened, forked or loaded
-	// by this caller, and loadCold refuses a quarantined id before it gets that far, so the
-	// refusal is not reachable today; it is answered rather than ignored because a caller
-	// that is told a session opened has to be able to use it.
+	// commit on this session takes, with Server.mu inside it rather than around it (see
+	// attachIfLive). A session reaching here was just opened, forked or loaded by this
+	// caller, and loadCold refuses a quarantined id before it gets that far, so the refusal
+	// is not reachable today; it is answered rather than ignored because a caller that is
+	// told a session opened has to be able to use it.
 	err := s.withSessionOperation(ls, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		s.live[ls.sess.ID()] = ls
 		at = ls.subscribeLocked(cn)
 		at.children = s.childAttachmentsLocked(cn, ls)
 		return nil
 	})
-	s.mu.Unlock()
 	if err != nil {
 		return protocol.SessionInfo{}, sessionErr(err)
 	}
@@ -1950,19 +1951,32 @@ func (s *Server) childAttachmentsLocked(cn *conn, ls *liveSession) []childAttach
 func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bool, *protocol.Error) {
 	s.mu.Lock()
 	ls, ok := s.live[sid]
+	s.mu.Unlock()
 	if !ok {
-		s.mu.Unlock()
 		return protocol.SessionInfo{}, false, s.sessionQuarantined(sid)
 	}
 	var at attachment
+	// The fence first, Server.mu inside it: this waits on whatever commit that session has in
+	// flight, which can be a terminal fsync, and waiting on it while holding Server.mu would
+	// stall every other session in the process (see sessionAdmission). The s.live read above
+	// is only a lookup; what has to be atomic against detach's decide-and-remove is the
+	// subscribe below, which holds Server.mu across the same re-read.
 	err := s.withSessionOperation(ls, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, live := s.live[sid]; !live {
+			ok = false
+			return nil
+		}
 		at = ls.subscribeLocked(cn)
 		at.children = s.childAttachmentsLocked(cn, ls)
 		return nil
 	})
-	s.mu.Unlock()
 	if err != nil {
 		return protocol.SessionInfo{}, false, s.sessionQuarantined(sid)
+	}
+	if !ok {
+		return protocol.SessionInfo{}, false, nil
 	}
 	deliverAttach(cn, sid, at)
 	slog.Info("session: resume", "session", sid, "conn", cn.id)
@@ -2019,13 +2033,12 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	cn.mu.Unlock()
 	slog.Info("session: detach", "session", ls.sess.ID(), "conn", cn.id)
 
-	s.mu.Lock()
-
 	var empty, steering, standing bool
 	// A detachment commit, so it is ordered against a quarantine's subscriber snapshot the
 	// same way an attachment is, and it runs whether or not this session is quarantined: the
 	// connection is already gone either way (see withSessionTeardown).
 	s.withSessionTeardown(ls, func() {
+		s.mu.Lock()
 		ls.obsMu.Lock()
 		kept := ls.conns[:0]
 		for _, c := range ls.conns {
@@ -2038,8 +2051,16 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 		steering = ls.state == turn.Steering
 		standing = len(ls.standing) > 0
 		ls.obsMu.Unlock()
+		s.mu.Unlock()
 	})
 
+	// Server.mu is dropped with the fence and taken again here rather than held across both,
+	// because the fence may not be held while closeIfUnusedLocked fires session_closed
+	// handlers. The decision is still atomic against an attach: closeIfUnusedLocked re-reads
+	// the subscriber set under this same Server.mu, so a connection that subscribed in the
+	// gap is counted and the session stays, and one arriving after the delete does not find
+	// it live at all.
+	s.mu.Lock()
 	s.closeIfUnusedLocked(ls)
 	if standing {
 		// A question this session is holding may have just lost the last connection that

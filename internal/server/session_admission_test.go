@@ -732,3 +732,68 @@ func TestAttachToAParentSkipsAQuarantinedChild(t *testing.T) {
 		t.Fatal("the parent's own replay never arrived, so this test proves nothing")
 	}
 }
+
+// TestAFenceHeldOnOneSessionDoesNotStallAnother is why the fence is taken before Server.mu
+// rather than under it. A terminal commit holds its session's fence across an fsync; if an
+// attach waited for that fence while holding Server.mu, every lookup, note, attach and new
+// connection in the process would queue behind one session's disk.
+func TestAFenceHeldOnOneSessionDoesNotStallAnother(t *testing.T) {
+	f := newFixture(t)
+	slow, other := f.open(), f.open()
+	held, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = f.srv.withSessionOperation(slow, func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	defer func() { close(release); <-done }()
+
+	// Both connections exist before anything is allowed to stall: this goroutine must not
+	// need Server.mu again, or an order that stalls it would hang this test instead of
+	// failing it.
+	stalled, cn := f.conn(true).cn, f.conn(true).cn
+
+	// The attach that has to wait: it wants the held session, and under an order that took
+	// Server.mu first it would be holding it for the length of that wait.
+	waiting := make(chan *protocol.Error, 1)
+	go func() {
+		_, _, e := f.srv.attachIfLive(stalled, slow.sess.ID())
+		waiting <- e
+	}()
+	select {
+	case e := <-waiting:
+		t.Fatalf("the attach to the held session did not wait: %v", e)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	attached := make(chan *protocol.Error, 1)
+	go func() {
+		_, e := f.srv.installAndAttach(cn, other)
+		attached <- e
+	}()
+	select {
+	case e := <-attached:
+		if e != nil {
+			t.Fatalf("attach to an unrelated session: %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an unrelated session's attach waited on a fence held elsewhere")
+	}
+	noted := make(chan error, 1)
+	go func() {
+		_, err := f.srv.appendNote(other.sess.ID(), "fake", "note", session.NoteInfo)
+		noted <- err
+	}()
+	select {
+	case err := <-noted:
+		if err != nil {
+			t.Fatalf("Host.Note on an unrelated session: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an unrelated session's note waited on a fence held elsewhere")
+	}
+}

@@ -26,11 +26,13 @@ import (
 // cancellation and subscriber snapshot that quarantine takes, or it observes the cause and
 // changes nothing.
 //
-// The fence is the innermost server lock but one. The order is Server.mu > liveSession.mu >
-// this > liveSession.obsMu > conn.mu, so a fenced operation may take obsMu (the mirror and the
-// broadcast) but must never reach for Server.mu or a liveSession's mu: an operation that needs
-// either takes it first and enters the fence for its commit alone. Provider requests, hook
-// handlers and transport waits stay outside entirely, and each later commit reenters.
+// The order is liveSession.mu > this > Server.mu > liveSession.obsMu > conn.mu. A fenced
+// operation may take obsMu (the mirror and the broadcast) and, for an attachment or detachment
+// commit, Server.mu; it must never reach for a liveSession's mu, and nothing holding Server.mu
+// may wait on a fence. That direction is deliberate: a terminal commit holds this across an
+// fsync, and taking it under Server.mu instead would put every session's lookup, note and new
+// connection behind one session's disk. Provider requests, hook handlers and transport waits
+// stay outside the fence entirely, and each later commit reenters.
 type sessionAdmission struct {
 	mu    sync.Mutex
 	cause error // first durability cause; nil until quarantine
@@ -127,7 +129,8 @@ func (s *Server) admissionIfAny(sid ulid.ULID) *sessionAdmission {
 // next operation in line observes it rather than committing behind it.
 //
 // f does its own work and nothing else: no provider request, no hook, no wait on a transport,
-// and nothing that reaches for Server.mu or a liveSession's mu (see sessionAdmission).
+// and nothing that reaches for a liveSession's mu (see sessionAdmission). An attachment or
+// detachment commit takes Server.mu inside f, which is the one nesting this order allows.
 func (s *Server) withSessionOperation(ls *liveSession, f func() error) error {
 	a := s.admission(ls.sess.ID())
 	a.mu.Lock()
