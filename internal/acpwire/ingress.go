@@ -1,5 +1,7 @@
 package acpwire
 
+import "io"
+
 // ingressFrame owns already admitted original bytes. Request-scoped cancels
 // retain only a validated handle and are encoded at SDK exposure.
 type ingressFrame struct {
@@ -14,7 +16,7 @@ func (w *Wire) Read(p []byte) (int, error) {
 	select {
 	case <-w.gate:
 	case <-w.done:
-		return 0, ErrClosed
+		return 0, w.inputEnd()
 	}
 	w.inputMu.Lock()
 	defer w.inputMu.Unlock()
@@ -22,7 +24,7 @@ func (w *Wire) Read(p []byte) (int, error) {
 		w.mu.Lock()
 		if w.closed() {
 			w.mu.Unlock()
-			return 0, ErrClosed
+			return 0, w.inputEnd()
 		}
 		if len(w.pending) > 0 {
 			n := copy(p, w.pending)
@@ -47,7 +49,7 @@ func (w *Wire) Read(p []byte) (int, error) {
 		w.mu.Lock()
 		if w.closed() {
 			w.mu.Unlock()
-			return 0, ErrClosed
+			return 0, w.inputEnd()
 		}
 		raw := frame.raw
 		if frame.dispatch.Intent == RequestCancel {
@@ -137,6 +139,15 @@ func (w *Wire) nextIngress() (ingressFrame, error) {
 			w.ingress = w.ingress[:len(w.ingress)-1]
 			w.mu.Unlock()
 			return frame, nil
+		}
+		// Nothing deliverable and nothing more coming: every frame the input carried has
+		// been handed over, so this is the end and the connection is released here. A
+		// frame still held back for a claim is not the end, so the wait continues until
+		// that claim releases it.
+		if w.inputDone && len(w.ingress) == 0 {
+			w.mu.Unlock()
+			_ = w.Close()
+			return ingressFrame{}, io.EOF
 		}
 		w.mu.Unlock()
 		select {

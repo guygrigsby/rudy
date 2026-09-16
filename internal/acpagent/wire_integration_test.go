@@ -19,15 +19,15 @@ import (
 func TestWireNullIDThroughPinnedSDK(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
 	var request *acpwire.Request
 	w := acpwire.New(inR, outW, acpwire.Options{RequireRequestClaims: true, BeforeDispatch: func(d acpwire.Dispatch) {
 		if d.Kind == acpwire.RequestFrame {
 			request = d.Request
 		}
 	}})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	sdk := acp.NewConnection(func(ctx context.Context, method string, params json.RawMessage) (any, *acp.RequestError) {
 		if w.ClaimRequest() != request {
 			t.Error("callback claimed wrong request")
@@ -54,10 +54,10 @@ func TestWireNullIDThroughPinnedSDK(t *testing.T) {
 func TestWireConcurrentSDKOutboundIDs(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
 	w := acpwire.New(inR, outW, acpwire.Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	sdk := acp.NewConnection(func(context.Context, string, json.RawMessage) (any, *acp.RequestError) { return struct{}{}, nil }, w.Output(), w.Input())
 	sdk.SetLogger(acpwire.NewLogger(slog.NewTextHandler(io.Discard, nil)))
 	w.Open()
@@ -112,11 +112,11 @@ func TestWireConcurrentSDKOutboundIDs(t *testing.T) {
 func TestWireNullCancellationThroughPinnedSDK(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
 	started := make(chan struct{})
 	w := acpwire.New(inR, outW, acpwire.Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	sdk := acp.NewConnection(func(ctx context.Context, _ string, _ json.RawMessage) (any, *acp.RequestError) {
 		close(started)
 		<-ctx.Done()
@@ -144,10 +144,10 @@ func TestWireNullCancellationThroughPinnedSDK(t *testing.T) {
 func TestWireSDKCancellationLeavesOtherRequestLive(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
 	w := acpwire.New(inR, outW, acpwire.Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	sdk := acp.NewConnection(func(context.Context, string, json.RawMessage) (any, *acp.RequestError) { return struct{}{}, nil }, w.Output(), w.Input())
 	sdk.SetLogger(acpwire.NewLogger(slog.NewTextHandler(io.Discard, nil)))
 	w.Open()
@@ -192,10 +192,10 @@ func TestWireSDKCancellationLeavesOtherRequestLive(t *testing.T) {
 func TestWireClaimsConcurrentIdenticalSDKRequests(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
 	w := acpwire.New(inR, outW, acpwire.Options{RequireRequestClaims: true})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	claimed := make(chan string, 2)
 	release := make(chan struct{})
 	defer close(release)
@@ -231,9 +231,9 @@ func TestWireClaimsConcurrentIdenticalSDKRequests(t *testing.T) {
 
 func TestWireClosesBeforeSDKRequest65(t *testing.T) {
 	inR, inW := io.Pipe()
-	defer inW.Close()
+	defer func() { _ = inW.Close() }()
 	w := acpwire.New(inR, io.Discard, acpwire.Options{RequireRequestClaims: true})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	started := make(chan string, 65)
 	sdk := acp.NewConnection(func(ctx context.Context, _ string, _ json.RawMessage) (any, *acp.RequestError) {
 		req := w.ClaimRequest()
@@ -277,10 +277,10 @@ func (refusedParams) MarshalJSON() ([]byte, error) { return nil, errors.New("SEC
 func TestWireSDKMarshalRefusalDoesNotPoisonNextID(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
 	w := acpwire.New(inR, outW, acpwire.Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	sdk := acp.NewConnection(func(context.Context, string, json.RawMessage) (any, *acp.RequestError) { return struct{}{}, nil }, w.Output(), w.Input())
 	sdk.SetLogger(acpwire.NewLogger(slog.NewTextHandler(io.Discard, nil)))
 	w.Open()
@@ -312,6 +312,40 @@ func TestWireSDKMarshalRefusalDoesNotPoisonNextID(t *testing.T) {
 	}
 }
 
-func TestWireUnboundResponseCannotCompleteDifferentSDKCall(t *testing.T){
- inR,inW:=io.Pipe();outR,outW:=io.Pipe();defer inW.Close();defer outR.Close();w:=acpwire.New(inR,outW,acpwire.Options{});defer w.Close();sdk:=acp.NewConnection(func(context.Context,string,json.RawMessage)(any,*acp.RequestError){return nil,nil},w.Output(),w.Input());sdk.SetLogger(acpwire.NewLogger(slog.NewTextHandler(io.Discard,nil)));w.Open();_,_=w.PrepareOutbound("unknown",json.RawMessage(`{}`));second,_:=w.PrepareOutbound("unknown",json.RawMessage(`{}`));ctx,cancel:=context.WithTimeout(context.Background(),time.Second);defer cancel();done:=make(chan error,1);go func(){done<-second.Invoke(ctx,func(ctx context.Context)error{_,err:=acp.SendRequest[struct{}](sdk,ctx,"unknown",struct{}{});return err})}();if _,err:=bufio.NewReader(outR).ReadString('\n');err!=nil{t.Fatal(err)};_,_=io.WriteString(inW,"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n");if err:=<-done;err==nil{t.Fatal("unbound wire response completed another SDK call")};select{case <-w.Failed():default:t.Fatal("unbound response was not refused")};if w.Usage().Responses!=0{t.Fatal("unbound response retained charge")}
+func TestWireUnboundResponseCannotCompleteDifferentSDKCall(t *testing.T) {
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
+	w := acpwire.New(inR, outW, acpwire.Options{})
+	defer func() { _ = w.Close() }()
+	sdk := acp.NewConnection(func(context.Context, string, json.RawMessage) (any, *acp.RequestError) { return nil, nil }, w.Output(), w.Input())
+	sdk.SetLogger(acpwire.NewLogger(slog.NewTextHandler(io.Discard, nil)))
+	w.Open()
+	_, _ = w.PrepareOutbound("unknown", json.RawMessage(`{}`))
+	second, _ := w.PrepareOutbound("unknown", json.RawMessage(`{}`))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- second.Invoke(ctx, func(ctx context.Context) error {
+			_, err := acp.SendRequest[struct{}](sdk, ctx, "unknown", struct{}{})
+			return err
+		})
+	}()
+	if _, err := bufio.NewReader(outR).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(inW, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+	if err := <-done; err == nil {
+		t.Fatal("unbound wire response completed another SDK call")
+	}
+	select {
+	case <-w.Failed():
+	default:
+		t.Fatal("unbound response was not refused")
+	}
+	if w.Usage().Responses != 0 {
+		t.Fatal("unbound response retained charge")
+	}
 }

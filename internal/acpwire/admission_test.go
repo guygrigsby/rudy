@@ -5,22 +5,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
 func TestCancelRetainsMatchedResponseUntilCallback(t *testing.T) {
 	w, r, _ := newTestWire(t, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n", Options{})
-	o, err := w.PrepareOutbound("session/new", json.RawMessage(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	peer := &sdkPeer{}
+	callback := make(chan struct{})
+	var wg sync.WaitGroup
+	o := peer.hold(t, w, "session/new", callback, &wg)
 	readLine(t, r)
 	before := w.Usage().InboundBytes
 	o.Cancel()
 	if u := w.Usage(); u.Responses != 1 || u.InboundBytes != before || u.OutboundRequests != 0 {
 		t.Fatal("cancellation released SDK-retained response")
 	}
-	o.Complete()
+	// Returning from the callback is what Invoke turns into Complete.
+	close(callback)
+	wg.Wait()
 	if u := w.Usage(); u.Responses != 0 || u.InboundBytes != 0 {
 		t.Fatal("callback retained response")
 	}
@@ -31,17 +34,23 @@ func TestResponseCountSurvivesCancellation(t *testing.T) {
 		fmt.Fprintf(&raw, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{}}\n", i+1)
 	}
 	w, r, _ := newTestWire(t, raw.String(), Options{})
-	for range 64 {
-		o, err := w.PrepareOutbound("session/new", json.RawMessage(`{}`))
-		if err != nil {
-			t.Fatal(err)
-		}
+	peer := &sdkPeer{}
+	callback := make(chan struct{})
+	var wg sync.WaitGroup
+	defer func() { close(callback); wg.Wait() }()
+	// Each response is charged while its request is still live, then cancelled: cancelling
+	// returns the outbound slot, it does not hand back a response the callback still holds.
+	for range MaxItems {
+		o := peer.hold(t, w, "session/new", callback, &wg)
 		readLine(t, r)
 		o.Cancel()
 	}
-	if _, err := w.PrepareOutbound("session/new", json.RawMessage(`{}`)); err != nil {
-		t.Fatal(err)
+	if u := w.Usage(); u.Responses != MaxItems || u.OutboundRequests != 0 {
+		t.Fatalf("cancellation lost the responses their callbacks still hold: %+v", u)
 	}
+	// Cancelling returned every outbound slot, so one more request is admitted. Its response
+	// meets a full response ledger and closes the wire rather than overrunning it.
+	peer.hold(t, w, "session/new", callback, &wg)
 	if _, err := r.ReadByte(); err == nil {
 		t.Fatal("65th retained response dispatched")
 	}
@@ -63,11 +72,13 @@ func TestAggregateInboundByteBudget(t *testing.T) {
 				raw.WriteByte('\n')
 			}
 			w, r, _ := newTestWire(t, raw.String(), Options{})
+			peer := &sdkPeer{}
+			callback := make(chan struct{})
+			var wg sync.WaitGroup
+			defer func() { close(callback); wg.Wait() }()
 			if kind == "responses" {
 				for range 5 {
-					if _, err := w.PrepareOutbound("session/new", json.RawMessage(`{}`)); err != nil {
-						t.Fatal(err)
-					}
+					peer.hold(t, w, "session/new", callback, &wg)
 				}
 			}
 			for range 4 {
@@ -169,7 +180,7 @@ func TestCloseReleasesOutboundFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Close()
+	_ = w.Close()
 	if len(o.Frame) != 0 {
 		t.Fatal("close retained outbound frame")
 	}

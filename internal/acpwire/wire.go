@@ -62,6 +62,7 @@ type Wire struct {
 	unclaimed      *Request
 	ingress        []ingressFrame
 	ingressChanged chan struct{}
+	inputDone      bool
 }
 
 func New(source io.ReadCloser, sink io.Writer, opts Options) *Wire {
@@ -81,7 +82,19 @@ func New(source io.ReadCloser, sink io.Writer, opts Options) *Wire {
 	}
 	return w
 }
-func (w *Wire) Input() io.Reader     { return w }
+func (w *Wire) Input() io.Reader { return w }
+
+// inputEnd is what a closed wire owes its reader. A connection the peer ended cleanly reports
+// io.EOF for the rest of its life, so a reader that comes back after the end still sees an
+// ordinary end of stream rather than a failure it would log.
+func (w *Wire) inputEnd() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.inputDone {
+		return io.EOF
+	}
+	return ErrClosed
+}
 func (w *Wire) Output() io.Writer    { return w.output }
 func (w *Wire) Open()                { w.openOnce.Do(func() { close(w.gate) }) }
 func (w *Wire) Failed() <-chan error { return w.failed }
@@ -141,6 +154,23 @@ func (w *Wire) scanFrame() (ingressFrame, error) {
 		}
 		raw, err := readFrame(w.reader)
 		if err != nil {
+			// A peer that closed its write side after a complete frame ended the input;
+			// it did not truncate one. That is not a supervisor failure, so nothing is
+			// reported on failed. The frames already admitted are still owed to the SDK,
+			// so the wire outlives the input exactly that long: whoever hands over the
+			// last of the ingress releases the connection. Anything less leaks the write
+			// loop, the source and every admitted charge until the process ends.
+			if errors.Is(err, io.EOF) {
+				w.mu.Lock()
+				w.inputDone = true
+				w.signalIngress()
+				queued := len(w.ingress)
+				w.mu.Unlock()
+				if queued == 0 {
+					_ = w.Close()
+				}
+				return ingressFrame{}, io.EOF
+			}
 			w.fail(ErrFrame)
 			return ingressFrame{}, ErrFrame
 		}

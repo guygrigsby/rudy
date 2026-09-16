@@ -3,6 +3,7 @@ package acpwire
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -13,10 +14,10 @@ import (
 func TestConstructionHeldUntilPhysicalWriteAndClose(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer inW.Close()
-	defer outR.Close()
+	defer func() { _ = inW.Close() }()
+	defer func() { _ = outR.Close() }()
 	w := New(inR, outW, Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	w.Open()
 	sdkReader := bufio.NewReader(w.Input())
 	go func() {
@@ -73,7 +74,7 @@ func TestConstructionHeldUntilPhysicalWriteAndClose(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("constructor stayed blocked")
 	}
-	w.Close()
+	_ = w.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	r, err := w.constructions.Acquire(ctx, Large)
@@ -161,4 +162,37 @@ func TestConstructionOutputBounds(t *testing.T) {
 		}
 		r.Release()
 	}
+}
+
+// The construction pool is released with the connection. A handler parked on a response the
+// departed peer will never send would otherwise hold its whole class until the process ends,
+// and the wire's own context is the only thing that cancels a waiter for it.
+func TestEndOfInputReleasesConstructionReservations(t *testing.T) {
+	var raw strings.Builder
+	for i := range 4 {
+		fmt.Fprintf(&raw, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"session/new\",\"params\":{}}\n", i+1)
+	}
+	w, r, _ := newTestWire(t, raw.String(), Options{})
+	for range 4 {
+		readLine(t, r)
+	}
+	for i := range 4 {
+		req := w.Request(numericID(int64(i + 1)))
+		if req == nil {
+			t.Fatalf("request %d was not admitted", i+1)
+		}
+		if _, err := req.AcquireConstruction(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("end of input = %v, want io.EOF", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	res, err := w.constructions.Acquire(ctx, Large)
+	if err != nil {
+		t.Fatalf("the pool outlived the connection: %v", err)
+	}
+	res.Release()
 }

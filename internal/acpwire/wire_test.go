@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -31,10 +32,57 @@ func newTestWire(t *testing.T, raw string, opts Options) (*Wire, *bufio.Reader, 
 	t.Helper()
 	out := new(lockedBuffer)
 	w := New(io.NopCloser(strings.NewReader(raw)), out, opts)
-	t.Cleanup(func() { w.Close() })
+	t.Cleanup(func() { _ = w.Close() })
 	w.Open()
 	return w, bufio.NewReader(w.Input()), out
 }
+
+// sdkPeer stands in for the SDK's request side. A reserved outbound id carries no response
+// until the SDK writes its own request through Output and the wire binds the two ids; a
+// response for an unbound id is refused on purpose (see acpagent's unbound-response test), so
+// every test about a matched response has to reach the bound state the way production does.
+type sdkPeer struct {
+	mu   sync.Mutex
+	next int64
+}
+
+// write is where acp.SendRequest would sit: inside Invoke, holding initiation, so the id it
+// allocates binds to the outbound the wire is waiting on. The lock keeps ids monotonic when
+// several callbacks are in flight, which the wire requires of the SDK.
+func (p *sdkPeer) write(w *Wire, method string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.next++
+	_, err := fmt.Fprintf(w.Output(), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":%q,\"params\":{}}\n", p.next, method)
+	return err
+}
+
+// hold reserves one outbound request, binds it, and parks its SDK callback until release is
+// closed. A parked callback is what keeps a matched response charged. It returns once the
+// binding is visible to the reader, so the caller can feed the response straight away.
+func (p *sdkPeer) hold(t *testing.T, w *Wire, method string, release <-chan struct{}, wg *sync.WaitGroup) *Outbound {
+	t.Helper()
+	o, err := w.PrepareOutbound(method, json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = o.Invoke(context.Background(), func(context.Context) error {
+			if err := p.write(w, method); err != nil {
+				return err
+			}
+			close(bound)
+			<-release
+			return nil
+		})
+	}()
+	<-bound
+	return o
+}
+
 func readLine(t *testing.T, r *bufio.Reader) string {
 	t.Helper()
 	v, err := r.ReadString('\n')
@@ -54,7 +102,7 @@ func waitAck(t *testing.T, a *Receipt) {
 func TestGateAndPartialReads(t *testing.T) {
 	raw := string(acptest.InitializeRequest) + "\n"
 	w := New(io.NopCloser(strings.NewReader(raw)), io.Discard, Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	done := make(chan []byte, 1)
 	go func() { p := make([]byte, len(raw)); _, _ = io.ReadFull(w.Input(), p); done <- p }()
 	select {
@@ -170,9 +218,9 @@ func TestInboundSlotsAndNull(t *testing.T) {
 func TestPhysicalWriteReleasesRequest(t *testing.T) {
 	peerR, peerW := io.Pipe()
 	outR, outW := io.Pipe()
-	defer outR.Close()
+	defer func() { _ = outR.Close() }()
 	w := New(peerR, outW, Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	w.Open()
 	go func() { _, _ = peerW.Write(append(bytes.Clone(acptest.InitializeRequest), '\n')) }()
 	r := bufio.NewReader(w.Input())
@@ -195,7 +243,7 @@ func TestPhysicalWriteReleasesRequest(t *testing.T) {
 	if w.Usage().Requests != 0 {
 		t.Fatal("request retained after write")
 	}
-	peerW.Close()
+	_ = peerW.Close()
 }
 func TestOutboundAdmissionAndLateResponses(t *testing.T) {
 	w, r, _ := newTestWire(t, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n"+string(acptest.InitializeRequest)+"\n", Options{})
@@ -218,44 +266,102 @@ func TestOutboundAdmissionAndLateResponses(t *testing.T) {
 		t.Fatal("65th outbound admitted")
 	}
 }
+
+// A peer that closes its write side after a complete frame ended the input. The reader owes
+// its consumer io.EOF for that, not a framing failure: the supervisor must not restart a
+// connection that simply finished, and readFrame keeps the two cases apart for this reason.
+// Ending is not abandoning, though. The connection is over, so it is released here as any
+// other close releases it; a wire left open on a departed peer holds its write loop, its
+// source and every admitted charge for the life of the process.
+func TestCleanEOFEndsInputAndReleasesTheConnection(t *testing.T) {
+	w, r, _ := newTestWire(t, string(acptest.InitializeRequest)+"\n", Options{})
+	readLine(t, r)
+	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("end of input = %v, want io.EOF", err)
+	}
+	if !w.closed() {
+		t.Fatal("the wire outlived the input it was reading")
+	}
+	if u := w.Usage(); u != (Usage{}) {
+		t.Fatalf("admission survived the connection: %+v", u)
+	}
+	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("read after the end = %v, want io.EOF", err)
+	}
+	select {
+	case err := <-w.Failed():
+		t.Fatalf("clean end of input reported %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+// The claim gate holds a request back until its callback claims it, so the end of input is not
+// the end of the connection: what the peer already sent is still owed to the SDK, and only the
+// last of it releases the wire.
+func TestClaimGateDrainsBeforeTheEndOfInput(t *testing.T) {
+	raw := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"unknown\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"unknown\"}\n"
+	w, r, _ := newTestWire(t, raw, Options{RequireRequestClaims: true})
+	for _, want := range []string{`"id":1`, `"id":2`} {
+		if line := readLine(t, r); !strings.Contains(line, want) {
+			t.Fatalf("line %q does not carry %s", line, want)
+		}
+		if w.ClaimRequest() == nil {
+			t.Fatal("nothing to claim")
+		}
+	}
+	if _, err := r.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("end of input = %v, want io.EOF", err)
+	}
+	if !w.closed() {
+		t.Fatal("the wire outlived its drained ingress")
+	}
+}
+
 func TestSeparateCountsAndSharedBytes(t *testing.T) {
 	var raw strings.Builder
-	for i := range 64 {
+	for i := range MaxItems {
 		fmt.Fprintf(&raw, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"unknown\"}\n", i)
 		raw.Write(acptest.CancelNotification)
 		raw.WriteByte('\n')
 		fmt.Fprintf(&raw, "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{}}\n", i+1)
 	}
 	w, r, _ := newTestWire(t, raw.String(), Options{})
-	for range 64 {
-		if _, err := w.PrepareOutbound("session/new", json.RawMessage(`{}`)); err != nil {
-			t.Fatal(err)
-		}
+	peer := &sdkPeer{}
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	defer func() { close(release); wg.Wait() }()
+	for range MaxItems {
+		peer.hold(t, w, "session/new", release, &wg)
 	}
-	for range 192 {
+	for range 3 * MaxItems {
 		readLine(t, r)
 	}
 	u := w.Usage()
-	if u.Requests != 64 || u.Notifications != 64 || u.Responses != 64 {
+	if u.Requests != MaxItems || u.Notifications != MaxItems || u.Responses != MaxItems {
 		t.Fatalf("wrong independent usage: %+v", u)
 	}
 }
 func TestNotificationAndResponseRelease(t *testing.T) {
 	w, r, _ := newTestWire(t, string(acptest.CancelNotification)+"\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n", Options{})
-	o, err := w.PrepareOutbound("session/new", json.RawMessage(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	peer := &sdkPeer{}
+	callback := make(chan struct{})
+	var wg sync.WaitGroup
+	peer.hold(t, w, "session/new", callback, &wg)
 	readLine(t, r)
 	readLine(t, r)
-	blocked, release := make(chan struct{}), make(chan struct{})
+	blocked, resume := make(chan struct{}), make(chan struct{})
 	done := make(chan struct{})
-	go func() { w.HandleNotification(func() { close(blocked); <-release }); o.Complete(); close(done) }()
+	go func() {
+		w.HandleNotification(func() { close(blocked); <-resume })
+		close(callback)
+		wg.Wait()
+		close(done)
+	}()
 	<-blocked
 	if u := w.Usage(); u.Notifications != 1 || u.Responses != 1 || u.InboundBytes == 0 {
 		t.Fatal("released behind callback barrier")
 	}
-	close(release)
+	close(resume)
 	<-done
 	if u := w.Usage(); u.InboundBytes != 0 || u.OutboundBytes != 0 {
 		t.Fatal("retained completed callbacks")
@@ -283,7 +389,7 @@ func TestCloseDoesNotReleasePendingInput(t *testing.T) {
 	if _, err := w.Input().Read(p); err != nil {
 		t.Fatal(err)
 	}
-	w.Close()
+	_ = w.Close()
 	if n, err := w.Input().Read(p); n != 0 || err == nil {
 		t.Fatal("close released charged frame remainder")
 	}

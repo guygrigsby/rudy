@@ -12,7 +12,7 @@ import (
 func TestRequestClaimPreventsScannerReadAhead(t *testing.T) {
 	raw := "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"unknown\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"unknown\"}\n"
 	w := New(io.NopCloser(strings.NewReader(raw)), io.Discard, Options{RequireRequestClaims: true})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	w.Open()
 	scanner := bufio.NewScanner(w.Input())
 	if !scanner.Scan() {

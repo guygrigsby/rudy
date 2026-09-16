@@ -38,10 +38,10 @@ func TestRejectSDKCaseFoldAliases(t *testing.T) {
 
 func TestClaimWaitKeepsIngressCancellationLive(t *testing.T) {
 	inR, inW := io.Pipe()
-	defer inW.Close()
+	defer func() { _ = inW.Close() }()
 	events := make(chan Dispatch, 8)
 	w := New(inR, io.Discard, Options{RequireRequestClaims: true, BeforeDispatch: func(d Dispatch) { events <- d }})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	w.Open()
 	r := bufio.NewReader(w.Input())
 	go func() { _, _ = io.WriteString(inW, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"unknown\"}\n") }()
@@ -71,7 +71,7 @@ func TestClaimWaitKeepsIngressCancellationLive(t *testing.T) {
 	if u := w.Usage(); u.Requests != 2 || u.Notifications != 1 {
 		t.Fatal("queued ingress was not charged")
 	}
-	w.Close()
+	_ = w.Close()
 	<-readDone
 }
 
@@ -83,7 +83,7 @@ func TestCloseClearsOwnedBuffersImmediately(t *testing.T) {
 	if _, err := w.Output().Write([]byte(strings.Repeat(" ", 1<<20))); err != nil {
 		t.Fatal(err)
 	}
-	w.Close()
+	_ = w.Close()
 	if len(w.pending) != 0 || len(w.output.partial) != 0 {
 		t.Fatalf("close retained buffers: input=%d output=%d", len(w.pending), len(w.output.partial))
 	}
@@ -131,14 +131,14 @@ func (w *signalledWriter) Write(p []byte) (int, error) {
 func TestDeliberateCloseDoesNotSignalIOFailure(t *testing.T) {
 	t.Run("reader", func(t *testing.T) {
 		r, p := io.Pipe()
-		defer p.Close()
+		defer func() { _ = p.Close() }()
 		source := &signalledReader{ReadCloser: r, started: make(chan struct{})}
 		w := New(source, io.Discard, Options{})
 		w.Open()
 		done := make(chan struct{})
 		go func() { _, _ = w.Read(make([]byte, 1)); close(done) }()
 		<-source.started
-		w.Close()
+		_ = w.Close()
 		<-done
 		select {
 		case err := <-w.Failed():
@@ -148,7 +148,7 @@ func TestDeliberateCloseDoesNotSignalIOFailure(t *testing.T) {
 	})
 	t.Run("writer", func(t *testing.T) {
 		r, p := io.Pipe()
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		sink := &signalledWriter{WriteCloser: p, started: make(chan struct{})}
 		w := New(io.NopCloser(strings.NewReader("")), sink, Options{})
 		ack, err := w.Send([]byte(`{"jsonrpc":"2.0","method":"unknown"}`), 0)
@@ -156,7 +156,7 @@ func TestDeliberateCloseDoesNotSignalIOFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 		<-sink.started
-		w.Close()
+		_ = w.Close()
 		_ = ack.Wait(context.Background())
 		select {
 		case err := <-w.Failed():
@@ -164,14 +164,6 @@ func TestDeliberateCloseDoesNotSignalIOFailure(t *testing.T) {
 		case <-time.After(20 * time.Millisecond):
 		}
 	})
-}
-
-func bindTestOutbound(o *Outbound) {
-	w := o.wire
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	id := o.ID
-	o.sdkID = &id
 }
 
 var _ json.RawMessage

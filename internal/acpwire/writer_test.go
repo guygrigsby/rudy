@@ -15,7 +15,7 @@ type shortWriter struct{}
 func (shortWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
 func TestWriterShortWriteFailsOnce(t *testing.T) {
 	w := New(io.NopCloser(strings.NewReader("")), shortWriter{}, Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	a, err := w.Send([]byte(`{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s"}}`), 0)
 	if err != nil {
 		t.Fatal(err)
@@ -37,9 +37,9 @@ func TestWriterShortWriteFailsOnce(t *testing.T) {
 }
 func TestWriterQueueAndPartialFrames(t *testing.T) {
 	outR, outW := io.Pipe()
-	defer outR.Close()
+	defer func() { _ = outR.Close() }()
 	w := New(io.NopCloser(strings.NewReader("")), outW, Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	frame := `{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s"}}`
 	for _, s := range []string{frame[:10], frame[10:] + "\n"} {
 		if _, err := w.Output().Write([]byte(s)); err != nil {
@@ -68,7 +68,7 @@ func TestOutboundStructuralAndByteOverflow(t *testing.T) {
 		if out.String() != "" {
 			t.Fatal("invalid bytes physically written")
 		}
-		w.Close()
+		_ = w.Close()
 	}
 }
 func TestResponseWrittenSignal(t *testing.T) {
@@ -82,9 +82,9 @@ func TestResponseWrittenSignal(t *testing.T) {
 }
 func TestReaderAndSDKResponsesShareWriter(t *testing.T) {
 	outR, outW := io.Pipe()
-	defer outR.Close()
+	defer func() { _ = outR.Close() }()
 	w := New(io.NopCloser(strings.NewReader("{bad\n")), outW, Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	w.Open()
 	notification := []byte(`{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s"}}`)
 	a, err := w.Send(notification, 5)
@@ -106,9 +106,9 @@ func TestReaderAndSDKResponsesShareWriter(t *testing.T) {
 
 func TestWriterQueueByteLimit(t *testing.T) {
 	outR, outW := io.Pipe()
-	defer outR.Close()
+	defer func() { _ = outR.Close() }()
 	w := New(io.NopCloser(strings.NewReader("")), outW, Options{})
-	defer w.Close()
+	defer func() { _ = w.Close() }()
 	base := `{"jsonrpc":"2.0","method":"unknown"}`
 	raw := []byte(base + strings.Repeat(" ", (8<<20)-len(base)))
 	for range 4 {
