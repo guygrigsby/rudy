@@ -54,6 +54,10 @@ func TestTerminalEntryIsNotPublishedWhenSyncFails(t *testing.T) {
 	rec := &recorder{}
 	r := newRunner(t, s, &scripted{scripts: [][]provider.Part{{text("done"), stop(session.StopEndTurn, "end_turn")}}}, nil, nil, rec)
 	r.cfg.Sync = func() error { return errors.New("private sync failure") }
-	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); !errors.Is(err, ErrTerminalDurability) { t.Fatalf("Run error = %v",err) }
-	if rec.count(session.KindAssistantMessage) != 0 { t.Fatal("published unsynchronized terminal assistant Entry") }
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); !errors.Is(err, ErrTerminalDurability) {
+		t.Fatalf("Run error = %v", err)
+	}
+	if rec.count(session.KindAssistantMessage) != 0 {
+		t.Fatal("published unsynchronized terminal assistant Entry")
+	}
 }

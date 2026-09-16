@@ -751,7 +751,16 @@ func (s *Server) handleInterrupt(cn *conn, raw json.RawMessage) (any, *protocol.
 	if r == nil || !isActive(r.State()) {
 		return nil, perr(protocol.CodeRefusedByInvariant, "no active turn")
 	}
-	r.Interrupt(p.How)
+	// A cancel that ends a steering turn writes that turn's last Entry, so it is a path that
+	// can fail durably. Reporting the turn's state to a client whose session just lost its
+	// durable prefix would be the false success ADR 0037 exists to refuse.
+	if err := r.Interrupt(p.How); err != nil {
+		if errors.Is(err, turn.ErrTerminalDurability) {
+			return nil, perr(protocol.CodeUnavailable, err.Error())
+		}
+		slog.Error("server: interrupt", "session", p.SessionID, "how", p.How, "err", err)
+		return nil, perr(protocol.CodeInternal, "interrupt failed")
+	}
 	return InterruptResult{TurnID: r.TurnID(), State: string(r.State())}, nil
 }
 
@@ -1966,7 +1975,12 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	if r == nil {
 		return
 	}
-	r.Interrupt(session.InterruptCancel)
+	// Nobody is left to tell: the connection that would have steered this turn is already
+	// gone, and the session is on its way out. A durable failure recording the interruption
+	// is the log's problem, not this path's, so it is logged and the close continues.
+	if err := r.Interrupt(session.InterruptCancel); err != nil {
+		slog.Error("server: cancel parked steering turn", "session", ls.sess.ID(), "err", err)
+	}
 	s.mu.Lock()
 	s.closeIfUnusedLocked(ls)
 }
@@ -2055,7 +2069,8 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 			_, tid := ls.mirroredState()
 			ls.markStarting(tid)
 			ls.mu.Unlock()
-			if e := s.spawnTurn(ls, r, msg); e != nil {
+			// A steer resume has its turn id already, so it waits on no first append.
+			if e := s.spawnTurn(ls, r, msg, nil); e != nil {
 				return "", e
 			}
 			return r.TurnID(), nil // no lock held here; direct call is fine and freshest
@@ -2122,7 +2137,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	ls.markStarting("")
 	ls.mu.Unlock()
 
-	if e := s.spawnTurn(ls, r, msg); e != nil {
+	if e := s.spawnTurn(ls, r, msg, first); e != nil {
 		ls.mu.Lock()
 		if ls.runner == r {
 			ls.runner = nil // nobody is running it; undo the assignment above
@@ -2152,7 +2167,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 // it. Does not touch ls.mu or Server.mu, only wgMu: it may be called with ls.mu held (from
 // startTurn) or not (it does not matter either way), and never nests under Server.mu, keeping
 // wgMu out of the mu > ls.mu > ls.obsMu order entirely.
-func (s *Server) spawnTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage) *protocol.Error {
+func (s *Server) spawnTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage, first *firstAppendSignal) *protocol.Error {
 	s.wgMu.Lock()
 	if s.shuttingDown {
 		s.wgMu.Unlock()
@@ -2160,16 +2175,19 @@ func (s *Server) spawnTurn(ls *liveSession, r *turn.Runner, msg session.UserMess
 	}
 	s.wg.Add(1)
 	s.wgMu.Unlock()
-	go s.runTurn(ls, r, msg)
+	go s.runTurn(ls, r, msg, first)
 	return nil
 }
 
-func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage) {
+func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage, first *firstAppendSignal) {
 	defer s.wg.Done()
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 	_ = r.Run(ctx, msg) // failures are already recorded as turn_failed entries by the runner
-	final := r.State()  // read before taking ls.mu: never call a Runner method while holding it
+	// Whatever Run made of it, the turn is over: anyone still waiting to learn its id learns
+	// here that no id is coming.
+	first.finished()
+	final := r.State() // read before taking ls.mu: never call a Runner method while holding it
 	ls.mu.Lock()
 	if ls.runner == r && final != turn.Steering {
 		ls.runner = nil

@@ -397,18 +397,25 @@ func (r *Runner) loop(ctx context.Context) error {
 			return r.fail(session.ErrTransport, err)
 		}
 		malformed := sanitizeToolInputs(am.Content)
-		if _, err := r.appendAssistant(ctx, am); err != nil {
-			return r.fail(session.ErrInternal, err)
-		}
-		r.maybeCompact(ctx, am)
-
 		var toolUses []session.Block
 		for _, b := range am.Content {
 			if b.Type == session.BlockToolUse {
 				toolUses = append(toolUses, b)
 			}
 		}
-		if len(toolUses) == 0 {
+		// A message with no call to make ends the turn, which makes it the turn's terminal
+		// Entry: it reaches a client only once the log that carries it synced. A message
+		// that asks for a tool has the turn's ending still ahead of it and publishes now.
+		last := len(toolUses) == 0
+		record := r.appendAssistant
+		if last {
+			record = r.appendFinalAssistant
+		}
+		if _, err := record(ctx, am); err != nil {
+			return r.fail(session.ErrInternal, err)
+		}
+		r.maybeCompact(ctx, am)
+		if last {
 			return r.rest(ctx, Completed)
 		}
 		// Every call of this message runs at once (ADR 0028). Malformed inputs are refused
@@ -822,7 +829,19 @@ func (r *Runner) maybeCompact(ctx context.Context, am session.AssistantMessage) 
 // after_response. Every assistant_message the loop writes, interrupted and cancelled ones
 // included, goes through here: the contract fires the hook on the append, not on a happy path.
 func (r *Runner) appendAssistant(ctx context.Context, am session.AssistantMessage) (session.Entry, error) {
-	e, err := r.append(am)
+	return r.recordAssistant(ctx, am, r.append)
+}
+
+// appendFinalAssistant is appendAssistant for the message that ends the turn. Nothing follows
+// it, so it is the Entry the durability fence has to hold: a sync failure returns the terminal
+// durability error with the Entry still unpublished, and no client ever saw a turn the log
+// cannot prove it holds.
+func (r *Runner) appendFinalAssistant(ctx context.Context, am session.AssistantMessage) (session.Entry, error) {
+	return r.recordAssistant(ctx, am, r.appendTerminal)
+}
+
+func (r *Runner) recordAssistant(ctx context.Context, am session.AssistantMessage, add func(session.Payload) (session.Entry, error)) (session.Entry, error) {
+	e, err := add(am)
 	if err != nil {
 		return e, err
 	}

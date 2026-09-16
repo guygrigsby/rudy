@@ -720,11 +720,15 @@ func (f *fanout) ToolStateChanged(turnID, toolUseID, name string, state turn.Too
 // separate from the state mirror above (which StateChanged keeps current): it exists only to
 // answer the one RPC call that started this turn, synchronously, with the id that call needs.
 //
-// A turn that reaches Failed without ever appending closes failed instead: that first append
-// is exactly what can fail (a user_message the log refuses), and the runner cannot record a
-// turn_failed for a turn whose id that same append was going to assign, so no entry would
-// ever arrive and startTurn would wait forever. One sync.Once covers both channels, so a
-// turn that started normally and failed later never also reports itself as never started.
+// A turn that ends without ever appending closes failed instead: that first append is exactly
+// what can fail (a user_message the log refuses), and the runner cannot record a turn_failed
+// for a turn whose id that same append was going to assign, so no entry would ever arrive and
+// startTurn would wait forever. runTurn closes it, once Run has returned, because that is the
+// one place that knows the turn is over however it ended. Reaching Failed is not the test: a
+// terminal durability failure deliberately publishes no state at all (see
+// turn.ErrTerminalDurability), and a turn that died that way still owes startTurn an answer.
+// One sync.Once covers both channels, so a turn that started normally and failed later never
+// also reports itself as never started.
 type firstAppendSignal struct {
 	turn.Observer
 	once    sync.Once
@@ -737,11 +741,13 @@ func (o *firstAppendSignal) EntryAppended(e session.Entry) {
 	o.Observer.EntryAppended(e)
 }
 
-func (o *firstAppendSignal) StateChanged(turnID string, s turn.State) {
-	if s == turn.Failed {
-		o.once.Do(func() { close(o.failed) })
+// finished releases a startTurn still waiting on a first append that never came. Called on
+// every turn once Run returns; a no-op for the turns that did append, whose Once is spent.
+func (o *firstAppendSignal) finished() {
+	if o == nil {
+		return
 	}
-	o.Observer.StateChanged(turnID, s)
+	o.once.Do(func() { close(o.failed) })
 }
 
 // askKey is the question a call would put to the operator: its matcher together with its exact

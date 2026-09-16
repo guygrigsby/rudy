@@ -213,6 +213,15 @@ func newRunner(t *testing.T, s *session.Session, p *scripted, tools toolSet, ask
 	})
 }
 
+// interrupt is Interrupt for a runner whose log is healthy, which every test here but the
+// durability ones has. t.Error rather than t.Fatal: one call site runs on its own goroutine.
+func interrupt(t *testing.T, r *Runner, how session.Interrupt) {
+	t.Helper()
+	if err := r.Interrupt(how); err != nil {
+		t.Errorf("Interrupt(%s): %v", how, err)
+	}
+}
+
 func userMsg(src session.Source, s string) session.UserMessage {
 	return session.UserMessage{Source: src, Content: []session.Block{session.TextBlock(s)}}
 }
@@ -303,7 +312,7 @@ func TestInterruptStopsEveryRunningCall(t *testing.T) {
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
 	<-started
 	<-started
-	r.Interrupt(session.InterruptCancel)
+	interrupt(t, r, session.InterruptCancel)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -710,7 +719,7 @@ func TestSteerMidStreamThenContinue(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
 	waitForDelta(t, rec, 1)
-	r.Interrupt(session.InterruptSteer)
+	interrupt(t, r, session.InterruptSteer)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -752,7 +761,7 @@ func TestCancelMidStream(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
 	waitForDelta(t, rec, 1)
-	r.Interrupt(session.InterruptCancel)
+	interrupt(t, r, session.InterruptCancel)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -791,7 +800,7 @@ func TestSteerDuringToolKillsIt(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "sleep")) }()
 	<-started
-	r.Interrupt(session.InterruptSteer)
+	interrupt(t, r, session.InterruptSteer)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -852,7 +861,7 @@ func TestResumeVsCancelRace(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
 	waitForDelta(t, rec, 1)
-	r.Interrupt(session.InterruptSteer)
+	interrupt(t, r, session.InterruptSteer)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -875,7 +884,7 @@ func TestResumeVsCancelRace(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		r.Interrupt(session.InterruptCancel)
+		interrupt(t, r, session.InterruptCancel)
 	}()
 	wg.Wait()
 
@@ -991,7 +1000,7 @@ func TestInterruptWhenIdleIsNoop(t *testing.T) {
 	s := openTestSession(t, session.ModeStrict)
 	rec := &recorder{}
 	r := newRunner(t, s, &scripted{}, toolSet{}, nil, rec)
-	r.Interrupt(session.InterruptCancel)
+	interrupt(t, r, session.InterruptCancel)
 	if r.State() != Idle || len(rec.entries) != 0 {
 		t.Fatalf("idle interrupt must change nothing: %s %v", r.State(), rec.kinds())
 	}
@@ -1054,11 +1063,11 @@ func TestTheStrongestInterruptEndsTheTurn(t *testing.T) {
 	<-started
 	<-started
 
-	r.Interrupt(session.InterruptSteer)
+	interrupt(t, r, session.InterruptSteer)
 	close(release["tu1"])
 	// tu1's killed result is on the log, so tu1 has already read the steer.
 	waitForEntries(t, rec, session.KindToolResult, 1)
-	r.Interrupt(session.InterruptCancel)
+	interrupt(t, r, session.InterruptCancel)
 	close(release["tu2"])
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -1104,7 +1113,7 @@ func TestSteerWhileAwaitingPermission(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "list")) }()
 	<-asked
-	r.Interrupt(session.InterruptSteer)
+	interrupt(t, r, session.InterruptSteer)
 	close(release)
 	select {
 	case err := <-done:
@@ -1154,7 +1163,7 @@ func TestCancelWhileAwaitingPermission(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "list")) }()
 	<-asked
-	r.Interrupt(session.InterruptCancel)
+	interrupt(t, r, session.InterruptCancel)
 	close(release)
 	select {
 	case err := <-done:
@@ -1216,7 +1225,7 @@ func TestLogIsDurableAfterACancel(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
 	waitForDelta(t, rec, 1)
-	r.Interrupt(session.InterruptCancel)
+	interrupt(t, r, session.InterruptCancel)
 	select {
 	case err := <-done:
 		if err != nil {
