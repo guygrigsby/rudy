@@ -963,6 +963,12 @@ func (s *Server) compactHoldingSession(ctx context.Context, ls *liveSession, ins
 	if !ok {
 		return session.Entry{}, 0, perr(protocol.CodeUnavailable, "provider not loaded: "+ls.model.Ref.Provider)
 	}
+	// Before the summary request: a compaction covering fewer than two entries appends
+	// nothing, so it would never reach the fence and would answer a quarantined session with
+	// success. The fenced append below is still what decides for every other compaction.
+	if e := s.sessionQuarantined(ls.sess.ID()); e != nil {
+		return session.Entry{}, 0, e
+	}
 	// The summary request answers to the server's own shutdown as well as to the caller: it
 	// runs under ls.mu, and Shutdown closes every live session, which needs that lock. Without
 	// this the caller's context is the only way out, and a shutdown would wait on a provider
@@ -1667,35 +1673,49 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 // this lock, landing the fork one entry stale. obsMu, which latestEntryID takes, nests inside mu
 // (see liveSession's doc), so taking it here while already holding parent.mu is safe.
 func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.SessionInfo, *protocol.Error) {
+	var (
+		child *session.Session
+		e     *protocol.Error
+	)
 	parent.mu.Lock()
-	if at == "" {
-		at = parent.latestEntryID()
-	}
-	atID, err := ulid.Parse(at)
-	if err != nil {
-		parent.mu.Unlock()
-		return protocol.SessionInfo{}, perr(protocol.CodeInvalidArgument, "bad entry id")
-	}
-	st, _ := parent.mirroredState()
-	active := parent.runner != nil && isActive(st)
-	closed := parent.closed
-	var child *session.Session
-	switch {
-	case closed:
-		parent.mu.Unlock()
-		return protocol.SessionInfo{}, perr(protocol.CodeUnavailable, "session unavailable, retry")
-	case active:
-		parent.mu.Unlock()
-		return protocol.SessionInfo{}, perr(protocol.CodeConflict, "a turn is active")
-	default:
-		child, err = parent.sess.Fork(s.d.Store, atID)
-		parent.mu.Unlock()
+	// The read of the parent and the Fork that copies it are one commit on the parent, so
+	// they cross its fence. A fork is otherwise the one operation that builds a whole fresh
+	// aggregate, with a new ULID and so no quarantine of its own, out of a prefix that may
+	// have just become uncertain, and its fork_point can name an entry the parent's log
+	// never held (ADR 0037). A caller that passed a check before a plugin command ran is
+	// exactly the caller this catches: command.run's /fork holds the liveSession lookup
+	// returned before that command started.
+	err := s.withSessionOperation(parent, func() error {
+		if at == "" {
+			at = parent.latestEntryID()
+		}
+		atID, perror := ulid.Parse(at)
+		if perror != nil {
+			e = perr(protocol.CodeInvalidArgument, "bad entry id")
+			return nil
+		}
+		st, _ := parent.mirroredState()
+		switch {
+		case parent.closed:
+			e = perr(protocol.CodeUnavailable, "session unavailable, retry")
+		case parent.runner != nil && isActive(st):
+			e = perr(protocol.CodeConflict, "a turn is active")
+		default:
+			var ferr error
+			child, ferr = parent.sess.Fork(s.d.Store, atID)
+			return ferr
+		}
+		return nil
+	})
+	parent.mu.Unlock()
+	if e != nil {
+		return protocol.SessionInfo{}, e
 	}
 	if err != nil {
 		if errors.Is(err, session.ErrInvariant) {
 			return protocol.SessionInfo{}, perr(protocol.CodeNotFound, err.Error())
 		}
-		return protocol.SessionInfo{}, protocol.ErrorFrom(err)
+		return protocol.SessionInfo{}, sessionErr(err)
 	}
 	m, rerr := s.d.Registry.Resolve(child.Model().String())
 	if rerr != nil {
@@ -1899,6 +1919,12 @@ func (s *Server) childAttachmentsLocked(cn *conn, ls *liveSession) []childAttach
 	var out []childAttachment
 	for sid, c := range s.live {
 		if c.parent != ls || cn.subscribed(sid) {
+			continue
+		}
+		// A quarantined child is not replayed into a newcomer's attach: the walk reads that
+		// child's aggregate, and its standing question would be put to an asker whose answer
+		// session.answer then refuses forever (ADR 0037).
+		if s.sessionQuarantined(sid) != nil {
 			continue
 		}
 		if at, ok := c.watchAttachment(cn.isAsker()); ok {

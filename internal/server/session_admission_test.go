@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tool"
 	"github.com/guygrigsby/rudy/internal/turn"
 )
 
@@ -131,6 +133,27 @@ func (f *fixture) attach(ls *liveSession, asker bool) *testConn {
 	return tc
 }
 
+// openChild opens a session the parent's attach walk recognizes as its child: the walk reads
+// the child's own session_opened, and only a logged parent tool_use makes it one.
+func (f *fixture) openChild(parent *liveSession) *liveSession {
+	f.t.Helper()
+	sess, err := session.Open(f.store, session.SessionOpened{
+		SchemaVersion: 1, RudyVersion: "test",
+		Workspace: session.Workspace{Root: f.t.TempDir(), ProjectID: "local/test"},
+		Model:     f.model.Ref, Thinking: session.ThinkingOff, Mode: session.ModeOff, Agent: "default",
+		ParentSessionID: parent.sess.ID().String(), ParentToolUseID: "tu-1",
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	ls := newLive(sess, f.model)
+	ls.parent = parent
+	f.srv.mu.Lock()
+	f.srv.live[sess.ID()] = ls
+	f.srv.mu.Unlock()
+	return ls
+}
+
 // testConn is one connection wired the way serveConn wires it, with a reader draining the
 // client end so the pump never blocks and the test can see what the client was told.
 type testConn struct {
@@ -175,6 +198,18 @@ func (c *testConn) read() {
 		c.msgs = append(c.msgs, string(raw))
 		c.mu.Unlock()
 	}
+}
+
+// received reports whether any message the server sent this connection carries substr.
+func (c *testConn) received(substr string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.msgs {
+		if strings.Contains(m, substr) {
+			return true
+		}
+	}
+	return false
 }
 
 // closed reports whether the server closed this connection within the budget.
@@ -542,17 +577,42 @@ func TestQuarantineLogsTheCauseItWillNotSend(t *testing.T) {
 	}
 }
 
-// TestQuarantineSparesThePluginConnectionThatOpenedTheChild holds quarantine to ADR 0037's
-// "affects only the failed Session". A plugin connection is that plugin's whole runtime, so
+// stubRegistrar stands in for a spawned plugin's adapter, which is what tells that plugin's
+// one stdio runtime connection from the per-call pipe a linked plugin gets (see connectPlugin).
+type stubRegistrar struct{}
+
+func (stubRegistrar) Name() string { return "spawned" }
+func (stubRegistrar) RegisterTool(string, string, json.RawMessage, tool.Safety) error {
+	return nil
+}
+func (stubRegistrar) RegisterCommand(string, string) error     { return nil }
+func (stubRegistrar) RegisterHook(plugin.HookPoint, int) error { return nil }
+func (stubRegistrar) RegisterProvider(string, string) error    { return nil }
+func (stubRegistrar) SetStatus(string, []plugin.Span)          {}
+func (stubRegistrar) SetWidget(string, plugin.WidgetSlot, []plugin.Span) error {
+	return nil
+}
+func (stubRegistrar) Deliver(string, json.RawMessage) {}
+func (stubRegistrar) RegisterAgent(string, string, string, *[]string, string, string, int) error {
+	return nil
+}
+
+// TestQuarantineSparesTheSpawnedPluginRuntime holds quarantine to ADR 0037's "affects only the
+// failed Session". A spawned plugin's stdio connection is that plugin's whole runtime, so
 // closing it would withdraw its tools, commands and providers from every session in the
-// process because one child session lost its log.
-func TestQuarantineSparesThePluginConnectionThatOpenedTheChild(t *testing.T) {
+// process because one child session lost its log. A linked plugin's connection is the opposite
+// case: Host.Connect hands out one pipe per agent tool call, and closing it is the only signal
+// a caller waiting on a child that publishes no terminal state will ever get.
+func TestQuarantineSparesTheSpawnedPluginRuntime(t *testing.T) {
 	f := newFixture(t)
 	child := f.open()
-	pluginConn := f.conn(false)
-	pluginConn.cn.plugin = "fake"
-	if _, e := f.srv.installAndAttach(pluginConn.cn, child); e != nil {
-		t.Fatalf("attach the plugin connection: %v", e)
+	runtime, linked := f.conn(false), f.conn(false)
+	runtime.cn.plugin, runtime.cn.reg = "spawned", stubRegistrar{}
+	linked.cn.plugin = "linked"
+	for _, cn := range []*conn{runtime.cn, linked.cn} {
+		if _, e := f.srv.installAndAttach(cn, child); e != nil {
+			t.Fatalf("attach %s: %v", cn.plugin, e)
+		}
 	}
 	clientConn := f.attach(child, true)
 
@@ -561,8 +621,11 @@ func TestQuarantineSparesThePluginConnectionThatOpenedTheChild(t *testing.T) {
 	if !clientConn.closed(2 * time.Second) {
 		t.Error("the subscribed client was not closed")
 	}
-	if pluginConn.closed(200 * time.Millisecond) {
-		t.Error("the plugin connection that opened the child was closed with it")
+	if !linked.closed(2 * time.Second) {
+		t.Error("a linked plugin's per-call connection was spared, so its agent tool waits out its timeout")
+	}
+	if runtime.closed(200 * time.Millisecond) {
+		t.Error("the spawned plugin's runtime connection was closed, withdrawing every registration it holds")
 	}
 }
 
@@ -617,5 +680,55 @@ func TestQuarantinedCompactIsUnavailableNotInternal(t *testing.T) {
 	_, _, e := f.srv.compact(context.Background(), ls, "")
 	if e == nil || e.Code != protocol.CodeUnavailable {
 		t.Fatalf("compact on a quarantined session = %v, want unavailable", e)
+	}
+	// A compaction with nothing to cover appends nothing, so it never reaches the fence.
+	// Answering that with success would be the same hole in its harmless form.
+	empty := f.open()
+	f.attach(empty, true)
+	f.srv.quarantine(empty, turn.DurabilityError(errors.New("private cause")))
+	if _, _, e := f.srv.compact(context.Background(), empty, ""); e == nil || e.Code != protocol.CodeUnavailable {
+		t.Fatalf("compact covering nothing on a quarantined session = %v, want unavailable", e)
+	}
+}
+
+// TestForkOfAQuarantinedSessionIsRefused closes the one hole a new ULID would open: a fork
+// builds a whole fresh aggregate out of the parent's entries, so a fork taken after the
+// parent's prefix became uncertain is an unquarantined session over an uncertain log, and its
+// fork_point can name an entry the parent's log never held.
+func TestForkOfAQuarantinedSessionIsRefused(t *testing.T) {
+	f := newFixture(t)
+	ls := f.open()
+	f.attach(ls, true)
+	f.srv.quarantine(ls, turn.DurabilityError(errors.New("private cause")))
+
+	_, e := f.srv.forkAt(f.conn(false).cn, ls, "")
+	if e == nil || e.Code != protocol.CodeUnavailable {
+		t.Fatalf("fork of a quarantined session = %v, want unavailable", e)
+	}
+	f.srv.mu.Lock()
+	live := len(f.srv.live)
+	f.srv.mu.Unlock()
+	if live != 1 {
+		t.Errorf("the refused fork left %d live sessions, want only the quarantined one", live)
+	}
+}
+
+// TestAttachToAParentSkipsAQuarantinedChild covers the read a parent's attach makes of each of
+// its live children. A quarantined child must not be replayed to a newcomer, and its standing
+// question must not be put to an asker whose answer session.answer would then refuse forever.
+func TestAttachToAParentSkipsAQuarantinedChild(t *testing.T) {
+	f := newFixture(t)
+	parent := f.open()
+	child := f.openChild(parent)
+	f.attach(parent, true)
+	f.srv.quarantine(child, turn.DurabilityError(errors.New("private cause")))
+
+	watcher := f.attach(parent, true)
+	time.Sleep(50 * time.Millisecond) // the attach replay is queued through the pump
+	if watcher.received(child.sess.ID().String()) {
+		t.Error("a quarantined child was replayed to a connection attaching to its parent")
+	}
+	if !watcher.received(parent.sess.ID().String()) {
+		t.Fatal("the parent's own replay never arrived, so this test proves nothing")
 	}
 }

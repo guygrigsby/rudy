@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/oklog/ulid/v2"
 
@@ -34,6 +35,14 @@ type sessionAdmission struct {
 	mu    sync.Mutex
 	cause error // first durability cause; nil until quarantine
 
+	// quarantined mirrors cause for the guards that only refuse. Written under mu, after the
+	// cause, and read without it. That is safe in the one direction a guard is allowed to
+	// matter: a cause is never cleared, so a guard that refuses is final, and a guard that
+	// admits authorizes nothing, because the commit behind it re-reads the cause under the
+	// fence. It is what keeps lookup, loadCold and a parent's walk over its children off the
+	// fence of a session whose terminal sync is in flight.
+	quarantined atomic.Bool
+
 	// cancels is the work registered against this Session, by registration id: the context
 	// of every turn running on it. Quarantine cancels each one. A turn registering after the
 	// cause is installed is cancelled on the spot rather than recorded.
@@ -51,21 +60,25 @@ func (a *sessionAdmission) installLocked(ls *liveSession, cause error) (fired bo
 		return false, nil, nil
 	}
 	a.cause = cause
+	a.quarantined.Store(true)
 	for _, cancel := range a.cancels {
 		cancels = append(cancels, cancel)
 	}
 	a.cancels = nil
 	ls.obsMu.Lock()
 	for _, c := range ls.conns {
-		// A plugin connection is not a subscriber being told a story about this session: it
-		// is the plugin's whole runtime. Closing it withdraws every tool, command, provider
-		// and hook that plugin registered, for every session in the process, which is the
-		// opposite of ADR 0037's "quarantine affects only the failed Session". The plugin
-		// learns the same way the contract already lets it: the child's turn is cancelled
-		// under it and every later Host call on this session is unavailable. Every other
-		// fan-out here filters plugin connections out for the same kind of reason (see
-		// liveSession.watchers, clientConns).
-		if c.plugin != "" {
+		// A spawned plugin's stdio peer is not a subscriber being told a story about this
+		// session: it is the plugin's whole runtime. Closing it withdraws every tool,
+		// command, provider and hook that plugin registered, from every session in the
+		// process, which is the opposite of ADR 0037's "quarantine affects only the failed
+		// Session". Its tool call learns through the cancelled turn and an unavailable Host
+		// call, and waits out its tool timeout rather than taking the plugin with it.
+		//
+		// A linked plugin's connection is the opposite case and is closed like any other:
+		// Host.Connect hands out one pipe per call (see connectPlugin), so the connection
+		// is that one agent tool call, not a runtime, and closing it is the only signal a
+		// caller waiting on a child that will publish no terminal state ever gets.
+		if c.reg != nil {
 			continue
 		}
 		// The connection that asked for shutdown owes the process its terminal proof (ADR
@@ -169,6 +182,12 @@ func (s *Server) quarantine(ls *liveSession, cause error) {
 // remaining work is cancelled and every connection that held it at that instant is closed. The
 // cause itself is logged here and never sent: a client is told the fixed text and nothing about
 // the log underneath it.
+//
+// It runs after the fence is released and may run under Server.mu or a liveSession's mu,
+// because a fenced commit can fail durably from either. Everything it does is therefore
+// non-blocking and takes no server lock: a context cancel, and a conn close that cancels a
+// pump and closes a transport. Anything added here that could wait on Server.mu or on a
+// session would deadlock the caller that installed the cause.
 func (s *Server) enforceQuarantine(ls *liveSession, cause error, conns []*conn, cancels []context.CancelFunc) {
 	// turn.Cause, not the error itself: a durability error's own text is the fixed one the
 	// client gets, and a log line that says only that tells an operator nothing about the
@@ -189,12 +208,7 @@ func (s *Server) enforceQuarantine(ls *liveSession, cause error, conns []*conn, 
 // file that failed.
 func (s *Server) sessionQuarantined(sid ulid.ULID) *protocol.Error {
 	a := s.admissionIfAny(sid)
-	if a == nil {
-		return nil
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cause == nil {
+	if a == nil || !a.quarantined.Load() {
 		return nil
 	}
 	return perr(protocol.CodeUnavailable, turn.ErrTerminalDurability.Error())
