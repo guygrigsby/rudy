@@ -19,6 +19,10 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      # First, and before anything is built: the tag and the changelog have to name the same
+      # release. The tree this tag points at is the tree whose CHANGELOG.md the binary
+      # embeds, so a disagreement here ships a header advertising the wrong release.
+      - run: make release-check VERSION=${GITHUB_REF_NAME}
       # The gate the tag has to pass. A release that skips it is a release nobody ran the
       # contracts tests against.
       - run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
@@ -44,4 +48,14 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt --generate-notes
+        # The notes are the changelog's newest section, not GitHub's generated list of
+        # commit subjects: the release page says what the startup header says. They are
+        # written outside dist/ so the asset globs beside them cannot pick them up.
+        run: |
+          set -euo pipefail
+          make release-notes > "${RUNNER_TEMP}/notes.md"
+          # An empty section is a release page that says nothing; release-check has already
+          # proved the heading is there, so this catches a section with no bullets under it.
+          test -s "${RUNNER_TEMP}/notes.md"
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt \
+            --title "${GITHUB_REF_NAME}" --notes-file "${RUNNER_TEMP}/notes.md"

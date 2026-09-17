@@ -55,6 +55,28 @@ trailers. Prefix by area: `session:`, `turn:`, `tui:`, `plugin:`, `provider:`, `
 
 Say why the change exists, not what the diff already shows.
 
+## Releasing
+
+The tag is the release. `release.yml` builds darwin and linux on arm64 and amd64 from the
+tree the tag points at, writes `checksums.txt` beside them and publishes, and the notes it
+publishes are the newest section of `CHANGELOG.md`.
+
+That file is embedded in the binary, so the startup header shows the same bullets the
+release page does, which is why the changelog is written and committed before the tag and
+not after:
+
+    # 1. add the release to CHANGELOG.md, newest first, as "## 0.2.0" with "- " bullets
+    make release-check VERSION=v0.2.0   # refuses a tag the changelog does not name
+    git commit -am "docs: 0.2.0 changelog"
+    git push
+    # 2. tag the commit that carries it
+    git tag -s v0.2.0 -m "rudy v0.2.0"
+    git push origin v0.2.0
+
+`make release-notes` prints what the release page will carry. The workflow runs
+`release-check` before it builds anything, so a tag that disagrees with the changelog fails
+in seconds rather than after four cross-compiles.
+
 ## The CLA
 
 A first pull request gets a bot asking you to sign

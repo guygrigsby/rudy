@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/guygrigsby/rudy/internal/cli.version=$(VERSION)
 
-.PHONY: build test lint check fmt-check vendor-types vuln install redeploy config-example config-sync
+.PHONY: build test lint check fmt-check vendor-types vuln install redeploy config-example config-sync release-notes release-check
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/rudy ./cmd/rudy
@@ -36,6 +36,27 @@ check: fmt-check vendor-types
 	go vet ./...
 	$(MAKE) lint
 	$(MAKE) test
+
+# release-notes prints the newest release's section of CHANGELOG.md: everything under the
+# first "## " heading down to the next one, with the leading blank lines dropped. The GitHub
+# release carries this, so what a person reads there is what the binary's own startup header
+# shows them (ADR 0016), rather than a list of commit subjects.
+release-notes:
+	@awk '/^## /{ if (seen) exit; seen=1; next } seen { print }' CHANGELOG.md | awk 'NF || seen { seen=1; print }'
+
+# release-check refuses a tag the changelog does not know about. The tag builds a tree, and
+# that tree's CHANGELOG.md is embedded in the binary, so a v0.2.0 tag over a changelog whose
+# newest release is 0.1.0 ships a header advertising the release before it. VERSION is the
+# tag, passed in by the release workflow and defaulted from git describe here.
+release-check:
+	@case "$(VERSION)" in v[0-9]*) ;; *) echo "release-check wants the tag: make release-check VERSION=v0.2.0 (got \"$(VERSION)\")"; exit 1;; esac; \
+	top=$$(awk '/^## /{ sub(/^## /, ""); print; exit }' CHANGELOG.md); \
+	want=$$(printf '%s' "$(VERSION)" | sed 's/^v//'); \
+	if [ -z "$$top" ]; then echo "CHANGELOG.md has no ## release heading"; exit 1; fi; \
+	if [ "$$top" != "$$want" ]; then \
+		echo "CHANGELOG.md's newest release is $$top and the tag is $(VERSION); add the release to the changelog and commit it before tagging"; \
+		exit 1; \
+	fi
 
 install:
 	CGO_ENABLED=0 go install -ldflags "$(LDFLAGS)" ./cmd/rudy
