@@ -218,6 +218,34 @@ survives logout:
 systemd sets `XDG_RUNTIME_DIR` to `/run/user/<uid>` for the unit and for your
 login session alike, so those agree on the socket too.
 
+## Trust model
+
+The boundary is your user account. `rudy serve` listens in a `0700` directory
+on a `0600` socket, and every connection's peer uid is checked with
+`SO_PEERCRED`, `LOCAL_PEERCRED` on macOS, before a byte is read. Inside that
+boundary everything is trusted, deliberately:
+
+- Any process running as you can drive any live session by id: submit a turn,
+  interrupt it, compact, close, change the model, and run `session.shell`,
+  which runs a command without asking the Gate because the operator typed it
+  (ADR 0023). Being attached is not a permission (`rudy-jkz`). Rudy is not
+  what stands between a machine that is already compromised and the rest of
+  it.
+- Permission modes, the dangerous set and the asker govern what the model may
+  do, not what a local caller may do. Tools run as you, on your filesystem,
+  with your network and your credentials. This is not a sandbox; `rudy-uvo` is
+  where that gets answered.
+- Installing a plugin runs its code. `rudy plugins install` builds from a
+  source you named (ADR 0025), a linked plugin runs in this process, and a
+  spawned one is a subprocess holding everything you hold.
+- A session log holds what the model saw: prompts, tool inputs, tool outputs
+  and whatever a file read put in front of it, `0600` under a `0700`
+  directory, unencrypted. Provider keys stay in config or the environment and
+  are never written to it.
+- `--host` runs the kernel on another machine over ssh (ADR 0029). That trust
+  is ssh's. Rudy adds no authentication of its own, and the daemon there
+  applies this same model as the remote user.
+
 ## Inspect
 
     rudy models list     # the discovered registry with prices
