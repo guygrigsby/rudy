@@ -65,7 +65,7 @@ func (g *Gate) Evaluate(in Input) Verdict {
 	} else {
 		for _, a := range in.Allowances {
 			if a == m {
-				return Verdict{Decision: session.Allow, DecidedBy: session.ByAllowance, Matcher: m, Reason: fmt.Sprintf("allowance %s %s", m.Tool, m.Prefix)}
+				return Verdict{Decision: session.Allow, DecidedBy: session.ByAllowance, Matcher: m, Reason: allowanceReason(m)}
 			}
 		}
 		switch in.Mode {
@@ -82,3 +82,17 @@ func (g *Gate) Evaluate(in Input) Verdict {
 	}
 	return Verdict{Ask: true, Matcher: m, Dangerous: isDangerous, Reason: askReason}
 }
+
+// allowanceReason names the allowance that decided, within the scalar bound a reason carries.
+// A matcher is already bounded on each half, so the pair can still run past it; a reason that
+// long is read by nobody and is persisted and broadcast to everybody.
+func allowanceReason(m session.Matcher) string {
+	r := fmt.Sprintf("allowance %s %s", m.Tool, m.Prefix)
+	if len(r) > reasonLimit {
+		return "allowance"
+	}
+	return r
+}
+
+// reasonLimit is the contract's scalar bound on a decision reason.
+const reasonLimit = 4096

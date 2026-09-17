@@ -859,3 +859,24 @@ func TestAnAttachMidGateOrMidQueueSeesTheCallsState(t *testing.T) {
 		})
 	}
 }
+
+// TestShutdownIsNotHeldByAToolThatIgnoresItsContext keeps the pool from making shutdown
+// unbounded. A plugin tool that never returns holds its worker, and joining the pool must not
+// outlast the deadline the caller gave.
+func TestShutdownIsNotHeldByAToolThatIgnoresItsContext(t *testing.T) {
+	f := newFixture(t)
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	if err := f.srv.sched.Submit(context.Background(), turn.LaneRoot, func(context.Context) { <-stuck }); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- f.srv.Shutdown(ctx) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown waited on a tool that ignores its context")
+	}
+}

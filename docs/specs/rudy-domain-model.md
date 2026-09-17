@@ -983,10 +983,8 @@ Enumeration.
 | `hook` | A `before_tool` handler decided |
 | `asker` | A human or client answered |
 | `no_asker` | Strict mode with nobody to ask; always a deny |
-| `interrupt` | A steer or cancel terminalized a call that had no decision yet; always a deny |
-| `invariant` | The Server refused the call itself, such as a permission notification that could not be published inside its bound; always a deny |
 | `interrupt` | Steer or cancel closed an admitted call before another decision; always a deny |
-| `invariant` | Turn failure closed an admitted call before another decision; always a deny |
+| `invariant` | The Server closed the call itself: a Turn failure, a permission notification that could not be published inside its bound, or recovery of a call the process died under; always a deny |
 
 ## Scope
 

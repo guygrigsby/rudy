@@ -27,12 +27,10 @@ func (c *callStates) start(calls []session.Block) {
 	}
 }
 
-// set records one call's state and returns the Turn state the whole set now reads as, and
-// whether the Turn has one at all: a set with every call done leaves the Turn's state to the
-// loop, which is about to ask the provider again or rest.
-func (c *callStates) set(id string, s ToolState) (State, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// setLocked records one call's state and returns the Turn state the whole set now reads as,
+// and whether the Turn has one at all: a set with every call done leaves the Turn's state to
+// the loop, which is about to ask the provider again or rest. Caller holds mu.
+func (c *callStates) setLocked(id string, s ToolState) (State, bool) {
 	if c.at == nil {
 		c.at = map[string]ToolState{}
 	}
@@ -56,9 +54,21 @@ func (c *callStates) deriveLocked() (State, bool) {
 	return coarse, any
 }
 
-// toolState publishes one call's state and moves the Turn to whatever the set now reads as.
+// toolState publishes one call's state and moves the Turn to whatever the set now reads as,
+// all under the set's own lock. Under one lock because the derivation and the publication
+// have to stay in the same order: two calls changing at once could otherwise derive
+// awaiting_permission and running_tool in that order and publish them in the other, leaving
+// the Turn reporting that it is running tools while a call waits on a human. setStateLocked
+// short-circuits on equality, so nothing would correct it afterwards.
+//
+// The lock order this adds is callStates.mu > the Observer's own locks > Runner.mu. Nothing
+// holding either of those reaches for this one: the Observer never calls back into the
+// Runner (see the liveSession doc on the server side), and every other setState caller holds
+// no call state.
 func (r *Runner) toolState(turnID string, tu session.Block, s ToolState) {
-	coarse, ok := r.states.set(tu.ID, s)
+	r.states.mu.Lock()
+	defer r.states.mu.Unlock()
+	coarse, ok := r.states.setLocked(tu.ID, s)
 	r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, s)
 	if ok {
 		r.setState(coarse)

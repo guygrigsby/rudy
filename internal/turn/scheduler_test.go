@@ -124,9 +124,15 @@ func TestSubmitAnswersItsCallersCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	refused := make(chan error, 1)
+	var parked atomic.Bool
 	go func() {
+		parked.Store(true)
 		refused <- s.Submit(ctx, LaneRoot, func(context.Context) { t.Error("a cancelled submission ran") })
 	}()
+	// Cancelled only once the submitter is demonstrably waiting for queue space, so this
+	// proves the wait answers cancellation and not just the guard at the top of Submit.
+	waitFor(t, "the submitter to park", func() bool { return parked.Load() && s.queued(LaneRoot) == rootQueue })
+	time.Sleep(20 * time.Millisecond)
 	cancel()
 	select {
 	case err := <-refused:
@@ -248,5 +254,83 @@ func TestNoResultResumesTheProviderWhileACallIsStillPending(t *testing.T) {
 	}
 	if got := rec.count(session.KindToolResult); got != 2 {
 		t.Errorf("tool results = %d, want 2", got)
+	}
+}
+
+// TestCloseRunsBackEveryQueuedJob is the wedge a dropped queue would cause: the Turn that
+// submitted a call waits for it to come back, and a job the pool swallowed on Close would
+// leave that Turn parked forever with an allow already in its log and no result to follow it.
+func TestCloseRunsBackEveryQueuedJob(t *testing.T) {
+	s := NewScheduler()
+	release := make(chan struct{})
+	var handed atomic.Int64
+	for range generalWorkers {
+		if err := s.Submit(context.Background(), LaneRoot, func(context.Context) {
+			handed.Add(1)
+			<-release
+		}); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+	}
+	waitFor(t, "the workers to fill", func() bool { return handed.Load() == int64(generalWorkers) })
+
+	queued := rootQueue
+	for range queued {
+		if err := s.Submit(context.Background(), LaneRoot, func(context.Context) { handed.Add(1) }); err != nil {
+			t.Fatalf("Submit: %v", err)
+		}
+	}
+	for range childQueue {
+		if err := s.Submit(context.Background(), LaneChild, func(context.Context) { handed.Add(1) }); err != nil {
+			t.Fatalf("Submit child: %v", err)
+		}
+	}
+	close(release)
+	s.Close()
+	if got, want := handed.Load(), int64(generalWorkers+queued+childQueue); got != want {
+		t.Errorf("%d of %d jobs came back, so %d Turns are waiting on a call the pool swallowed", got, want, want-got)
+	}
+	if s.running() != 0 {
+		t.Errorf("%d jobs still counted in flight after Close", s.running())
+	}
+}
+
+// TestACallRunsThroughThePool exercises the seam the rest of the turn tests skip: with a live
+// Scheduler wired, a call reaches a worker, runs there and comes back with its result.
+func TestACallRunsThroughThePool(t *testing.T) {
+	s := openTestSession(t, session.ModeOff)
+	rec := &recorder{}
+	sched := NewScheduler()
+	t.Cleanup(sched.Close)
+	p := &scripted{scripts: callThenDone("tu1", "echo", `{"x":1}`)}
+	r := newRunner(t, s, p, toolSet{"echo": echoTool(tool.Safe, "echo")}, nil, rec)
+	r.cfg.Scheduler = sched
+
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var result session.ToolResult
+	for _, e := range s.Entries() {
+		if tr, ok := e.Payload.(session.ToolResult); ok {
+			result = tr
+		}
+	}
+	if result.Outcome != session.OutcomeOK {
+		t.Fatalf("the call did not run on the pool: %+v", result)
+	}
+	var seq []ToolState
+	rec.mu.Lock()
+	for _, ts := range rec.toolStates {
+		seq = append(seq, ts.state)
+	}
+	rec.mu.Unlock()
+	want := []ToolState{ToolGating, ToolQueued, ToolRunning, ToolDone}
+	if len(seq) != len(want) {
+		t.Fatalf("tool states %v, want %v", seq, want)
+	}
+	for i := range want {
+		if seq[i] != want[i] {
+			t.Fatalf("tool states %v, want %v", seq, want)
+		}
 	}
 }

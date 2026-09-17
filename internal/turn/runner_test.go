@@ -1133,7 +1133,7 @@ func TestSteerWhileAwaitingPermission(t *testing.T) {
 		t.Fatalf("entries %v want %v", got, want)
 	}
 	pd := rec.entries[2].Payload.(session.PermissionDecision)
-	if pd.ToolUseID != "tu1" || pd.Decision != session.Deny || pd.DecidedBy != session.ByAsker || pd.Scope != session.ScopeOnce || pd.Reason != "interrupted" {
+	if pd.ToolUseID != "tu1" || pd.Decision != session.Deny || pd.DecidedBy != session.ByInterrupt || pd.Scope != session.ScopeOnce || pd.Reason != interruptDenyReason {
 		t.Fatalf("decision %+v", pd)
 	}
 	tr := rec.entries[3].Payload.(session.ToolResult)
@@ -1183,7 +1183,7 @@ func TestCancelWhileAwaitingPermission(t *testing.T) {
 		t.Fatalf("entries %v want %v", got, want)
 	}
 	pd := rec.entries[2].Payload.(session.PermissionDecision)
-	if pd.Decision != session.Deny || pd.DecidedBy != session.ByAsker || pd.Reason != "interrupted" {
+	if pd.Decision != session.Deny || pd.DecidedBy != session.ByInterrupt || pd.Reason != interruptDenyReason {
 		t.Fatalf("decision %+v", pd)
 	}
 	if ti := rec.entries[4].Payload.(session.TurnInterrupted); ti.How != session.InterruptCancel || ti.TurnID != rec.entries[0].ID {

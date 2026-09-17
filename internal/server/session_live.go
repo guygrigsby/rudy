@@ -1005,14 +1005,8 @@ func (a *liveAsker) ask(ctx context.Context, q turn.Question) (turn.Answer, erro
 	req := protocol.PermissionRequested{
 		SessionID: a.sid, TurnID: a.runner.TurnID(), ToolUseID: q.ToolUseID, Tool: q.Tool, Input: q.Input, Matcher: q.Matcher,
 	}
-	// Preflighted before the question stands, not as it is sent: a question too large to
-	// carry must reach no asker at all, rather than some of them and not the rest, and must
-	// leave nothing standing that an answer could later match (the permission.requested
-	// contract row). Admission bounds every input well under this, so reaching it means an
-	// invariant broke; the runner denies that call and fails the Turn.
-	if n, err := notificationSize(protocol.NotifyPermissionRequested, req); err != nil || n > permissionNotificationLimit {
-		slog.Error("server: permission question over its bound", "session", a.sid, "tool", q.Tool, "bytes", n, "err", err)
-		return turn.Answer{}, turn.ErrPermissionOversized
+	if err := a.Preflight(q); err != nil {
+		return turn.Answer{}, err
 	}
 	ch := make(chan turn.Answer, 1)
 	abandon := make(chan struct{})
@@ -1045,6 +1039,24 @@ func (a *liveAsker) ask(ctx context.Context, q turn.Question) (turn.Answer, erro
 		a.ls.forget(q.ToolUseID)
 		return turn.Answer{}, ctx.Err()
 	}
+}
+
+// Preflight reports whether this question's complete notification fits its bound, before the
+// call it belongs to leaves gating (turn.QuestionPreflight). Measured here rather than as the
+// notification is sent: a question too large to carry must reach no asker at all rather than
+// some of them and not the rest, and must leave nothing standing that an answer could later
+// match. Admission bounds every input well under this, so a refusal means an invariant broke;
+// the runner denies that call and fails the Turn.
+func (a *liveAsker) Preflight(q turn.Question) error {
+	req := protocol.PermissionRequested{
+		SessionID: a.sid, TurnID: a.runner.TurnID(), ToolUseID: q.ToolUseID, Tool: q.Tool, Input: q.Input, Matcher: q.Matcher,
+	}
+	n, err := notificationSize(protocol.NotifyPermissionRequested, req)
+	if err != nil || n > permissionNotificationLimit {
+		slog.Error("server: permission question over its bound", "session", a.sid, "tool", q.Tool, "bytes", n, "err", err)
+		return turn.ErrPermissionOversized
+	}
+	return nil
 }
 
 // permissionNotificationLimit is the contract's bound on a complete permission.requested

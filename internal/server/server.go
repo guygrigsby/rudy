@@ -395,9 +395,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	// After the turns have been cancelled and waited for, and before the sessions close:
-	// a worker still holding a tool call would be writing into a session about to be shut.
-	s.sched.Close()
+	// After the turns have been cancelled and waited for, and before the sessions close: a
+	// worker still holding a tool call would be writing into a session about to be shut.
+	//
+	// Bounded by the caller's context like the wait above, and for the same reason. A tool
+	// that ignores its own cancellation holds its worker, and joining the pool is not worth
+	// hanging the shutdown a caller asked to be over by a deadline. Leaving one behind is
+	// the pre-pool behaviour, and the log it might still write to is recovered on the next
+	// load.
+	pool := make(chan struct{})
+	go func() {
+		s.sched.Close()
+		close(pool)
+	}()
+	select {
+	case <-pool:
+	case <-ctx.Done():
+		slog.Error("server: shutdown budget ran out before the tool pool drained")
+	}
 
 	var errs []error
 	for _, ls := range lives {

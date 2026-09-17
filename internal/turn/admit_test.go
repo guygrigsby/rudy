@@ -23,16 +23,20 @@ func callParts(blocks ...[]provider.Part) []provider.Part {
 	return append(out, stop(session.StopToolUse, "tool_use"))
 }
 
-// manyCalls is n well formed calls on one tool, ids call-0 upward.
-func manyCalls(n int, name string) []provider.Part {
+// manyCalls is n well formed calls on one tool, ids call-000 upward.
+func manyCalls(n int, name string) []provider.Part { return manyCallsFrom("call", n, name) }
+
+// manyCallsFrom is the same with a prefix, so two responses of one Turn can carry distinct
+// ids and reach the cumulative call bound rather than the id-reuse rule.
+func manyCallsFrom(prefix string, n int, name string) []provider.Part {
 	var parts []provider.Part
 	for i := range n {
-		parts = append(parts, toolCall(idFor(i), name, `{"x":1}`)...)
+		parts = append(parts, toolCall(prefix+"-"+idFor(i), name, `{"x":1}`)...)
 	}
 	return append(parts, stop(session.StopToolUse, "tool_use"))
 }
 
-func idFor(i int) string { return "call-" + strings.Repeat("0", 3-len(itoa(i))) + itoa(i) }
+func idFor(i int) string { return strings.Repeat("0", 3-len(itoa(i))) + itoa(i) }
 
 func itoa(i int) string {
 	if i == 0 {
@@ -59,6 +63,9 @@ type admitCase struct {
 	// the turn_failed: a first response that was admitted leaves its own.
 	wantAssistant int
 	wantRan       bool
+	// wantRule is a fragment of the refusal, for a case where another rule would otherwise
+	// fire first and the test would prove the wrong one.
+	wantRule string
 }
 
 // TestAProviderResponseOverItsLimitsRunsNothing covers every bound ADR 0034 and the
@@ -72,10 +79,10 @@ func TestAProviderResponseOverItsLimitsRunsNothing(t *testing.T) {
 		{
 			name: "65 calls across two responses in one turn",
 			scripts: [][]provider.Part{
-				manyCalls(40, "echo"),
-				manyCalls(25, "echo"),
+				manyCallsFrom("first", 40, "echo"),
+				manyCallsFrom("second", 25, "echo"),
 			},
-			wantAssistant: 1, wantRan: true,
+			wantAssistant: 1, wantRan: true, wantRule: "more than 64 tool calls",
 		},
 		{name: "invalid utf8 tool use id", scripts: [][]provider.Part{callParts(toolCall("call-\xff", "echo", `{"x":1}`))}},
 		{name: "invalid utf8 tool name", scripts: [][]provider.Part{callParts(toolCall("call-1", "echo\xff", `{"x":1}`))}},
@@ -120,6 +127,9 @@ func TestAProviderResponseOverItsLimitsRunsNothing(t *testing.T) {
 			}
 			if strings.Contains(failureText(rec), "xxxx") {
 				t.Error("the refusal repeated the provider's bytes")
+			}
+			if tc.wantRule != "" && !strings.Contains(failureText(rec), tc.wantRule) {
+				t.Errorf("refused by %q, want the rule %q", failureText(rec), tc.wantRule)
 			}
 		})
 	}
@@ -394,9 +404,7 @@ func TestAQuestionThatCannotBePublishedDeniesAndFailsTheTurn(t *testing.T) {
 	s := openTestSession(t, session.ModeStrict)
 	rec := &recorder{}
 	prov := &scripted{scripts: callThenDone("tu1", "danger", `{"x":1}`)}
-	asker := askerFunc(func(context.Context, Question) (Answer, error) {
-		return Answer{}, ErrPermissionOversized
-	})
+	asker := preflightAsker{err: ErrPermissionOversized}
 	r := newRunner(t, s, prov, toolSet{"danger": echoTool(tool.Unsafe, "danger")}, asker, rec)
 	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); err == nil {
 		t.Fatal("the turn survived a question it could not ask")
@@ -417,4 +425,19 @@ func TestAQuestionThatCannotBePublishedDeniesAndFailsTheTurn(t *testing.T) {
 	if ran {
 		t.Error("a call ran without the consent nobody was asked for")
 	}
+	for _, ts := range rec.toolStates {
+		if ts.state == ToolAwaitingPermission {
+			t.Error("the call was reported waiting on a question that was never published")
+		}
+	}
+}
+
+// preflightAsker refuses every question before it stands, the way the Server's own asker does
+// when the complete notification will not fit.
+type preflightAsker struct{ err error }
+
+func (p preflightAsker) Preflight(Question) error { return p.err }
+
+func (p preflightAsker) Ask(context.Context, Question) (Answer, error) {
+	panic("a refused question must never be asked")
 }

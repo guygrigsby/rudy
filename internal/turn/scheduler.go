@@ -143,6 +143,12 @@ func (s *Scheduler) Submit(ctx context.Context, lane Lane, run func(context.Cont
 	s.inFlight.Add(1)
 	select {
 	case queue <- job{ctx: ctx, run: run}:
+		// A Close that ran between the check above and this send has already drained, so
+		// this job would sit in a queue nobody reads. Drain again rather than leave the
+		// caller waiting on a call that will never come back.
+		if s.closed.Load() {
+			s.drain()
+		}
 		return nil
 	case <-ctx.Done():
 		s.inFlight.Add(-1)
@@ -153,15 +159,34 @@ func (s *Scheduler) Submit(ctx context.Context, lane Lane, run func(context.Cont
 	}
 }
 
-// Close shuts the pool down: admission stops, every queued and running job is cancelled and
-// every worker is joined before it returns. Idempotent, because Server shutdown may reach it
-// from more than one path.
+// Close shuts the pool down: admission stops, every queued and running job is cancelled, every
+// worker is joined, and every job still in a queue is handed back to the Turn that submitted
+// it with a context already done. Handed back rather than dropped: that Turn is waiting for
+// its call to return and holds an allow for it in the log, so a swallowed job parks the Turn
+// for the life of the process. Idempotent, because Server shutdown may reach it twice.
 func (s *Scheduler) Close() {
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		s.cancel()
 		s.wg.Wait()
+		s.drain()
 	})
+}
+
+// drain hands back every job still queued, each with a dead context. Safe to run while
+// workers are alive (a channel receive is exclusive) and after they are gone, which is why
+// both Close and a submission that raced it call it.
+func (s *Scheduler) drain() {
+	for {
+		select {
+		case j := <-s.root:
+			s.run(j)
+		case j := <-s.child:
+			s.run(j)
+		default:
+			return
+		}
+	}
 }
 
 // queued is how many jobs are waiting in one lane, for the tests that prove the bound.

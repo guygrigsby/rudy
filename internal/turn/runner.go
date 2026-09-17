@@ -84,6 +84,13 @@ type Asker interface {
 // when nothing was attached at all, down to the reason, rather than an asker error.
 var ErrNoAsker = errors.New("turn: no asker attached")
 
+// QuestionPreflight is an Asker that can say whether a complete question can be published at
+// all, before the call it belongs to leaves gating. An Asker that cannot fail that way does
+// not implement it, and a question is simply asked.
+type QuestionPreflight interface {
+	Preflight(Question) error
+}
+
 // ErrPermissionOversized is what an Asker returns when the complete permission question could
 // not be published inside its bound, so no asker was shown it and no answer can arrive. The
 // runner denies that call by invariant and fails the Turn: the contract's preflight makes this
@@ -592,6 +599,9 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 		// The Turn was cut before this call was decided. It still owes the log a decision
 		// and a result, because the assistant message already asked for it, but the tool
 		// must not run: that would be a success landing after the cut.
+		// Announced before it is closed out, so a client is never told a call is done that
+		// it was never told about at all.
+		r.toolState(turnID, tu, ToolGating)
 		defer r.toolState(turnID, tu, ToolDone)
 		if err := r.refuse(ctx, interruptedDeny(r.classDeny(tu, "interrupted")), session.OutcomeKilled, interruptedText); err != nil {
 			return toolOutcome{class: session.ErrInternal, err: err}
@@ -658,12 +668,26 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 		dec.Input = input
 	}
 	if ask {
-		r.toolState(turnID, tu, ToolAwaitingPermission)
-		askCtx, cancel := context.WithCancel(ctx)
-		r.calls.add(tu.ID, cancel)
-		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: input, Matcher: dec.Matcher, Dangerous: dangerous})
-		r.calls.remove(tu.ID)
-		cancel()
+		q := Question{ToolUseID: tu.ID, Tool: tu.Name, Input: input, Matcher: dec.Matcher, Dangerous: dangerous}
+		var (
+			ans    Answer
+			askErr error
+		)
+		// Before the call leaves gating, because that is what the transition means: the
+		// question is standing and an answer can arrive. A question that cannot be
+		// published never stands, so the call must not be reported as waiting on one
+		// (the permission.requested contract row).
+		if pf, ok := r.cfg.Asker.(QuestionPreflight); ok {
+			askErr = pf.Preflight(q)
+		}
+		if askErr == nil {
+			r.toolState(turnID, tu, ToolAwaitingPermission)
+			askCtx, cancel := context.WithCancel(ctx)
+			r.calls.add(tu.ID, cancel)
+			ans, askErr = r.cfg.Asker.Ask(askCtx, q)
+			r.calls.remove(tu.ID)
+			cancel()
+		}
 		if how := r.observeInterrupt(); how != "" {
 			if err := r.refuse(ctx, interruptedDeny(dec), session.OutcomeKilled, interruptedText); err != nil {
 				return toolOutcome{class: session.ErrInternal, err: err}
@@ -998,7 +1022,9 @@ func (r *Runner) classDeny(tu session.Block, reason string) session.PermissionDe
 // own matcher and mode from the verdict, is attributed to the asker because interrupting is
 // the asker's own act, and is scoped once so it never becomes a session allowance.
 func interruptedDeny(dec session.PermissionDecision) session.PermissionDecision {
-	dec.Decision, dec.DecidedBy, dec.Scope, dec.Reason = session.Deny, session.ByAsker, session.ScopeOnce, "interrupted"
+	// By interrupt, not by asker: nobody answered this, the turn ended under it. One
+	// spelling for the condition, the same one terminalize writes (ADR 0034).
+	dec.Decision, dec.DecidedBy, dec.Scope, dec.Reason = session.Deny, session.ByInterrupt, session.ScopeOnce, interruptDenyReason
 	return dec
 }
 
@@ -1078,7 +1104,10 @@ func (r *Runner) failCall(ctx context.Context, class session.ErrorClass, err err
 	// the causal one with its own error and its peers killed (ADR 0034). A durability
 	// failure is the exception above: its log is exactly what cannot be written to.
 	if terr := r.terminalize(ctx, session.ByInvariant, invariantDenyReason, killedByTurnFailure, causal, errText(err)); terr != nil {
-		return terr
+		// Logged, not returned: the turn is failing either way, and swallowing turn_failed
+		// because the sweep could not write would end the turn with no terminal Entry at
+		// all, which is worse than a call left open in the log.
+		slog.Error("turn: terminalize before failure", "session", r.cfg.Session.ID(), "err", terr)
 	}
 	retries := 0
 	msg := err.Error()
