@@ -1,0 +1,20 @@
+name: Feature
+description: Something rudy should do and does not
+labels: ["feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were trying to do when you wanted this. Not the solution yet.
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: What it would look like
+      description: The command, key, config key or protocol method as you would use it.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today instead

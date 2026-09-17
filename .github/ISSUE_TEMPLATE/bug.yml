@@ -1,0 +1,39 @@
+name: Bug
+description: Something rudy does that it should not
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected and what you got. Paste the output.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest sequence that shows it. A failing test is welcome and not expected.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`rudy --version`, or the commit you built."
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and terminal
+      description: macOS or Linux, and which terminal if it is a display problem.
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: The part of config.toml this touches, with secrets removed.
+      render: toml
+  - type: markdown
+    attributes:
+      value: "A vulnerability goes to [security reporting](https://github.com/guygrigsby/rudy/security/advisories/new) instead, not here."
