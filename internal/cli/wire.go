@@ -225,6 +225,12 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		refreshTimeout = defaultRefreshTimeout
 	}
 	hadSnapshot := len(registry.Models()) > 0
+	// No provider and no snapshot is a fresh install, not an endpoint that went away:
+	// nothing is dialed below, so a timeout would be a lie. Name the file a provider goes
+	// in and the command that writes it, which is all a first run needs to hear.
+	if len(providers) == 0 && !hadSnapshot {
+		return nil, fmt.Errorf("no model provider is configured: %s has no [providers.*] table and no provider plugin is loaded. `rudy config sync` writes that file with every key and what it is for", paths.ConfigFile())
+	}
 	if !hadSnapshot {
 		names := make([]string, len(providers))
 		for i, p := range providers {

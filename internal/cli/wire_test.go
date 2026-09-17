@@ -620,3 +620,37 @@ func TestDiscoverPluginsSpawnsNothingWhenTheLockIsCorrupt(t *testing.T) {
 		t.Fatalf("errors = %v", errs)
 	}
 }
+
+// TestBuildWithNoProvidersNamesTheConfigFile pins what a fresh install is told. Nothing was
+// dialed, so a timeout is the wrong story: the error names the file that holds a provider
+// and the command that writes it, and no refresh line is printed for an empty provider set.
+func TestBuildWithNoProvidersNamesTheConfigFile(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t))
+	var stderr bytes.Buffer
+	_, err := Build(context.Background(), BuildOptions{
+		Version: "test",
+		Plugins: BuiltinTools(),
+		Home:    base,
+		Stderr:  &stderr,
+	})
+	if err == nil {
+		t.Fatal("expected an error with no provider configured")
+	}
+	want := filepath.Join(base, "config", "rudy", "config.toml")
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not name %s", err.Error(), want)
+	}
+	if !strings.Contains(err.Error(), "rudy config sync") {
+		t.Errorf("error %q does not name the command that writes it", err.Error())
+	}
+	if strings.Contains(err.Error(), "could not be reached") {
+		t.Errorf("error %q blames a timeout for a provider that was never dialed", err.Error())
+	}
+	if strings.Contains(stderr.String(), "refreshing model registry") {
+		t.Errorf("stderr %q announced a refresh with no provider to refresh from", stderr.String())
+	}
+}

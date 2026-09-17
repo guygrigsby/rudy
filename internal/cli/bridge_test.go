@@ -513,10 +513,9 @@ func TestBridgeReportsADaemonThatCannotServe(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	start := time.Now()
-	// The daemon finds out it has no provider in milliseconds, not in the 20s its message
-	// names: Refresh with no provider to ask returns at once and only the text mentions the
-	// timeout. So this bounds the one thing that could go wrong, the bridge waiting out
-	// bridgeStartBudget on a child it has already buried.
+	// The daemon finds out it has no provider in milliseconds: nothing is dialed when no
+	// provider is configured. So this bounds the one thing that could go wrong, the bridge
+	// waiting out bridgeStartBudget on a child it has already buried.
 	select {
 	case err = <-done:
 	case <-time.After(bridgeStartBudget - 5*time.Second):
@@ -530,7 +529,7 @@ func TestBridgeReportsADaemonThatCannotServe(t *testing.T) {
 	if !strings.Contains(out.String(), "rudy serve exited") {
 		t.Fatalf("bridge said %q, want it to say the daemon exited", out.String())
 	}
-	if !strings.Contains(out.String(), "no provider registered") {
+	if !strings.Contains(out.String(), "no model provider is configured") {
 		t.Fatalf("bridge said %q, want the provider error from the daemon's log", out.String())
 	}
 }
