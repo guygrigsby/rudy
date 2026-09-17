@@ -4,7 +4,13 @@ on:
   pull_request:
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Both, because the socket transport has a darwin half and a linux half
+    # (unixsock_darwin.go, unixsock_linux.go) and only one of them ever runs on a laptop.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     env:
       CGO_ENABLED: "0"
     steps:

@@ -1,0 +1,47 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+# The tag is the release. Building here rather than on a laptop is what makes the binary
+# reproducible from the tag alone, and what lets `rudy hosts install` stop building on the
+# box once it can download one instead (rudy-sag).
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      # The gate the tag has to pass. A release that skips it is a release nobody ran the
+      # contracts tests against.
+      - run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+      - run: make check
+      - name: build every target
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
+            os="${target%/*}"
+            arch="${target#*/}"
+            out="dist/rudy_${version}_${os}_${arch}"
+            mkdir -p "$out"
+            GOOS="$os" GOARCH="$arch" go build \
+              -ldflags "-X github.com/guygrigsby/rudy/internal/cli.version=${version}" \
+              -o "$out/rudy" ./cmd/rudy
+            cp LICENSE README.md "$out/"
+            tar -C dist -czf "${out}.tar.gz" "$(basename "$out")"
+            rm -rf "$out"
+          done
+          cd dist && shasum -a 256 *.tar.gz > checksums.txt
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt --generate-notes
