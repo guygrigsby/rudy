@@ -155,7 +155,7 @@ func TestModelPickerFiltersAndSetsTheModel(t *testing.T) {
 // and never reaches the turn behind it, which is what the idle row of the TurnControl
 // table says (docs/specs/rudy-domain-model.md).
 func TestPickerTakesEscBeforeTheTurn(t *testing.T) {
-	h := newAppHarness(t, scripted{slowText("thinking", 2*time.Second)})
+	h := newAppHarness(t, scripted{heldText("thinking")})
 	h.typeText("go")
 	h.press("enter")
 	h.waitTurn(stateStreaming)

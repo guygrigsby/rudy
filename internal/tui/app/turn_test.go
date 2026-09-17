@@ -50,7 +50,7 @@ func TestSubmitStreamsAndCommitsInline(t *testing.T) {
 }
 
 func TestEscOnceSteersTwiceCancels(t *testing.T) {
-	h := newAppHarnessWith(t, scripted{slowText("thinking...", 2*time.Second)}, inlineRender)
+	h := newAppHarnessWith(t, scripted{heldText("thinking...")}, inlineRender)
 	h.typeText("go")
 	h.press("enter")
 	h.waitTurn(stateStreaming)
@@ -83,7 +83,7 @@ func TestEscOnceSteersTwiceCancels(t *testing.T) {
 // through, because a steer and a cancel issued in the same instant race inside the
 // server's runner, which is its own problem and not this table's.
 func TestDoubleEscWithinWindowCancels(t *testing.T) {
-	h := newAppHarnessWith(t, scripted{slowText("x", 2*time.Second)}, func(c *config.Config) {
+	h := newAppHarnessWith(t, scripted{heldText("x")}, func(c *config.Config) {
 		c.Permissions.DoublePressMS = 300
 	})
 	h.typeText("go")
@@ -362,7 +362,7 @@ func TestSubmitWhileRunningQueues(t *testing.T) {
 }
 
 func TestDequeueRestoresTheEditor(t *testing.T) {
-	h := newAppHarness(t, scripted{slowText("one", 2*time.Second)})
+	h := newAppHarness(t, scripted{heldText("one")})
 	h.typeText("first")
 	h.press("enter")
 	h.waitTurn(stateStreaming)
@@ -382,7 +382,7 @@ func TestDequeueRestoresTheEditor(t *testing.T) {
 }
 
 func TestCancelPutsTheQueueBackInTheEditor(t *testing.T) {
-	h := newAppHarness(t, scripted{slowText("one", 2*time.Second)})
+	h := newAppHarness(t, scripted{heldText("one")})
 	h.typeText("first")
 	h.press("enter")
 	h.waitTurn(stateStreaming)

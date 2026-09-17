@@ -875,6 +875,21 @@ func slowText(s string, d time.Duration) step {
 	}
 }
 
+// heldText is a step that streams one delta and then holds the turn open until the turn is
+// interrupted, with no clock in it at all. A test that drives keys through a running turn
+// is the thing that ends it, so a duration is a guess about how long the test will take,
+// and a duration long enough on a laptop is one a loaded CI runner outruns: the turn
+// completes on its own, the key lands on an idle session and the wait times out (rudy-tqg).
+func heldText(s string) step {
+	return func(ctx context.Context, _ string, emit func(provider.Part) error) error {
+		if err := emit(provider.Part{Type: provider.PartTextDelta, Text: s}); err != nil {
+			return err
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+}
+
 // toolCall is a step that calls one tool with input verbatim.
 func toolCall(name, input string) step {
 	return func(_ context.Context, id string, emit func(provider.Part) error) error {
