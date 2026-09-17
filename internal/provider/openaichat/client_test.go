@@ -423,3 +423,46 @@ func TestCompleteEmitErrorIsReturnedVerbatim(t *testing.T) {
 		t.Fatalf("want sentinel, got %v", err)
 	}
 }
+
+// TestADifferentIDAtTheSameIndexIsANewCall: fragments were keyed by index alone, so a
+// provider that reused index 0 for a second call had its arguments appended to the first
+// one's. The Gate's consent is given for the bytes of one call, so two calls blended into
+// one is consent for an input nobody saw (rudy-k0.25).
+func TestADifferentIDAtTheSameIndexIsANewCall(t *testing.T) {
+	c, _ := serve(t, 200, "text/event-stream", fixture(t, "reused-index-stream.sse"))
+	parts := collect(t, c, simpleRequest())
+
+	args := map[string]string{}
+	names := map[string]string{}
+	var order []string
+	for _, p := range parts {
+		switch p.Type {
+		case provider.PartToolUseStart:
+			names[p.ID] = p.Name
+			order = append(order, p.ID)
+		case provider.PartToolUseDelta:
+			args[p.ID] += p.Text
+		}
+	}
+	if len(order) != 2 || order[0] != "call_a" || order[1] != "call_b" {
+		t.Fatalf("calls started = %v, want call_a then call_b", order)
+	}
+	if names["call_b"] != "bash" {
+		t.Errorf("call_b is named %q, want its own name", names["call_b"])
+	}
+	if got := args["call_a"]; got != `{"path":"/etc/hosts"}` {
+		t.Errorf("call_a arguments = %q, want only its own", got)
+	}
+	if got := args["call_b"]; got != `{"command":"id"}` {
+		t.Errorf("call_b arguments = %q, want only its own", got)
+	}
+	var ends []string
+	for _, p := range parts {
+		if p.Type == provider.PartToolUseEnd {
+			ends = append(ends, p.ID)
+		}
+	}
+	if len(ends) != 2 {
+		t.Errorf("tool_use_end parts = %v, want one per call", ends)
+	}
+}

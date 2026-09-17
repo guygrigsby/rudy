@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -98,8 +99,8 @@ func unwrapEmit(err error) error {
 // buffers the stop so it is emitted exactly once, last.
 type streamState struct {
 	emit  func(provider.Part) error
-	open  map[int]string // index to tool_use id
-	order []int          // indexes in arrival order
+	open  map[int]string // index to the tool_use id currently open at it
+	order []int          // indexes with an open call, in arrival order
 	stop  *provider.Part
 }
 
@@ -160,6 +161,16 @@ func (s *streamState) delta(d chunkDelta) error {
 	}
 	for _, tc := range d.ToolCalls {
 		id, known := s.open[tc.Index]
+		if known && tc.ID != "" && tc.ID != id {
+			// A different id at the same index is a different call, not more of this
+			// one. Appending its arguments to the open call would assemble an input
+			// out of two, and the Gate's consent is given for the bytes of one
+			// (rudy-k0.25). Close the one that was open and start the new one.
+			if err := s.closeCall(tc.Index); err != nil {
+				return err
+			}
+			known = false
+		}
 		if !known {
 			if tc.ID == "" || tc.Function.Name == "" {
 				continue // a fragment for a call that never started; nothing to attach it to
@@ -178,6 +189,18 @@ func (s *streamState) delta(d chunkDelta) error {
 		}
 	}
 	return nil
+}
+
+// closeCall ends the call open at one index and forgets it, so the index is free for the
+// next call the provider puts there and the end is emitted exactly once.
+func (s *streamState) closeCall(index int) error {
+	id, open := s.open[index]
+	if !open {
+		return nil
+	}
+	delete(s.open, index)
+	s.order = slices.DeleteFunc(s.order, func(i int) bool { return i == index })
+	return s.send(provider.Part{Type: provider.PartToolUseEnd, ID: id})
 }
 
 func (s *streamState) closeToolCalls() error {
