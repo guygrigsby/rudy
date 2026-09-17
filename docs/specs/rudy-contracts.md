@@ -1055,6 +1055,19 @@ or method-not-found code.
 
 A port reached by two classes has one authentication story per class, listed above. The authz column below names the class-level rule.
 
+Attachment is not a permission, deliberately. Apart from `session.submit` and
+`session.interrupt` on a session whose log records a parent, a plain client may
+name any live session by id and interrupt, compact, close, shell or change the
+model on it without ever having attached to it; only the plugin class is checked
+for ownership. The boundary is the socket, not the subscription: the directory is
+`0700`, the socket `0600`, and the peer uid is proved on accept, so every caller
+that reaches the port is already the user whose sessions these are, and
+`session.shell` runs a command ungated on exactly that reasoning (ADR 0023). A
+gate here would be a rail against a mistake rather than a boundary against an
+attacker, and `session.resume` would have to be reconciled with it first, since
+its authz is any session on this machine. Recorded rather than closed silently
+(`rudy-jkz`); the README's trust model says the same thing to an operator.
+
 ### Internal daemon capabilities
 
 `client.hello.capabilities` is a sorted, duplicate-free set from this closed table. A Server

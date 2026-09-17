@@ -65,16 +65,13 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
 `RUDY_TEST_TRANSPORT=socket`, so every server test runs over both transports:
 the in-memory pipe and the unix socket `rudy serve` listens on.
 
-## Building against memory-go
+## Building against memory-go and vimbubble
 
-`go.mod` replaces `github.com/aeryx-ai/memory/memory-go` with
-`../memory/memory-go`, so the memory repository has to sit beside this one:
-`~/projects/rudy` and `~/projects/memory`. CI checks the two out side by side
-under the workspace, rudy into `rudy/` and `aeryx-ai/memory` into `memory/`,
-and runs `make check` with `working-directory: rudy`. The workflow cannot pass
-until the memory repository is pushed to `aeryx-ai/memory`. vimbubble v2 is
-required from `github.com/guygrigsby/vimbubble/v2` by pseudo-version; a change
-to it is a push there and a `go get` here.
+Both are required by pseudo-version from their own public repositories,
+`github.com/aeryx-ai/memory/memory-go` and `github.com/guygrigsby/vimbubble/v2`.
+There is no `replace` and nothing sits beside this checkout: a change to either
+is a push there and a `go get` here. A release tags memory-go and pins the
+version; until then the pseudo-version names the commit.
 
 
 ## Beads Issue Tracker
