@@ -43,10 +43,13 @@ func question(t *testing.T, cl *protocol.Client) (protocol.PermissionRequested, 
 	return pr, ns
 }
 
-// answerWith sends one session.answer and returns whatever the server made of it.
-func answerWith(cl *protocol.Client, sid, toolUseID string, d session.Decision) error {
+// answerWith sends one session.answer for the question pr asked and returns whatever the
+// server made of it. The turn comes from the question itself, which is where a client gets
+// it: an answer names the turn its consent was given in (rudy-rn7).
+func answerWith(cl *protocol.Client, pr protocol.PermissionRequested, d session.Decision) error {
 	return cl.Call(context.Background(), protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
-		SessionID: sid, ToolUseID: toolUseID, Decision: d, Scope: session.ScopeOnce, Reason: "test",
+		SessionID: pr.SessionID, TurnID: pr.TurnID, ToolUseID: pr.ToolUseID,
+		Decision: d, Scope: session.ScopeOnce, Reason: "test",
 	}, &struct{}{})
 }
 
@@ -199,7 +202,7 @@ func TestEveryAskerHearsTheQuestion(t *testing.T) {
 		t.Fatalf("question = %+v", first)
 	}
 
-	if err := answerWith(cl, info.SessionID, first.ToolUseID, session.Allow); err != nil {
+	if err := answerWith(cl, first, session.Allow); err != nil {
 		t.Fatalf("answer: %v", err)
 	}
 	drain(t, cl, completedOn(info.SessionID))
@@ -220,7 +223,7 @@ func TestTheFirstAnswerDecides(t *testing.T) {
 	submit(t, cl, info.SessionID, "go")
 	pr, _ := question(t, cl)
 	_, ns := question(t, second)
-	if err := answerWith(cl, info.SessionID, pr.ToolUseID, session.Allow); err != nil {
+	if err := answerWith(cl, pr, session.Allow); err != nil {
 		t.Fatalf("first answer: %v", err)
 	}
 	select {
@@ -228,7 +231,7 @@ func TestTheFirstAnswerDecides(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the allowed tool never ran")
 	}
-	err := answerWith(second, info.SessionID, pr.ToolUseID, session.Deny)
+	err := answerWith(second, pr, session.Deny)
 	if err == nil {
 		t.Fatal("the second answer was accepted")
 	}
@@ -253,7 +256,7 @@ func TestTheFirstAnswerDecides(t *testing.T) {
 
 	// The answered set is the turn's, not the session's: once the turn has rested, the same
 	// tool_use id is a question nobody is asking rather than one already decided.
-	err = answerWith(second, info.SessionID, pr.ToolUseID, session.Deny)
+	err = answerWith(second, pr, session.Deny)
 	if got := code(t, err); got != protocol.CodeNotFound {
 		t.Fatalf("answer after the turn rested = %d, want %d (not_found)", got, protocol.CodeNotFound)
 	}
@@ -312,7 +315,7 @@ func TestAnAskerAttachingMidQuestionHearsIt(t *testing.T) {
 		t.Fatalf("headless attach order = %v, want %v", got, quiet)
 	}
 
-	if err := answerWith(cl, info.SessionID, pr.ToolUseID, session.Deny); err != nil {
+	if err := answerWith(cl, pr, session.Deny); err != nil {
 		t.Fatalf("answer: %v", err)
 	}
 	drain(t, cl, completedOn(info.SessionID))
@@ -500,9 +503,45 @@ func TestAClientAttachingMidTurnSeesCallsInFlight(t *testing.T) {
 		t.Fatalf("a finished call was replayed as tool.state on attach: %v", states)
 	}
 
-	if err := answerWith(cl, info.SessionID, pr.ToolUseID, session.Allow); err != nil {
+	if err := answerWith(cl, pr, session.Allow); err != nil {
 		t.Fatalf("answer: %v", err)
 	}
 	close(blk.release)
+	drain(t, cl, completedOn(info.SessionID))
+}
+
+// TestAnAnswerForAnotherTurnIsRefused: consent is given for one call of one turn, and a
+// tool_use id can come round again. An answer aimed at a question that has since been cut
+// must not decide a later one, so it names its turn and the server checks it (rudy-rn7).
+func TestAnAnswerForAnotherTurnIsRefused(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	cl := h.dial(t, true)
+	info := h.open(t, cl)
+	submit(t, cl, info.SessionID, "go")
+	pr, _ := question(t, cl)
+	if pr.TurnID == "" {
+		t.Fatal("the question named no turn, so an answer has nothing to match")
+	}
+
+	stale := cl.Call(context.Background(), protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
+		SessionID: pr.SessionID, TurnID: "01M000000000000000000STALE", ToolUseID: pr.ToolUseID,
+		Decision: session.Allow, Scope: session.ScopeOnce, Reason: "another turn",
+	}, &struct{}{})
+	if got := code(t, stale); got != protocol.CodeConflict {
+		t.Fatalf("answer naming another turn: code %d (%v)", got, stale)
+	}
+
+	missing := cl.Call(context.Background(), protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
+		SessionID: pr.SessionID, ToolUseID: pr.ToolUseID,
+		Decision: session.Allow, Scope: session.ScopeOnce, Reason: "no turn named",
+	}, &struct{}{})
+	if got := code(t, missing); got != protocol.CodeInvalidArgument {
+		t.Fatalf("answer naming no turn: code %d (%v)", got, missing)
+	}
+
+	// Neither refusal took the question down: the right answer still decides it.
+	if err := answerWith(cl, pr, session.Deny); err != nil {
+		t.Fatalf("the question was lost with the refusals: %v", err)
+	}
 	drain(t, cl, completedOn(info.SessionID))
 }

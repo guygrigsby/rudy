@@ -182,7 +182,7 @@ func TestTUIDialDeclaresAsker(t *testing.T) {
 					// before this returns, or the shutdown below waits out its budget
 					// with a tool still asking.
 					answer := protocol.SessionAnswerParams{
-						SessionID: r.info.SessionID, ToolUseID: asked.ToolUseID,
+						SessionID: r.info.SessionID, TurnID: asked.TurnID, ToolUseID: asked.ToolUseID,
 						Decision: session.Deny, Scope: session.ScopeOnce, Reason: "asker",
 					}
 					if err := r.dial.Client.Call(context.Background(), protocol.MethodSessionAnswer, answer, nil); err != nil {

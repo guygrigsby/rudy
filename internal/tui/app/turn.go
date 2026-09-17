@@ -388,6 +388,7 @@ func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {
 		// subscription gated (contracts), so this is the mechanism working as designed
 		// (rudy-ssz), not this session answering for another it does not own.
 		SessionID: p.SessionID,
+		TurnID:    p.TurnID,
 		ToolUseID: p.ToolUseID,
 		Decision:  decision,
 		Scope:     scope,

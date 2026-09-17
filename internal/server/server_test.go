@@ -510,7 +510,7 @@ func TestTurnWithAskerAllows(t *testing.T) {
 			}
 			go func() {
 				_ = cl.Call(ctx, protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
-					SessionID: info.SessionID, ToolUseID: pr.ToolUseID,
+					SessionID: info.SessionID, TurnID: pr.TurnID, ToolUseID: pr.ToolUseID,
 					Decision: session.Allow, Scope: session.ScopeOnce, Reason: "test allows",
 				}, &struct{}{})
 			}()
@@ -581,7 +581,7 @@ func TestToolStateReachesAClient(t *testing.T) {
 			_ = json.Unmarshal(n.Params, &pr)
 			go func() {
 				_ = cl.Call(ctx, protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
-					SessionID: info.SessionID, ToolUseID: pr.ToolUseID,
+					SessionID: info.SessionID, TurnID: pr.TurnID, ToolUseID: pr.ToolUseID,
 					Decision: session.Allow, Scope: session.ScopeOnce, Reason: "test allows",
 				}, &struct{}{})
 			}()
@@ -2997,7 +2997,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 			}
 			go func() {
 				_ = cl.Call(ctx, protocol.MethodSessionAnswer, protocol.SessionAnswerParams{
-					SessionID: pr.SessionID, ToolUseID: pr.ToolUseID,
+					SessionID: pr.SessionID, TurnID: pr.TurnID, ToolUseID: pr.ToolUseID,
 					Decision: session.Allow, Scope: session.ScopeOnce, Reason: "test allows",
 				}, &struct{}{})
 			}()
@@ -3978,7 +3978,7 @@ func TestAttachToAParentHearsAChildsStandingQuestion(t *testing.T) {
 	// And it can be answered from there, which is what decides whether the call runs or waits out
 	// tool_timeout_ms.
 	answerer := dialAs(t, srv.srv, true)
-	if err := answerWith(answerer, child, standing.ToolUseID, session.Allow); err != nil {
+	if err := answerWith(answerer, *standing, session.Allow); err != nil {
 		t.Fatalf("answer the child's question from a connection attached to the parent: %v", err)
 	}
 	select {

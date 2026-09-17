@@ -770,6 +770,16 @@ func (s *Server) handleAnswer(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	if !p.Decision.Valid() || !p.Scope.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "invalid decision or scope")
 	}
+	// The turn the question was asked in, as the notification carried it. Consent is given
+	// for one call of one turn, and a tool_use id can come round again: without this, an
+	// answer aimed at a question that has since been cut could decide a later question
+	// that reuses the id (rudy-rn7, and the answer row of the contracts).
+	if p.TurnID == "" {
+		return nil, perr(protocol.CodeInvalidArgument, "answer names no turn")
+	}
+	if _, active := ls.mirroredState(); active != p.TurnID {
+		return nil, perr(protocol.CodeConflict, "that question belongs to another turn")
+	}
 	// The first answer decides. resolveAnswer claims the pending channel and marks the id
 	// answered in one critical section, which is what makes that race-free between two askers
 	// holding the same question: exactly one of them finds the channel, and the loser is told

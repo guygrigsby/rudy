@@ -242,7 +242,11 @@ type SessionInterruptParams struct {
 }
 
 type SessionAnswerParams struct {
-	SessionID string           `json:"session_id"`
+	SessionID string `json:"session_id"`
+	// TurnID is the turn the question was asked in, as permission.requested carried it.
+	// An answer names it so a decision cannot land on a later turn's question that
+	// happens to reuse the tool_use id: consent is given for one call of one turn.
+	TurnID    string           `json:"turn_id"`
 	ToolUseID string           `json:"tool_use_id"`
 	Decision  session.Decision `json:"decision"`
 	Scope     session.Scope    `json:"scope"`
