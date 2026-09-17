@@ -1,6 +1,8 @@
 package gate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 
@@ -61,11 +63,24 @@ func bashCommand(args json.RawMessage) (string, bool) {
 	return a.Command, true
 }
 
+// prefixLimit is the contract's scalar bound on a matcher value.
+const prefixLimit = 4096
+
+// firstWords is the matcher's prefix: the first n words joined with one space, or, when that
+// runs past the scalar limit, its digest. The prefix is an allowance key and it rides in
+// every permission.requested notification, so it has to be bounded; naming an overlong
+// command by its digest keeps the key exact without carrying the command (rudy-contracts.md,
+// the matcher row).
 func firstWords(words []string, n int) string {
 	if len(words) > n {
 		words = words[:n]
 	}
-	return strings.Join(words, " ")
+	joined := strings.Join(words, " ")
+	if len(joined) <= prefixLimit {
+		return joined
+	}
+	sum := sha256.Sum256([]byte(joined))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // shellCalls parses src and returns the words of every simple command in

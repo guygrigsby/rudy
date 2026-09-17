@@ -179,6 +179,13 @@ type Runner struct {
 	// calls is every tool call currently running. Self-locking, and the reference never
 	// changes: Run resets its contents instead (see inflight.reset).
 	calls *inflight
+
+	// limits is what this Turn will admit from a provider response, and admitted is what it
+	// has admitted so far: the tool_use ids of the active Turn and the raw input bytes they
+	// carried. Both belong to the Run goroutine, which is the only thing that admits a
+	// response, and both are discarded when the Turn ends.
+	limits   limits
+	admitted admitted
 }
 
 // NewRunner returns an idle runner.
@@ -189,7 +196,7 @@ func NewRunner(c Config) *Runner {
 	if c.Overrides == nil {
 		c.Overrides = map[string][]session.Block{}
 	}
-	return &Runner{cfg: c, state: Idle, calls: newInflight()}
+	return &Runner{cfg: c, state: Idle, calls: newInflight(), limits: defaultLimits()}
 }
 
 // TurnID is the id of the current or most recent turn: the ULID of the user_message entry
@@ -307,6 +314,7 @@ func (r *Runner) Run(ctx context.Context, msg session.UserMessage) error {
 // deliberately not reset: they outlive the turn that made them (see Config.Overrides).
 func (r *Runner) startTurnState(ctx context.Context, e session.Entry) {
 	r.system = r.cfg.System
+	r.admitted.reset()
 	r.mu.Lock()
 	r.turnUsage = session.Usage{}
 	r.mu.Unlock()
@@ -395,6 +403,11 @@ func (r *Runner) loop(ctx context.Context) error {
 				return r.fail(pe.Class, err)
 			}
 			return r.fail(session.ErrTransport, err)
+		}
+		// Before the assistant Entry is appended and before anything is allocated per call:
+		// a response outside the Turn's bounds is refused whole (ADR 0034).
+		if err := r.admit(am.Content); err != nil {
+			return r.fail(session.ErrProvider, err)
 		}
 		malformed := sanitizeToolInputs(am.Content)
 		var toolUses []session.Block
@@ -629,10 +642,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 			dec.Decision, dec.DecidedBy, dec.Reason = session.Deny, session.ByNoAsker, "asker failed: "+askErr.Error()
 		default:
 			dec.Decision, dec.DecidedBy = ans.Decision, session.ByAsker
-			dec.Reason = ans.Reason
-			if dec.Reason == "" {
-				dec.Reason = "asker"
-			}
+			dec.Reason = reason(ans.Reason, "asker")
 			if ans.Decision == session.Allow && ans.Scope == session.ScopeSession {
 				dec.Scope = session.ScopeSession
 			}
@@ -760,19 +770,26 @@ func (r *Runner) askHooks(ctx context.Context, tu session.Block, safety tool.Saf
 		if !ok {
 			continue
 		}
-		reason := bt.Reason
-		if reason == "" {
-			reason = "hook"
-		}
+		hookReason := reason(bt.Reason, "hook")
 		switch bt.Decision {
 		case plugin.DecisionModify:
-			if json.Valid(bt.Input) {
-				input, modified = bt.Input, true
+			if !json.Valid(bt.Input) {
+				break
 			}
+			// The replacement is what the tool will run and the log will keep, so it
+			// passes the same admission a provider's own input does and is charged to
+			// this Turn's retained budget. A violation denies this call with a fixed
+			// reason: repeating what the handler sent would publish the bytes the rule
+			// exists to keep out.
+			if err := r.admitReplacement(bt.Input); err != nil {
+				slog.Error("turn: before_tool replacement refused", "session", sid, "turn", tid, "tool", tu.Name, "err", errRuleOnly(err))
+				return tu.Input, false, &hookVerdict{decision: session.Deny, reason: "hook input refused"}
+			}
+			input, modified = bt.Input, true
 		case plugin.DecisionAllow:
-			return input, modified, &hookVerdict{decision: session.Allow, reason: reason}
+			return input, modified, &hookVerdict{decision: session.Allow, reason: hookReason}
 		case plugin.DecisionDeny:
-			return input, modified, &hookVerdict{decision: session.Deny, reason: reason}
+			return input, modified, &hookVerdict{decision: session.Deny, reason: hookReason}
 		}
 	}
 	return input, modified, nil

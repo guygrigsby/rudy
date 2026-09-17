@@ -1,7 +1,10 @@
 package gate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/session"
@@ -68,5 +71,28 @@ func TestDangerous(t *testing.T) {
 	}
 	if got, _ := g.Dangerous("write", json.RawMessage(`{"path":"/etc/passwd"}`)); got {
 		t.Fatal("non-bash tools are never dangerous by prefix")
+	}
+}
+
+// TestABashPrefixIsBounded holds the matcher to the contract's scalar limit. The prefix is an
+// allowance key and it rides in every permission.requested notification, so a command whose
+// first two words are enormous is named by its digest instead of by itself.
+func TestABashPrefixIsBounded(t *testing.T) {
+	g := New(nil)
+	long := strings.Repeat("a", 5000)
+	m := g.MatcherFor("bash", json.RawMessage(`{"command":"`+long+` arg"}`))
+	if !strings.HasPrefix(m.Prefix, "sha256:") {
+		t.Fatalf("prefix kept %d bytes, want a digest", len(m.Prefix))
+	}
+	sum := sha256.Sum256([]byte(long + " arg"))
+	if want := "sha256:" + hex.EncodeToString(sum[:]); m.Prefix != want {
+		t.Errorf("prefix = %q, want %q", m.Prefix, want)
+	}
+	if strings.Contains(m.Prefix, "aaaa") {
+		t.Error("the digest form still carries the command")
+	}
+	short := g.MatcherFor("bash", json.RawMessage(`{"command":"go test ./..."}`))
+	if short.Prefix != "go test" {
+		t.Errorf("prefix = %q, want the first two words unchanged", short.Prefix)
 	}
 }
