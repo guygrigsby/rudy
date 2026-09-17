@@ -8,38 +8,61 @@ or as a server without changing the loop.
 This build is the kernel, the terminal client, the headless printer and the
 server.
 
-## Build
+## Install
+
+    go install github.com/guygrigsby/rudy/cmd/rudy@latest
+
+Or take a binary for your platform from the
+[releases page](https://github.com/guygrigsby/rudy/releases): each tag builds
+darwin and linux on arm64 and amd64, with a `checksums.txt` beside them.
+
+From a checkout:
 
     make            # bin/rudy
     make check      # fmt, vendor-type greps, vet, lint, test
-    make install    # go install ./cmd/rudy
+    make install    # go install ./cmd/rudy, then rudy config sync
 
 Nothing to check out beside it: every dependency resolves from its own module.
+Go 1.26 or newer, and `make check` needs cgo for the race detector.
 
 ## Configure
 
-`~/.config/rudy/config.toml` names providers and one default model. The
-registry itself is discovered from each provider's `/v1/models`.
+`~/.config/rudy/config.toml` names providers and one default model. Until it
+names one, a session cannot open and rudy says which file to write.
+`rudy config sync` writes that file with every key commented; the smallest one
+that works is:
 
     [default]
-    provider = "aperture"
-    model = "cline-pass/kimi-k3"
+    provider = "anthropic"
+    model = "claude-opus-5"
     thinking = "off"
 
     [permissions]
     mode = "strict"        # strict, permissive or off
 
-    [providers.aperture]
-    wire = "openai_chat"
-    base_url = "https://ai.guy.ts.net/v1"
+    [providers.anthropic]
+    wire = "anthropic_messages"
+    base_url = "https://api.anthropic.com"
+    auth = "env:ANTHROPIC_API_KEY"
+
+The model list is not configuration: the registry is discovered from the
+provider itself, `/v1/models` or the wire's equivalent, so `model` is any id
+that endpoint serves. Any OpenAI-compatible endpoint is a provider too, local
+ones included:
 
     [providers.mlx]
     wire = "openai_chat"
     base_url = "http://localhost:8080/v1"
 
-`auth = "env:NAME"` or `auth = "cache:KEY"` adds a bearer token from the
-environment or from `~/Library/Caches/op-secrets.env`. Neither entry above
-needs one: aperture authenticates by tailnet and mlx is local.
+    [providers.gateway]
+    wire = "openai_chat"
+    base_url = "https://gateway.example.com/v1"
+    auth = "env:GATEWAY_TOKEN"
+
+`auth` is `env:NAME` for an environment variable or `cache:KEY` for a key in an
+env-format file, `~/Library/Caches/op-secrets.env`, which is where a macOS
+1Password cache lands. An endpoint that needs no token, a local one or one
+behind a VPN, leaves `auth` out.
 
 Paths follow XDG: `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME`
 each default to `~/.config`, `~/.local/share` and `~/.cache`, plus `/rudy`.
