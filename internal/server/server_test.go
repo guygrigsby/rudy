@@ -4761,3 +4761,49 @@ func TestATurnIsClampedToWhatTheModelServes(t *testing.T) {
 		t.Errorf("request asked for %d output tokens, want it clamped to 64000", got)
 	}
 }
+
+// TestResumeReopensASessionClosedUnderIt is TestDetachRacesResume with the race made to
+// happen every time. resume loads the session, then attaches, and between those two the last
+// subscriber's close is entitled to close it, since nothing is attached yet. The hook runs
+// that close inside the window. The contract has one meaning for unavailable on
+// session.resume, a session another process holds, named by data.socket, so this server
+// re-opening what it closed under itself is the answer and telling the client to retry is
+// not (rudy-anw).
+func TestResumeReopensASessionClosedUnderIt(t *testing.T) {
+	h := newHarness(t, &scriptProvider{textOnly: true})
+	clA := h.dial(t, false)
+	info := h.open(t, clA)
+	clB := h.dial(t, false)
+
+	ctx := context.Background()
+	var once sync.Once
+	var closeErr error
+	restore := server.SetBeforeAttachHook(func() {
+		once.Do(func() {
+			closeErr = clA.Call(ctx, protocol.MethodSessionClose,
+				protocol.SessionCloseParams{SessionID: info.SessionID}, &struct{}{})
+		})
+	})
+	t.Cleanup(restore)
+
+	var resumed protocol.SessionInfo
+	if err := clB.Call(ctx, protocol.MethodSessionResume,
+		protocol.SessionResumeParams{SessionID: info.SessionID}, &resumed); err != nil {
+		t.Fatalf("resume with a close landing in its window: %v", err)
+	}
+	if closeErr != nil {
+		t.Fatalf("the close that was meant to race it failed: %v", closeErr)
+	}
+	if resumed.SessionID != info.SessionID {
+		t.Fatalf("resumed %s, want %s", resumed.SessionID, info.SessionID)
+	}
+
+	// Attached to a session that works, not to a husk: a turn through it reaches this client.
+	var sub protocol.SessionSubmitResult
+	if err := clB.Call(ctx, protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: resumed.SessionID, Content: []session.Block{session.TextBlock("go")}, Source: session.SourceTyped,
+	}, &sub); err != nil {
+		t.Fatalf("submit through the resumed session: %v", err)
+	}
+	drain(t, clB, completedOn(resumed.SessionID))
+}

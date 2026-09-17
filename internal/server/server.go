@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -1621,6 +1622,19 @@ func (s *Server) parentOf(cn *conn, ref *protocol.ParentRef, ws session.Workspac
 	return parent, nil
 }
 
+// resumeAttempts bounds how many times resume will re-open a session that was closed out
+// from under it between the load and the attach. Each pass waits for the close in flight and
+// re-opens, so one retry is enough for a single racing close and three covers a pile-up; a
+// session that keeps being closed as fast as this loads it is not a session to attach to.
+const resumeAttempts = 3
+
+// beforeAttachHook runs inside resume between loading the session and attaching to it: the
+// one window a close can take the session away in, a few instructions wide and reachable in
+// practice only on a loaded machine. Nil in every build but the test that closes the session
+// inside it on purpose (export_test.go). Atomic because a server from a finished test can
+// still be reading it while the next test writes it.
+var beforeAttachHook atomic.Pointer[func()]
+
 // resume attaches cn to sid, loading it from disk first when it is not already live. loadCold
 // single-flights concurrent cold loads of the same id (see loadCold); attachIfLive then
 // subscribes atomically with the s.live lookup (see detach for why that matters).
@@ -1629,17 +1643,27 @@ func (s *Server) resume(cn *conn, p protocol.SessionResumeParams) (any, *protoco
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, "bad session id")
 	}
-	if _, lerr := s.loadCold(cn, sid); lerr != nil {
-		return nil, lerr
+	// loadCold and attachIfLive are two critical sections, and between them the last
+	// subscriber's close can take the session away: nothing is attached to it yet, so it is
+	// unused and closeIfUnusedLocked is entitled to close it. Loading it again is this
+	// server's job rather than the client's, and the contract says so: session.resume's
+	// unavailable means a session another process holds, named by data.socket, not a race
+	// this process had with itself. loadCold waits out the close that is in flight and
+	// re-opens from disk, so every pass makes progress (rudy-anw).
+	for range resumeAttempts {
+		if _, lerr := s.loadCold(cn, sid); lerr != nil {
+			return nil, lerr
+		}
+		if f := beforeAttachHook.Load(); f != nil {
+			(*f)()
+		}
+		if info, ok := s.attachIfLive(cn, sid); ok {
+			return info, nil
+		}
 	}
-	info, ok := s.attachIfLive(cn, sid)
-	if !ok {
-		// Vanishingly rare: the session was detached and closed by someone else between
-		// loadCold returning and this attach (or the server is shutting down). Ask the client
-		// to retry rather than looping here.
-		return nil, perr(protocol.CodeUnavailable, "session unavailable, retry")
-	}
-	return info, nil
+	// Every attempt lost the same race, or the server is shutting down and s.live is being
+	// emptied under us. Nothing here can attach a client to a session that keeps going away.
+	return nil, perr(protocol.CodeUnavailable, "session unavailable, retry")
 }
 
 func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Error) {
