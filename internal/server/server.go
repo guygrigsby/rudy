@@ -1314,7 +1314,23 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	spec := firstNonEmpty(p.Model, def.Model, fromParent.model, s.d.Config.Default.Provider+":"+s.d.Config.Default.Model)
 	m, err := s.d.Registry.Resolve(spec)
 	if err != nil {
-		return nil, perr(protocol.CodeNotFound, err.Error())
+		// A model the caller named is a request this server cannot honour, and saying so is
+		// the useful answer. A model that came from config, an agent definition or a parent
+		// is different: the provider dropped an id the operator wrote down months ago, and
+		// refusing to open means the harness cannot be started by the person who needs it
+		// to change the setting. So the session opens on the ref as written, with a notice,
+		// the way a resume already does for a session whose recorded model has gone (see
+		// coldLoadOne). The picker is one keystroke away and set_model still refuses an id
+		// the registry does not have.
+		ref, parsed := session.ParseModelRef(spec)
+		if p.Model != "" || !parsed {
+			return nil, perr(protocol.CodeNotFound, err.Error())
+		}
+		m = provider.Model{Ref: ref}
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{
+			Level: "warn",
+			Text:  "model not in registry: " + spec + "; pick another with the model picker",
+		})
 	}
 	mode := session.Mode(firstNonEmpty(p.Mode, fromParent.mode, s.d.Config.Permissions.Mode))
 	thinking := session.ThinkingLevel(firstNonEmpty(p.Thinking, string(def.Thinking), fromParent.thinking, s.d.Config.Default.Thinking))
