@@ -1044,8 +1044,8 @@ func TestTheHelloNamesTheServersHome(t *testing.T) {
 	if hello.Home == "" {
 		t.Fatal("hello.home is empty; a client over ssh places the workspace under it")
 	}
-	if len(hello.Capabilities) != 0 {
-		t.Fatalf("initial Server advertised unimplemented guarantees %q", hello.Capabilities)
+	if !slices.Equal(hello.Capabilities, []string{protocol.CapabilityTerminalTurnDurabilityV1}) {
+		t.Fatalf("hello capabilities = %q, want only the guarantees this Server implements", hello.Capabilities)
 	}
 	if hello.Capabilities == nil {
 		t.Fatal("hello.capabilities encoded null, want an empty array")
@@ -1136,10 +1136,14 @@ func TestServerShutdownFlushesItsResponseAndHoldsTheConnectionUntilCleanup(t *te
 	if result.InstanceID != hello.InstanceID || result.State != protocol.ServerStateShuttingDown {
 		t.Fatalf("server.shutdown = %+v, want instance %s shutting_down", result, hello.InstanceID)
 	}
+	// Waited for rather than read once: the response is physically written before the
+	// transition begins (ADR 0031), so a client can hold the response in its hand while the
+	// serve loop has not reached requestShutdown yet. What the contract owes is that the
+	// owner is notified, not that it happens between two of this goroutine's instructions.
 	select {
 	case <-srv.ShutdownRequested():
-	default:
-		t.Fatal("shutdown response arrived before the process owner was notified")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the process owner was never notified of the shutdown")
 	}
 	shutdown := make(chan error, 1)
 	go func() { shutdown <- srv.Shutdown(context.Background()) }()

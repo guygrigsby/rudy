@@ -58,6 +58,10 @@ func (s *Server) connectPlugin(_ context.Context, name string) (protocol.Conn, e
 // carries its own mutex; the mirror is updated under obsMu and the entry broadcast like any
 // other. It takes no ls.mu: a note is display only, never sent to a model, so unlike every
 // other server-side append it does not have to wait for the turn to give the session back.
+//
+// It is still a Session commit, so it enters the same admission fence every other one does: a
+// linked plugin holding a session reference is exactly the caller that can pass a liveness
+// check, pause inside its own handler and come back after a terminal sync failed (ADR 0037).
 func (s *Server) appendNote(sid ulid.ULID, owner, text string, role session.NoteRole) (session.Entry, error) {
 	s.mu.Lock()
 	ls, ok := s.live[sid]
@@ -65,7 +69,13 @@ func (s *Server) appendNote(sid ulid.ULID, owner, text string, role session.Note
 	if !ok {
 		return session.Entry{}, fmt.Errorf("%w: %s", errSessionNotOpen, sid)
 	}
-	return ls.appendNote(owner, text, role)
+	var e session.Entry
+	err := s.withSessionOperation(ls, func() error {
+		var aerr error
+		e, aerr = ls.appendNote(owner, text, role)
+		return aerr
+	})
+	return e, err
 }
 
 // broadcastStatus sends the whole status line to every client connection. The conns snapshot

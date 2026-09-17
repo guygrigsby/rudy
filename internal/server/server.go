@@ -94,6 +94,12 @@ type Server struct {
 	closing map[ulid.ULID]chan struct{} // sids detach is closing; see detach, loadCold
 	conns   map[int]*conn               // every live connection, for the status and widget broadcasts
 	nextID  int
+
+	// admMu guards admissions alone and is an independent leaf: see sessionAdmission for the
+	// order the fences themselves hold. The map is one fence per Session ULID this process has
+	// committed anything for, retained after the session unloads, and empty in a new process.
+	admMu      sync.Mutex
+	admissions map[ulid.ULID]*sessionAdmission
 }
 
 // New wires a Server. Deps must already be fully populated.
@@ -104,6 +110,7 @@ func New(d Deps) *Server {
 		instanceID: ulid.Make(), state: protocol.ServerStateRunning,
 		shutdownRequested: make(chan struct{}), shutdownComplete: make(chan struct{}), shutdownFailed: make(chan struct{}),
 		live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{},
+		admissions: map[ulid.ULID]*sessionAdmission{},
 	}
 }
 
@@ -158,6 +165,7 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	}
 	s.wg.Add(1)
 	s.wgMu.Unlock()
+	pumpCtx, stopPump := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.nextID++
 	cn := newConn(s.nextID, c)
@@ -165,12 +173,13 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	cn.plugin = name
 	cn.reg = reg
 	cn.hello = name != ""
+	// Before the conn is reachable from s.conns or a session's subscriber list: a quarantine
+	// closing this connection reads abortPump from another goroutine (see conn.closeNow).
+	cn.abortPump = stopPump
 	s.conns[cn.id] = cn
 	s.mu.Unlock()
 	slog.Info("server: conn open", "conn", cn.id, "plugin", name)
 
-	pumpCtx, stopPump := context.WithCancel(context.Background())
-	cn.abortPump = stopPump
 	go cn.pump(pumpCtx)
 	err := s.serve(ctx, cn)
 	shutdownControl := errors.Is(err, ErrShutdownRequested)
@@ -634,7 +643,7 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// thing about who is an asker.
 	cn.asker = p.Asker
 	cn.asker = cn.isAsker()
-	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home, Capabilities: []string{}}, nil
+	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home, Capabilities: s.capabilities()}, nil
 }
 
 func (s *Server) handleServerShutdown(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
@@ -648,6 +657,9 @@ func (s *Server) handleServerShutdown(cn *conn, raw json.RawMessage) (any, *prot
 	if !s.claimShutdown() {
 		return nil, perr(protocol.CodeRefusedByInvariant, "server shutdown already requested")
 	}
+	// From here this connection owes the process its terminal proof, so nothing may close it
+	// out from under that duty (see conn.claimShutdownProof).
+	cn.claimShutdownProof()
 	return protocol.ServerShutdownResult{InstanceID: s.instanceID.String(), State: protocol.ServerStateShuttingDown}, nil
 }
 
@@ -751,7 +763,16 @@ func (s *Server) handleInterrupt(cn *conn, raw json.RawMessage) (any, *protocol.
 	if r == nil || !isActive(r.State()) {
 		return nil, perr(protocol.CodeRefusedByInvariant, "no active turn")
 	}
-	r.Interrupt(p.How)
+	// A cancel that ends a steering turn writes that turn's last Entry, so it is a path that
+	// can fail durably. Reporting the turn's state to a client whose session just lost its
+	// durable prefix would be the false success ADR 0037 exists to refuse.
+	if err := r.Interrupt(p.How); err != nil {
+		if errors.Is(err, turn.ErrTerminalDurability) {
+			return nil, sessionErr(err)
+		}
+		slog.Error("server: interrupt", "session", p.SessionID, "how", p.How, "err", err)
+		return nil, perr(protocol.CodeInternal, "interrupt failed")
+	}
 	return InterruptResult{TurnID: r.TurnID(), State: string(r.State())}, nil
 }
 
@@ -828,9 +849,9 @@ func (s *Server) setModel(ls *liveSession, spec string) (provider.Model, EntryID
 	if m.Ref == view.Model {
 		return m, EntryIDResult{EntryID: ls.latestEntryID(session.KindModelChange, session.KindSessionOpened)}, nil
 	}
-	e2, err := ls.appendAndBroadcastLocked(session.ModelChange{Model: m.Ref})
+	e2, err := s.appendEntry(ls, session.ModelChange{Model: m.Ref})
 	if err != nil {
-		return provider.Model{}, EntryIDResult{}, protocol.ErrorFrom(err)
+		return provider.Model{}, EntryIDResult{}, sessionErr(err)
 	}
 	ls.model = m
 	return m, EntryIDResult{EntryID: e2.ID.String()}, nil
@@ -942,6 +963,12 @@ func (s *Server) compactHoldingSession(ctx context.Context, ls *liveSession, ins
 	if !ok {
 		return session.Entry{}, 0, perr(protocol.CodeUnavailable, "provider not loaded: "+ls.model.Ref.Provider)
 	}
+	// Before the summary request: a compaction covering fewer than two entries appends
+	// nothing, so it would never reach the fence and would answer a quarantined session with
+	// success. The fenced append below is still what decides for every other compaction.
+	if e := s.sessionQuarantined(ls.sess.ID()); e != nil {
+		return session.Entry{}, 0, e
+	}
 	// The summary request answers to the server's own shutdown as well as to the caller: it
 	// runs under ls.mu, and Shutdown closes every live session, which needs that lock. Without
 	// this the caller's context is the only way out, and a shutdown would wait on a provider
@@ -952,7 +979,7 @@ func (s *Server) compactHoldingSession(ctx context.Context, ls *liveSession, ins
 	n := len(turn.Cover(ls.sess, ulid.ULID{}))
 	e, err := s.compactorLocked(prov, ls).Compact(cctx, ls.sess, ulid.ULID{}, instructions)
 	if err != nil {
-		return session.Entry{}, 0, protocol.ErrorFrom(err)
+		return session.Entry{}, 0, sessionErr(err)
 	}
 	if e.ID.IsZero() {
 		return session.Entry{}, 0, nil
@@ -977,6 +1004,7 @@ func (s *Server) compactorLocked(prov provider.Provider, ls *liveSession) *turn.
 		Provider:  prov,
 		Model:     ls.model,
 		Hooks:     s.hookFirer(),
+		Commit:    s.sessionCommit(ls),
 		MaxTokens: s.d.Config.MaxTokens,
 		Overrides: ls.overrides,
 	}
@@ -1002,7 +1030,7 @@ func (s *Server) handleAppendNote(cn *conn, raw json.RawMessage) (any, *protocol
 	case errors.Is(aerr, errSessionNotOpen):
 		return nil, perr(protocol.CodeNotFound, aerr.Error())
 	case aerr != nil:
-		return nil, protocol.ErrorFrom(aerr)
+		return nil, sessionErr(aerr)
 	}
 	return EntryIDResult{EntryID: e.ID.String()}, nil
 }
@@ -1125,9 +1153,9 @@ func (s *Server) handleShell(ctx context.Context, raw json.RawMessage) (any, *pr
 	if ls.closed {
 		return nil, perr(protocol.CodeNotFound, "session closed")
 	}
-	entry, err := ls.appendAndBroadcastLocked(msg)
+	entry, err := s.appendEntry(ls, msg)
 	if err != nil {
-		return nil, protocol.ErrorFrom(err)
+		return nil, sessionErr(err)
 	}
 	return protocol.SessionShellResult{EntryID: entry.ID.String(), IsError: res.IsError}, nil
 }
@@ -1240,10 +1268,17 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 	}
 }
 
+// lookup resolves a session id to the live session it names. A quarantined Session is
+// unavailable here whether or not it is still live: the guard is what makes every later
+// operation on it, including the ones that would only read, refuse until a new Server process
+// recovers the log (ADR 0037).
 func (s *Server) lookup(id string) (*liveSession, *protocol.Error) {
 	sid, err := ulid.Parse(id)
 	if err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, "bad session id")
+	}
+	if e := s.sessionQuarantined(sid); e != nil {
+		return nil, e
 	}
 	s.mu.Lock()
 	ls, ok := s.live[sid]
@@ -1276,9 +1311,9 @@ func (s *Server) setEntry(id string, kind session.Kind, f func(view protocol.Ses
 	if same {
 		return EntryIDResult{EntryID: ls.latestEntryID(kind, session.KindSessionOpened)}, nil
 	}
-	e2, err := ls.appendAndBroadcastLocked(p)
+	e2, err := s.appendEntry(ls, p)
 	if err != nil {
-		return nil, protocol.ErrorFrom(err)
+		return nil, sessionErr(err)
 	}
 	return EntryIDResult{EntryID: e2.ID.String()}, nil
 }
@@ -1361,7 +1396,7 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	}
 	s.applyAgent(ls, def, allow)
 	s.fireSessionOpened(s.ctx, ls, false)
-	return s.installAndAttach(cn, ls), nil
+	return s.installAndAttach(cn, ls)
 }
 
 // firstNonEmpty is the first non-empty of vs, or "" when there is none: the resolution order
@@ -1599,7 +1634,10 @@ func (s *Server) resume(cn *conn, p protocol.SessionResumeParams) (any, *protoco
 	if _, lerr := s.loadCold(cn, sid); lerr != nil {
 		return nil, lerr
 	}
-	info, ok := s.attachIfLive(cn, sid)
+	info, ok, aerr := s.attachIfLive(cn, sid)
+	if aerr != nil {
+		return nil, aerr
+	}
 	if !ok {
 		// Vanishingly rare: the session was detached and closed by someone else between
 		// loadCold returning and this attach (or the server is shutting down). Ask the client
@@ -1635,35 +1673,49 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 // this lock, landing the fork one entry stale. obsMu, which latestEntryID takes, nests inside mu
 // (see liveSession's doc), so taking it here while already holding parent.mu is safe.
 func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.SessionInfo, *protocol.Error) {
+	var (
+		child *session.Session
+		e     *protocol.Error
+	)
 	parent.mu.Lock()
-	if at == "" {
-		at = parent.latestEntryID()
-	}
-	atID, err := ulid.Parse(at)
-	if err != nil {
-		parent.mu.Unlock()
-		return protocol.SessionInfo{}, perr(protocol.CodeInvalidArgument, "bad entry id")
-	}
-	st, _ := parent.mirroredState()
-	active := parent.runner != nil && isActive(st)
-	closed := parent.closed
-	var child *session.Session
-	switch {
-	case closed:
-		parent.mu.Unlock()
-		return protocol.SessionInfo{}, perr(protocol.CodeUnavailable, "session unavailable, retry")
-	case active:
-		parent.mu.Unlock()
-		return protocol.SessionInfo{}, perr(protocol.CodeConflict, "a turn is active")
-	default:
-		child, err = parent.sess.Fork(s.d.Store, atID)
-		parent.mu.Unlock()
+	// The read of the parent and the Fork that copies it are one commit on the parent, so
+	// they cross its fence. A fork is otherwise the one operation that builds a whole fresh
+	// aggregate, with a new ULID and so no quarantine of its own, out of a prefix that may
+	// have just become uncertain, and its fork_point can name an entry the parent's log
+	// never held (ADR 0037). A caller that passed a check before a plugin command ran is
+	// exactly the caller this catches: command.run's /fork holds the liveSession lookup
+	// returned before that command started.
+	err := s.withSessionOperation(parent, func() error {
+		if at == "" {
+			at = parent.latestEntryID()
+		}
+		atID, perror := ulid.Parse(at)
+		if perror != nil {
+			e = perr(protocol.CodeInvalidArgument, "bad entry id")
+			return nil
+		}
+		st, _ := parent.mirroredState()
+		switch {
+		case parent.closed:
+			e = perr(protocol.CodeUnavailable, "session unavailable, retry")
+		case parent.runner != nil && isActive(st):
+			e = perr(protocol.CodeConflict, "a turn is active")
+		default:
+			var ferr error
+			child, ferr = parent.sess.Fork(s.d.Store, atID)
+			return ferr
+		}
+		return nil
+	})
+	parent.mu.Unlock()
+	if e != nil {
+		return protocol.SessionInfo{}, e
 	}
 	if err != nil {
 		if errors.Is(err, session.ErrInvariant) {
 			return protocol.SessionInfo{}, perr(protocol.CodeNotFound, err.Error())
 		}
-		return protocol.SessionInfo{}, protocol.ErrorFrom(err)
+		return protocol.SessionInfo{}, sessionErr(err)
 	}
 	m, rerr := s.d.Registry.Resolve(child.Model().String())
 	if rerr != nil {
@@ -1675,7 +1727,7 @@ func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.Sess
 	// no step limit.
 	ls := newLive(child, m)
 	s.applyAgentFromLog(cn, ls)
-	return s.installAndAttach(cn, ls), nil
+	return s.installAndAttach(cn, ls)
 }
 
 // loadCold returns the live session for sid, loading it from disk first if it is not already
@@ -1691,6 +1743,13 @@ func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.Sess
 // released the flock, so a cold load that only checked s.live could still lose to that flock,
 // seeing session.ErrLocked for a session nobody has held live for a while.
 func (s *Server) loadCold(cn *conn, sid ulid.ULID) (*liveSession, *protocol.Error) {
+	// Before the live map, the load single-flight and the disk: a quarantined Session stays
+	// quarantined for this process however it is reached for, and reading its log back in
+	// would be exactly the fresh in-memory aggregate ADR 0037 refuses until a new process
+	// recovers it.
+	if e := s.sessionQuarantined(sid); e != nil {
+		return nil, e
+	}
 	for {
 		s.mu.Lock()
 		if ls, ok := s.live[sid]; ok {
@@ -1817,15 +1876,28 @@ func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
 // subscribes cn to it in one critical section. Used by open, fork's child and resume's cold
 // load. Safe unconditionally: the session is not yet visible to any other goroutine before this
 // call, so there is no id to race.
-func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInfo {
-	s.mu.Lock()
-	s.live[ls.sess.ID()] = ls
-	at := ls.subscribeLocked(cn)
-	at.children = s.childAttachmentsLocked(cn, ls)
-	s.mu.Unlock()
+func (s *Server) installAndAttach(cn *conn, ls *liveSession) (protocol.SessionInfo, *protocol.Error) {
+	var at attachment
+	// The install and the attachment are one commit, and it takes the same fence every other
+	// commit on this session takes, with Server.mu inside it rather than around it (see
+	// attachIfLive). A session reaching here was just opened, forked or loaded by this
+	// caller, and loadCold refuses a quarantined id before it gets that far, so the refusal
+	// is not reachable today; it is answered rather than ignored because a caller that is
+	// told a session opened has to be able to use it.
+	err := s.withSessionOperation(ls, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.live[ls.sess.ID()] = ls
+		at = ls.subscribeLocked(cn)
+		at.children = s.childAttachmentsLocked(cn, ls)
+		return nil
+	})
+	if err != nil {
+		return protocol.SessionInfo{}, sessionErr(err)
+	}
 	deliverAttach(cn, ls.sess.ID(), at)
 	slog.Info("session: open", "session", ls.sess.ID(), "agent", ls.sess.Agent(), "conn", cn.id)
-	return at.info
+	return at.info, nil
 }
 
 // childAttachmentsLocked is what cn is owed about the children of ls that are live right now
@@ -1850,6 +1922,12 @@ func (s *Server) childAttachmentsLocked(cn *conn, ls *liveSession) []childAttach
 		if c.parent != ls || cn.subscribed(sid) {
 			continue
 		}
+		// A quarantined child is not replayed into a newcomer's attach: the walk reads that
+		// child's aggregate, and its standing question would be put to an asker whose answer
+		// session.answer then refuses forever (ADR 0037).
+		if s.sessionQuarantined(sid) != nil {
+			continue
+		}
 		if at, ok := c.watchAttachment(cn.isAsker()); ok {
 			out = append(out, at)
 		}
@@ -1864,19 +1942,45 @@ func (s *Server) childAttachmentsLocked(cn *conn, ls *liveSession) []childAttach
 // Server.mu across both is what keeps this from ever racing detach's decide-and-remove into
 // subscribing to a session that is concurrently being closed (see detach). ok is false when
 // sid is not currently live.
-func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bool) {
+//
+// The subscription itself is an attachment commit, so it goes through the Session's admission
+// fence: an attach either lands in the subscriber set a quarantine closes or observes the cause
+// and subscribes to nothing, which is the third outcome ADR 0037 removes. The refusal is
+// returned rather than reported as "not live", because a quarantined session is there and
+// unavailable, not gone.
+func (s *Server) attachIfLive(cn *conn, sid ulid.ULID) (protocol.SessionInfo, bool, *protocol.Error) {
 	s.mu.Lock()
 	ls, ok := s.live[sid]
-	if !ok {
-		s.mu.Unlock()
-		return protocol.SessionInfo{}, false
-	}
-	at := ls.subscribeLocked(cn)
-	at.children = s.childAttachmentsLocked(cn, ls)
 	s.mu.Unlock()
+	if !ok {
+		return protocol.SessionInfo{}, false, s.sessionQuarantined(sid)
+	}
+	var at attachment
+	// The fence first, Server.mu inside it: this waits on whatever commit that session has in
+	// flight, which can be a terminal fsync, and waiting on it while holding Server.mu would
+	// stall every other session in the process (see sessionAdmission). The s.live read above
+	// is only a lookup; what has to be atomic against detach's decide-and-remove is the
+	// subscribe below, which holds Server.mu across the same re-read.
+	err := s.withSessionOperation(ls, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if _, live := s.live[sid]; !live {
+			ok = false
+			return nil
+		}
+		at = ls.subscribeLocked(cn)
+		at.children = s.childAttachmentsLocked(cn, ls)
+		return nil
+	})
+	if err != nil {
+		return protocol.SessionInfo{}, false, s.sessionQuarantined(sid)
+	}
+	if !ok {
+		return protocol.SessionInfo{}, false, nil
+	}
 	deliverAttach(cn, sid, at)
 	slog.Info("session: resume", "session", sid, "conn", cn.id)
-	return at.info, true
+	return at.info, true, nil
 }
 
 func replay(cn *conn, sid ulid.ULID, entries []session.Entry) {
@@ -1929,21 +2033,34 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	cn.mu.Unlock()
 	slog.Info("session: detach", "session", ls.sess.ID(), "conn", cn.id)
 
-	s.mu.Lock()
-
-	ls.obsMu.Lock()
-	kept := ls.conns[:0]
-	for _, c := range ls.conns {
-		if c != cn {
-			kept = append(kept, c)
+	var empty, steering, standing bool
+	// A detachment commit, so it is ordered against a quarantine's subscriber snapshot the
+	// same way an attachment is, and it runs whether or not this session is quarantined: the
+	// connection is already gone either way (see withSessionTeardown).
+	s.withSessionTeardown(ls, func() {
+		s.mu.Lock()
+		ls.obsMu.Lock()
+		kept := ls.conns[:0]
+		for _, c := range ls.conns {
+			if c != cn {
+				kept = append(kept, c)
+			}
 		}
-	}
-	ls.conns = kept
-	empty := len(ls.conns) == 0
-	steering := ls.state == turn.Steering
-	standing := len(ls.standing) > 0
-	ls.obsMu.Unlock()
+		ls.conns = kept
+		empty = len(ls.conns) == 0
+		steering = ls.state == turn.Steering
+		standing = len(ls.standing) > 0
+		ls.obsMu.Unlock()
+		s.mu.Unlock()
+	})
 
+	// Server.mu is dropped with the fence and taken again here rather than held across both,
+	// because the fence may not be held while closeIfUnusedLocked fires session_closed
+	// handlers. The decision is still atomic against an attach: closeIfUnusedLocked re-reads
+	// the subscriber set under this same Server.mu, so a connection that subscribed in the
+	// gap is counted and the session stays, and one arriving after the delete does not find
+	// it live at all.
+	s.mu.Lock()
 	s.closeIfUnusedLocked(ls)
 	if standing {
 		// A question this session is holding may have just lost the last connection that
@@ -1966,7 +2083,12 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	if r == nil {
 		return
 	}
-	r.Interrupt(session.InterruptCancel)
+	// Nobody is left to tell: the connection that would have steered this turn is already
+	// gone, and the session is on its way out. A durable failure recording the interruption
+	// is the log's problem, not this path's, so it is logged and the close continues.
+	if err := r.Interrupt(session.InterruptCancel); err != nil {
+		slog.Error("server: cancel parked steering turn", "session", ls.sess.ID(), "err", err)
+	}
 	s.mu.Lock()
 	s.closeIfUnusedLocked(ls)
 }
@@ -2055,7 +2177,8 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 			_, tid := ls.mirroredState()
 			ls.markStarting(tid)
 			ls.mu.Unlock()
-			if e := s.spawnTurn(ls, r, msg); e != nil {
+			// A steer resume has its turn id already, so it waits on no first append.
+			if e := s.spawnTurn(ls, r, msg, nil); e != nil {
 				return "", e
 			}
 			return r.TurnID(), nil // no lock held here; direct call is fine and freshest
@@ -2096,7 +2219,12 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	// prompt describes, and the template is whatever the operator's prompt file said.
 	base := s.renderPrompt(ls, view.Workspace, tools.Tools())
 	r := turn.NewRunner(turn.Config{
-		Session:     ls.sess,
+		Session: ls.sess,
+		// Every Entry this turn appends, and the terminal sync that publishes its state,
+		// commits through the Session's admission fence: a Turn append is a Session commit
+		// like any other, and a terminal sync failure has to install its cause there before
+		// anything else reads the Session (ADR 0037).
+		Commit:      s.sessionCommit(ls),
 		Provider:    prov,
 		Model:       ls.model,
 		Tools:       tools,
@@ -2122,7 +2250,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 	ls.markStarting("")
 	ls.mu.Unlock()
 
-	if e := s.spawnTurn(ls, r, msg); e != nil {
+	if e := s.spawnTurn(ls, r, msg, first); e != nil {
 		ls.mu.Lock()
 		if ls.runner == r {
 			ls.runner = nil // nobody is running it; undo the assignment above
@@ -2140,8 +2268,12 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		return e.ID.String(), nil
 	case <-first.failed:
 		// The runner failed before it appended anything, so there is no turn id to report
-		// and no turn_failed entry naming one either (see firstAppendSignal). Answering
-		// the caller is what matters; the runner has already logged what went wrong.
+		// and no turn_failed entry naming one either (see firstAppendSignal). A first
+		// append the fence refused is the ordinary quarantine refusal and says so;
+		// anything else is this server's own failure and is answered as one.
+		if e := s.sessionQuarantined(ls.sess.ID()); e != nil {
+			return "", e
+		}
 		return "", perr(protocol.CodeInternal, "the turn failed before it started")
 	case <-s.ctx.Done():
 		return "", perr(protocol.CodeUnavailable, "server is shutting down")
@@ -2152,7 +2284,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 // it. Does not touch ls.mu or Server.mu, only wgMu: it may be called with ls.mu held (from
 // startTurn) or not (it does not matter either way), and never nests under Server.mu, keeping
 // wgMu out of the mu > ls.mu > ls.obsMu order entirely.
-func (s *Server) spawnTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage) *protocol.Error {
+func (s *Server) spawnTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage, first *firstAppendSignal) *protocol.Error {
 	s.wgMu.Lock()
 	if s.shuttingDown {
 		s.wgMu.Unlock()
@@ -2160,16 +2292,24 @@ func (s *Server) spawnTurn(ls *liveSession, r *turn.Runner, msg session.UserMess
 	}
 	s.wg.Add(1)
 	s.wgMu.Unlock()
-	go s.runTurn(ls, r, msg)
+	go s.runTurn(ls, r, msg, first)
 	return nil
 }
 
-func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage) {
+func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessage, first *firstAppendSignal) {
 	defer s.wg.Done()
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
+	// A quarantine cancels the work still running on the session it fenced, and this turn is
+	// that work. A turn offered to a session already quarantined is cancelled before its
+	// first request rather than left to discover the refusal at its first append.
+	release := s.registerSessionWork(ls, cancel)
+	defer release()
 	_ = r.Run(ctx, msg) // failures are already recorded as turn_failed entries by the runner
-	final := r.State()  // read before taking ls.mu: never call a Runner method while holding it
+	// Whatever Run made of it, the turn is over: anyone still waiting to learn its id learns
+	// here that no id is coming.
+	first.finished()
+	final := r.State() // read before taking ls.mu: never call a Runner method while holding it
 	ls.mu.Lock()
 	if ls.runner == r && final != turn.Steering {
 		ls.runner = nil

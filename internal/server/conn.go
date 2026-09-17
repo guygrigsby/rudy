@@ -43,7 +43,10 @@ type conn struct {
 	abortPump context.CancelFunc
 	pumpErr   error
 	stopped   bool
-	subs      map[ulid.ULID]*liveSession
+	// shutdownProof is set on the connection whose server.shutdown was accepted: its writer
+	// stays open past its serve loop to send server.stopped, so nothing else may close it.
+	shutdownProof bool
+	subs          map[ulid.ULID]*liveSession
 }
 
 type outbound struct {
@@ -129,6 +132,22 @@ func (cn *conn) subscribed(sid ulid.ULID) bool {
 	return ok
 }
 
+// claimShutdownProof marks this connection as the one that asked for shutdown and is holding
+// its writer open for server.stopped. Set once the shutdown claim is won, before the response
+// is written, which is the moment from which the proof is owed (ADR 0031).
+func (cn *conn) claimShutdownProof() {
+	cn.mu.Lock()
+	cn.shutdownProof = true
+	cn.mu.Unlock()
+}
+
+// keepsShutdownProof reports whether this connection owes the process its shutdown proof.
+func (cn *conn) keepsShutdownProof() bool {
+	cn.mu.Lock()
+	defer cn.mu.Unlock()
+	return cn.shutdownProof
+}
+
 // pump drains the outbox to the transport, in order, until ctx ends or a send fails.
 func (cn *conn) pump(ctx context.Context) {
 	var stopErr error
@@ -159,6 +178,18 @@ func (cn *conn) pump(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// closeNow tears this connection down: the pump stops and the transport closes, so whatever
+// the client had in flight fails and its next read is EOF. It is what a Session quarantine
+// does to every connection that held the Session (ADR 0037), and it says nothing about why:
+// the cause is the Server log's. abortPump is written before the connection is reachable from
+// s.conns or any subscriber list (see serveConn), which is what makes reading it here safe.
+func (cn *conn) closeNow() {
+	if cn.abortPump != nil {
+		cn.abortPump()
+	}
+	_ = cn.c.Close()
 }
 
 func (cn *conn) stopPump(err error) {

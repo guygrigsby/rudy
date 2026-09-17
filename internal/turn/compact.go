@@ -22,9 +22,14 @@ const summarySystem = "You summarize a coding session so the assistant can conti
 // It is a domain service of the turn, not a plugin: an automatic compaction and an explicit
 // session.compact are the same code, so they cover the same entries and fire the same hook.
 type ModelCompactor struct {
-	Provider  provider.Provider
-	Model     provider.Model
-	Hooks     HookFirer // nil means no hooks
+	Provider provider.Provider
+	Model    provider.Model
+	Hooks    HookFirer // nil means no hooks
+	// Commit enters the owning Server's Session admission fence for the compaction append,
+	// the same boundary Config.Commit gives the rest of the turn. The summary request is made
+	// outside it. Nil commits directly, which is what a compaction with no Server behind it
+	// (a test) wants.
+	Commit    func(func() error) error
 	MaxTokens int
 	// Overrides is what after_tool handlers replaced, by tool_use id, the same map the turn's
 	// requests are assembled with (see Config.Overrides). The summary is written from what the
@@ -104,7 +109,17 @@ func (c *ModelCompactor) Compact(ctx context.Context, s *session.Session, before
 			return session.Entry{}, err
 		}
 	}
-	return s.Append(session.Compaction{Summary: summary, FirstEntryID: firstID, LastEntryID: last.ID, Model: c.Model.Ref, Usage: usage})
+	p := session.Compaction{Summary: summary, FirstEntryID: firstID, LastEntryID: last.ID, Model: c.Model.Ref, Usage: usage}
+	if c.Commit == nil {
+		return s.Append(p)
+	}
+	var e session.Entry
+	err := c.Commit(func() error {
+		var aerr error
+		e, aerr = s.Append(p)
+		return aerr
+	})
+	return e, err
 }
 
 // summarize sends the covered entries as the conversation and asks for the summary as a final
