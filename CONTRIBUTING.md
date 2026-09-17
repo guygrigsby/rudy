@@ -55,7 +55,22 @@ trailers. Prefix by area: `session:`, `turn:`, `tui:`, `plugin:`, `provider:`, `
 
 Say why the change exists, not what the diff already shows.
 
+## The CLA
+
+A first pull request gets a bot asking you to sign
+[the CLA](CLA.md) with one comment. You keep the copyright in what you write;
+the agreement grants the right to ship it under terms other than the AGPL,
+which is what a commercially licensed build needs. A contribution with no
+signature behind it can only ever be AGPL, so it would have to be rewritten
+before it could go in one.
+
 ## Filing something you found and did not fix
 
-Issues live in `.beads/issues.jsonl`, tracked with [beads](https://github.com/gastownhall/beads).
-`bd create` writes one. A `TODO` comment is not a tracked issue.
+Open a GitHub issue. The bug and feature forms ask for what a report needs, and a
+vulnerability goes through [private reporting](https://github.com/guygrigsby/rudy/security/advisories/new)
+rather than an issue.
+
+Maintainer-side, that issue becomes a bead: the tracker is
+[beads](https://github.com/gastownhall/beads), the issues are committed in
+`.beads/issues.jsonl`, and `bd create` writes one. Nothing about contributing needs bd
+installed. A `TODO` comment is not a tracked issue.
