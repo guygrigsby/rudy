@@ -70,6 +70,17 @@ var Sections = []Section{
 		},
 	},
 	{
+		Table: "secrets",
+		Comment: []string{
+			"Where a cache:KEY secret reference reads its value: an env-format file of",
+			"KEY=value or export KEY=\"value\" lines, with # comments ignored. env:NAME",
+			"reads the environment instead and needs nothing here.",
+		},
+		Keys: []Doc{
+			{Key: "secrets.file", Comment: "Empty means ~/Library/Caches/op-secrets.env on macOS, where a 1Password cache lands, and $XDG_CACHE_HOME/rudy/secrets.env everywhere else.", Example: `"~/keys.env"`},
+		},
+	},
+	{
 		Table: "remote",
 		Comment: []string{
 			"Run the kernel on another machine over ssh, with this terminal as the client.",

@@ -531,6 +531,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `sessions.compact_at` | float | 0.8 | fraction of the context window that triggers the Compactor |
 | `log.level` | `debug`, `info`, `warn`, `error` | `info` | the least severe record written; `debug` adds each tool invocation and provider stream error. Any other value is refused at load |
 | `log.file` | path | `""` | empty means `$XDG_CACHE_HOME/rudy/rudy.log`, filled at load the way `sessions.dir` is; `~` expands. The record layer row above says what is written and what happens when the file cannot be opened |
+| `secrets.file` | path | `""` | The env-format file a `cache:KEY` secret reference is read from: `KEY=value` or `export KEY="value"` lines, `#` comments ignored. Empty is filled at load the way `log.file` is, with `~/Library/Caches/op-secrets.env` on macOS, where a 1Password cache lands, and `$XDG_CACHE_HOME/rudy/secrets.env` everywhere else; `~` expands. A `cache:` reference whose file cannot be opened names this key |
 | `remote.host` | string | `""` | The ssh destination, alias or `user@name`, of the machine that runs the kernel when `--host` is not given; empty means the kernel runs here. A value beginning with `-` is refused at load (ADR 0029) |
 | `remote.source` | path | `~/projects/rudy` | Where the rudy checkout sits on the host, which `rudy hosts install` checks out at this binary's commit and runs `make install` in; `~` expands on the host (ADR 0029) |
 | `ui.status.host` | bool | `true` | Show `host:` before the workspace path in the status bar when the session runs on a host reached by `--host` or `remote.host` (ADR 0029) |
@@ -570,7 +571,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `keys.<action id>` | string or [string] | pi defaults | one of the ids ADR 0013 decision 5 lists; a value replaces the default for that action; `[]` unbinds; an unknown id or an unparseable key is a load error naming it |
 | `providers.<name>.wire` | `anthropic_messages`, `openai_chat`, `custom` | required | `custom` is a provider a plugin serves over `provider.complete`; the two codec wires are the linked provider plugins |
 | `providers.<name>.base_url` | string | required | |
-| `providers.<name>.auth` | string | `` | `env:NAME` reads the environment; `cache:KEY` reads a `KEY=value` line from the 1Password cache file; empty means no auth header |
+| `providers.<name>.auth` | string | `` | `env:NAME` reads the environment; `cache:KEY` reads a `KEY=value` line from the file `secrets.file` names; empty means no auth header |
 | `providers.<name>.headers` | table | `{}` | sent on every request |
 | `providers.<name>.models_path` | string | `/v1/models` | discovery endpoint relative to `base_url`; pass 3: not yet implemented, the key is unread and each codec asks its own fixed path |
 | `providers.<name>.dialect` | `` or `clinepass` | `` | a dialect plugin that wraps the wire codec for this endpoint; the `openai_chat` plugin skips a provider that names one |
@@ -583,7 +584,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `memory.fold.<key>` | int | the SDK's own | `observe_after_tokens`, `reflect_after_tokens`, `observations_max_tokens`, `observations_target_tokens`, `observer_max_tokens`; a missing key takes the SDK default |
 | `skills.migrate_from` | [path] | `["~/.claude/skills", "~/.pi/agent/skills"]` | roots `rudy skills migrate` copies from, one directory per skill |
 | `mcp.connect_timeout_ms` | int | 10000 | per server at boot |
-| `web.brave_api_key` | string | `env:BRAVE_API_KEY` | where Brave's key comes from, in a provider key's form: `env:NAME` or `cache:NAME` for the 1Password cache |
+| `web.brave_api_key` | string | `env:BRAVE_API_KEY` | where Brave's key comes from, in a provider key's form: `env:NAME` or `cache:NAME` for the file `secrets.file` names |
 | `web.exa_api_key` | string | `env:EXA_API_KEY` | where Exa's key comes from, same form. Brave is asked first and Exa answers when Brave cannot; no backend with a key means neither web tool is registered (ADR 0039) |
 | `web.max_results` | int | 5 | results one `web_search` returns, 1 through 20 |
 | `web.fetch_max_bytes` | int | 2000000 | most one `web_fetch` reads from a response before it stops reading; at least 1024 |

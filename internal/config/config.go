@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -249,6 +250,11 @@ type Config struct {
 		Level string `mapstructure:"level"`
 		File  string `mapstructure:"file"`
 	} `mapstructure:"log"`
+	Secrets struct {
+		// File is the env-format file a cache:KEY reference reads a secret from. Empty is
+		// filled at load with the platform's own, the way Log.File is.
+		File string `mapstructure:"file"`
+	} `mapstructure:"secrets"`
 	Remote struct {
 		// Host is the ssh destination that runs the kernel when --host is not given. Empty
 		// means the kernel runs here.
@@ -300,6 +306,7 @@ func Defaults() map[string]any {
 		"web.allow_private_hosts":          false,
 		"log.level":                        "info",
 		"log.file":                         "", // filled from paths.Cache when still empty after Load
+		"secrets.file":                     "", // filled by defaultSecretsFile when still empty after Load
 		"remote.host":                      "",
 		"remote.source":                    "~/projects/rudy",
 		"max_tokens":                       8192,
@@ -441,6 +448,10 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 		c.Log.File = filepath.Join(paths.Cache, "rudy.log")
 	}
 	c.Log.File = ExpandHome(c.Log.File, paths.Home)
+	if c.Secrets.File == "" {
+		c.Secrets.File = defaultSecretsFile(paths)
+	}
+	c.Secrets.File = ExpandHome(c.Secrets.File, paths.Home)
 	// remote.source is deliberately not expanded: it is a directory on the host, and the home
 	// a ~ in it means is the host's, not this machine's. The client sends it as written and
 	// the host's own shell expands it (ADR 0029).
@@ -455,6 +466,18 @@ func Load(paths Paths, overrides map[string]any) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// defaultSecretsFile is the file a cache:KEY reference reads when secrets.file is empty.
+// macOS has one already: op-refresh-secrets writes the 1Password cache under
+// ~/Library/Caches, and reading it is why cache: exists. Nothing writes that path on any
+// other platform, so there the default is rudy's own file under the cache directory, which
+// is a file the operator writes rather than one this binary keeps up to date.
+func defaultSecretsFile(paths Paths) string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(paths.Home, "Library", "Caches", "op-secrets.env")
+	}
+	return filepath.Join(paths.Cache, "secrets.env")
 }
 
 // ExpandHome replaces a leading "~/" (or a bare "~") with home. Anything else is returned as

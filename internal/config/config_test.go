@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -498,5 +499,59 @@ func TestWaveValidation(t *testing.T) {
 				t.Error("want error")
 			}
 		})
+	}
+}
+
+// TestSecretsFileDefaultsToThePlatformCache: cache:KEY used to read one hardcoded macOS
+// path, so on Linux the documented form could not work at all. Empty now resolves to the
+// cache file that platform keeps, and a value set in config wins on both.
+func TestSecretsFileDefaultsToThePlatformCache(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	paths := config.Paths{Config: dir, Data: dir, Runtime: dir, Cache: filepath.Join(dir, "cache", "rudy"), Home: home}
+	c, err := config.Load(paths, map[string]any{"default.provider": "p", "default.model": "m"})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	want := filepath.Join(dir, "cache", "rudy", "secrets.env")
+	if runtime.GOOS == "darwin" {
+		want = filepath.Join(home, "Library", "Caches", "op-secrets.env")
+	}
+	if c.Secrets.File != want {
+		t.Errorf("secrets.file is %q, want %q", c.Secrets.File, want)
+	}
+}
+
+// TestSecretsFileIsTheOperatorsWhenSet, with ~ expanded against this machine's home: the
+// file is read here, unlike remote.source, which names a path on the host.
+func TestSecretsFileIsTheOperatorsWhenSet(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	paths := config.Paths{Config: dir, Data: dir, Runtime: dir, Cache: dir, Home: home}
+	c, err := config.Load(paths, map[string]any{
+		"default.provider": "p", "default.model": "m", "secrets.file": "~/keys.env",
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if want := filepath.Join(home, "keys.env"); c.Secrets.File != want {
+		t.Errorf("secrets.file is %q, want %q", c.Secrets.File, want)
+	}
+}
+
+// TestResolveSecretNamesTheKeyWhenTheFileIsMissing: the operator's next move is to set
+// secrets.file or write that file, and an open error that names neither says which path
+// failed without saying what decides it.
+func TestResolveSecretNamesTheKeyWhenTheFileIsMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.env")
+	_, err := config.ResolveSecret("cache:TOKEN", func(string) string { return "" }, missing)
+	if err == nil {
+		t.Fatal("expected an error for a cache ref with no file")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("error %q does not name the file", err.Error())
+	}
+	if !strings.Contains(err.Error(), "secrets.file") {
+		t.Errorf("error %q does not name the config key that moves it", err.Error())
 	}
 }

@@ -173,7 +173,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	// processes it did not ask for.
 	discover := set == nil
 	if discover {
-		set = BuiltinPlugins(cfg, paths, httpc, home, env, o.Version, summarizeWith(cfg, registry, notice))
+		set = BuiltinPlugins(cfg, paths, httpc, env, o.Version, summarizeWith(cfg, registry, notice))
 	}
 	// The server is built before the plugins load, and takes its providers from them
 	// afterwards: a plugin's Host reaches the server through the protocol (Connect, Note,
@@ -377,9 +377,8 @@ func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []erro
 // /skills, /memory, the kernel's own slash commands (/model, /help, /fork, /plugins), the
 // MCP servers from mcp.toml, the openai_chat and anthropic_messages providers, and the
 // clinepass dialect over openai_chat.
-func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
-	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
-	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
+func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
+	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cfg.Secrets.File) }
 	return append(BuiltinTools(), webplugin.New(cfg.Web, version, resolve),
 		subagents.New(paths.Config), initcmd.New(), compactcmd.New(), commands.New(),
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),

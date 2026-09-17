@@ -26,6 +26,14 @@ level = "info"
 # e.g. "~/rudy.log"
 file = ""
 
+# Where a cache:KEY secret reference reads its value: an env-format file of
+# KEY=value or export KEY="value" lines, with # comments ignored. env:NAME
+# reads the environment instead and needs nothing here.
+[secrets]
+# Empty means ~/Library/Caches/op-secrets.env on macOS, where a 1Password cache lands, and $XDG_CACHE_HOME/rudy/secrets.env everywhere else.
+# e.g. "~/keys.env"
+file = ""
+
 # Run the kernel on another machine over ssh, with this terminal as the client.
 # --host on the command line overrides host. Sessions, plugins, memory and the
 # provider keys are that machine's; only the terminal is here (ADR 0029).

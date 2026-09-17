@@ -60,9 +60,10 @@ ones included:
     auth = "env:GATEWAY_TOKEN"
 
 `auth` is `env:NAME` for an environment variable or `cache:KEY` for a key in an
-env-format file, `~/Library/Caches/op-secrets.env`, which is where a macOS
-1Password cache lands. An endpoint that needs no token, a local one or one
-behind a VPN, leaves `auth` out.
+env-format file of `KEY=value` lines, which `[secrets] file` names. That file
+defaults to `~/Library/Caches/op-secrets.env` on macOS, where a 1Password cache
+lands, and `$XDG_CACHE_HOME/rudy/secrets.env` everywhere else. An endpoint that
+needs no token, a local one or one behind a VPN, leaves `auth` out.
 
 Paths follow XDG: `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME`
 each default to `~/.config`, `~/.local/share` and `~/.cache`, plus `/rudy`.
