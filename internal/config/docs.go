@@ -138,6 +138,19 @@ var Sections = []Section{
 		},
 	},
 	{
+		Table: "web",
+		Comment: []string{
+			"The web_search and web_fetch tools (ADR 0039). Neither is registered unless the",
+			"search key resolves, the same env: or cache: reference a provider key takes.",
+		},
+		Keys: []Doc{
+			{Key: "web.search_api_key", Comment: "Where the Brave Search key comes from.", Example: `"cache:BRAVE_API_KEY"`},
+			{Key: "web.max_results", Comment: "Results one search returns, 1 through 20.", Example: "10"},
+			{Key: "web.fetch_max_bytes", Comment: "Most one fetch reads from a response.", Example: "500000"},
+			{Key: "web.allow_private_hosts", Comment: "True lets a fetch reach loopback, private and link-local addresses.", Example: "true"},
+		},
+	},
+	{
 		Table:   "mcp",
 		Comment: []string{"MCP servers are configured in mcp.toml, which `rudy mcp add` writes."},
 		Keys: []Doc{

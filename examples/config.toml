@@ -92,6 +92,22 @@ enabled = true
 # e.g. "aperture:cline-pass/kimi-k3"
 summary_model = ""
 
+# The web_search and web_fetch tools (ADR 0039). Neither is registered unless the
+# search key resolves, the same env: or cache: reference a provider key takes.
+[web]
+# Where the Brave Search key comes from.
+# e.g. "cache:BRAVE_API_KEY"
+search_api_key = "env:BRAVE_API_KEY"
+# Results one search returns, 1 through 20.
+# e.g. 10
+max_results = 5
+# Most one fetch reads from a response.
+# e.g. 500000
+fetch_max_bytes = 2000000
+# True lets a fetch reach loopback, private and link-local addresses.
+# e.g. true
+allow_private_hosts = false
+
 # MCP servers are configured in mcp.toml, which `rudy mcp add` writes.
 [mcp]
 # How long a server has to answer its handshake.

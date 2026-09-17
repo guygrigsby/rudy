@@ -33,6 +33,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/plugins/tools/grep"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/read"
 	"github.com/guygrigsby/rudy/internal/plugins/tools/write"
+	webplugin "github.com/guygrigsby/rudy/internal/plugins/web"
 	"github.com/guygrigsby/rudy/internal/pluginstore"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/provider/httpx"
@@ -373,7 +374,8 @@ func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []erro
 func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, home string, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
 	cache := filepath.Join(home, "Library", "Caches", "op-secrets.env")
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cache) }
-	return append(BuiltinTools(), subagents.New(paths.Config), initcmd.New(), compactcmd.New(), commands.New(),
+	return append(BuiltinTools(), webplugin.New(cfg.Web, version, resolve),
+		subagents.New(paths.Config), initcmd.New(), compactcmd.New(), commands.New(),
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
 		newMCPPlugin(cfg, paths, resolve, version),
 		openaichatplugin.New(cfg.Providers, httpc, resolve),

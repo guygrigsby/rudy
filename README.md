@@ -242,6 +242,12 @@ boundary everything is trusted, deliberately:
   and whatever a file read put in front of it, `0600` under a `0700`
   directory, unencrypted. Provider keys stay in config or the environment and
   are never written to it.
+- `web_fetch` puts somebody else's page into the model's context as text, and
+  rudy puts no fence around it: a page can carry instructions and the model
+  reads them like any other text. The tool is `unsafe`, so strict mode asks
+  before the first one, and it refuses loopback, private and link-local
+  addresses at every redirect so a URL cannot reach this machine's own
+  services (ADR 0039).
 - `--host` runs the kernel on another machine over ssh (ADR 0029). That trust
   is ssh's. Rudy adds no authentication of its own, and the daemon there
   applies this same model as the remote user.

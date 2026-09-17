@@ -187,6 +187,24 @@ type MemoryConfig struct {
 	Fold         map[string]int `mapstructure:"fold"`
 }
 
+// WebConfig is what the web tools may reach and how much they may bring back (ADR 0039).
+type WebConfig struct {
+	// SearchAPIKey is where the search key comes from, in the same form a provider's key
+	// takes: "env:NAME" or "cache:NAME" for the 1Password cache. Empty, or a ref that does
+	// not resolve, means neither tool is registered: a model that can see a tool it cannot
+	// use spends a turn finding out.
+	SearchAPIKey string `mapstructure:"search_api_key"`
+	// MaxResults is how many search results one call returns.
+	MaxResults int `mapstructure:"max_results"`
+	// FetchMaxBytes is the most one fetch reads from a response before it stops reading.
+	FetchMaxBytes int `mapstructure:"fetch_max_bytes"`
+	// AllowPrivateHosts lets a fetch reach an address that is loopback, private, link-local
+	// or unique-local. False refuses them, at resolution and at every redirect: the model
+	// chooses the URL, so it chooses the address, and the ones worth reaching that way are
+	// this machine's own services and the cloud metadata endpoint (ADR 0039).
+	AllowPrivateHosts bool `mapstructure:"allow_private_hosts"`
+}
+
 // Config is config.toml after defaults, environment and overrides.
 type Config struct {
 	Default struct {
@@ -221,6 +239,7 @@ type Config struct {
 	MCP    struct {
 		ConnectTimeoutMS int `mapstructure:"connect_timeout_ms"`
 	} `mapstructure:"mcp"`
+	Web WebConfig `mapstructure:"web"`
 	Log struct {
 		Level string `mapstructure:"level"`
 		File  string `mapstructure:"file"`
@@ -269,6 +288,10 @@ func Defaults() map[string]any {
 		"memory.enabled":                   true,
 		"memory.summary_model":             "",
 		"mcp.connect_timeout_ms":           10000,
+		"web.search_api_key":               "env:BRAVE_API_KEY",
+		"web.max_results":                  5,
+		"web.fetch_max_bytes":              2000000,
+		"web.allow_private_hosts":          false,
 		"log.level":                        "info",
 		"log.file":                         "", // filled from paths.Cache when still empty after Load
 		"remote.host":                      "",
@@ -558,6 +581,12 @@ func (c *Config) validate() error {
 	}
 	if c.HookTimeoutMS <= 0 {
 		errs = append(errs, fmt.Errorf("config: hook_timeout_ms %d must be positive", c.HookTimeoutMS))
+	}
+	if c.Web.MaxResults < 1 || c.Web.MaxResults > 20 {
+		errs = append(errs, fmt.Errorf("config: web.max_results %d must be 1 through 20", c.Web.MaxResults))
+	}
+	if c.Web.FetchMaxBytes < 1024 {
+		errs = append(errs, fmt.Errorf("config: web.fetch_max_bytes %d must be at least 1024", c.Web.FetchMaxBytes))
 	}
 	if c.ToolTimeoutMS < 0 {
 		errs = append(errs, fmt.Errorf("config: tool_timeout_ms %d must be zero or positive; zero means no timeout", c.ToolTimeoutMS))
