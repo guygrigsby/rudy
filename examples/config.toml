@@ -8,8 +8,9 @@
 
 # The agent definition a session runs under.
 agent = "default"
-# Output tokens a single request may produce.
-max_tokens = 8192
+# Output tokens a single request may produce. 0 means the model's own maximum, which the registry knows; a larger value is clamped to it.
+# e.g. 64000
+max_tokens = 0
 # How long one hook handler may take before it is abandoned.
 hook_timeout_ms = 5000
 # How long one tool invocation may take.

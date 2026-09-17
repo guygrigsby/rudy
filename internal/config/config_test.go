@@ -74,7 +74,7 @@ func TestLoadDefaultsWithoutFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Permissions.Mode != "strict" || c.Default.Thinking != "high" || c.MaxTokens != 8192 {
+	if c.Permissions.Mode != "strict" || c.Default.Thinking != "high" || c.MaxTokens != 0 {
 		t.Errorf("defaults: %+v", c)
 	}
 	if len(c.Permissions.Dangerous) == 0 || c.Permissions.Dangerous[0] != "rm -rf" {
@@ -555,5 +555,23 @@ func TestResolveSecretNamesTheKeyWhenTheFileIsMissing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "secrets.file") {
 		t.Errorf("error %q does not name the config key that moves it", err.Error())
+	}
+}
+
+// TestMaxTokensDefaultsToTheModelsOwn: the default is 0, which means the model's max_output
+// rather than a flat cap, and load accepts it. A negative value is still refused.
+func TestMaxTokensDefaultsToTheModelsOwn(t *testing.T) {
+	paths := testPaths(t)
+	c, err := config.Load(paths, map[string]any{"default.provider": "p", "default.model": "m"})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.MaxTokens != 0 {
+		t.Errorf("max_tokens defaults to %d, want 0 so the model decides", c.MaxTokens)
+	}
+	if _, err := config.Load(paths, map[string]any{
+		"default.provider": "p", "default.model": "m", "max_tokens": -1,
+	}); err == nil {
+		t.Error("max_tokens -1 loaded; want it refused")
 	}
 }

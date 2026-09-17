@@ -522,7 +522,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `agent` | string | `default` | agent definition for new sessions |
 | `hook_timeout_ms` | int | 5000 | per handler |
 | `tool_timeout_ms` | int | 600000 | per tool invocation |
-| `max_tokens` | int | 8192 | output tokens one request may produce |
+| `max_tokens` | int | 0 | output tokens one request may produce. 0 means the model's own `max_output`, which the registry already carries per model, so a model that serves 128000 is asked for 128000 and one that serves 64000 is asked for 64000. A value above the model's maximum is clamped to it rather than sent and refused, and 8192 is the floor for a model whose endpoint reports no maximum. Negative is refused at load |
 | `permissions.mode` | PermissionMode | `strict` | |
 | `permissions.dangerous` | [string] | see open list | matchers that always ask unless the mode is off, ahead of any session allowance. Three forms: a bare `prefix` is a bash command prefix, `tool:` is every call of that tool whatever its input, and `tool:prefix` is that tool with a bash command prefix. For bash, every simple command of the input is matched, and so is every command a wrapper runs: a shell's `-c` script, an `eval` argument and the remainder after `env`, `xargs`, `sudo`, `nohup`, `time`, `exec`, `command`, `timeout` and the rest, three wrappers deep. An entry a wrapper walks around is an entry that does nothing (rudy-k0.34, rudy-y3d) |
 | `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it; must be positive, since zero is a window no two presses fall inside and the double-Esc cancel would be unreachable |

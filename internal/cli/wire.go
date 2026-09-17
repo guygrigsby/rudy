@@ -425,10 +425,13 @@ func summarizeWith(cfg *config.Config, registry *provider.Registry, notice func(
 		}
 		var b strings.Builder
 		err = prov.Complete(ctx, provider.Request{
-			Model:     m.Ref,
-			Messages:  []provider.Message{{Role: provider.RoleUser, Content: []session.Block{session.TextBlock(prompt)}}},
-			Thinking:  session.ThinkingOff,
-			MaxTokens: cfg.MaxTokens,
+			Model:    m.Ref,
+			Messages: []provider.Message{{Role: provider.RoleUser, Content: []session.Block{session.TextBlock(prompt)}}},
+			Thinking: session.ThinkingOff,
+			// The fold resolves its budget against the model it is folding through, not the
+			// session's: max_tokens 0 means the model's own, and a request that names no
+			// limit is refused outright on the Anthropic wire.
+			MaxTokens: m.OutputBudget(cfg.MaxTokens),
 			SessionID: sid,
 		}, func(part provider.Part) error {
 			if part.Type == provider.PartTextDelta {

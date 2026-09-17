@@ -656,3 +656,22 @@ func TestBuildWithNoProvidersNamesTheConfigFile(t *testing.T) {
 		t.Errorf("stderr %q announced a refresh with no provider to refresh from", stderr.String())
 	}
 }
+
+// TestSummarizeAsksForWhatTheSummaryModelServes: the fold is a provider request like any
+// other, so it resolves max_tokens against its own model. It passed cfg.MaxTokens raw, which
+// with the default 0 meant a request that named no limit at all: omitted on the OpenAI wire
+// and refused outright on Anthropic's, where max_tokens is required.
+func TestSummarizeAsksForWhatTheSummaryModelServes(t *testing.T) {
+	fp, reg, cfg := summarizeFixture(t, []provider.Part{
+		{Type: provider.PartTextDelta, Text: "summary"},
+		{Type: provider.PartStop, StopReason: session.StopEndTurn},
+	})
+	cfg.MaxTokens = 0
+	sid := ulid.Make()
+	if _, err := summarizeWith(cfg, reg, func(string) {})(context.Background(), sid.String(), "observe this"); err != nil {
+		t.Fatalf("summarize: %v", err)
+	}
+	if got := fp.request(0).MaxTokens; got != 8192 {
+		t.Errorf("fold asked for %d output tokens, want the model's 8192", got)
+	}
+}

@@ -59,11 +59,13 @@ func renderModels(w io.Writer, models []provider.Model) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	// UPSTREAM before the price: an endpoint that fronts several serves the same id from
 	// more than one of them, and without this column the rows read as duplicates.
-	_, _ = fmt.Fprintln(tw, "PROVIDER\tMODEL\tUPSTREAM\tCONTEXT\tIN/1M\tOUT/1M\tNAME")
+	// MAX OUT beside CONTEXT: it is what max_tokens resolves to when it is left at 0, so the
+	// ceiling on one answer is a number a reader can see rather than one only the wire knows.
+	_, _ = fmt.Fprintln(tw, "PROVIDER\tMODEL\tUPSTREAM\tCONTEXT\tMAX OUT\tIN/1M\tOUT/1M\tNAME")
 	for _, m := range models {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			m.Ref.Provider, m.Ref.Model, dashIfEmpty(m.Upstream), intOrDash(m.ContextWindow),
-			per1M(m.Pricing.Input), per1M(m.Pricing.Output), m.DisplayName)
+			intOrDash(m.MaxOutput), per1M(m.Pricing.Input), per1M(m.Pricing.Output), m.DisplayName)
 	}
 	return tw.Flush()
 }

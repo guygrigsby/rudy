@@ -105,6 +105,7 @@ func (p *scriptProvider) ListModels(ctx context.Context) ([]provider.Model, erro
 		Ref:           session.ModelRef{Provider: "fake", Model: "m1"},
 		DisplayName:   "Fake 1",
 		ContextWindow: 100000,
+		MaxOutput:     64000,
 		Capabilities:  provider.Capabilities{Tools: true},
 	}}, nil
 }
@@ -4720,5 +4721,43 @@ func TestAFailedPluginsAgentIsNotResolvable(t *testing.T) {
 	}, &info)
 	if code(t, err) != protocol.CodeNotFound {
 		t.Fatalf("open with a failed plugin's agent name: err = %v, want not_found", err)
+	}
+}
+
+// TestATurnAsksForWhatTheModelServes: max_tokens 0 means the model's own ceiling, which the
+// registry already carries. A flat 8192 truncated a large write on a model that serves 64000.
+func TestATurnAsksForWhatTheModelServes(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	cfg := testConfig()
+	cfg.MaxTokens = 0
+	srv, _ := newServerWith(t, cfg, &fakePlugin{prov: prov})
+	cl := dialAs(t, srv, false)
+	var info protocol.SessionInfo
+	if err := cl.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: t.TempDir()}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	submit(t, cl, info.SessionID, "go")
+	drain(t, cl, completedOn(info.SessionID))
+	if got := prov.request(0).MaxTokens; got != 64000 {
+		t.Errorf("request asked for %d output tokens, want the model's 64000", got)
+	}
+}
+
+// TestATurnIsClampedToWhatTheModelServes: asking for more than the endpoint allows gets the
+// endpoint's maximum rather than a request it refuses.
+func TestATurnIsClampedToWhatTheModelServes(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	cfg := testConfig()
+	cfg.MaxTokens = 1000000
+	srv, _ := newServerWith(t, cfg, &fakePlugin{prov: prov})
+	cl := dialAs(t, srv, false)
+	var info protocol.SessionInfo
+	if err := cl.Call(context.Background(), protocol.MethodSessionOpen, protocol.SessionOpenParams{Cwd: t.TempDir()}, &info); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	submit(t, cl, info.SessionID, "go")
+	drain(t, cl, completedOn(info.SessionID))
+	if got := prov.request(0).MaxTokens; got != 64000 {
+		t.Errorf("request asked for %d output tokens, want it clamped to 64000", got)
 	}
 }

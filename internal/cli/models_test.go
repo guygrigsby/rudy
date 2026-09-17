@@ -30,7 +30,7 @@ func TestPer1M(t *testing.T) {
 
 func TestRenderModels(t *testing.T) {
 	models := []provider.Model{
-		{Ref: session.ModelRef{Provider: "aperture", Model: "cline-pass/kimi-k3"}, DisplayName: "Kimi K3", ContextWindow: 262144, Pricing: provider.Pricing{Input: "0.0000006", Output: "0.0000025"}},
+		{Ref: session.ModelRef{Provider: "aperture", Model: "cline-pass/kimi-k3"}, DisplayName: "Kimi K3", ContextWindow: 262144, MaxOutput: 64000, Pricing: provider.Pricing{Input: "0.0000006", Output: "0.0000025"}},
 		{Ref: session.ModelRef{Provider: "mlx", Model: "qwen3-coder"}},
 	}
 	var out bytes.Buffer
@@ -46,6 +46,11 @@ func TestRenderModels(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], "cline-pass/kimi-k3") || !strings.Contains(lines[1], "$0.60") || !strings.Contains(lines[1], "$2.50") || !strings.Contains(lines[1], "262144") {
 		t.Fatalf("row %q", lines[1])
+	}
+	// MAX OUT is what max_tokens resolves to when it is left at 0, so the number that
+	// decides how long one answer may be is one a reader can see.
+	if !strings.Contains(lines[0], "MAX OUT") || !strings.Contains(lines[1], "64000") {
+		t.Fatalf("header %q row %q missing the max output column", lines[0], lines[1])
 	}
 	if !strings.Contains(lines[2], "qwen3-coder") || strings.Count(lines[2], "-") < 3 {
 		t.Fatalf("row with unknowns %q", lines[2])

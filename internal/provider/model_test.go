@@ -40,3 +40,32 @@ func TestErrorString(t *testing.T) {
 		t.Fatalf("got %q", e.Error())
 	}
 }
+
+// TestOutputBudget pins what one request may produce. The registry already knows each
+// model's ceiling, so a flat config value was both too low for a model that serves 128000
+// and too high for one that serves 64000; the first truncated a large write, the second was
+// refused by the endpoint.
+func TestOutputBudget(t *testing.T) {
+	known := provider.Model{MaxOutput: 64000}
+	unknown := provider.Model{}
+	cases := []struct {
+		name       string
+		model      provider.Model
+		configured int
+		want       int
+	}{
+		{"unset takes the model's own", known, 0, 64000},
+		{"a value under the ceiling is the operator's", known, 8192, 8192},
+		{"a value over it is clamped rather than refused", known, 1000000, 64000},
+		{"negative is treated as unset", known, -1, 64000},
+		{"unset with no ceiling known falls back", unknown, 0, 8192},
+		{"a value with no ceiling known is sent as asked", unknown, 32000, 32000},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.model.OutputBudget(c.configured); got != c.want {
+				t.Errorf("OutputBudget(%d) = %d, want %d", c.configured, got, c.want)
+			}
+		})
+	}
+}

@@ -989,7 +989,7 @@ func (s *Server) compactorLocked(prov provider.Provider, ls *liveSession) *turn.
 		Provider:  prov,
 		Model:     ls.model,
 		Hooks:     s.hookFirer(),
-		MaxTokens: s.d.Config.MaxTokens,
+		MaxTokens: ls.model.OutputBudget(s.d.Config.MaxTokens),
 		Overrides: ls.overrides,
 	}
 }
@@ -2133,7 +2133,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		Observer:    first,
 		System:      base + ls.hookContextSuffixLocked(),
 		MaxSteps:    ls.maxSteps,
-		MaxTokens:   s.d.Config.MaxTokens,
+		MaxTokens:   ls.model.OutputBudget(s.d.Config.MaxTokens),
 		Hooks:       s.hookFirer(),
 		Compactor:   s.compactorLocked(prov, ls),
 		CompactAt:   s.d.Config.Sessions.CompactAt,

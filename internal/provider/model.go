@@ -46,6 +46,11 @@ type Capabilities struct {
 	Reasoning bool `json:"reasoning"`
 }
 
+// fallbackOutputTokens is what one request may produce when nothing knows better: the
+// operator set no max_tokens and the endpoint reported no maximum for the model. Every wire
+// needs a number, so this is the floor rather than a guess large enough to be refused.
+const fallbackOutputTokens = 8192
+
 // Model is one id a provider serves.
 type Model struct {
 	Ref           session.ModelRef `json:"ref"`
@@ -59,4 +64,22 @@ type Model struct {
 	// so per model, and without it every model reads as the proxy's own. Empty when the
 	// endpoint says nothing, which is every plain OpenAI server.
 	Upstream string `json:"upstream,omitempty"`
+}
+
+// OutputBudget is how many output tokens one request against this model may produce.
+// configured is the operator's max_tokens: zero or less means this model's own maximum,
+// which the registry already carries, and a value above that maximum is clamped to it
+// rather than sent to an endpoint that would refuse it. A model whose endpoint reports no
+// maximum takes the operator's value, or the fallback when they set none.
+func (m Model) OutputBudget(configured int) int {
+	if m.MaxOutput <= 0 {
+		if configured <= 0 {
+			return fallbackOutputTokens
+		}
+		return configured
+	}
+	if configured <= 0 || int64(configured) > m.MaxOutput {
+		return int(m.MaxOutput)
+	}
+	return configured
 }

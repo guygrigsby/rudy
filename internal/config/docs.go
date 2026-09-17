@@ -54,7 +54,7 @@ var Sections = []Section{
 		},
 		Keys: []Doc{
 			{Key: "agent", Comment: "The agent definition a session runs under."},
-			{Key: "max_tokens", Comment: "Output tokens a single request may produce."},
+			{Key: "max_tokens", Comment: "Output tokens a single request may produce. 0 means the model's own maximum, which the registry knows; a larger value is clamped to it.", Example: "64000"},
 			{Key: "hook_timeout_ms", Comment: "How long one hook handler may take before it is abandoned."},
 			{Key: "tool_timeout_ms", Comment: "How long one tool invocation may take.", Example: "60000"},
 		},

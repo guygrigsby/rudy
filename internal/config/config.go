@@ -311,7 +311,7 @@ func Defaults() map[string]any {
 		"secrets.file":                     "", // filled by defaultSecretsFile when still empty after Load
 		"remote.host":                      "",
 		"remote.source":                    "~/projects/rudy",
-		"max_tokens":                       8192,
+		"max_tokens":                       0, // 0 means the model's own max_output (provider.Model.OutputBudget)
 		"prompt.file":                      "",
 		"ui.render":                        "altscreen",
 		"ui.header.show":                   true,
@@ -628,8 +628,8 @@ func (c *Config) validate() error {
 	if c.MCP.ConnectTimeoutMS <= 0 {
 		errs = append(errs, fmt.Errorf("config: mcp.connect_timeout_ms %d must be positive", c.MCP.ConnectTimeoutMS))
 	}
-	if c.MaxTokens <= 0 {
-		errs = append(errs, fmt.Errorf("config: max_tokens %d must be positive", c.MaxTokens))
+	if c.MaxTokens < 0 {
+		errs = append(errs, fmt.Errorf("config: max_tokens %d must be zero, for the model's own maximum, or positive", c.MaxTokens))
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
