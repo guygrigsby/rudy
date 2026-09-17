@@ -61,6 +61,8 @@ func TestToolStateVocabularyMatchesTheProtocol(t *testing.T) {
 		domain turn.ToolState
 		wire   string
 	}{
+		{turn.ToolGating, protocol.ToolStateGating},
+		{turn.ToolQueued, protocol.ToolStateQueued},
 		{turn.ToolRunning, protocol.ToolStateRunning},
 		{turn.ToolAwaitingPermission, protocol.ToolStateAwaitingPermission},
 		{turn.ToolDone, protocol.ToolStateDone},

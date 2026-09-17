@@ -492,7 +492,9 @@ func TestRunToolFlowStrictAskerAllows(t *testing.T) {
 	if tr.Outcome != session.OutcomeOK || tr.Content[0].Text != "ran" || tr.ToolUseID != "tu1" {
 		t.Fatalf("tool result %+v", tr)
 	}
-	wantStates := []State{Streaming, AwaitingPermission, RunningTool, Streaming, Completed}
+	// running_tool as soon as the call is admitted and gating, before the question stands:
+	// the Turn's state is read from the whole call set now (see callStates).
+	wantStates := []State{Streaming, RunningTool, AwaitingPermission, RunningTool, Streaming, Completed}
 	if len(rec.states) != len(wantStates) {
 		t.Fatalf("states %v", rec.states)
 	}

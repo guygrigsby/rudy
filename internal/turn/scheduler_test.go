@@ -6,6 +6,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/guygrigsby/rudy/internal/provider"
+	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/tool"
 )
 
 // waitFor polls until cond holds or the budget runs out, which is how a test watches a pool
@@ -197,4 +201,52 @@ func TestCloseCancelsAndJoins(t *testing.T) {
 		t.Error("admission stayed open after Close")
 	}
 	s.Close() // idempotent: Shutdown may reach it twice
+}
+
+// TestNoResultResumesTheProviderWhileACallIsStillPending is the rule that makes the per-call
+// states safe to act on: a finished call does not resume the Turn. The provider is asked
+// again only once every call of the response is done, whatever order they finished in.
+func TestNoResultResumesTheProviderWhileACallIsStillPending(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	rec := &recorder{}
+	p := &scripted{scripts: [][]provider.Part{
+		append(append(toolCall("tu_fast", "danger", `{"x":1}`), toolCall("tu_slow", "danger", `{"y":2}`)...),
+			stop(session.StopToolUse, "tool_use")),
+		{text("done"), stop(session.StopEndTurn, "end_turn")},
+	}}
+	held := make(chan struct{})
+	asked := make(chan string, 2)
+	asker := askerFunc(func(ctx context.Context, q Question) (Answer, error) {
+		asked <- q.ToolUseID
+		if q.ToolUseID == "tu_slow" {
+			<-held
+		}
+		return Answer{Decision: session.Allow, Scope: session.ScopeOnce, Reason: "ok"}, nil
+	})
+	r := newRunner(t, s, p, toolSet{"danger": echoTool(tool.Unsafe, "danger")}, asker, rec)
+	done := make(chan error, 1)
+	go func() { done <- r.Run(context.Background(), userMsg(session.SourceTyped, "go")) }()
+
+	for range 2 {
+		select {
+		case <-asked:
+		case <-time.After(3 * time.Second):
+			t.Fatal("both calls should have reached the asker at once")
+		}
+	}
+	// tu_fast is answered and has run by now; the provider must not have been asked again.
+	waitFor(t, "the quick call to finish", func() bool { return rec.count(session.KindToolResult) == 1 })
+	p.mu.Lock()
+	calls := p.calls
+	p.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("the provider was asked %d times while a call was still awaiting permission", calls)
+	}
+	close(held)
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := rec.count(session.KindToolResult); got != 2 {
+		t.Errorf("tool results = %d, want 2", got)
+	}
 }

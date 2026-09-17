@@ -40,6 +40,11 @@ const (
 type ToolState string
 
 const (
+	// ToolGating is a call the Gate has not decided yet: admitted, visible, and not
+	// runnable. ToolQueued is a call whose allow is durable and which is waiting for a
+	// worker (ADR 0034). A call is reported in exactly one of these at a time.
+	ToolGating             ToolState = "gating"
+	ToolQueued             ToolState = "queued"
 	ToolRunning            ToolState = "running"
 	ToolAwaitingPermission ToolState = "awaiting_permission"
 	ToolDone               ToolState = "done"
@@ -199,6 +204,10 @@ type Runner struct {
 	// response, and both are discarded when the Turn ends.
 	limits   limits
 	admitted admitted
+
+	// states is where each admitted call of the current response has got to, and what the
+	// Turn's own coarse state is read from while they run (see callStates).
+	states callStates
 }
 
 // NewRunner returns an idle runner.
@@ -458,20 +467,15 @@ func (r *Runner) loop(ctx context.Context) error {
 			runnable = append(runnable, tu)
 		}
 		outcomes := make([]toolOutcome, len(runnable))
+		r.states.start(runnable)
 		var wg sync.WaitGroup
 		for i, tu := range runnable {
-			wg.Add(1)
-			// Submitted, not spawned: the calls of one response run concurrently on the
-			// Server's bounded pool (ADR 0034), and a full pool makes this wait rather
-			// than allocate. A submission the pool refuses is the turn's ending, since
-			// the call it names will never run and never come back.
-			if err := r.submit(ctx, func(jobCtx context.Context) {
-				defer wg.Done()
-				outcomes[i] = r.runTool(jobCtx, tu)
-			}); err != nil {
-				wg.Done()
-				outcomes[i] = submissionOutcome(err)
-			}
+			// One goroutine per call for the gating phase, which asks the hooks, the Gate
+			// and the operator and runs no tool: coalesced questions have to be in flight
+			// together for the Gate to coalesce them at all (ADR 0028), and admission
+			// bounds the set to 64. Execution is what the Server's pool bounds, and
+			// runTool submits it there once the call's own allow is durable (ADR 0034).
+			wg.Go(func() { outcomes[i] = r.runTool(ctx, tu) })
 		}
 		wg.Wait()
 		// One slot per call, read in call order, so the turn ends on the same outcome
@@ -580,16 +584,19 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 	s := r.cfg.Session
 	turnID := r.TurnID()
 	if ctx.Err() != nil {
-		// The Turn was cut while this call waited for a worker. It still owes the log a
-		// decision and a result, because the assistant message already asked for it, but
-		// the tool must not run: that would be a success landing after the cut.
+		// The Turn was cut before this call was decided. It still owes the log a decision
+		// and a result, because the assistant message already asked for it, but the tool
+		// must not run: that would be a success landing after the cut.
+		defer r.toolState(turnID, tu, ToolDone)
 		if err := r.refuse(ctx, interruptedDeny(r.classDeny(tu, "interrupted")), session.OutcomeKilled, interruptedText); err != nil {
 			return toolOutcome{class: session.ErrInternal, err: err}
 		}
 		return toolOutcome{ctxErr: ctx.Err()}
 	}
-	r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolRunning)
-	defer r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolDone)
+	// Gating, not running: the call is admitted and visible, and nothing of it runs until
+	// the Gate has decided it (ADR 0034).
+	r.toolState(turnID, tu, ToolGating)
+	defer r.toolState(turnID, tu, ToolDone)
 
 	t, ok := r.cfg.Tools.Tool(tu.Name)
 	if !ok {
@@ -646,8 +653,7 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 		dec.Input = input
 	}
 	if ask {
-		r.setState(AwaitingPermission)
-		r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolAwaitingPermission)
+		r.toolState(turnID, tu, ToolAwaitingPermission)
 		askCtx, cancel := context.WithCancel(ctx)
 		r.calls.add(tu.ID, cancel)
 		ans, askErr := r.cfg.Asker.Ask(askCtx, Question{ToolUseID: tu.ID, Tool: tu.Name, Input: input, Matcher: dec.Matcher, Dangerous: dangerous})
@@ -706,15 +712,42 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 		return toolOutcome{}
 	}
 
-	r.setState(RunningTool)
-	if ask {
-		// Back from the operator, so this call is running again rather than waiting on an
-		// answer. Only a call that asked has anything to correct here.
-		r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolRunning)
-	}
 	if t.Invoke == nil {
 		return toolOutcome{class: session.ErrPlugin, err: fmt.Errorf("tool %s has no Invoke", tu.Name)}
 	}
+	// Allowed and durable, so this call may now wait for a worker. Queued is exactly that
+	// wait: the decision is in the log, the tool has not started, and the pool decides when
+	// it does (ADR 0034).
+	r.toolState(turnID, tu, ToolQueued)
+	var out toolOutcome
+	done := make(chan struct{})
+	if err := r.submit(ctx, func(jobCtx context.Context) {
+		defer close(done)
+		out = r.invokeCall(jobCtx, tu, t, input)
+	}); err != nil {
+		return submissionOutcome(err)
+	}
+	<-done
+	return out
+}
+
+// invokeCall is the half of a call that runs on the Server's pool: everything after its
+// decision is durable. It is handed the worker's context, so a Turn cut or a Server shutdown
+// reaches the tool it is running.
+func (r *Runner) invokeCall(ctx context.Context, tu session.Block, t tool.Tool, input json.RawMessage) toolOutcome {
+	s := r.cfg.Session
+	turnID := r.TurnID()
+	if ctx.Err() != nil {
+		// Cut while it sat in the queue. The decision is already in the log, so what is
+		// owed is the result, and the tool does not run.
+		if _, err := r.appendToolResult(ctx, session.ToolResult{
+			ToolUseID: tu.ID, Outcome: session.OutcomeKilled, Content: []session.Block{session.TextBlock("killed")},
+		}); err != nil {
+			return toolOutcome{class: session.ErrInternal, err: err}
+		}
+		return toolOutcome{ctxErr: ctx.Err()}
+	}
+	r.toolState(turnID, tu, ToolRunning)
 	var toolCtx context.Context
 	var cancel context.CancelFunc
 	if r.cfg.ToolTimeout > 0 {

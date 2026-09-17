@@ -357,9 +357,13 @@ type ToolStateChanged struct {
 	State     string `json:"state"`
 }
 
-// The states a tool call is reported in. turn.ToolState carries the same three values; the
-// server converts by taking the string, so a drift test holds them together.
+// The states a tool call is reported in. turn.ToolState carries the same five values; the
+// server converts by taking the string, so a drift test holds them together. gating is an
+// admitted call the Gate has not decided, queued is one whose allow is durable and which is
+// waiting for a worker (ADR 0034).
 const (
+	ToolStateGating             = "gating"
+	ToolStateQueued             = "queued"
 	ToolStateRunning            = "running"
 	ToolStateAwaitingPermission = "awaiting_permission"
 	ToolStateDone               = "done"

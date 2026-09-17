@@ -603,9 +603,12 @@ func TestToolStateReachesAClient(t *testing.T) {
 		}
 		seq = append(seq, ts.State)
 	}
+	// The exact per-call sequence the contract's tool.state row names: admitted and
+	// gating, the question, the allow made durable and the wait for a worker, the tool
+	// itself, done (ADR 0034).
 	want := []string{
-		protocol.ToolStateRunning, protocol.ToolStateAwaitingPermission,
-		protocol.ToolStateRunning, protocol.ToolStateDone,
+		protocol.ToolStateGating, protocol.ToolStateAwaitingPermission,
+		protocol.ToolStateQueued, protocol.ToolStateRunning, protocol.ToolStateDone,
 	}
 	if !slices.Equal(seq, want) {
 		t.Fatalf("tool.state sequence = %v, want %v", seq, want)

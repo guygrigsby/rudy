@@ -839,3 +839,23 @@ func TestShutdownJoinsTheToolPool(t *testing.T) {
 		t.Error("the pool stayed open after shutdown")
 	}
 }
+
+// TestAnAttachMidGateOrMidQueueSeesTheCallsState is what a client joining a Turn already in
+// flight is owed: every call in flight, in the state it is actually in, including the two
+// states a call holds before it runs anything (ADR 0034).
+func TestAnAttachMidGateOrMidQueueSeesTheCallsState(t *testing.T) {
+	for _, st := range []turn.ToolState{turn.ToolGating, turn.ToolQueued} {
+		t.Run(string(st), func(t *testing.T) {
+			f := newFixture(t)
+			ls := f.open()
+			sid := ls.sess.ID().String()
+			(&fanout{ls: ls, sid: sid}).ToolStateChanged("01M2M4BBT3T087RHJW7E4R5NFY", "tu1", "echo", st)
+
+			tc := f.attach(ls, true)
+			time.Sleep(50 * time.Millisecond) // the attach replay is queued through the pump
+			if !tc.received(string(st)) {
+				t.Errorf("the attaching client was not told about a call that is %s", st)
+			}
+		})
+	}
+}
