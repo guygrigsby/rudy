@@ -1,5 +1,12 @@
 # rudy
 
+               /\_/\  /\
+              / o o \ \ \
+             /   Y   \/ /
+            /         \/
+            \ | | | | /
+             `|_|-|_|
+
 A coding agent harness in Go. One binary that runs a model-driven loop over a
 workspace with tools, sessions, permissions and plugins, fronted by a
 terminal client the owner controls down to the glyph, and runnable headless
