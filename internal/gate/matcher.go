@@ -26,29 +26,129 @@ func (g *Gate) MatcherFor(tool string, args json.RawMessage) session.Matcher {
 	return session.Matcher{Tool: tool, Prefix: firstWords(calls[0], 2)}
 }
 
-// Dangerous reports whether any simple command in a bash input starts with a
-// dangerous entry, and which entry matched.
+// Dangerous reports whether this call matches an entry of the dangerous set, and which
+// entry it was. An entry takes one of three forms:
+//
+//	rm -rf        a bash command prefix, which is what every default is
+//	web_fetch:    a tool, dangerous whatever its input
+//	bash:git push a tool and, for bash, a command prefix
+//
+// For bash, every simple command in the input is checked, and so is every command a
+// wrapper runs: the set is what forces a question in permissive mode, and an entry that
+// `sh -c` walks around is an entry that does nothing (rudy-k0.34, rudy-y3d).
 func (g *Gate) Dangerous(tool string, args json.RawMessage) (bool, string) {
-	if tool != "bash" {
-		return false, ""
+	var calls [][]string
+	if tool == "bash" {
+		if cmd, ok := bashCommand(args); ok {
+			calls = expand(shellCallsOrFields(cmd), 0)
+		}
 	}
-	cmd, ok := bashCommand(args)
-	if !ok {
-		return false, ""
-	}
-	calls, err := shellCalls(cmd)
-	if err != nil || len(calls) == 0 {
-		calls = [][]string{strings.Fields(cmd)}
-	}
-	for _, call := range calls {
-		joined := strings.Join(call, " ")
-		for _, d := range g.dangerous {
-			if joined == d || strings.HasPrefix(joined, d+" ") {
+	for _, d := range g.dangerous {
+		entryTool, prefix, scoped := strings.Cut(d, ":")
+		switch {
+		case scoped && entryTool != tool:
+			continue
+		case scoped && prefix == "":
+			// A tool with no prefix: every call of it is dangerous, which is the only
+			// way to say "always ask" for a tool that is not bash.
+			return true, d
+		case tool != "bash":
+			// Every other entry is a bash command prefix, and no other tool has one.
+			continue
+		}
+		want := d
+		if scoped {
+			want = prefix
+		}
+		for _, call := range calls {
+			joined := strings.Join(call, " ")
+			if joined == want || strings.HasPrefix(joined, want+" ") {
 				return true, d
 			}
 		}
 	}
 	return false, ""
+}
+
+// shellCallsOrFields is the parsed simple commands of src, or its words when it does not
+// parse: an input the shell will refuse is still an input the set should be read against.
+func shellCallsOrFields(src string) [][]string {
+	calls, err := shellCalls(src)
+	if err != nil || len(calls) == 0 {
+		return [][]string{strings.Fields(src)}
+	}
+	return calls
+}
+
+// wrapperDepth bounds how far a wrapper inside a wrapper is followed. Three is past
+// anything a person writes and short of anything a generated command can spend.
+const wrapperDepth = 3
+
+// shellFlagged are the commands that run a script given as one argument, after a flag that
+// ends in c: sh -c, bash -lc, zsh -ic.
+var shellFlagged = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "ksh": true}
+
+// prefixWrappers run whatever follows them, once their own flags and assignments are past.
+// sudo and doas are here as wrappers as well as being dangerous entries in their own right:
+// `env sudo rm -rf` has to match both the sudo entry and the rm one.
+var prefixWrappers = map[string]bool{
+	"env": true, "xargs": true, "nohup": true, "time": true, "exec": true, "command": true,
+	"sudo": true, "doas": true, "nice": true, "ionice": true, "timeout": true, "stdbuf": true,
+	"setsid": true, "watch": true,
+}
+
+// expand adds, for every call that runs another command, the command it runs. The wrapper
+// call itself stays in the set: `sudo ls` is still a sudo.
+func expand(calls [][]string, depth int) [][]string {
+	if depth >= wrapperDepth {
+		return calls
+	}
+	out := calls
+	for _, call := range calls {
+		for _, inner := range unwrap(call) {
+			if len(inner) == 0 {
+				continue
+			}
+			out = append(out, inner)
+			out = append(out, expand([][]string{inner}, depth+1)...)
+		}
+	}
+	return out
+}
+
+// unwrap is what one call runs, if it runs anything: the parsed script of a shell's -c, the
+// parsed argument of eval, or the remainder of a prefix wrapper.
+func unwrap(call []string) [][]string {
+	if len(call) < 2 {
+		return nil
+	}
+	head := call[0]
+	if i := strings.LastIndexByte(head, '/'); i >= 0 {
+		head = head[i+1:] // /bin/sh and sh are the same wrapper
+	}
+	switch {
+	case shellFlagged[head]:
+		for i := 1; i < len(call)-1; i++ {
+			// -c, and the bundles a login or interactive shell takes: -lc, -ic, -ec.
+			if strings.HasPrefix(call[i], "-") && strings.HasSuffix(call[i], "c") {
+				return shellCallsOrFields(call[i+1])
+			}
+		}
+		return nil
+	case head == "eval":
+		return shellCallsOrFields(strings.Join(call[1:], " "))
+	case prefixWrappers[head]:
+		rest := call[1:]
+		for len(rest) > 0 && (strings.HasPrefix(rest[0], "-") || strings.Contains(rest[0], "=")) {
+			// env's assignments and a wrapper's own flags are not the command it runs.
+			rest = rest[1:]
+		}
+		if len(rest) == 0 {
+			return nil
+		}
+		return [][]string{rest}
+	}
+	return nil
 }
 
 func bashCommand(args json.RawMessage) (string, bool) {

@@ -70,3 +70,91 @@ func TestDangerous(t *testing.T) {
 		t.Fatal("non-bash tools are never dangerous by prefix")
 	}
 }
+
+// TestAWrapperCannotHideADangerousCommand: the dangerous set is what forces a question in
+// permissive mode, so a command that runs another command has to be read for what it runs.
+// Otherwise every entry in the set is one `sh -c` away from silence (rudy-k0.34).
+func TestAWrapperCannotHideADangerousCommand(t *testing.T) {
+	g := New([]string{"rm -rf", "git push --force", "sudo"})
+	for _, command := range []string{
+		`rm -rf /tmp/x`,
+		`sh -c "rm -rf /tmp/x"`,
+		`bash -c 'rm -rf /tmp/x'`,
+		`bash -lc "rm -rf /tmp/x"`,
+		`zsh -c "rm -rf /tmp/x"`,
+		`eval "rm -rf /tmp/x"`,
+		`xargs rm -rf`,
+		`env FOO=1 sudo ls`,
+		`nohup rm -rf /tmp/x`,
+		`time rm -rf /tmp/x`,
+		`exec sudo ls`,
+		`command sudo ls`,
+		`sh -c "echo hi && rm -rf /tmp/x"`,
+		`sh -c "sh -c 'rm -rf /tmp/x'"`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			dangerous, entry := g.Dangerous("bash", json.RawMessage(`{"command":`+quote(command)+`}`))
+			if !dangerous {
+				t.Errorf("%s is not dangerous, so permissive mode runs it without asking", command)
+			} else if entry == "" {
+				t.Error("dangerous with no entry named")
+			}
+		})
+	}
+}
+
+// TestAnOrdinaryCommandStaysOrdinary keeps the widening honest: reading wrappers must not
+// make every command dangerous by accident.
+func TestAnOrdinaryCommandStaysOrdinary(t *testing.T) {
+	g := New([]string{"rm -rf", "sudo"})
+	for _, command := range []string{
+		`go test ./...`,
+		`sh -c "go build ./..."`,
+		`echo "rm -rf is a dangerous command"`,
+		`grep -rn "sudo" .`,
+		`rm -i one-file`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			if dangerous, entry := g.Dangerous("bash", json.RawMessage(`{"command":`+quote(command)+`}`)); dangerous {
+				t.Errorf("%s was called dangerous by %q", command, entry)
+			}
+		})
+	}
+}
+
+// quote is the JSON spelling of a command string.
+func quote(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// TestABareToolNameIsDangerousForThatTool covers the config shape the contracts describe:
+// an entry naming a tool marks every call of it dangerous, which is the only way to say
+// "always ask before this one" for a tool that is not bash (rudy-y3d).
+func TestABareToolNameIsDangerousForThatTool(t *testing.T) {
+	g := New([]string{"web_fetch:", "rm -rf"})
+	if dangerous, entry := g.Dangerous("web_fetch", json.RawMessage(`{"url":"https://example.com"}`)); !dangerous || entry != "web_fetch:" {
+		t.Errorf("web_fetch dangerous = %v by %q, want the tool entry to match every call", dangerous, entry)
+	}
+	if dangerous, _ := g.Dangerous("read", json.RawMessage(`{"path":"x"}`)); dangerous {
+		t.Error("an entry for one tool made another tool dangerous")
+	}
+	if dangerous, _ := g.Dangerous("bash", json.RawMessage(`{"command":"rm -rf /tmp/x"}`)); !dangerous {
+		t.Error("a tool entry in the set stopped a bash prefix from matching")
+	}
+}
+
+// TestAToolPrefixEntryNarrowsToThatTool is the third shape: tool:prefix, which is what a
+// bash entry has always meant implicitly and what any other tool needs said explicitly.
+func TestAToolPrefixEntryNarrowsToThatTool(t *testing.T) {
+	g := New([]string{"bash:git push"})
+	if dangerous, _ := g.Dangerous("bash", json.RawMessage(`{"command":"git push origin main"}`)); !dangerous {
+		t.Error("bash:git push did not match a git push")
+	}
+	if dangerous, _ := g.Dangerous("bash", json.RawMessage(`{"command":"git status"}`)); dangerous {
+		t.Error("bash:git push matched a git status")
+	}
+}

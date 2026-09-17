@@ -63,7 +63,7 @@ file = ""
 mode = "strict"
 # The window two Escapes have to fall inside to cancel a turn.
 double_press_ms = 500
-# Command prefixes that ask every time unless the mode is off.
+# Always ask, unless the mode is off: a bash prefix, "tool:", or "tool:prefix".
 dangerous = ["rm -rf", "rm -r", "git push --force", "git push -f", "git reset --hard", "git clean", "sudo", "chmod -R", "chown -R", "mkfs", "dd"]
 
 # Where session logs live and when they are compacted.

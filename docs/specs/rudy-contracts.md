@@ -524,7 +524,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `tool_timeout_ms` | int | 600000 | per tool invocation |
 | `max_tokens` | int | 8192 | output tokens one request may produce |
 | `permissions.mode` | PermissionMode | `strict` | |
-| `permissions.dangerous` | [string] | see open list | matchers that always ask unless the mode is off, ahead of any session allowance; each is `tool` or `tool:prefix`. Pass 1 entries are plain shell command prefixes for bash; the `tool:prefix` form is deferred |
+| `permissions.dangerous` | [string] | see open list | matchers that always ask unless the mode is off, ahead of any session allowance. Three forms: a bare `prefix` is a bash command prefix, `tool:` is every call of that tool whatever its input, and `tool:prefix` is that tool with a bash command prefix. For bash, every simple command of the input is matched, and so is every command a wrapper runs: a shell's `-c` script, an `eval` argument and the remainder after `env`, `xargs`, `sudo`, `nohup`, `time`, `exec`, `command`, `timeout` and the rest, three wrappers deep. An entry a wrapper walks around is an entry that does nothing (rudy-k0.34, rudy-y3d) |
 | `permissions.double_press_ms` | int | 500 | the Esc window; lives here because the client reads it; must be positive, since zero is a window no two presses fall inside and the double-Esc cancel would be unreachable |
 | `prompt.file` | path | `` | a system prompt template of the operator's own; empty reads `system.md` under the config directory when it exists, and the built-in template when it does not. `${base}`, `${tools}`, `${agents}`, `${version}`, `${workspace}`, `${project}`, `${model}`, `${date}`, `${os}` are the values a template may name, `$${` writes a literal `${`, and a name outside the set is a warning notice and the built-in prompt (ADR 0024) |
 | `sessions.dir` | path | `$XDG_DATA_HOME/rudy/sessions` | |
@@ -725,7 +725,8 @@ Invariants and where they are enforced:
 
 ## Open
 
-- the contents of `permissions.dangerous`; proposed shape is `tool` or `tool:prefix`, contents undecided
+- the contents of `permissions.dangerous`; the shape is settled (a bash prefix, `tool:`, or
+  `tool:prefix`) and the shipped contents are still the pass 1 shell prefixes
 - whether `before_request` may mutate the request body, or only headers, in pass 2
 - paging for `session.resume` on very large logs; pass 1 returns every entry
 - whether `session` scope allowances should survive a fork
