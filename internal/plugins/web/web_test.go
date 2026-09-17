@@ -351,3 +351,31 @@ func TestEveryBackendFailingIsOneError(t *testing.T) {
 		t.Errorf("all backends down = %+v, want an error naming the last one tried", res)
 	}
 }
+
+// TestNoKeySaysHowToEnableIt: an operator who wanted the tools and has not keyed them has no
+// other way to learn why they are missing, so the plugin says so once, with the keys and the
+// file it needs.
+func TestNoKeySaysHowToEnableIt(t *testing.T) {
+	var notices []string
+	reg := plugin.NewRegistry(nil, func(s string) { notices = append(notices, s) })
+	reg.Load(context.Background(), &webPlugin{cfg: testConfig(), version: "test"})
+	t.Cleanup(func() { _ = reg.Close(context.Background()) })
+
+	if len(reg.Tools()) != 0 {
+		t.Fatalf("registered %d tools with no key", len(reg.Tools()))
+	}
+	var said string
+	for _, n := range notices {
+		if strings.Contains(n, "web_search") {
+			said = n
+		}
+	}
+	if said == "" {
+		t.Fatalf("no notice told the operator how to enable the tools: %v", notices)
+	}
+	for _, want := range []string{"web.brave_api_key", "web.exa_api_key", "config.toml", "env:", "cache:"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("the notice does not name %q: %q", want, said)
+		}
+	}
+}

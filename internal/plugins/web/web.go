@@ -74,6 +74,11 @@ func (p *webPlugin) Init(ctx context.Context, h plugin.Host) error {
 			// and cannot use it spends a turn discovering that, and an operator who set no
 			// key never asked for the tool, so a failed plugin in the status line would be
 			// rudy complaining about a choice (ADR 0039).
+			//
+			// A notice rather than silence, because the operator who wanted the tools and
+			// has not keyed them has no other way to find out why they are missing. It
+			// says which keys and in which file, so the next step needs no documentation.
+			h.Notice(p.howToEnable())
 			slog.Info("web: tools not registered", "reason", "no search backend has a key")
 			return nil
 		}
@@ -202,4 +207,13 @@ func (p *webPlugin) key(ref string) string {
 		return ""
 	}
 	return strings.TrimSpace(v)
+}
+
+// howToEnable is what an operator with no search key is told, once, at startup: which keys
+// turn the tools on, where they go and what a key reference looks like.
+func (p *webPlugin) howToEnable() string {
+	return "web_search and web_fetch are off. Set web.brave_api_key or web.exa_api_key in " +
+		"config.toml to a key reference (env:NAME, or cache:NAME for the 1Password cache) " +
+		"and restart. Brave is asked first and Exa answers when Brave cannot; " +
+		"api.search.brave.com and exa.ai issue the keys."
 }
