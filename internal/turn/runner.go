@@ -475,7 +475,11 @@ func (r *Runner) loop(ctx context.Context) error {
 			// together for the Gate to coalesce them at all (ADR 0028), and admission
 			// bounds the set to 64. Execution is what the Server's pool bounds, and
 			// runTool submits it there once the call's own allow is durable (ADR 0034).
-			wg.Go(func() { outcomes[i] = r.runTool(ctx, tu) })
+			wg.Go(func() {
+				out := r.runTool(ctx, tu)
+				out.id = tu.ID
+				outcomes[i] = out
+			})
 		}
 		wg.Wait()
 		// One slot per call, read in call order, so the turn ends on the same outcome
@@ -493,6 +497,7 @@ func (r *Runner) loop(ctx context.Context) error {
 // which failure the log records. So each leaves its answer here and the loop acts on the
 // answers once, in call order.
 type toolOutcome struct {
+	id        string             // the call this outcome came from, so a failure can name its own
 	interrupt session.Interrupt  // the turn was cut short and finishes this way
 	ctxErr    error              // the caller's context ended the turn; Run returns this
 	class     session.ErrorClass // with err, the turn_failed to record
@@ -506,7 +511,7 @@ func (r *Runner) endTurn(ctx context.Context, outcomes []toolOutcome) (ended boo
 	for _, o := range outcomes {
 		switch {
 		case o.err != nil:
-			return true, r.fail(o.class, o.err)
+			return true, r.failCall(ctx, o.class, o.err, o.id)
 		case o.ctxErr != nil:
 			_ = r.finishInterrupt(ctx, session.InterruptCancel)
 			return true, o.ctxErr
@@ -998,6 +1003,11 @@ func interruptedDeny(dec session.PermissionDecision) session.PermissionDecision 
 }
 
 func (r *Runner) finishInterrupt(ctx context.Context, how session.Interrupt) error {
+	// Before the steering or terminal Entry, never after: a client reading the log in order
+	// must not see the turn end while one of its calls is still open (ADR 0034).
+	if err := r.terminalize(ctx, session.ByInterrupt, interruptDenyReason, killedByInterrupt, "", ""); err != nil {
+		return err
+	}
 	if how == session.InterruptSteer {
 		return r.rest(ctx, Steering)
 	}
@@ -1054,9 +1064,21 @@ func invokeTool(t tool.Tool, ctx context.Context, call tool.Call) (res tool.Resu
 // Retries is zero. A tool whose Invoke returns a non-nil error is a tool_result with
 // outcome error, not a failure; ErrPlugin is reserved for a panic or a nil Invoke, which
 // are programming faults in a plugin.
+// fail records a failure no single call caused: a provider error, a step limit, a response
+// the Turn refused. failCall is the same ending for a failure one call is responsible for.
 func (r *Runner) fail(class session.ErrorClass, err error) error {
+	return r.failCall(context.Background(), class, err, "")
+}
+
+func (r *Runner) failCall(ctx context.Context, class session.ErrorClass, err error, causal string) error {
 	if errors.Is(err, ErrTerminalDurability) {
 		return err
+	}
+	// Every call this Turn admitted and did not finish is closed out before turn_failed,
+	// the causal one with its own error and its peers killed (ADR 0034). A durability
+	// failure is the exception above: its log is exactly what cannot be written to.
+	if terr := r.terminalize(ctx, session.ByInvariant, invariantDenyReason, killedByTurnFailure, causal, errText(err)); terr != nil {
+		return terr
 	}
 	retries := 0
 	msg := err.Error()

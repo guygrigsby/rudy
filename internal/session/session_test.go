@@ -220,7 +220,9 @@ func TestLoadRecoversLostResults(t *testing.T) {
 	if tail[0].Kind != KindToolResult || tail[0].Payload.(ToolResult).Outcome != OutcomeLost || tail[0].Payload.(ToolResult).ToolUseID != "allowed" {
 		t.Fatalf("expected lost result for allowed, got %+v", tail[0])
 	}
-	if tail[1].Kind != KindPermissionDecision || tail[1].Payload.(PermissionDecision).DecidedBy != ByNoAsker {
+	// By invariant, not by no_asker: nobody was asked and nobody could have been. Recovery
+	// is the Server closing out a call the process died under (ADR 0034).
+	if tail[1].Kind != KindPermissionDecision || tail[1].Payload.(PermissionDecision).DecidedBy != ByInvariant {
 		t.Fatalf("expected recovery deny for undecided, got %+v", tail[1])
 	}
 	if tail[2].Kind != KindToolResult || tail[2].Payload.(ToolResult).Outcome != OutcomeLost {

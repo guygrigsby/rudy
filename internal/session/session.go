@@ -474,6 +474,13 @@ func (s *Session) isPendingLocked(toolUseID string) bool {
 }
 
 // decisionFor is the self-locking form, for a caller that holds nothing (Recover).
+// DecisionFor is the permission_decision this log holds for a tool_use, if any. The Turn's
+// terminalization reads it to tell a call that was decided and never finished from one that
+// was never decided at all, which owe different entries (ADR 0034).
+func (s *Session) DecisionFor(toolUseID string) (PermissionDecision, bool) {
+	return s.decisionFor(toolUseID)
+}
+
 func (s *Session) decisionFor(toolUseID string) (PermissionDecision, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
