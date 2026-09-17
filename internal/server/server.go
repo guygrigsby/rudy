@@ -100,6 +100,11 @@ type Server struct {
 	// committed anything for, retained after the session unloads, and empty in a new process.
 	admMu      sync.Mutex
 	admissions map[ulid.ULID]*sessionAdmission
+
+	// sched is the one bounded pool every Turn's tool calls run on, whatever Session they
+	// belong to (ADR 0034). Shutdown closes it after the turns have been cancelled and
+	// joined, so no worker and no queued job outlives the process's teardown.
+	sched *turn.Scheduler
 }
 
 // New wires a Server. Deps must already be fully populated.
@@ -111,6 +116,7 @@ func New(d Deps) *Server {
 		shutdownRequested: make(chan struct{}), shutdownComplete: make(chan struct{}), shutdownFailed: make(chan struct{}),
 		live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{},
 		admissions: map[ulid.ULID]*sessionAdmission{},
+		sched:      turn.NewScheduler(),
 	}
 }
 
@@ -388,6 +394,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	case <-done:
 	case <-ctx.Done():
 	}
+
+	// After the turns have been cancelled and waited for, and before the sessions close:
+	// a worker still holding a tool call would be writing into a session about to be shut.
+	s.sched.Close()
 
 	var errs []error
 	for _, ls := range lives {
@@ -2235,6 +2245,8 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		MaxSteps:    ls.maxSteps,
 		MaxTokens:   s.d.Config.MaxTokens,
 		Hooks:       s.hookFirer(),
+		Scheduler:   s.sched,
+		Lane:        laneFor(ls),
 		Compactor:   s.compactorLocked(prov, ls),
 		CompactAt:   s.d.Config.Sessions.CompactAt,
 		ToolTimeout: time.Duration(s.d.Config.ToolTimeoutMS) * time.Millisecond,
@@ -2321,4 +2333,15 @@ func (s *Server) runTurn(ls *liveSession, r *turn.Runner, msg session.UserMessag
 	// while the child was still streaming, and equally a client that disconnected mid-turn.
 	s.mu.Lock()
 	s.closeIfUnusedLocked(ls)
+}
+
+// laneFor is which of the scheduler's two admission lanes this session's tool calls belong
+// to. A child session's calls hold the reserved lane, which is what keeps a response full of
+// agent calls from occupying every worker while the children they are waiting on have none
+// (ADR 0034). The parent link is written before the session is shared and never changes.
+func laneFor(ls *liveSession) turn.Lane {
+	if ls.parent != nil || openedAsChild(ls.snapshotEntries()) {
+		return turn.LaneChild
+	}
+	return turn.LaneRoot
 }

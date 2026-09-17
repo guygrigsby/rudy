@@ -797,3 +797,45 @@ func TestAFenceHeldOnOneSessionDoesNotStallAnother(t *testing.T) {
 		t.Fatal("an unrelated session's note waited on a fence held elsewhere")
 	}
 }
+
+// TestAChildSessionsCallsTakeTheReservedLane is the lane assignment ADR 0034 rests on: a
+// parked agent call holds a general worker, and the child Turn it waits for must be able to
+// run somewhere that call can never occupy.
+func TestAChildSessionsCallsTakeTheReservedLane(t *testing.T) {
+	f := newFixture(t)
+	root := f.open()
+	child := f.openChild(root)
+	if got := laneFor(root); got != turn.LaneRoot {
+		t.Errorf("root session lane = %v, want the root lane", got)
+	}
+	if got := laneFor(child); got != turn.LaneChild {
+		t.Errorf("child session lane = %v, want the reserved lane", got)
+	}
+	// A session loaded cold has no parent pointer, only the log that records one.
+	cold := &liveSession{sess: child.sess, entries: child.snapshotEntries()}
+	if got := laneFor(cold); got != turn.LaneChild {
+		t.Errorf("cold child lane = %v, want the reserved lane from its log", got)
+	}
+}
+
+// TestShutdownJoinsTheToolPool proves no worker and no admitted job outlives teardown: the
+// pool refuses work afterwards, and Shutdown returned only once its workers were joined.
+func TestShutdownJoinsTheToolPool(t *testing.T) {
+	f := newFixture(t)
+	running := make(chan struct{})
+	if err := f.srv.sched.Submit(context.Background(), turn.LaneRoot, func(ctx context.Context) {
+		close(running)
+		<-ctx.Done()
+	}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	<-running
+	if err := f.srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if err := f.srv.sched.Submit(context.Background(), turn.LaneRoot, func(context.Context) {
+		t.Error("the pool took work after shutdown")
+	}); err == nil {
+		t.Error("the pool stayed open after shutdown")
+	}
+}

@@ -123,7 +123,14 @@ type Config struct {
 	Session *session.Session
 	// Commit enters the owning Server's Session admission fence. It must retain a
 	// durability failure before releasing admission. No provider or hook waits belong here.
-	Commit      func(func() error) error
+	Commit func(func() error) error
+	// Scheduler is the Server's bounded tool pool, and Lane is which of its two admission
+	// lanes this Session's calls belong to: a child Session's calls hold the reserved lane
+	// open for the work a parked agent call is waiting on (ADR 0034). Nil runs each call on
+	// its own goroutine, the pre-scheduler shape, which is what a turn with no Server behind
+	// it (a test) wants; every Server wires one.
+	Scheduler   *Scheduler
+	Lane        Lane
 	Sync        func() error // nil uses Session.Sync
 	Provider    provider.Provider
 	Model       provider.Model
@@ -453,7 +460,18 @@ func (r *Runner) loop(ctx context.Context) error {
 		outcomes := make([]toolOutcome, len(runnable))
 		var wg sync.WaitGroup
 		for i, tu := range runnable {
-			wg.Go(func() { outcomes[i] = r.runTool(ctx, tu) })
+			wg.Add(1)
+			// Submitted, not spawned: the calls of one response run concurrently on the
+			// Server's bounded pool (ADR 0034), and a full pool makes this wait rather
+			// than allocate. A submission the pool refuses is the turn's ending, since
+			// the call it names will never run and never come back.
+			if err := r.submit(ctx, func(jobCtx context.Context) {
+				defer wg.Done()
+				outcomes[i] = r.runTool(jobCtx, tu)
+			}); err != nil {
+				wg.Done()
+				outcomes[i] = submissionOutcome(err)
+			}
 		}
 		wg.Wait()
 		// One slot per call, read in call order, so the turn ends on the same outcome
@@ -561,6 +579,15 @@ func (r *Runner) stream(ctx context.Context) (session.AssistantMessage, error) {
 func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 	s := r.cfg.Session
 	turnID := r.TurnID()
+	if ctx.Err() != nil {
+		// The Turn was cut while this call waited for a worker. It still owes the log a
+		// decision and a result, because the assistant message already asked for it, but
+		// the tool must not run: that would be a success landing after the cut.
+		if err := r.refuse(ctx, interruptedDeny(r.classDeny(tu, "interrupted")), session.OutcomeKilled, interruptedText); err != nil {
+			return toolOutcome{class: session.ErrInternal, err: err}
+		}
+		return toolOutcome{ctxErr: ctx.Err()}
+	}
 	r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolRunning)
 	defer r.cfg.Observer.ToolStateChanged(turnID, tu.ID, tu.Name, ToolDone)
 
