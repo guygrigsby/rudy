@@ -84,6 +84,15 @@ func (s *Server) broadcastStatus() {
 // and ready as the registry loads it, failed when its process dies under a live session.
 func (s *Server) broadcastPluginState(st plugin.Status) {
 	ps := protocol.PluginState{Name: st.Name, Origin: stateOrigin(st), State: string(st.State), Reason: st.Reason}
+	// pluginState is the lock sendConnectState also takes, and it is what keeps a client
+	// from being told loading after it has been told ready: a connection joins the
+	// broadcast set when it is accepted and gets its snapshot later, so without this a
+	// broadcast could land between the snapshot's read of the registry and its notify, and
+	// the stale read would be enqueued last. The registry writes the status before it calls
+	// here, so a snapshot that waits on this lock reads the state this call is carrying
+	// (rudy-9jl). notify only enqueues, so nothing blocks under it.
+	s.pluginState.Lock()
+	defer s.pluginState.Unlock()
 	for _, cn := range s.clientConns() {
 		cn.notify(protocol.NotifyPluginState, ps)
 	}
@@ -112,11 +121,14 @@ func (s *Server) sendConnectState(cn *conn) {
 	for _, w := range s.d.Plugins.Widgets() {
 		cn.notify(protocol.NotifyWidgetUpdated, w)
 	}
+	// Read and enqueued under the same lock a broadcast takes: see broadcastPluginState.
+	s.pluginState.Lock()
 	for _, st := range s.d.Plugins.Statuses() {
 		cn.notify(protocol.NotifyPluginState, protocol.PluginState{
 			Name: st.Name, Origin: stateOrigin(st), State: string(st.State), Reason: st.Reason,
 		})
 	}
+	s.pluginState.Unlock()
 }
 
 // clientConns is every connection a render notification is worth sending to: the clients.

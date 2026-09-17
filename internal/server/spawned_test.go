@@ -132,8 +132,23 @@ func newSpawnHarness(t *testing.T, prov *scriptProvider, env map[string]string) 
 	return h
 }
 
+// collapseStates drops a state that repeats the one before it. plugin.state carries what a
+// plugin's state now is rather than that it changed, and a client that connects mid-load is
+// told the current state twice, once by a broadcast and once by its connect snapshot, so the
+// transitions are what a test can assert and the repeats are not (rudy-9jl).
+func collapseStates(states []string) []string {
+	var out []string
+	for _, st := range states {
+		if len(out) > 0 && out[len(out)-1] == st {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
 // helloStates collects the plugin.state notifications for the hello plugin until it reaches
-// last.
+// last, with a repeated state collapsed into the one before it.
 func helloStates(t *testing.T, cl *protocol.Client, last string) []string {
 	t.Helper()
 	var states []string
@@ -157,7 +172,7 @@ func helloStates(t *testing.T, cl *protocol.Client, last string) []string {
 		}
 		return ps.State == last
 	})
-	return states
+	return collapseStates(states)
 }
 
 func (h *spawnHarness) openSession(t *testing.T) protocol.SessionInfo {

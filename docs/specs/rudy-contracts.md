@@ -151,7 +151,7 @@ Two things this does not claim. Answering is deliberately not gated, because a c
 | `status.updated` | every client | `{items: [{owner, key, content: [Span]}]}` full set | latest wins; sent on connect |
 | `widget.updated` | every client | `{owner, key, slot, content: [Span]}` | latest wins per owner and key; all sent on connect |
 | `notice` | every client | `{level: info, warn or error, owner, text}` | best effort; not replayed |
-| `plugin.state` | every client | `{name, origin: linked or spawned, state: loading, ready, failed or stopped, reason: string}`; `reason` empty unless failed | latest wins; all sent on connect |
+| `plugin.state` | every client | `{name, origin: linked or spawned, state: loading, ready, failed or stopped, reason: string}`; `reason` empty unless failed | latest wins; all sent on connect. It carries what the state now is, not that it changed, so a client renders it and keeps no history. A connection is in the broadcast set before its connect snapshot is sent, so it may be told the same state twice and must treat the repeat as the state it already holds. What it is never told is an older state after a newer one: the snapshot and the broadcasts are serialized against each other, so the last `plugin.state` a client receives for a plugin is that plugin's state (rudy-9jl) |
 | `registry.updated` | every client | `{fetched_at, providers: [{name, count: int, error: string}]}`; `error` empty on success | latest wins |
 | `server.stopped` | the one connection whose `server.shutdown` request was accepted | `{instance_id, state: stopped}` | sent only after successful runtime and listener cleanup, then followed by EOF. Cleanup failure, process death or transport loss produces no notification, so bare EOF is failure |
 

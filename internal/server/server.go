@@ -90,6 +90,11 @@ type Server struct {
 	shutdownClaimed   bool
 	shutdownCommitted bool
 
+	// pluginState orders what clients are told about plugin load state: one connection's
+	// connect snapshot against every broadcast. It is taken on its own, never while mu or a
+	// conn's lock is held, and only enqueues happen under it (see broadcastPluginState).
+	pluginState sync.Mutex
+
 	mu      sync.Mutex
 	live    map[ulid.ULID]*liveSession
 	loading map[ulid.ULID]chan struct{} // sids with a cold load in flight; see loadCold
