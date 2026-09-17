@@ -1,0 +1,20 @@
+name: vuln
+on:
+  push:
+  pull_request:
+  # An advisory is published against code that did not change, so a push is not the only
+  # event that matters. Dependabot raises a PR for a dependency; nothing raises one for the
+  # Go toolchain, which is where most of these land.
+  schedule:
+    - cron: "17 13 * * 1"
+
+jobs:
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - run: make vuln

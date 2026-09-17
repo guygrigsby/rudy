@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # The charm.land v2 modules and the provider SDKs are pinned exactly and their bumps are
+  # gated on the teatest goldens, so these arrive as PRs that CI judges, never as pushes.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-minor-and-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

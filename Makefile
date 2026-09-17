@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/guygrigsby/rudy/internal/cli.version=$(VERSION)
 
-.PHONY: build test lint check fmt-check vendor-types install redeploy config-example config-sync
+.PHONY: build test lint check fmt-check vendor-types vuln install redeploy config-example config-sync
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/rudy ./cmd/rudy
@@ -24,6 +24,13 @@ vendor-types:
 	@bad=$$(grep -rl 'anthropic-sdk-go' internal | grep -v '^internal/provider/anthropicmsgs/'); test -z "$$bad" || { echo "anthropic sdk outside its codec:"; echo "$$bad"; exit 1; }
 	@bad=$$(grep -rl 'modelcontextprotocol' internal | grep -v '^internal/plugins/mcp/'); test -z "$$bad" || { echo "mcp sdk outside its plugin:"; echo "$$bad"; exit 1; }
 	@bad=$$(grep -rl 'memory-go' internal | grep -v '^internal/plugins/memory/'); test -z "$$bad" || { echo "memory-go outside its plugin:"; echo "$$bad"; exit 1; }
+
+# vuln is its own target rather than a step in check: it asks the vulnerability database
+# over the network, and the gate is worth more when it runs the same offline as on. CI runs
+# it on every push and again weekly, because an advisory lands against code that did not
+# change and no push announces it.
+vuln:
+	govulncheck ./...
 
 check: fmt-check vendor-types
 	go vet ./...

@@ -5,8 +5,15 @@
     make check
 
 That is fmt, the vendor-type greps, vet, lint and the whole test suite, including the server
-package a second time over the unix socket. CI runs the same target on Linux and macOS and
-nothing else, so a green `make check` locally is the same gate.
+package a second time over the unix socket. CI runs the same target on Linux and macOS, so a
+green `make check` locally is the same gate.
+
+    make vuln
+
+is the second one: `govulncheck ./...` over the module and the standard library. It is not
+part of `check` because it asks the vulnerability database over the network and `check`
+answers offline. CI runs it on every push and again weekly, since an advisory lands against
+code that did not change.
 
 Nothing to check out beside this repository: every dependency resolves from its own module.
 
