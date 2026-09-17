@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package agentdef reads agent definitions: the markdown files under an agents/ directory
 // whose YAML frontmatter names a subagent's tools, model, thinking level and turn budget, and
 // whose body is its system prompt.

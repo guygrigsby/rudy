@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package plugintest is the plugin.Host a test hands a plugin's Init to see what it
 // registers. It exists because every plugin's test needs the same stub, and plugin.Host grows:
 // one implementation here is one place to add a method when it does.

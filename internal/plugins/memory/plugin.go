@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package memory is the memory plugin: it injects the bundle's context render on
 // session_opened, folds the session transcript into a running Session Summary after every
 // completed turn, finalizes that summary on session_closed, supplies it to the compactor on

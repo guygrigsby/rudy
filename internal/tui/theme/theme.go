@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package theme resolves the fifteen config.toml theme roles
 // (docs/specs/rudy-contracts.md, "themes/<name>.toml") into lipgloss styles. Fourteen
 // roles are colors; the fifteenth, code, names a chroma style for syntax highlighting

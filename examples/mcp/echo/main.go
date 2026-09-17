@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Command echo is the MCP server rudy's mcp plugin tests connect to over stdio: one tool
 // that echoes its input and one that always fails. It is an example of the smallest server
 // the plugin has to work with, and the fixture the plugin's tests build.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package anthropicmsgs is the Messages API codec, built on anthropic-sdk-go. It is the only
 // package that may import the SDK: everything above it speaks provider.Request and
 // provider.Part. Requests go out through httpx so they carry rudy's headers and its retry

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package skills reads the skill directories a user or a workspace keeps under skills.dirs:
 // one subdirectory per skill, each with a SKILL.md whose frontmatter names it and describes
 // when to use it. Skills are read, never written, except by Migrate, which copies them in

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package cli holds the cobra commands. The root carries global flags; every
 // subcommand lives in its own file and attaches in NewRoot.
 package cli

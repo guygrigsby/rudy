@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package pluginstore is the record of what is installed: the plugin checkouts under the XDG
 // data root and the lock file beside them. rudy plugin install and its siblings own the
 // whole file; the server's own boot path only ever reads the enabled flag through

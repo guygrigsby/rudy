@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package edit is the built-in edit tool: replace an exact substring in one file.
 package edit
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package glob is the built-in glob tool: list workspace paths matching a pattern.
 package glob
 

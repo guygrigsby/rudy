@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package session is the core: the append-only log, its entry kinds, the
 // aggregate that derives everything from the log, and the store that holds
 // session directories. It imports nothing from the rest of rudy.

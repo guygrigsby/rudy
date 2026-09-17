@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package read is the built-in read tool: a numbered window of a text file.
 package read
 

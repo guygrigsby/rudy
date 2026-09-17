@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package commands is the kernel's own slash commands: /model, /help, /permissions,
 // /rename, /fork and /plugins. They
 // have no private path to the server either, each is a plugin.Command registered through the

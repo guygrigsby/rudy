@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package provider is the port through which the turn loop reaches a model. Wire formats
 // live in subpackages; nothing here knows what an HTTP request looks like.
 package provider

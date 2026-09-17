@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package gate decides whether a tool call runs, asks or is refused. It is a
 // pure function of the safety class, the permission mode, the session's
 // allowances and whether anyone is attached who can answer.

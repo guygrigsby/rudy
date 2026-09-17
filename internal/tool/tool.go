@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package tool defines what a plugin registers as a callable and what the
 // loop hands it. The safety class is the one switch that drives both the gate
 // and the durable-record rule.

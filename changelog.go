@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package rudy is the module root, and exists for one reason: to embed the files a built
 // binary has to carry with it. Nothing else lives here; the harness is under internal/.
 package rudy

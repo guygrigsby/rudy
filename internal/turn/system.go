@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package turn builds provider requests from a session's log and drives one turn at a time
 // through its state machine: streaming a completion, gating and running tools, and recording
 // every step back to the session.

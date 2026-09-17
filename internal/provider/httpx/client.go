@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package httpx is the one HTTP client every wire codec uses: identifying headers, retry
 // with backoff and Retry-After, context cancellation.
 package httpx

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package compactcmd is the /compact slash command: summarize the session so far and continue
 // from the summary. The work is the kernel's Compactor; the command is only how a user asks
 // for it, registered through the same plugin interface an external command would use.

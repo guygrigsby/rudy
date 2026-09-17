@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package banner draws the startup header: the greeting, the mark, the session's own
 // facts, a tip or two and what the build it was cut from carries as news. ADR 0016.
 //

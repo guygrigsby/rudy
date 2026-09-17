@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package openaichatplugin is the provider plugin for every configured openai_chat endpoint.
 // The directory is internal/plugins/openaichat; the package name differs from the codec's so
 // importers never need an alias to hold both.

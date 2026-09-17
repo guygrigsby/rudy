@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package anthropicplugin is the provider plugin for every configured anthropic_messages
 // endpoint. The directory is internal/plugins/anthropic; the package name differs from the
 // codec's so importers never need an alias to hold both.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package input is the composer: a bubbles v2 textarea carrying pi's tui.editor.*
 // bindings (docs/adr/0013-the-tui-wave.md, decision 5), vimbubble v2's modal editing
 // over the top of it, and the client-side queue a follow-up message waits in while the

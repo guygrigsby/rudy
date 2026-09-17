@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package bash is the built-in bash tool: run one shell command in the workspace.
 package bash
 

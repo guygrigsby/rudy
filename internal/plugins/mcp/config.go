@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package mcp is the plugin that turns every server in mcp.toml into tools. One plugin
 // serves every configured server: a server is a source of tools, not a plugin of its own,
 // so nothing about it reaches the kernel except the tools it registers.

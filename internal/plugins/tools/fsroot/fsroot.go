@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package fsroot confines tool file access to the workspace root.
 package fsroot
 

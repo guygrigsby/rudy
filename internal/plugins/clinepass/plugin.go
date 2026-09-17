@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package clinepass is the provider plugin for every configured openai_chat entry whose
 // dialect is clinepass: aperture's cline-pass route, which claims OpenAI compatibility and
 // does not strictly deliver it (ADR 0010). It reuses the openai_chat codec and supplies the

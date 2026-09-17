@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package spinner is the glyph the turn cell animates while the model is working: a named
 // preset, or frames a config wrote itself.
 //

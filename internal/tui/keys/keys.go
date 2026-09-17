@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package keys resolves the [keys] table (docs/adr/0013-the-tui-wave.md, decision 5)
 // against pi's action ids: a closed set of Action constants, pi's default bindings for
 // each, and Table, which parses config.Config.Keys' overrides over those defaults and

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package initcmd is the /init slash command: create or revise the workspace's AGENTS.md.
 package initcmd
 

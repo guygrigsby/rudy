@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Command hello is the example spawned plugin: it speaks rudy's protocol on stdin and
 // stdout with nothing but the standard library, which is the point. A third party writes one
 // of these in any language; nothing here imports rudy.

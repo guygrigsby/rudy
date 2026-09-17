@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package openaichat is the openai_chat codec: the OpenAI chat-completions wire shape, shared
 // by every server that speaks it closely enough (OpenAI itself, aperture, mlx, llama.cpp).
 // Requests go out through httpx so they carry rudy's retry policy and headers.

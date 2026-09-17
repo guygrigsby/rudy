@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package transcript turns a session's entries and a turn's stream deltas into the rows
 // the client draws, and renders one row to styled lines. It is the client side of ADR
 // 0013 decisions 2 and 3: a row is derived from entries, one entity per thing on screen,

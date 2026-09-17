@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package subagents is the agent tool: it opens a child session under a named agent
 // definition, submits one prompt to it and returns the subagent's final answer to the parent
 // model as the tool result. It reaches the server the same way any plugin does, over the

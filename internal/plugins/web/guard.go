@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package web is the built-in web tools: search the web and read a page (ADR 0039).
 package web
 

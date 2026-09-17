@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package write is the built-in write tool: create or replace one file.
 package write
 

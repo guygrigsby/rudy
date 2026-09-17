@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package skills is the skills plugin: it indexes the configured skill directories into a
 // session's context on session_opened, and answers /skills with the same list. It has no
 // private path to the loader either, internal/skills.Load and internal/skills.Migrate do the

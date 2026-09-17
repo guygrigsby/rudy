@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package session
 
 // Recover appends the entries that make a log consistent after a crash and

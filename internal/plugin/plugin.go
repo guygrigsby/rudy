@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package plugin is how every capability arrives: tools, slash commands and
 // providers, whether the plugin is linked into the binary or spawned. Built-ins
 // use exactly this interface; nothing in the kernel has a private path.

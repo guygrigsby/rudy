@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package frontmatter splits a YAML header from a body in a file that opens with a "---"
 // fence, the shape shared by agent definitions and skills.
 package frontmatter

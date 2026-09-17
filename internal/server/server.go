@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package server is the protocol server: it dispatches JSON-RPC requests over one or more
 // connections, holds every open session live for the process, runs turns through turn.Runner,
 // routes permission questions to asker connections and fans notifications out in order.

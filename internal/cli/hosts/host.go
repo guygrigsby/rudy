@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package hosts is the Hosts context (ADR 0029): reaching a kernel on another machine over
 // ssh, placing the workspace there and moving the tree in and out. Client side only; the
 // kernel never sees a Host.

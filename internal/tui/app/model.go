@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package app is rudy's Bubble Tea client: one model over one protocol connection,
 // drawing the slots ui.layout.slots names and nothing else.
 //

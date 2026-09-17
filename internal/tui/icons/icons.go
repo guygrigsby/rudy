@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package icons is the client's glyph set: one name per thing the screen labels, three
 // sets to draw them from, and a config override per name.
 //

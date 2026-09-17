@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package tarx unpacks a tar archive whose bytes came from somewhere this machine does not
 // control: a tarball an https: URL served, or a tar a host wrote down an ssh connection. Both
 // callers write the result onto disk next to the operator's own files, so both need the same
