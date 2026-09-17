@@ -24,11 +24,11 @@ type Log struct {
 // OpenLog creates dir when missing and opens its entries file for append.
 func OpenLog(dir string) (*Log, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("session: open log: %w", err)
+		return nil, opErr("open log", err)
 	}
 	f, err := os.OpenFile(filepath.Join(dir, LogFile), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("session: open log: %w", err)
+		return nil, opErr("open log", err)
 	}
 	return &Log{f: f, w: bufio.NewWriterSize(f, 64*1024)}, nil
 }
@@ -47,10 +47,10 @@ func (l *Log) Append(e Entry) error {
 		return fmt.Errorf("session: append: %w", ErrClosed)
 	}
 	if _, err := l.w.Write(line); err != nil {
-		return fmt.Errorf("session: append: %w", err)
+		return opErr("append", err)
 	}
 	if err := l.w.WriteByte('\n'); err != nil {
-		return fmt.Errorf("session: append: %w", err)
+		return opErr("append", err)
 	}
 	return nil
 }
@@ -68,10 +68,10 @@ func (l *Log) Sync() error {
 
 func (l *Log) syncLocked() error {
 	if err := l.w.Flush(); err != nil {
-		return fmt.Errorf("session: sync: %w", err)
+		return opErr("sync", err)
 	}
 	if err := l.f.Sync(); err != nil {
-		return fmt.Errorf("session: sync: %w", err)
+		return opErr("sync", err)
 	}
 	return nil
 }
@@ -112,7 +112,7 @@ func ReadLog(dir string) ([]Entry, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("session: read log: %w", err)
+		return nil, opErr("read log", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -123,7 +123,7 @@ func ReadLog(dir string) ([]Entry, error) {
 		line++
 		raw, rerr := r.ReadBytes('\n')
 		if rerr != nil && rerr != io.EOF {
-			return nil, fmt.Errorf("session: read log: %w", rerr)
+			return nil, opErr("read log", rerr)
 		}
 		complete := bytes.HasSuffix(raw, []byte("\n"))
 		raw = bytes.TrimRight(raw, "\n")

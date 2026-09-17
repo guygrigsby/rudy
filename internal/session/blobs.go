@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -16,7 +15,7 @@ type Blobs struct{ dir string }
 func OpenBlobs(dir string) (*Blobs, error) {
 	d := filepath.Join(dir, "blobs")
 	if err := os.MkdirAll(d, 0o700); err != nil {
-		return nil, fmt.Errorf("session: open blobs: %w", err)
+		return nil, opErr("open blobs", err)
 	}
 	return &Blobs{dir: d}, nil
 }
@@ -32,26 +31,26 @@ func (b *Blobs) Put(data []byte) (string, error) {
 	}
 	tmp, err := os.CreateTemp(b.dir, "put-*")
 	if err != nil {
-		return "", fmt.Errorf("session: put blob: %w", err)
+		return "", opErr("put blob", err)
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("session: put blob: %w", err)
+		return "", opErr("put blob", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("session: put blob: %w", err)
+		return "", opErr("put blob", err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("session: put blob: %w", err)
+		return "", opErr("put blob", err)
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
 		_ = os.Remove(tmpName)
-		return "", fmt.Errorf("session: put blob: %w", err)
+		return "", opErr("put blob", err)
 	}
 	return name, nil
 }
@@ -63,7 +62,7 @@ func (b *Blobs) Get(sha256hex string) ([]byte, error) {
 	}
 	data, err := os.ReadFile(filepath.Join(b.dir, sha256hex))
 	if err != nil {
-		return nil, fmt.Errorf("session: get blob: %w", err)
+		return nil, opErr("get blob", err)
 	}
 	return data, nil
 }
