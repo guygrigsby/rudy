@@ -1708,7 +1708,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Six findings, computed concurrently with an `errgroup` or plain goroutines and a `sync.WaitGroup`, returned in a fixed order: `ssh` (`true` when `Run(ctx, "true")` exits 0), `rudy` (`command -v rudy` under `remotePath`), `version` (`rudy --version` there against ours, fix `rudy hosts install <host>`), `source` (`git -C <source> rev-parse` and `test -d <source>/../memory`, fix `git clone github.com/guygrigsby/rudy <source>` plus the memory sibling), `daemon` (`rudy bridge --no-start` exits 0 within 5s, fix "starts on first --host"), `placement` (`Inspect` says exists, and is git when the local tree is; fix `rudy hosts push <host>`). `rudy hosts check [host]` prints one line per finding, `ok` or `gap` with the fix, exits 1 on any gap.
+Six findings, computed concurrently with an `errgroup` or plain goroutines and a `sync.WaitGroup`, returned in a fixed order: `ssh` (`true` when `Run(ctx, "true")` exits 0), `rudy` (`command -v rudy` under `remotePath`), `version` (`rudy --version` there against ours, fix `rudy hosts install <host>`), `source` (`git -C <source> rev-parse`, fix `git clone github.com/guygrigsby/rudy <source>`; there is no sibling checkout to test for since memory-go is required by version), `daemon` (`rudy bridge --no-start` exits 0 within 5s, fix "starts on first --host"), `placement` (`Inspect` says exists, and is git when the local tree is; fix `rudy hosts push <host>`). `rudy hosts check [host]` prints one line per finding, `ok` or `gap` with the fix, exits 1 on any gap.
 
 - [ ] **Step 4: Run, break, restore, `make check`, commit, push**
 
