@@ -273,6 +273,7 @@ var Sections = []Section{
 			`accent = "#7aa2f7"`,
 			`text   = "#c0caf5"`,
 			`muted  = "#565f89"`,
+			`tool   = "#73daca"`,
 			`code   = "chroma:tokyonight-night"`,
 		},
 	},

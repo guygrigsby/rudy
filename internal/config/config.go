@@ -149,13 +149,15 @@ var themeDefaults = map[string]string{
 	"muted":     "#565f89",
 	"user":      "accent",
 	"assistant": "text",
-	"tool":      "muted",
-	"success":   "#9ece6a",
-	"error":     "#f7768e",
-	"warning":   "#e0af68",
-	"diff_add":  "success",
-	"diff_del":  "error",
-	"shell":     "warning",
+	// Teal, where a tool row used to be muted: what the agent did is not chrome, and the
+	// transcript reads better when the doing is one colour and the frame another.
+	"tool":     "#73daca",
+	"success":  "#9ece6a",
+	"error":    "#f7768e",
+	"warning":  "#e0af68",
+	"diff_add": "success",
+	"diff_del": "error",
+	"shell":    "warning",
 	// The status line is pink where it used to be muted, and the spinner is the hot one:
 	// the only cell on that line that moves is the only one that is news.
 	"status":  "#b48ead",

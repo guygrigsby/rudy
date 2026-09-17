@@ -2,5 +2,5 @@
 
    [38;2;192;202;245mThe fork copied `s.entries[:at]`, which drops the entry at the fork point.[m
 
- [38;2;86;95;137m▸ read  internal/session/fork.go[m
+ [38;2;115;218;202m▸ read  internal/session/fork.go[m
      [38;2;86;95;137mrunning[m
