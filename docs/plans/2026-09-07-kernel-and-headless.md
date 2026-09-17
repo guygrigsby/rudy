@@ -932,7 +932,7 @@ Use the id `bd create` prints in place of `rudy-1` below.
 - [ ] **Step 2: Initialize the module and fetch cobra**
 
 ```bash
-cd /Users/guygrigsby/projects/rudy
+cd ~/projects/rudy
 go mod init github.com/guygrigsby/rudy
 go get github.com/spf13/cobra@v1.10.2
 ```
