@@ -1,6 +1,7 @@
 package web
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"log/slog"
@@ -36,10 +37,11 @@ type webPlugin struct {
 	// resolveSecret turns the configured ref into the key, the same way a provider's key is
 	// resolved. Nil means no key is available, which registers nothing.
 	resolveSecret func(ref string) (string, error)
-	// searcher and endpoint are the seams a test uses: a fake Searcher, or a real brave
-	// pointed at an httptest server. Both are nil in every production path.
-	searcher Searcher
-	endpoint string
+	// searcher, endpoint and exaEndpoint are the seams a test uses: a fake Searcher, or a
+	// real backend pointed at an httptest server. All three are unset in production.
+	searcher    Searcher
+	endpoint    string
+	exaEndpoint string
 	// resolve is the policy's lookup, injected for the same reason.
 	resolve func(ctx context.Context, host string) ([]net.IP, error)
 }
@@ -54,22 +56,6 @@ func New(cfg config.WebConfig, version string, resolveSecret func(string) (strin
 func (*webPlugin) Name() string { return "tools.web" }
 
 func (p *webPlugin) Init(ctx context.Context, h plugin.Host) error {
-	key := ""
-	if p.cfg.SearchAPIKey != "" && p.resolveSecret != nil {
-		v, err := p.resolveSecret(p.cfg.SearchAPIKey)
-		if err != nil {
-			slog.Info("web: tools not registered", "reason", "the search key did not resolve", "err", err)
-		}
-		key = strings.TrimSpace(v)
-	}
-	if key == "" && p.searcher == nil {
-		// Registering nothing, and not failing either: a model that can see web_search and
-		// cannot use it spends a turn discovering that, and an operator who never set a key
-		// never asked for the tool, so a failed plugin in the status line would be rudy
-		// complaining about a choice (ADR 0039).
-		slog.Info("web: tools not registered", "reason", "no search key", "ref", p.cfg.SearchAPIKey)
-		return nil
-	}
 	client := &http.Client{
 		Timeout: requestTimeout,
 		// Redirects are followed by the fetcher, not by the client: every hop has to pass
@@ -82,11 +68,16 @@ func (p *webPlugin) Init(ctx context.Context, h plugin.Host) error {
 
 	search := p.searcher
 	if search == nil {
-		endpoint := p.endpoint
-		if endpoint == "" {
-			endpoint = braveEndpoint
+		backends := p.backends(client, agent, lim)
+		if len(backends) == 0 {
+			// Registering nothing, and not failing either: a model that can see web_search
+			// and cannot use it spends a turn discovering that, and an operator who set no
+			// key never asked for the tool, so a failed plugin in the status line would be
+			// rudy complaining about a choice (ADR 0039).
+			slog.Info("web: tools not registered", "reason", "no search backend has a key")
+			return nil
 		}
-		search = &brave{client: client, endpoint: endpoint, key: key, userAgent: agent, limiter: lim}
+		search = chain{backends: backends}
 	}
 	f := &fetcher{
 		client:    client,
@@ -179,4 +170,36 @@ func (p *webPlugin) fetchTool(f *fetcher) func(context.Context, tool.Call) (tool
 
 func errResult(text string) tool.Result {
 	return tool.Result{IsError: true, Content: []session.Block{session.TextBlock(text)}}
+}
+
+// backends is the search chain this config asks for, in the order it is asked: Brave first
+// because it is the one most operators key, then Exa, so one vendor's quota or outage costs
+// a turn a retry rather than the capability (ADR 0039).
+func (p *webPlugin) backends(client *http.Client, agent string, lim *limiter) []named {
+	var out []named
+	if key := p.key(p.cfg.BraveAPIKey); key != "" {
+		out = append(out, named{name: "brave", Searcher: &brave{
+			client: client, endpoint: cmp.Or(p.endpoint, braveEndpoint), key: key, userAgent: agent, limiter: lim,
+		}})
+	}
+	if key := p.key(p.cfg.ExaAPIKey); key != "" {
+		out = append(out, named{name: "exa", Searcher: &exa{
+			client: client, endpoint: cmp.Or(p.exaEndpoint, exaEndpoint), key: key, userAgent: agent, limiter: lim,
+		}})
+	}
+	return out
+}
+
+// key resolves one backend's reference, or reports why it could not and leaves that backend
+// out of the chain.
+func (p *webPlugin) key(ref string) string {
+	if ref == "" || p.resolveSecret == nil {
+		return ""
+	}
+	v, err := p.resolveSecret(ref)
+	if err != nil {
+		slog.Info("web: search backend has no key", "ref", ref, "err", err)
+		return ""
+	}
+	return strings.TrimSpace(v)
 }

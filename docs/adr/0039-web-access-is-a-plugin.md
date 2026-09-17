@@ -28,9 +28,15 @@ built-in tool uses. The kernel gains nothing.
 
 It registers two tools.
 
-`web_search` takes a query and returns bounded results, each a title, URL and snippet. Its
-backend is Brave, reached over its documented HTTP API with a key read from the environment
-variable config names. It is `safe`: the query reaches one endpoint the operator configured.
+`web_search` takes a query and returns bounded results, each a title, URL and snippet. It is
+`safe`: the query reaches one of the endpoints the operator configured.
+
+Its backends are a chain, asked in order: Brave first, then Exa. One vendor's quota, outage
+or bad gateway should cost a turn a few hundred milliseconds rather than the capability, and
+a search key is the kind of thing that expires on a Sunday. Each backend has its own key
+reference in config and a backend without one is not in the chain. An empty result set is an
+answer and ends the chain: the fallback does not get to overrule the first backend about what
+the web holds.
 
 `web_fetch` takes a URL and returns the page as text. It is `unsafe`: the URL is the model's,
 so the host is the model's, and an unsafe class is what makes strict mode ask before a session
@@ -58,8 +64,11 @@ endpoint.
 - A page fetched is untrusted text placed in the model's context, and rudy has no fence around
   it: a page can carry instructions and the model will read them. That exposure belongs in the
   README's trust model alongside the rest.
-- The search backend is one vendor's API behind an interface in rudy's own types. A second
+- A search backend is one vendor's API behind an interface in rudy's own types. A third
   backend is another implementation, not another tool.
+- Exa without a key, which is how pi's web extension works out of the box, means speaking MCP
+  to their hosted server. Rudy already ships an MCP client, and `rudy mcp add` is the path
+  for somebody else's hosted tools, so this plugin does not grow a second one.
 - Brave rate limits and a plan's monthly quota now bound part of what a session can do. Rudy
   reports the refusal rather than retrying past it.
 - An operator who wants a search MCP server instead may still have one; this decides what

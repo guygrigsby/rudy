@@ -1,9 +1,12 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -159,3 +162,135 @@ func (l *limiter) wait(ctx context.Context, key string) error {
 		return ctx.Err()
 	}
 }
+
+// exaEndpoint is Exa's documented search endpoint.
+const exaEndpoint = "https://api.exa.ai/search"
+
+// exa is the second backend's anti-corruption layer. Exa answers with page text rather than
+// a snippet, so what a result carries here is the head of that text: the same three fields
+// Brave's results have, from a different shape.
+type exa struct {
+	client    *http.Client
+	endpoint  string
+	key       string
+	userAgent string
+	limiter   *limiter
+}
+
+// exaRequest is the documented body. type "auto" lets Exa pick between its own modes, and
+// the text is asked for bounded rather than whole: a snippet is what a model needs to decide
+// whether to fetch the page.
+type exaRequest struct {
+	Query      string      `json:"query"`
+	NumResults int         `json:"numResults"`
+	Type       string      `json:"type"`
+	Contents   exaContents `json:"contents"`
+}
+
+type exaContents struct {
+	Text exaText `json:"text"`
+}
+
+type exaText struct {
+	MaxCharacters int `json:"maxCharacters"`
+}
+
+type exaResponse struct {
+	Results []struct {
+		Title string `json:"title"`
+		URL   string `json:"url"`
+		Text  string `json:"text"`
+	} `json:"results"`
+}
+
+// exaSnippet is how much of a page's text a result carries.
+const exaSnippet = 400
+
+func (e *exa) Search(ctx context.Context, query string, limit int) ([]Result, error) {
+	if err := e.limiter.wait(ctx, "search"); err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(exaRequest{
+		Query:      query,
+		NumResults: limit,
+		Type:       "auto",
+		Contents:   exaContents{Text: exaText{MaxCharacters: exaSnippet}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("x-api-key", e.key)
+	req.Header.Set("User-Agent", e.userAgent)
+	res, err := e.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("searching: %w", err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	if res.StatusCode != http.StatusOK {
+		return nil, statusError(res)
+	}
+	raw, _, err := readCapped(res.Body, 4<<20)
+	if err != nil {
+		return nil, fmt.Errorf("searching: %w", err)
+	}
+	var parsed exaResponse
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("searching: the answer was not the documented JSON")
+	}
+	out := make([]Result, 0, len(parsed.Results))
+	for _, r := range parsed.Results {
+		if len(out) == limit {
+			break
+		}
+		out = append(out, Result{
+			Title:   strings.TrimSpace(r.Title),
+			URL:     strings.TrimSpace(r.URL),
+			Snippet: oneLine(r.Text),
+		})
+	}
+	return out, nil
+}
+
+// chain asks each backend in turn and returns the first answer. A backend that fails is
+// logged and the next one is asked, which is the point: a quota, an outage or a bad gateway
+// at one search vendor should cost a turn a few hundred milliseconds, not the capability
+// (ADR 0039). An empty result set is an answer, not a failure: the second backend does not
+// get to overrule the first about what the web holds.
+type chain struct {
+	backends []named
+}
+
+// named is one backend and the name its failures are logged under.
+type named struct {
+	name string
+	Searcher
+}
+
+func (c chain) Search(ctx context.Context, query string, limit int) ([]Result, error) {
+	var last error
+	for _, b := range c.backends {
+		results, err := b.Search(ctx, query, limit)
+		if err == nil {
+			return results, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		slog.Warn("web: search backend failed", "backend", b.name, "err", err)
+		last = fmt.Errorf("%s: %w", b.name, err)
+	}
+	if last == nil {
+		return nil, errors.New("no search backend is configured")
+	}
+	return nil, last
+}
+
+// oneLine is page text as a snippet: whitespace of every kind squeezed to single spaces, so
+// a result list stays a list rather than becoming the pages themselves.
+func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }

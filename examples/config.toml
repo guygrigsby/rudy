@@ -92,12 +92,16 @@ enabled = true
 # e.g. "aperture:cline-pass/kimi-k3"
 summary_model = ""
 
-# The web_search and web_fetch tools (ADR 0039). Neither is registered unless the
-# search key resolves, the same env: or cache: reference a provider key takes.
+# The web_search and web_fetch tools (ADR 0039). Brave is asked first and Exa is
+# the fallback; a key is the same env: or cache: reference a provider key takes,
+# and neither tool is registered when no backend has one.
 [web]
 # Where the Brave Search key comes from.
 # e.g. "cache:BRAVE_API_KEY"
-search_api_key = "env:BRAVE_API_KEY"
+brave_api_key = "env:BRAVE_API_KEY"
+# Where the Exa key comes from; Exa answers when Brave cannot.
+# e.g. "cache:EXA_API_KEY"
+exa_api_key = "env:EXA_API_KEY"
 # Results one search returns, 1 through 20.
 # e.g. 10
 max_results = 5

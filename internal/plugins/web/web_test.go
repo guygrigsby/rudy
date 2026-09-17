@@ -32,7 +32,7 @@ func load(t *testing.T, p plugin.Plugin) map[string]tool.Tool {
 
 // testConfig is the shipped defaults, with the seams a test needs.
 func testConfig() config.WebConfig {
-	return config.WebConfig{SearchAPIKey: "env:RUDY_TEST_WEB_KEY", MaxResults: 3, FetchMaxBytes: 1 << 20}
+	return config.WebConfig{BraveAPIKey: "env:RUDY_TEST_WEB_KEY", MaxResults: 3, FetchMaxBytes: 1 << 20}
 }
 
 // loopbackResolver lets a test reach its own httptest server, which lives at exactly the
@@ -260,5 +260,94 @@ func TestBraveIsTheOnlyPlaceThatKnowsBrave(t *testing.T) {
 	}
 	if strings.Contains(got, "Second") {
 		t.Errorf("max_results was not honoured: %q", got)
+	}
+}
+
+// TestExaAnswersWhenBraveCannot is the fallback ADR 0039 asks for: one vendor's quota or
+// outage costs a turn a retry, not the capability.
+func TestExaAnswersWhenBraveCannot(t *testing.T) {
+	var braveCalls, exaCalls int
+	braveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		braveCalls++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer braveSrv.Close()
+	exaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		exaCalls++
+		if got := r.Header.Get("x-api-key"); got != "exa-key" {
+			t.Errorf("exa key header = %q", got)
+		}
+		var body exaRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("exa body: %v", err)
+		}
+		if body.Query != "go 1.26" || body.NumResults != 3 {
+			t.Errorf("exa asked for %+v", body)
+		}
+		_, _ = w.Write([]byte(`{"results":[{"title":"Go 1.26","url":"https://go.dev","text":"The   release\n\nnotes"}]}`))
+	}))
+	defer exaSrv.Close()
+
+	cfg := testConfig()
+	cfg.ExaAPIKey = "env:RUDY_TEST_EXA_KEY"
+	tools := load(t, &webPlugin{
+		cfg: cfg, version: "test", endpoint: braveSrv.URL, exaEndpoint: exaSrv.URL,
+		resolveSecret: func(ref string) (string, error) {
+			if strings.Contains(ref, "EXA") {
+				return "exa-key", nil
+			}
+			return "brave-key", nil
+		},
+	})
+	got := text(invoke(t, tools["web_search"], `{"query":"go 1.26"}`))
+	if braveCalls != 1 || exaCalls != 1 {
+		t.Errorf("brave asked %d times and exa %d, want one each", braveCalls, exaCalls)
+	}
+	if !strings.Contains(got, "https://go.dev") || !strings.Contains(got, "The release notes") {
+		t.Errorf("the fallback's results did not reach the model: %q", got)
+	}
+}
+
+// TestBraveIsAskedFirst keeps the order the config promises: Exa is the fallback, not a
+// second opinion, so a Brave answer ends it.
+func TestBraveIsAskedFirst(t *testing.T) {
+	exaSrv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("exa was asked while brave was answering")
+	}))
+	defer exaSrv.Close()
+	braveSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"web":{"results":[{"title":"Brave","url":"https://brave.example","description":"hit"}]}}`))
+	}))
+	defer braveSrv.Close()
+
+	cfg := testConfig()
+	cfg.ExaAPIKey = "env:RUDY_TEST_EXA_KEY"
+	tools := load(t, &webPlugin{
+		cfg: cfg, version: "test", endpoint: braveSrv.URL, exaEndpoint: exaSrv.URL,
+		resolveSecret: func(string) (string, error) { return "key", nil },
+	})
+	if got := text(invoke(t, tools["web_search"], `{"query":"anything"}`)); !strings.Contains(got, "https://brave.example") {
+		t.Errorf("search returned %q, want Brave's answer", got)
+	}
+}
+
+// TestEveryBackendFailingIsOneError: the model is told the search failed, with the last
+// backend's reason, rather than being handed an empty result set that reads like "nothing
+// exists on the web".
+func TestEveryBackendFailingIsOneError(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer down.Close()
+
+	cfg := testConfig()
+	cfg.ExaAPIKey = "env:RUDY_TEST_EXA_KEY"
+	tools := load(t, &webPlugin{
+		cfg: cfg, version: "test", endpoint: down.URL, exaEndpoint: down.URL,
+		resolveSecret: func(string) (string, error) { return "key", nil },
+	})
+	res := invoke(t, tools["web_search"], `{"query":"anything"}`)
+	if !res.IsError || !strings.Contains(text(res), "exa") {
+		t.Errorf("all backends down = %+v, want an error naming the last one tried", res)
 	}
 }

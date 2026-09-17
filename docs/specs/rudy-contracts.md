@@ -583,7 +583,8 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `memory.fold.<key>` | int | the SDK's own | `observe_after_tokens`, `reflect_after_tokens`, `observations_max_tokens`, `observations_target_tokens`, `observer_max_tokens`; a missing key takes the SDK default |
 | `skills.migrate_from` | [path] | `["~/.claude/skills", "~/.pi/agent/skills"]` | roots `rudy skills migrate` copies from, one directory per skill |
 | `mcp.connect_timeout_ms` | int | 10000 | per server at boot |
-| `web.search_api_key` | string | `env:BRAVE_API_KEY` | where the search key comes from, in a provider key's form: `env:NAME` or `cache:NAME` for the 1Password cache. A ref that does not resolve means neither web tool is registered (ADR 0039) |
+| `web.brave_api_key` | string | `env:BRAVE_API_KEY` | where Brave's key comes from, in a provider key's form: `env:NAME` or `cache:NAME` for the 1Password cache |
+| `web.exa_api_key` | string | `env:EXA_API_KEY` | where Exa's key comes from, same form. Brave is asked first and Exa answers when Brave cannot; no backend with a key means neither web tool is registered (ADR 0039) |
 | `web.max_results` | int | 5 | results one `web_search` returns, 1 through 20 |
 | `web.fetch_max_bytes` | int | 2000000 | most one `web_fetch` reads from a response before it stops reading; at least 1024 |
 | `web.allow_private_hosts` | bool | false | true lets `web_fetch` reach loopback, private, link-local and unique-local addresses, checked at resolution and at every redirect |

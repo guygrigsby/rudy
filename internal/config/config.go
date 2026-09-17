@@ -189,11 +189,14 @@ type MemoryConfig struct {
 
 // WebConfig is what the web tools may reach and how much they may bring back (ADR 0039).
 type WebConfig struct {
-	// SearchAPIKey is where the search key comes from, in the same form a provider's key
-	// takes: "env:NAME" or "cache:NAME" for the 1Password cache. Empty, or a ref that does
-	// not resolve, means neither tool is registered: a model that can see a tool it cannot
-	// use spends a turn finding out.
-	SearchAPIKey string `mapstructure:"search_api_key"`
+	// BraveAPIKey and ExaAPIKey are where each search backend's key comes from, in the form
+	// a provider key takes: "env:NAME" or "cache:NAME" for the 1Password cache. Brave is
+	// asked first and Exa is the fallback, so a Brave quota or outage does not take search
+	// with it (ADR 0039). A backend whose ref is empty or does not resolve is not in the
+	// chain; an empty chain registers neither tool, because a model that can see a tool it
+	// cannot use spends a turn finding out.
+	BraveAPIKey string `mapstructure:"brave_api_key"`
+	ExaAPIKey   string `mapstructure:"exa_api_key"`
 	// MaxResults is how many search results one call returns.
 	MaxResults int `mapstructure:"max_results"`
 	// FetchMaxBytes is the most one fetch reads from a response before it stops reading.
@@ -288,7 +291,8 @@ func Defaults() map[string]any {
 		"memory.enabled":                   true,
 		"memory.summary_model":             "",
 		"mcp.connect_timeout_ms":           10000,
-		"web.search_api_key":               "env:BRAVE_API_KEY",
+		"web.brave_api_key":                "env:BRAVE_API_KEY",
+		"web.exa_api_key":                  "env:EXA_API_KEY",
 		"web.max_results":                  5,
 		"web.fetch_max_bytes":              2000000,
 		"web.allow_private_hosts":          false,
