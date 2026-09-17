@@ -147,11 +147,17 @@ const (
 	ByHook      DecidedBy = "hook"
 	ByAsker     DecidedBy = "asker"
 	ByNoAsker   DecidedBy = "no_asker"
+	// ByInterrupt and ByInvariant are the Server's own denials, written where a call is
+	// terminalized rather than decided: a steer or cancel that cut a call before anything
+	// decided it, and a call the Server refused itself, such as a permission question it
+	// could not publish inside its bound.
+	ByInterrupt DecidedBy = "interrupt"
+	ByInvariant DecidedBy = "invariant"
 )
 
 func (d DecidedBy) Valid() bool {
 	switch d {
-	case ByClass, ByMode, ByAllowance, ByHook, ByAsker, ByNoAsker:
+	case ByClass, ByMode, ByAllowance, ByHook, ByAsker, ByNoAsker, ByInterrupt, ByInvariant:
 		return true
 	}
 	return false

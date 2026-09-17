@@ -79,6 +79,12 @@ type Asker interface {
 // when nothing was attached at all, down to the reason, rather than an asker error.
 var ErrNoAsker = errors.New("turn: no asker attached")
 
+// ErrPermissionOversized is what an Asker returns when the complete permission question could
+// not be published inside its bound, so no asker was shown it and no answer can arrive. The
+// runner denies that call by invariant and fails the Turn: the contract's preflight makes this
+// unreachable for an admitted input, and a Turn that reached it has lost the ability to ask.
+var ErrPermissionOversized = errors.New("turn: permission question over its bound")
+
 // Observer sees every entry, every stream part and every state change. Its methods are called
 // from every goroutine a turn runs on, one per tool call as well as the turn's own, so an
 // implementation has to be safe for concurrent use.
@@ -633,6 +639,16 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 			return toolOutcome{ctxErr: ctx.Err()}
 		}
 		switch {
+		case errors.Is(askErr, ErrPermissionOversized):
+			// The question could not be published inside its bound, so nobody was asked
+			// and nobody can answer. The call is denied by the Server itself and the Turn
+			// fails: a call left waiting on a question that does not exist would hang the
+			// Turn, and running it unasked would be consent nobody gave.
+			dec.Decision, dec.DecidedBy, dec.Reason = session.Deny, session.ByInvariant, "permission question over its bound"
+			if err := r.refuse(ctx, dec, session.OutcomeError, "permission question over its bound"); err != nil {
+				return toolOutcome{class: session.ErrInternal, err: err}
+			}
+			return toolOutcome{class: session.ErrInternal, err: ErrPermissionOversized}
 		case errors.Is(askErr, ErrNoAsker):
 			// Nobody to ask reads the same in the log wherever it was decided: this is the
 			// string gate.Evaluate writes for the same verdict, and the domain model fixes

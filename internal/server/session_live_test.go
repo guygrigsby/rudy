@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -860,5 +861,42 @@ func TestRetireIfCurrentLockedSkipsAReplacedEntry(t *testing.T) {
 	retireIfCurrentLocked(asking, key, fresh)
 	if _, ok := asking[key]; ok {
 		t.Fatal("asking[key] still present after retiring the entry that was actually current")
+	}
+}
+
+// TestAnOversizedPermissionQuestionStandsForNobody is the server's half of the preflight: a
+// question whose complete notification is over the bound reaches no asker, leaves nothing
+// standing for a later answer to match, and tells the runner so.
+func TestAnOversizedPermissionQuestionStandsForNobody(t *testing.T) {
+	saved := permissionNotificationLimit
+	permissionNotificationLimit = 256
+	t.Cleanup(func() { permissionNotificationLimit = saved })
+
+	ls := &liveSession{
+		pending:  map[string]pendingAsk{},
+		asking:   map[askKey]*standingAsk{},
+		standing: map[string]standingQuestion{},
+		answered: map[string]bool{},
+		inFlight: map[string]protocol.ToolStateChanged{},
+	}
+	a := &liveAsker{ls: ls, sid: "01JZZZZZZZZZZZZZZZZZZZZZZZ", runner: turn.NewRunner(turn.Config{})}
+	q := turn.Question{
+		ToolUseID: "tu1",
+		Tool:      "bash",
+		Input:     json.RawMessage(`{"command":"` + strings.Repeat("x", 512) + `"}`),
+		Matcher:   session.Matcher{Tool: "bash", Prefix: "x"},
+	}
+	_, err := a.ask(context.Background(), q)
+	if !errors.Is(err, turn.ErrPermissionOversized) {
+		t.Fatalf("ask = %v, want the oversized refusal", err)
+	}
+	ls.mu.Lock()
+	pending := len(ls.pending)
+	ls.mu.Unlock()
+	ls.obsMu.Lock()
+	standing := len(ls.standing)
+	ls.obsMu.Unlock()
+	if pending != 0 || standing != 0 {
+		t.Errorf("left %d pending and %d standing, want nothing an answer could match", pending, standing)
 	}
 }

@@ -386,3 +386,35 @@ func TestADecisionReasonIsBounded(t *testing.T) {
 		}
 	})
 }
+
+// TestAQuestionThatCannotBePublishedDeniesAndFailsTheTurn is the runner's half of the
+// permission preflight. Nobody was asked, so nobody can answer: the call is denied by the
+// Server itself and the Turn fails rather than waiting on a question that does not exist.
+func TestAQuestionThatCannotBePublishedDeniesAndFailsTheTurn(t *testing.T) {
+	s := openTestSession(t, session.ModeStrict)
+	rec := &recorder{}
+	prov := &scripted{scripts: callThenDone("tu1", "danger", `{"x":1}`)}
+	asker := askerFunc(func(context.Context, Question) (Answer, error) {
+		return Answer{}, ErrPermissionOversized
+	})
+	r := newRunner(t, s, prov, toolSet{"danger": echoTool(tool.Unsafe, "danger")}, asker, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); err == nil {
+		t.Fatal("the turn survived a question it could not ask")
+	}
+	dec := decisionFor(t, s, "tu1")
+	if dec.Decision != session.Deny || dec.DecidedBy != session.ByInvariant {
+		t.Errorf("decision = %s by %s, want a deny by invariant", dec.Decision, dec.DecidedBy)
+	}
+	if got := rec.count(session.KindTurnFailed); got != 1 {
+		t.Errorf("turn_failed entries = %d, want 1", got)
+	}
+	var ran bool
+	for _, e := range s.Entries() {
+		if tr, ok := e.Payload.(session.ToolResult); ok && tr.Outcome == session.OutcomeOK {
+			ran = true
+		}
+	}
+	if ran {
+		t.Error("a call ran without the consent nobody was asked for")
+	}
+}
