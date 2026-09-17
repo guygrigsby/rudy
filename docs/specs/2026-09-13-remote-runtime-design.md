@@ -154,8 +154,10 @@ host renamed in ssh config leaves no stale remote behind.
 - Install runs on the host from its own checkout, `remote.source` (default
   `~/projects/rudy`): `git fetch`, `git checkout --detach <rev>`, `make install`. `<rev>` is
   parsed from the Mac's version string, which `make` sets from `git describe --tags --always
-  --dirty`: the trailing `g<hash>` component, or the bare hash. A `-dirty` version or `dev`
-  refuses to install, saying the Mac's binary is not a commit the box can check out.
+  --dirty=-dev` and an unstamped build takes from the commit the toolchain recorded: the
+  trailing `g<hash>` component, or the bare hash. A `-dev` version, the older `-dirty` and
+  `dev` spellings, or `unknown` refuses to install, saying the Mac's binary is not a commit
+  the box can check out.
 - Automatic install happens on connect in two cases: rudy is not on the host's PATH (bridge
   exit 111), or no daemon is running and the versions differ. A running daemon with a
   different version is left alone: restarting it would end live turns.

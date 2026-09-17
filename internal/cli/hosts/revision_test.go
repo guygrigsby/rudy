@@ -17,8 +17,8 @@ func TestRevisionReadsGitDescribe(t *testing.T) {
 	}
 }
 
-func TestRevisionRefusesDirtyAndDev(t *testing.T) {
-	for _, in := range []string{"v0.1.0-3-gabc1234-dirty", "abc1234-dirty", "dev", ""} {
+func TestRevisionRefusesAModifiedTreeAndAnUnstampedBuild(t *testing.T) {
+	for _, in := range []string{"v0.1.0-3-gabc1234-dev", "abc1234-dev", "v0.1.0-3-gabc1234-dirty", "abc1234-dirty", "dev", "unknown", ""} {
 		if _, err := Revision(in); err == nil {
 			t.Fatalf("Revision(%q) accepted a version the box cannot check out", in)
 		}

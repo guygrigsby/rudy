@@ -65,8 +65,10 @@ That file is embedded in the binary, so the startup header shows the same bullet
 release page does, which is why the changelog is written and committed before the tag and
 not after:
 
-    # 1. add the release to CHANGELOG.md, newest first, as "## 0.2.0" with "- " bullets
-    make release-check VERSION=v0.2.0   # refuses a tag the changelog does not name
+    # 1. write the release section, which rudy drafts from the commits since the last tag
+    make changelog VERSION=v0.2.0             # DRY_RUN=1 prints it without writing
+    # read what it wrote and fix what it got wrong: a model drafts the notes, you sign them
+    make release-check VERSION=v0.2.0         # refuses a tag the changelog does not name
     git commit -am "docs: 0.2.0 changelog"
     git push
     # 2. tag the commit that carries it

@@ -1,7 +1,7 @@
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION ?= $(shell git describe --tags --always --dirty=-dev 2>/dev/null || echo unknown)
 LDFLAGS := -X github.com/guygrigsby/rudy/internal/cli.version=$(VERSION)
 
-.PHONY: build test lint check fmt-check vendor-types vuln install redeploy config-example config-sync release-notes release-check
+.PHONY: build test lint check fmt-check vendor-types vuln install redeploy config-example config-sync changelog release-notes release-check
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/rudy ./cmd/rudy
@@ -36,6 +36,14 @@ check: fmt-check vendor-types
 	go vet ./...
 	$(MAKE) lint
 	$(MAKE) test
+
+# changelog writes the newest section of CHANGELOG.md from the commits since the last
+# release, through rudy itself: the harness is the thing that reads a diff and says what
+# changed, so the release notes are not a thing it makes a person do by hand. Read what it
+# wrote before committing it; a model writing your release notes is a draft, not an author.
+changelog:
+	@$(MAKE) --no-print-directory build VERSION=
+	@VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" ./scripts/changelog.sh
 
 # release-notes prints the newest release's section of CHANGELOG.md: everything under the
 # first "## " heading down to the next one, with the leading blank lines dropped. The GitHub
