@@ -783,7 +783,12 @@ Entity, owned by Session, not stored (its progress is the tail of the log). One 
   event-driven scheduler owns 64 workers and two admission queues totaling 64 jobs. Forty-eight
   general workers serve root or child jobs and sixteen child-reserved workers serve only child
   Session jobs. The root queue holds 48 and the child queue holds 16. Turns submit with
-  cancellation-aware backpressure instead of starting one goroutine per tool. A root response can
+  cancellation-aware backpressure rather than running tools on goroutines of their own. What a
+  worker holds is execution: the gating phase asks the hooks, the Gate and the operator, runs no
+  tool and stays on the Turn, because coalesced questions have to be in flight together for the
+  Gate to coalesce them at all and the Turn's own 64-call admission already bounds that set. So no
+  call waiting for an answer occupies a worker, and none reaches a queue before its own allow is
+  durable. A root response can
   therefore park at most 48 workers in `agent` calls while child work retains progress capacity;
   child Sessions cannot invoke `agent` recursively.
 - Each provider tool-use id and name is valid UTF-8 and at most 4096 bytes. Its exact raw input is
