@@ -297,5 +297,6 @@ AGPL-3.0-or-later, copyright 2026 Guy Grigsby. See `LICENSE`.
 
 Use it, change it, run it. Convey a copy or a derivative, or run a modified one
 where other people reach it over a network, and that version's source goes with
-it under the same terms (AGPL sections 5, 6 and 13). A license for other terms
-is a conversation: guy@grigsby.dev.
+it under the same terms (AGPL sections 5, 6 and 13). A license for other terms is a
+conversation: open an issue titled "commercial licensing" and it moves to
+somewhere private from there.

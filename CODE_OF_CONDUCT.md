@@ -59,9 +59,11 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-guy@grigsby.dev. All complaints will be reviewed and investigated promptly and
-fairly.
+reported privately to the maintainer through GitHub's
+[private reporting form](https://github.com/guygrigsby/rudy/security/advisories/new),
+which is this project's one private channel and is read by nobody else. Say it
+is a conduct report rather than a vulnerability. All complaints will be
+reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.

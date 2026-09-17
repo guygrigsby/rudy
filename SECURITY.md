@@ -4,8 +4,12 @@
 
 Report a vulnerability privately through GitHub's
 [report a vulnerability](https://github.com/guygrigsby/rudy/security/advisories/new)
-form, or by email to guy@grigsby.dev. Please do not open a public issue for
-one.
+form. It reaches the maintainer and nobody else, and it is the only channel
+this project asks you to use. Please do not open a public issue for one.
+
+No GitHub account, or the form is refusing you? Open an issue that says you
+have a security report and nothing else about it, and you will get a private
+channel back.
 
 Say what an attacker controls, what they get, and how you reproduced it. A
 patch is welcome and not expected. Expect an acknowledgement within a week and
