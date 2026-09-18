@@ -1,6 +1,6 @@
 # 39. Web access is a plugin: search and fetch
 
-Status: Accepted
+Status: Accepted. The registration rule is superseded by ADR 0040.
 
 Date: 2026-09-16
 

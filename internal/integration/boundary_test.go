@@ -55,13 +55,11 @@ func TestWebFetchStaysOffThisMachine(t *testing.T) {
 		t.Run(url, func(t *testing.T) {
 			h := newHome(t)
 			p := h.withProvider(t)
-			// A search key, because the web plugin registers neither tool without one,
-			// web_fetch included, and a fetch needs no search backend to read a URL
-			// (rudy-8io). Without this the whole battery comes back "unknown tool" and
-			// proves nothing, which is how it passed on a laptop that had a real key in
-			// its environment and failed on CI.
-			h.writeConfig(t, modeConfig(p.URL(), "permissive")+"\n[web]\nbrave_api_key = \"env:RUDY_TEST_BRAVE_KEY\"\n")
-			h.env = append(h.env, "RUDY_TEST_BRAVE_KEY=not-a-real-key")
+			// No key anywhere, which is the point: web_fetch registers without one
+			// (ADR 0040), and this battery is what proves the address policy still stands
+			// in the configuration an operator who never signed up for a search account
+			// actually has.
+			h.writeConfig(t, modeConfig(p.URL(), "permissive"))
 			p.onCompletion(toolCall("web_fetch", map[string]any{"url": url}))
 
 			r := h.run(t, 60*time.Second, "-p", "--output", "stream-json", "read that page")

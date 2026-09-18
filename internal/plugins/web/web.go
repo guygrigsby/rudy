@@ -68,24 +68,10 @@ func (p *webPlugin) Init(ctx context.Context, h plugin.Host) error {
 	agent := "rudy/" + p.version + " (+https://github.com/guygrigsby/rudy)"
 	lim := newLimiter(perHostDelay)
 
-	search := p.searcher
-	if search == nil {
-		backends := p.backends(client, agent, lim)
-		if len(backends) == 0 {
-			// Registering nothing, and not failing either: a model that can see web_search
-			// and cannot use it spends a turn discovering that, and an operator who set no
-			// key never asked for the tool, so a failed plugin in the status line would be
-			// rudy complaining about a choice (ADR 0039).
-			//
-			// A notice rather than silence, because the operator who wanted the tools and
-			// has not keyed them has no other way to find out why they are missing. It
-			// says which keys and in which file, so the next step needs no documentation.
-			h.Notice(p.howToEnable())
-			slog.Info("web: tools not registered", "reason", "no search backend has a key")
-			return nil
-		}
-		search = chain{backends: backends}
-	}
+	// Fetch first, and unconditionally: it takes a URL and reads it, so it asks no backend
+	// anything and a key would buy it nothing. ADR 0039 registered the two together and
+	// ADR 0040 separated them, because the rule cost an operator with no search key the
+	// ability to have a model read a page they pasted in.
 	f := &fetcher{
 		client:    client,
 		policy:    policy{allowPrivate: p.cfg.AllowPrivateHosts, resolve: p.resolve},
@@ -94,20 +80,39 @@ func (p *webPlugin) Init(ctx context.Context, h plugin.Host) error {
 		userAgent: agent,
 	}
 	if err := h.RegisterTool(tool.Tool{
-		Name:        "web_search",
-		Description: "Search the web and return titles, URLs and snippets. Use it to find pages; use web_fetch to read one.",
-		Schema:      json.RawMessage(searchSchema),
-		Safety:      tool.Safe,
-		Invoke:      p.searchTool(search),
-	}); err != nil {
-		return err
-	}
-	return h.RegisterTool(tool.Tool{
 		Name:        "web_fetch",
 		Description: "Read an http or https URL and return the page as text. HTML is reduced to text and long pages are truncated.",
 		Schema:      json.RawMessage(fetchSchema),
 		Safety:      tool.Unsafe,
 		Invoke:      p.fetchTool(f),
+	}); err != nil {
+		return err
+	}
+
+	search := p.searcher
+	if search == nil {
+		backends := p.backends(client, agent, lim)
+		if len(backends) == 0 {
+			// No search, and not a failure either: a model that can see web_search and
+			// cannot use it spends a turn discovering that, and an operator who set no key
+			// never asked for the tool, so a failed plugin in the status line would be rudy
+			// complaining about a choice (ADR 0039).
+			//
+			// A notice rather than silence, because the operator who wanted search and has
+			// not keyed it has no other way to find out why it is missing. It says which
+			// keys and in which file, so the next step needs no documentation.
+			h.Notice(p.howToEnable())
+			slog.Info("web: search not registered", "reason", "no search backend has a key")
+			return nil
+		}
+		search = chain{backends: backends}
+	}
+	return h.RegisterTool(tool.Tool{
+		Name:        "web_search",
+		Description: "Search the web and return titles, URLs and snippets. Use it to find pages; use web_fetch to read one.",
+		Schema:      json.RawMessage(searchSchema),
+		Safety:      tool.Safe,
+		Invoke:      p.searchTool(search),
 	})
 }
 
@@ -212,9 +217,10 @@ func (p *webPlugin) key(ref string) string {
 }
 
 // howToEnable is what an operator with no search key is told, once, at startup: which keys
-// turn the tools on, where they go and what a key reference looks like.
+// turn search on, where they go and what a key reference looks like. It names search alone,
+// since web_fetch is registered whatever the keys say (ADR 0040).
 func (p *webPlugin) howToEnable() string {
-	return "web_search and web_fetch are off. Set web.brave_api_key or web.exa_api_key in " +
+	return "web_search is off. Set web.brave_api_key or web.exa_api_key in " +
 		"config.toml to a key reference (env:NAME, or cache:NAME for the 1Password cache) " +
 		"and restart. Brave is asked first and Exa answers when Brave cannot; " +
 		"api.search.brave.com and exa.ai issue the keys."

@@ -71,12 +71,20 @@ func invoke(t *testing.T, tl tool.Tool, input string) tool.Result {
 
 func text(res tool.Result) string { return session.TextOf(res.Content) }
 
-// TestNoKeyRegistersNothing keeps a tool the operator never configured out of the model's
-// view, without making an unconfigured key look like a broken plugin.
-func TestNoKeyRegistersNothing(t *testing.T) {
+// TestNoKeyStillFetches: search needs a backend and fetch does not, so a missing key takes
+// away the search and leaves the fetch. ADR 0039 registered them together and ADR 0040
+// separated them: an operator with no key could not have the model read a page they pasted,
+// and the notice told them to get a search key for a tool that never asks one anything.
+func TestNoKeyStillFetches(t *testing.T) {
 	tools := load(t, &webPlugin{cfg: testConfig(), version: "test"})
-	if len(tools) != 0 {
-		t.Errorf("registered %d tools with no key", len(tools))
+	if _, ok := tools["web_fetch"]; !ok {
+		t.Error("web_fetch needs no key and was not registered")
+	}
+	if _, ok := tools["web_search"]; ok {
+		t.Error("web_search was registered with no backend to ask")
+	}
+	if len(tools) != 1 {
+		t.Errorf("registered %d tools with no key, want web_fetch alone", len(tools))
 	}
 }
 
@@ -363,14 +371,19 @@ func TestNoKeySaysHowToEnableIt(t *testing.T) {
 	reg.Load(context.Background(), &webPlugin{cfg: testConfig(), version: "test"})
 	t.Cleanup(func() { _ = reg.Close(context.Background()) })
 
-	if len(reg.Tools()) != 0 {
-		t.Fatalf("registered %d tools with no key", len(reg.Tools()))
+	if len(reg.Tools()) != 1 {
+		t.Fatalf("registered %d tools with no key, want web_fetch alone", len(reg.Tools()))
 	}
 	var said string
 	for _, n := range notices {
 		if strings.Contains(n, "web_search") {
 			said = n
 		}
+	}
+	// The notice names what is actually missing: fetch is there, so claiming it is off
+	// would send an operator looking for a key they do not need (ADR 0040).
+	if strings.Contains(said, "web_fetch") {
+		t.Errorf("the notice says fetch is off when it is registered: %q", said)
 	}
 	if said == "" {
 		t.Fatalf("no notice told the operator how to enable the tools: %v", notices)
