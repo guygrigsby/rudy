@@ -29,7 +29,7 @@ const (
 // registered: they are the client's vocabulary, and they never reach a session log.
 var clientCommands = []protocol.CommandInfo{
 	{Name: scopedModelsCommand, Description: "Choose the models ctrl+p cycles through"},
-	{Name: exitCommand, Description: "Close the client; a session on a running rudy serve keeps its place"},
+	{Name: exitCommand, Description: "Close the client; a session on a running rudy server keeps its place"},
 	{Name: quitCommand, Description: "Close the client, the same as /exit"},
 }
 
