@@ -9,6 +9,7 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/plugin/plugintest"
+	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
@@ -40,13 +41,56 @@ func TestModelCommand(t *testing.T) {
 		t.Fatalf("action %#v", act)
 	}
 
-	act, err = cmds["model"].Run(context.Background(), plugin.CommandCall{})
+}
+
+// TestBareModelListsWhatThereIs: /model with nothing after it used to answer with its own
+// usage line, which tells a person the syntax and not the one thing they asked for. It
+// lists the registry the way /permissions with no argument lists the modes, and marks the
+// one the session is on.
+func TestBareModelListsWhatThereIs(t *testing.T) {
+	h := &plugintest.Host{Name: "commands", ModelSet: []provider.Model{
+		{Ref: session.ModelRef{Provider: "aperture", Model: "kimi"}, DisplayName: "Kimi"},
+		{Ref: session.ModelRef{Provider: "anthropic", Model: "claude-opus-5"}, DisplayName: "Opus 5"},
+		{Ref: session.ModelRef{Provider: "aperture", Model: "claude-opus-5"}, DisplayName: "Opus 5"},
+	}}
+	cmds := register(t, h)
+	act, err := cmds["model"].Run(context.Background(), plugin.CommandCall{
+		Model: session.ModelRef{Provider: "aperture", Model: "kimi"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	n, ok := act.(plugin.Notice)
-	if !ok || !strings.HasPrefix(n.Text, "usage: /model <provider:id>") {
+	if !ok {
 		t.Fatalf("bare /model action %#v", act)
+	}
+	for _, want := range []string{"aperture:kimi", "anthropic:claude-opus-5", "aperture:claude-opus-5"} {
+		if !strings.Contains(n.Text, want) {
+			t.Errorf("the listing leaves out %s:\n%s", want, n.Text)
+		}
+	}
+	// The one in force is marked, since the whole point of asking is to see where you are.
+	for _, line := range strings.Split(n.Text, "\n") {
+		if strings.Contains(line, "aperture:kimi") && !strings.Contains(line, "*") {
+			t.Errorf("the model in force is not marked:\n%s", n.Text)
+		}
+	}
+	if !strings.Contains(n.Text, "/model <provider:id>") {
+		t.Errorf("the listing never says how to switch:\n%s", n.Text)
+	}
+}
+
+// TestBareModelWithAnEmptyRegistry: a registry that answered nothing is a different thing
+// from a model nobody named, and saying so beats printing an empty list.
+func TestBareModelWithAnEmptyRegistry(t *testing.T) {
+	cmds := register(t, &plugintest.Host{Name: "commands"})
+	act, err := cmds["model"].Run(context.Background(), plugin.CommandCall{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, ok := act.(plugin.Notice)
+	if !ok || !strings.Contains(n.Text, "no models") {
+		t.Fatalf("bare /model with an empty registry: %#v", act)
 	}
 }
 
@@ -60,7 +104,7 @@ func TestHelpCommandListsTheRegistryInOrder(t *testing.T) {
 	if !ok {
 		t.Fatalf("action %T", act)
 	}
-	want := "/model  Switch this session's model: /model <provider:id or unique id>\n" +
+	want := "/model  List the models, or switch this session's: /model [provider:id or unique id]\n" +
 		"/help  List the slash commands\n" +
 		"/permissions  Show or set how rudy asks before an unsafe tool: /permissions [strict|permissive|off]\n" +
 		"/rename  Name this session: /rename <name>\n" +

@@ -741,3 +741,16 @@ func (h *host) Commands() []Command                       { return h.r.Commands(
 func (h *host) Tools() []tool.Tool                        { return h.r.Tools() }
 func (h *host) Statuses() []Status                        { return h.r.Statuses() }
 func (h *host) AgentDefs() map[string]agentdef.Definition { return h.r.AgentDefs() }
+
+// Models is the provider registry's current set, which the plugin registry does not hold
+// itself: the server wires it as a service. Nothing wired means a plugin loaded outside a
+// server, and an empty list rather than a nil dereference.
+func (h *host) Models() []provider.Model {
+	h.r.mu.RLock()
+	f := h.r.services.Models
+	h.r.mu.RUnlock()
+	if f == nil {
+		return nil
+	}
+	return f()
+}

@@ -33,6 +33,9 @@ func (s *Server) PluginServices() plugin.Services {
 		StatusChanged: s.broadcastStatus,
 		WidgetChanged: s.broadcastWidget,
 		OnStatus:      s.broadcastPluginState,
+		// The provider registry's read side, which the plugin registry does not hold: it
+		// is how /model with no argument lists what a session could switch to.
+		Models: s.d.Registry.Models,
 	}
 }
 

@@ -9,11 +9,13 @@ package commands
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
 
@@ -25,10 +27,13 @@ func (cmdPlugin) Name() string { return "commands" }
 
 func (cmdPlugin) Init(ctx context.Context, h plugin.Host) error {
 	cmds := []plugin.Command{
-		{Name: "model", Description: "Switch this session's model: /model <provider:id or unique id>", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
+		{Name: "model", Description: "List the models, or switch this session's: /model [provider:id or unique id]", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
 			spec := strings.TrimSpace(c.Args)
 			if spec == "" {
-				return plugin.Notice{Text: "usage: /model <provider:id>"}, nil
+				// Asking with nothing after it is asking what there is, the way
+				// /permissions with no argument answers with the modes. A usage line
+				// answered the one question nobody had.
+				return plugin.Notice{Text: modelList(h.Models(), c.Model)}, nil
 			}
 			return plugin.SetModel{Model: spec}, nil
 		}},
@@ -85,4 +90,29 @@ func (cmdPlugin) Init(ctx context.Context, h plugin.Host) error {
 		}
 	}
 	return nil
+}
+
+// modelList is the registry as /model prints it: one provider:id per line, sorted, with a
+// star on the one the session is using. The registry is discovered rather than configured,
+// so this is the only place a person sees the whole of it without leaving the client.
+func modelList(models []provider.Model, current session.ModelRef) string {
+	if len(models) == 0 {
+		return "no models: the registry is empty, so either no provider is configured or none answered /v1/models"
+	}
+	refs := make([]string, 0, len(models))
+	for _, m := range models {
+		refs = append(refs, m.Ref.String())
+	}
+	sort.Strings(refs)
+	var b strings.Builder
+	b.WriteString("models:\n")
+	for _, ref := range refs {
+		mark := "  "
+		if ref == current.String() {
+			mark = "* "
+		}
+		fmt.Fprintf(&b, "%s%s\n", mark, ref)
+	}
+	b.WriteString("switch with /model <provider:id>")
+	return b.String()
 }

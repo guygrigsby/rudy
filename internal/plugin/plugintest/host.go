@@ -34,8 +34,10 @@ type Host struct {
 	Widgets            []plugin.Widget
 	Notes              []session.Note
 	PluginStatuses     []plugin.Status
-	Cfg                map[string]any
-	NoteErr            error
+	// ModelSet is what Models() answers, named apart from the method.
+	ModelSet []provider.Model
+	Cfg      map[string]any
+	NoteErr  error
 }
 
 var _ plugin.Host = (*Host)(nil)
@@ -115,3 +117,6 @@ func (h *Host) AgentDefs() map[string]agentdef.Definition {
 	}
 	return out
 }
+
+// Models is the registry a test handed this host, for a plugin that reports on it.
+func (h *Host) Models() []provider.Model { return h.ModelSet }

@@ -50,6 +50,10 @@ type Services struct {
 	// set that survives. The provider registry keeps its own copy of the provider set, so
 	// withdrawing one here is invisible to a turn until that copy is replaced.
 	ProvidersChanged func(ps []provider.Provider)
+	// Models is the provider registry's current set, for a plugin that reports on it: the
+	// /model command with no argument lists what a session could switch to. Nil means the
+	// registry is not wired, which is a plugin loaded outside a server.
+	Models func() []provider.Model
 	// OnStatus is called for every load state change, in order; the server broadcasts
 	// plugin.state. It is called with no registry lock held, so a sink is free to read the
 	// registry back.
@@ -146,6 +150,9 @@ type Host interface {
 	// AgentDefs is every agent definition plugins have registered, by name. Read side of
 	// RegisterAgent, for a plugin that wants to see what its peers contributed.
 	AgentDefs() map[string]agentdef.Definition
+	// Models is what the provider registry is currently serving, empty before it has
+	// refreshed or when no server wired one.
+	Models() []provider.Model
 }
 
 type Plugin interface {

@@ -326,7 +326,7 @@ func TestGoldenStartupHeader(t *testing.T) {
 func TestGoldenSlashMenu(t *testing.T) {
 	golden(t, "slash_menu", screen(t, nil, func(tm *teatest.TestModel, _ string) {
 		list, err := json.Marshal(protocol.CommandListResult{Commands: []protocol.CommandInfo{
-			{Name: "model", Description: "Switch this session's model: /model <provider:id or unique id>"},
+			{Name: "model", Description: "List the models, or switch this session's: /model [provider:id or unique id]"},
 			{Name: "help", Description: "List the slash commands"},
 			{Name: "fork", Description: "Fork this session at an entry: /fork [entry id], default the newest"},
 			{Name: "plugins", Description: "List loaded plugins and their state"},
