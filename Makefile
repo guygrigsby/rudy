@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty=-dev 2>/dev/null || echo unknown)
 LDFLAGS := -X github.com/guygrigsby/rudy/internal/cli.version=$(VERSION)
 
-.PHONY: build test lint check fmt-check vendor-types vuln install redeploy config-example config-sync changelog release-notes release-check
+.PHONY: build test lint check fmt-check vendor-types vuln integration install redeploy config-example config-sync changelog release-notes release-check
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/rudy ./cmd/rudy
@@ -24,6 +24,14 @@ vendor-types:
 	@bad=$$(grep -rl 'anthropic-sdk-go' internal | grep -v '^internal/provider/anthropicmsgs/'); test -z "$$bad" || { echo "anthropic sdk outside its codec:"; echo "$$bad"; exit 1; }
 	@bad=$$(grep -rl 'modelcontextprotocol' internal | grep -v '^internal/plugins/mcp/'); test -z "$$bad" || { echo "mcp sdk outside its plugin:"; echo "$$bad"; exit 1; }
 	@bad=$$(grep -rl 'memory-go' internal | grep -v '^internal/plugins/memory/'); test -z "$$bad" || { echo "memory-go outside its plugin:"; echo "$$bad"; exit 1; }
+
+# integration is the adversarial suite: it builds the binary and drives it, and a daemon,
+# with inputs nobody types on purpose. Malformed config, corrupt session logs, hostile
+# provider streams, raw bytes on the socket, a dangerous command dressed up as a safe one.
+# It is behind a build tag and out of check because it spends minutes on timeouts that have
+# to be longer than the ones under test, and CI runs it as its own job.
+integration:
+	CGO_ENABLED=1 go test -tags=integration -timeout 20m -count=1 ./internal/integration/
 
 # vuln is its own target rather than a step in check: it asks the vulnerability database
 # over the network, and the gate is worth more when it runs the same offline as on. CI runs

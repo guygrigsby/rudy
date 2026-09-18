@@ -1,0 +1,21 @@
+name: integration
+# The adversarial suite, on its own job because it is minutes of deliberate timeouts rather
+# than seconds of unit tests, and because a failure here is a different question than a
+# failure in check: something got through, rather than something broke.
+on:
+  push:
+  pull_request:
+
+jobs:
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make integration
