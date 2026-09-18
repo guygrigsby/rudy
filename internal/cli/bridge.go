@@ -109,9 +109,13 @@ func runBridgeStop(ctx context.Context, o BuildOptions) (int, error) {
 	}
 	client := protocol.NewClient(conn)
 	defer func() { _ = client.Close() }()
-	helloCtx, cancelHello := context.WithTimeout(stopCtx, greetTimeout)
-	hello, err := greet(helloCtx, client, "rudy-bridge-stop", Version(), false)
-	cancelHello()
+	// The stop budget, not the probe's. greetTimeout is how long an interactive dial waits
+	// before deciding to serve itself instead, which is a different question: this command
+	// was told to stop a daemon that is answering its socket, and a daemon still loading
+	// its plugins on a loaded machine takes longer than a probe is willing to wait. Giving
+	// the handshake two seconds inside a thirty second budget failed the stop while the
+	// daemon it was asked to stop was perfectly well.
+	hello, err := greet(stopCtx, client, "rudy-bridge-stop", Version(), false)
 	if err != nil {
 		return 1, err
 	}

@@ -535,3 +535,43 @@ func TestBridgeReportsADaemonThatCannotServe(t *testing.T) {
 		t.Fatalf("bridge said %q, want the provider error from the daemon's log", out.String())
 	}
 }
+
+// TestBridgeStopWaitsOutASlowHello: bridge --stop is a lifecycle command with a thirty
+// second budget, and it used to give the handshake two of them, the budget an interactive
+// probe uses to decide whether to fall back to serving itself. A daemon that is loading
+// plugins on a loaded machine answers later than that, and the stop then failed with
+// "hello: context deadline exceeded" while the daemon it was asked to stop was fine. Seen
+// on a macOS CI runner, reproduced here by shrinking the probe budget to nothing.
+func TestBridgeStopWaitsOutASlowHello(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary and starts a daemon")
+	}
+	old := greetTimeout
+	greetTimeout = time.Nanosecond // an interactive probe would give up instantly
+	t.Cleanup(func() { greetTimeout = old })
+
+	bin := builtRudy(t)
+	upstream := fakeOpenAI(t, "ok")
+	_, env := boxWithProvider(t, bin, upstream.URL)
+	start := exec.Command(bin, "bridge")
+	start.Env = env
+	if out, err := start.CombinedOutput(); err != nil {
+		t.Fatalf("start through bridge: %v\n%s", err, out)
+	}
+	if code, err := runBridgeStop(context.Background(), BuildOptions{Env: envLookup(env)}); err != nil || code != 0 {
+		t.Fatalf("bridge --stop with a slow handshake = %d, %v", code, err)
+	}
+}
+
+// envLookup turns an exec-style environment into the lookup BuildOptions takes, for a test
+// that drives a command in process rather than shelling out to the binary.
+func envLookup(env []string) func(string) string {
+	return func(key string) string {
+		for i := len(env) - 1; i >= 0; i-- {
+			if name, value, ok := strings.Cut(env[i], "="); ok && name == key {
+				return value
+			}
+		}
+		return ""
+	}
+}
