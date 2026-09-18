@@ -160,3 +160,71 @@ func TestAToolPrefixEntryNarrowsToThatTool(t *testing.T) {
 		t.Error("bash:git push matched a git status")
 	}
 }
+
+// TestACommandNamedByPathIsTheSameCommand: the set says rm, and /bin/rm is rm. unwrap
+// already reads /bin/sh as the sh wrapper; the dangerous match did not do the same for the
+// command it was reading, so naming the binary by path or with a backslash walked past
+// every entry in the set. Found by the integration suite's evasion battery.
+func TestACommandNamedByPathIsTheSameCommand(t *testing.T) {
+	g := New([]string{"rm -rf", "sudo"})
+	for _, command := range []string{
+		`/bin/rm -rf /tmp/x`,
+		`/usr/bin/env rm -rf /tmp/x`,
+		`\rm -rf /tmp/x`,
+		`/usr/bin/sudo ls`,
+		`\sudo ls`,
+		`sh -c "/bin/rm -rf /tmp/x"`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			dangerous, entry := g.Dangerous("bash", json.RawMessage(`{"command":`+quote(command)+`}`))
+			if !dangerous {
+				t.Errorf("%s is not dangerous, so permissive mode runs it without asking", command)
+			} else if entry == "" {
+				t.Error("dangerous with no entry named")
+			}
+		})
+	}
+}
+
+// TestAnEntryWrittenWithAPathStillMatches: normalizing the command must not take away the
+// spelling an operator chose for their own entry.
+func TestAnEntryWrittenWithAPathStillMatches(t *testing.T) {
+	g := New([]string{"/usr/local/bin/deploy"})
+	dangerous, _ := g.Dangerous("bash", json.RawMessage(`{"command":"/usr/local/bin/deploy --prod"}`))
+	if !dangerous {
+		t.Error("an entry written with a path no longer matches the command written the same way")
+	}
+}
+
+// TestFindExecRunsACommandToo: find -exec is a wrapper like xargs, and a cleanup task is
+// exactly where a model writes one.
+func TestFindExecRunsACommandToo(t *testing.T) {
+	g := New([]string{"rm -rf", "sudo"})
+	for _, command := range []string{
+		`find . -name '*.tmp' -exec rm -rf {} \;`,
+		`find . -type d -execdir rm -rf {} +`,
+		`find /tmp -exec sudo chown root {} \;`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			if dangerous, _ := g.Dangerous("bash", json.RawMessage(`{"command":`+quote(command)+`}`)); !dangerous {
+				t.Errorf("%s is not dangerous, so permissive mode runs it without asking", command)
+			}
+		})
+	}
+}
+
+// TestFindWithoutExecStaysOrdinary: the widening above must not make every find dangerous.
+func TestFindWithoutExecStaysOrdinary(t *testing.T) {
+	g := New([]string{"rm -rf", "sudo"})
+	for _, command := range []string{
+		`find . -name '*.go'`,
+		`find . -type f -print`,
+		`find . -name rm`,
+	} {
+		t.Run(command, func(t *testing.T) {
+			if dangerous, entry := g.Dangerous("bash", json.RawMessage(`{"command":`+quote(command)+`}`)); dangerous {
+				t.Errorf("%s matched %q, so an ordinary search now asks", command, entry)
+			}
+		})
+	}
+}

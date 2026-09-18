@@ -63,13 +63,43 @@ func (g *Gate) Dangerous(tool string, args json.RawMessage) (bool, string) {
 			want = prefix
 		}
 		for _, call := range calls {
-			joined := strings.Join(call, " ")
-			if joined == want || strings.HasPrefix(joined, want+" ") {
-				return true, d
+			for _, joined := range callForms(call) {
+				if joined == want || strings.HasPrefix(joined, want+" ") {
+					return true, d
+				}
 			}
 		}
 	}
 	return false, ""
+}
+
+// callForms is the spellings of one call the set is read against: the words as written,
+// and, when the command was named by path or escaped, the same call under the name the
+// shell will actually run. unwrap already reads /bin/sh as the sh wrapper, and the entries
+// have to see /bin/rm as rm for the same reason: a set that any path walks around is a set
+// that does nothing. Both forms are kept, so an operator whose entry names a full path
+// still matches the command written that way.
+func callForms(call []string) []string {
+	if len(call) == 0 {
+		return nil
+	}
+	joined := strings.Join(call, " ")
+	head := shellName(call[0])
+	if head == call[0] {
+		return []string{joined}
+	}
+	normalized := append([]string{head}, call[1:]...)
+	return []string{joined, strings.Join(normalized, " ")}
+}
+
+// shellName is the command a word runs: its last path element, with a leading backslash
+// dropped. \rm is how a shell asks for the binary rather than an alias, and it is still rm.
+func shellName(word string) string {
+	name := strings.TrimPrefix(word, `\`)
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
 }
 
 // shellCallsOrFields is the parsed simple commands of src, or its words when it does not
@@ -124,11 +154,10 @@ func unwrap(call []string) [][]string {
 	if len(call) < 2 {
 		return nil
 	}
-	head := call[0]
-	if i := strings.LastIndexByte(head, '/'); i >= 0 {
-		head = head[i+1:] // /bin/sh and sh are the same wrapper
-	}
+	head := shellName(call[0]) // /bin/sh and sh are the same wrapper
 	switch {
+	case head == "find":
+		return findExec(call)
 	case shellFlagged[head]:
 		for i := 1; i < len(call)-1; i++ {
 			// -c, and the bundles a login or interactive shell takes: -lc, -ic, -ec.
@@ -217,4 +246,32 @@ func partText(p syntax.WordPart) string {
 	var b strings.Builder
 	_ = syntax.NewPrinter().Print(&b, p)
 	return b.String()
+}
+
+// findExec is the command a find runs, if it runs one: the words after -exec or -execdir up
+// to the ; or + that ends them, with the {} placeholder dropped. A cleanup task is exactly
+// where a model writes find -exec rm -rf, and find is not a prefix wrapper, so without this
+// the set never reads what it runs.
+func findExec(call []string) [][]string {
+	var out [][]string
+	for i := 0; i < len(call); i++ {
+		if call[i] != "-exec" && call[i] != "-execdir" && call[i] != "-ok" && call[i] != "-okdir" {
+			continue
+		}
+		var inner []string
+		for j := i + 1; j < len(call); j++ {
+			w := call[j]
+			if w == ";" || w == "+" || w == `\;` {
+				break
+			}
+			if w == "{}" {
+				continue
+			}
+			inner = append(inner, w)
+		}
+		if len(inner) > 0 {
+			out = append(out, inner)
+		}
+	}
+	return out
 }
