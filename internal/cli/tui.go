@@ -248,6 +248,7 @@ func launchApp(ctx context.Context, r clientRun) (bool, error) {
 		Models:    reg.Models,
 		Version:   r.dial.Version,
 		Cwd:       r.cwd,
+		Home:      r.dial.Paths.Home,
 		Prompt:    r.prompt,
 		Scope:     scope,
 		SaveScope: func(refs []session.ModelRef) error { return writeScope(r.dial.Paths.Data, refs) },

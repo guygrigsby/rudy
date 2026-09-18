@@ -338,7 +338,7 @@ func Defaults() map[string]any {
 		"ui.transcript.user_prefix":        "›",
 		"ui.transcript.block_gap":          1,
 		"ui.diff.style":                    "text",
-		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "cat"},
+		"ui.status.items":                  []string{"vim_mode", "model", "permission_mode", "cost", "cwd", "workspace", "cat"},
 		"ui.status.above_editor":           []string{"turn"},
 		"ui.status.host":                   true,
 		"ui.notices.max":                   3,
@@ -662,11 +662,11 @@ var legalHeaderFacts = map[string]bool{
 	"model": true, "thinking": true, "mode": true, "workspace": true,
 }
 
-// builtinStatusItems are ui.status.items' seven built-in keys; anything else must be a
+// builtinStatusItems are ui.status.items' built-in keys; anything else must be a
 // non-empty "<plugin>:<key>" pair.
 var builtinStatusItems = map[string]bool{
 	"vim_mode": true, "model": true, "permission_mode": true,
-	"context": true, "cost": true, "workspace": true, "turn": true, "cat": true,
+	"context": true, "cost": true, "cwd": true, "workspace": true, "turn": true, "cat": true,
 }
 
 func (c *Config) validateUI() []error {

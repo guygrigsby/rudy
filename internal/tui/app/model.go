@@ -91,6 +91,10 @@ type Options struct {
 	Models  []provider.Model     // for the picker and the context percent
 	Version string
 	Cwd     string
+	// Home is this machine's home directory, for writing Cwd with a ~ in the status line.
+	// Passed in rather than read here: a status line is drawn on every keystroke and the
+	// client reads nothing from the environment while it draws.
+	Home string
 	// Prompt seeds the editor with a draft rather than sending it. The positional words
 	// of `rudy <prompt>` land here: the design opens ready to type, and a prompt written
 	// on the command line is a draft the user has already typed, not a turn they have
@@ -141,6 +145,8 @@ type Model struct {
 	// cwd is the caller's directory, kept for the calls that need it: a session this
 	// client opens later is opened on the same one.
 	cwd string
+	// home is Options.Home, the prefix the status line writes as ~.
+	home string
 
 	// session mirrors what the server says about the session: the model, mode, thinking
 	// and title the status line reads, moved by the change entries the log appends.
@@ -260,6 +266,7 @@ func New(o Options) *Model {
 		keys:         table,
 		cl:           o.Client,
 		cwd:          o.Cwd,
+		home:         o.Home,
 		session:      o.Session,
 		models:       o.Models,
 		status:       make(map[string]protocol.StatusItem),

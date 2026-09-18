@@ -339,7 +339,10 @@ func TestUIDefaultsAreTheDesignScreen(t *testing.T) {
 	// No "context": the percentage is drawn on the composer's lower rule, once (ADR 0017).
 	// No "turn": the turn cell is drawn over the composer, where the eye is while a turn
 	// runs, and ui.status.above_editor is what puts it there.
-	want := []string{"vim_mode", "model", "permission_mode", "cost", "workspace", "cat"}
+	// cwd sits before workspace: the workspace item draws the repository and the branch and
+	// draws nothing at all outside a repository, so without cwd the line said nothing about
+	// where the session was.
+	want := []string{"vim_mode", "model", "permission_mode", "cost", "cwd", "workspace", "cat"}
 	if !reflect.DeepEqual(c.UI.Status.Items, want) {
 		t.Errorf("status %v", c.UI.Status.Items)
 	}

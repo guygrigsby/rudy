@@ -213,9 +213,9 @@ style = "text"
 # The status line, above the composer line: what is worth seeing while you type rather than after.
 # e.g. ["turn", "context"]
 above_editor = ["turn"]
-# Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is "<plugin>:<key>".
-# e.g. ["vim_mode", "model", "context", "cost", "workspace", "turn"]
-items = ["vim_mode", "model", "permission_mode", "cost", "workspace", "cat"]
+# Built-ins are vim_mode, model, permission_mode, context, cost, cwd, workspace, turn, cat; a plugin's is "<plugin>:<key>". cwd is the directory the session runs in, which is the only item that says where you are outside a repository.
+# e.g. ["vim_mode", "model", "context", "cost", "cwd", "workspace", "turn"]
+items = ["vim_mode", "model", "permission_mode", "cost", "cwd", "workspace", "cat"]
 # Prefix the workspace item with host: when the session runs on a --host.
 host = true
 

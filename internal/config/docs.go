@@ -247,7 +247,7 @@ var Sections = []Section{
 		Comment: []string{"The status line under the composer."},
 		Keys: []Doc{
 			{Key: "ui.status.above_editor", Comment: "The status line, above the composer line: what is worth seeing while you type rather than after.", Example: `["turn", "context"]`},
-			{Key: "ui.status.items", Comment: "Built-ins are vim_mode, model, permission_mode, context, cost, workspace, turn, cat; a plugin's is \"<plugin>:<key>\".", Example: `["vim_mode", "model", "context", "cost", "workspace", "turn"]`},
+			{Key: "ui.status.items", Comment: "Built-ins are vim_mode, model, permission_mode, context, cost, cwd, workspace, turn, cat; a plugin's is \"<plugin>:<key>\". cwd is the directory the session runs in, which is the only item that says where you are outside a repository.", Example: `["vim_mode", "model", "context", "cost", "cwd", "workspace", "turn"]`},
 			{Key: "ui.status.host", Comment: "Prefix the workspace item with host: when the session runs on a --host."},
 		},
 	},

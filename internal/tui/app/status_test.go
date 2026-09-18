@@ -67,8 +67,10 @@ func TestStatusLineIsTheDesignScreen(t *testing.T) {
 	})
 	got := ansi.Strip(h.m.statusLine())
 	// One column in, the gutter the design draws every row and the status line in. No
-	// context percentage: the composer's lower rule carries it now (ADR 0017).
-	want := " INSERT  ◆ fake:m1  strict  $0.08  rudy ⎇ main*"
+	// context percentage: the composer's lower rule carries it now (ADR 0017). The cwd sits
+	// before the workspace, since the workspace item has nothing to draw outside a
+	// repository and a session still has to say where it is.
+	want := " INSERT  ◆ fake:m1  strict  $0.08  /w  rudy ⎇ main*"
 	if got != want {
 		t.Fatalf("status %q want %q", got, want)
 	}
@@ -340,5 +342,38 @@ func TestTheSpinnerIsPaintedApartFromTheLineItSitsOn(t *testing.T) {
 	}
 	if open(spin) == open(status) {
 		t.Error("and the two roles are not the same paint")
+	}
+}
+
+// TestCwdCell: the workspace item draws the repository and the branch, and draws nothing at
+// all when git has nothing to say, so a session in a plain directory had no line telling
+// anyone where it was. cwd is that line.
+func TestCwdCell(t *testing.T) {
+	home := t.TempDir()
+	cases := map[string]struct {
+		cwd  string
+		want string
+	}{
+		"under home is written with a tilde": {filepath.Join(home, "projects", "rudy"), "~/projects/rudy"},
+		"home itself":                        {home, "~"},
+		"outside home is written out":        {"/var/tmp/thing", "/var/tmp/thing"},
+		"nothing to say":                     {"", ""},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := cwdLabel(c.cwd, home); got != c.want {
+				t.Errorf("cwdLabel(%q) = %q, want %q", c.cwd, got, c.want)
+			}
+		})
+	}
+}
+
+// TestCwdIsInTheFooter: the item is drawn where the config asks for it, which by default is
+// the line under the composer.
+func TestCwdIsInTheFooter(t *testing.T) {
+	h := newAppHarness(t, scripted{text("ok")})
+	line := h.m.statusLine()
+	if !strings.Contains(line, "~") && !strings.Contains(line, string(filepath.Separator)) {
+		t.Errorf("the status line says nothing about where the session is:\n%q", line)
 	}
 }

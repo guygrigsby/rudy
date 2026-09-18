@@ -28,6 +28,7 @@ const (
 	itemPermissionMode = "permission_mode"
 	itemContext        = "context"
 	itemCost           = "cost"
+	itemCwd            = "cwd"
 	itemWorkspace      = "workspace"
 	itemTurn           = "turn"
 	itemCat            = "cat"
@@ -95,6 +96,8 @@ func (m *Model) statusItem(id string) string {
 		return m.styled(theme.RoleStatus, cost(m.model.Pricing, m.usage))
 	case itemWorkspace:
 		return m.styled(theme.RoleStatus, m.workspaceCell())
+	case itemCwd:
+		return m.styled(theme.RoleStatus, cwdLabel(m.cwd, m.home))
 	case itemTurn:
 		// Its own cell rather than a styled string: the spinner inside it is the one thing
 		// on this line that moves, and it is painted apart from the word it spins beside.
@@ -111,6 +114,28 @@ func (m *Model) statusItem(id string) string {
 		return ""
 	}
 	return renderSpans(m.th, item.Content)
+}
+
+// cwdLabel is the cwd item: the directory the session runs in, with the home directory
+// written as ~ because a path is worth reading and a home prefix is not. The workspace item
+// draws the repository and the branch and draws nothing outside a repository, so this is
+// the only item that answers where a session is when git cannot.
+func cwdLabel(cwd, home string) string {
+	if cwd == "" {
+		return ""
+	}
+	if home == "" || !strings.HasPrefix(cwd, home) {
+		return cwd
+	}
+	rest := strings.TrimPrefix(cwd, home)
+	if rest == "" {
+		return "~"
+	}
+	if strings.HasPrefix(rest, string(filepath.Separator)) {
+		return "~" + rest
+	}
+	// A directory whose name merely starts with the home path, /home/guyx next to /home/guy.
+	return cwd
 }
 
 // workspaceCell is the workspace item: the repository, then the branch behind the branch
