@@ -27,7 +27,7 @@ func ResolveSecret(ref string, env func(string) string, cachePath string) (strin
 		key := strings.TrimPrefix(ref, "cache:")
 		f, err := os.Open(cachePath)
 		if err != nil {
-			return "", fmt.Errorf("config: secret %s: %w; secrets.file is the key that names that file", ref, err)
+			return "", fmt.Errorf("config: secret %s: %w; secrets.file names it", ref, err)
 		}
 		defer func() { _ = f.Close() }()
 		sc := bufio.NewScanner(f)
@@ -50,7 +50,7 @@ func ResolveSecret(ref string, env func(string) string, cachePath string) (strin
 		if err := sc.Err(); err != nil {
 			return "", fmt.Errorf("config: secret %s: %w", ref, err)
 		}
-		return "", fmt.Errorf("config: secret %s: %s not in %s, the file secrets.file names", ref, key, cachePath)
+		return "", fmt.Errorf("config: secret %s: %s not in %s; secrets.file names it", ref, key, cachePath)
 	default:
 		return "", fmt.Errorf("config: secret reference %q must be empty, env:NAME or cache:KEY", ref)
 	}

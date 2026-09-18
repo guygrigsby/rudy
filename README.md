@@ -30,7 +30,7 @@ From a checkout:
     make install    # go install ./cmd/rudy, then rudy config sync
 
 Nothing to check out beside it: every dependency resolves from its own module.
-Go 1.26 or newer, and `make check` needs cgo for the race detector.
+Go 1.26.6 or newer, which is what `go.mod` asks for; an older toolchain downloads it. `make check` needs cgo for the race detector.
 
 ## Configure
 

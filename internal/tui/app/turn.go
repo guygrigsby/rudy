@@ -363,7 +363,7 @@ func (m *Model) reaskOne(sid, toolUseID string) {
 // the turn is waiting on it, so nothing may take y, a, n or Esc from it. Any other key
 // falls through to the rest of the keyboard, which is what keeps ctrl+c and ctrl+d
 // working while a question stands. It answers the focused question, the one nearest the input
-// (rudy-9nc, rudy-omc) — concurrent tool calls mean more than one can be waiting, and the
+// (rudy-9nc, rudy-omc): concurrent tool calls mean more than one can be waiting, and the
 // keyboard has no way to name one but the nearest until a picker gives it one, which is why
 // that row is also the only one that draws the keys.
 func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {

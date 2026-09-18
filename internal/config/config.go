@@ -629,7 +629,7 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("config: mcp.connect_timeout_ms %d must be positive", c.MCP.ConnectTimeoutMS))
 	}
 	if c.MaxTokens < 0 {
-		errs = append(errs, fmt.Errorf("config: max_tokens %d must be zero, for the model's own maximum, or positive", c.MaxTokens))
+		errs = append(errs, fmt.Errorf("config: max_tokens %d must be positive, or zero for the model's own maximum", c.MaxTokens))
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
