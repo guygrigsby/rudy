@@ -85,14 +85,21 @@ func newHome(t *testing.T) *home {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(runtime) })
-	h.env = append(os.Environ(),
-		"XDG_CONFIG_HOME="+filepath.Join(root, "config"),
-		"XDG_DATA_HOME="+filepath.Join(root, "data"),
-		"XDG_CACHE_HOME="+filepath.Join(root, "cache"),
-		"XDG_RUNTIME_DIR="+runtime,
-		"HOME="+root,
+	// Built rather than inherited. os.Environ() here meant the developer's own keys and
+	// settings reached the binary under test, so this suite passed on a laptop that had a
+	// BRAVE_API_KEY and failed on CI, which is the suite lying about the product. PATH is
+	// kept because the binary shells out to git and bash, and nothing else is.
+	h.env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"XDG_CONFIG_HOME=" + filepath.Join(root, "config"),
+		"XDG_DATA_HOME=" + filepath.Join(root, "data"),
+		"XDG_CACHE_HOME=" + filepath.Join(root, "cache"),
+		"XDG_RUNTIME_DIR=" + runtime,
+		"HOME=" + root,
+		"TMPDIR=" + os.TempDir(),
 		"NO_COLOR=1",
-	)
+		"TERM=dumb",
+	}
 	return h
 }
 
