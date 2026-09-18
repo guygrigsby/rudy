@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
@@ -60,6 +62,22 @@ var stdinIsTerminal = func() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
+// emptyFlags are the flags whose empty value can only be a mistake. --host is not among
+// them: config can name a host, so passing it empty is a plausible way to ask for this one
+// run to stay here, and refusing that would take away the only way to say it.
+var emptyFlags = []string{"resume", "model", "cwd", "socket", "mode", "thinking"}
+
+// flagPassedEmpty names the first flag the operator wrote with nothing after it, or "".
+func flagPassedEmpty(cmd *cobra.Command) string {
+	for _, name := range emptyFlags {
+		f := cmd.Flags().Lookup(name)
+		if f != nil && f.Changed && strings.TrimSpace(f.Value.String()) == "" {
+			return name
+		}
+	}
+	return ""
+}
+
 // registerPrint adds the --print flags and the root run function.
 func registerPrint(root *cobra.Command, build buildFunc) {
 	var headless bool
@@ -77,6 +95,14 @@ func registerPrint(root *cobra.Command, build buildFunc) {
 	root.Args = cobra.ArbitraryArgs
 	root.RunE = func(cmd *cobra.Command, args []string) error {
 		stderr := cmd.ErrOrStderr()
+		// Before anything reads them: a flag the operator passed with nothing in it is an
+		// unset variable, not a default. --resume "$SID" with SID unset used to open a new
+		// session and exit 0, which is a script losing the conversation it meant to carry
+		// on and hearing nothing about it.
+		if name := flagPassedEmpty(cmd); name != "" {
+			_, _ = fmt.Fprintf(stderr, "--%s was given nothing; name a value or leave the flag out\n", name)
+			return ExitError{2}
+		}
 		if !headless {
 			return tuiExit(runTUI(cmd.Context(), build, d, resumeWith(o, "--resume", stderr), launchTUI, strings.Join(args, " "), stderr))
 		}
@@ -330,7 +356,7 @@ func (t *turnOutput) finish(ctx context.Context, o printOptions, d *dialed, info
 	switch o.Output {
 	case "text":
 		if t.text != "" {
-			_, _ = fmt.Fprintln(stdout, t.text)
+			_, _ = fmt.Fprintln(stdout, answerText(t.text, stdoutIsTerminal()))
 		}
 	case "json":
 		cost := ""
@@ -344,8 +370,56 @@ func (t *turnOutput) finish(ctx context.Context, o printOptions, d *dialed, info
 			return 1, err
 		}
 	}
-	if t.state == "idle" {
-		return 130, nil
+	return exitFor(t.state, t.stopReason), nil
+}
+
+// answerText is the answer as it is safe to print. A model's text is not the client's: it
+// carries whatever the model wrote, and a model reads pages that carry whatever somebody
+// else wrote on them. Printed to a terminal, an escape in it sets the title bar, clears the
+// screen or writes the clipboard on a terminal that answers OSC 52, so a terminal gets the
+// text with its escapes and control bytes taken out, the same treatment the client's own
+// transcript has always given model and plugin text.
+//
+// A pipe gets the bytes the model produced. The consumer there is a program, and a script
+// that asked for the answer is owed the answer, not this function's opinion of it.
+func answerText(s string, terminal bool) string {
+	if !terminal {
+		return s
 	}
-	return 0, nil
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return r
+		case r < 0x20 || r == 0x7f:
+			return -1
+		}
+		return r
+	}, ansi.Strip(s))
+}
+
+// stdoutIsTerminal reports whether the answer is going to a terminal rather than a pipe.
+// Replaceable for the tests, the way stdinIsTerminal is.
+var stdoutIsTerminal = func() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// exitFor is what the process says about how the turn ended, for the script reading it.
+// An answer exits 0, and so does an answer max_tokens cut short, which is still an answer
+// and says so in the json. Everything else is news: a refusal did not do the work, and
+// other means the stream ended without naming a reason either wire knows. Those exited 0
+// with an empty stdout before, which a caller cannot tell from a model that had nothing to
+// say.
+func exitFor(state string, stop session.StopReason) int {
+	if state == "idle" || stop == session.StopInterrupted {
+		return 130
+	}
+	switch stop {
+	case session.StopEndTurn, session.StopMaxTokens:
+		return 0
+	}
+	return 1
 }

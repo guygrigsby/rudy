@@ -170,8 +170,20 @@ says so.
 `--output text` prints the final answer. `--output json` prints one JSON
 line with `session_id`, `result`, `usage`, `cost` and `stop_reason`.
 `--output stream-json` prints every protocol notification as one JSON line,
-including each `permission_decision` and `tool_result`. Exit codes: 0
-completed, 1 the turn failed, 2 usage, 130 interrupted.
+including each `permission_decision` and `tool_result`.
+
+`--output text` printed to a terminal has the escape sequences taken out of it:
+the answer came from a model, a model reads pages that carry whatever somebody
+wrote on them, and an escape printed to a terminal sets the title bar, clears
+the screen or writes the clipboard. Piped, the answer is the bytes the model
+produced, since the consumer there is a program.
+
+Exit codes follow how the turn ended, so a script can tell an answer from a
+silence: 0 when the model finished, including an answer `max_tokens` cut short,
+which the json says; 1 when the turn failed, the model refused, or the stream
+stopped without saying why; 2 for usage; 130 interrupted. The old behaviour
+exited 0 for all of those, so an endpoint that answered with nothing looked
+exactly like a model that had nothing to say.
 
 `--mode` overrides `[permissions] mode` from config for one run: `strict`
 asks before an unsafe tool and denies it if nothing can answer, `permissive`

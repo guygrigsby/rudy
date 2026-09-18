@@ -429,3 +429,93 @@ func TestNewestInSkipsChildSessions(t *testing.T) {
 		t.Fatalf("newestIn = %s, want the parent %s, not the child %s", got, parent.ID(), child.ID())
 	}
 }
+
+// TestExitForSaysHowTheTurnEnded: a headless run is something a script reads, so the exit
+// code has to separate an answer from a silence. Every terminal state used to exit 0 but
+// an interrupt, so an endpoint that closed the stream without a word looked exactly like a
+// model with nothing to say.
+func TestExitForSaysHowTheTurnEnded(t *testing.T) {
+	cases := []struct {
+		name  string
+		state string
+		stop  session.StopReason
+		want  int
+	}{
+		{"an answer", "completed", session.StopEndTurn, 0},
+		{"an answer cut short", "completed", session.StopMaxTokens, 0},
+		{"the model refused", "completed", session.StopRefused, 1},
+		{"the stream stopped without saying why", "completed", session.StopOther, 1},
+		{"no turn reported anything", "completed", session.StopReason(""), 1},
+		{"a turn that rested on a tool call", "completed", session.StopToolUse, 1},
+		{"interrupted", "idle", session.StopInterrupted, 130},
+		{"idle beats the stop reason", "idle", session.StopEndTurn, 130},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := exitFor(c.state, c.stop); got != c.want {
+				t.Errorf("exitFor(%q, %q) = %d, want %d", c.state, c.stop, got, c.want)
+			}
+		})
+	}
+}
+
+// TestAFlagPassedEmptyIsUsage: --resume "$SID" with SID unset used to open a new session and
+// exit 0, so a script lost the conversation it meant to continue and nothing said so. A flag
+// the operator passed with nothing in it is a usage error, which is what an unset variable
+// deserves; a flag they left out entirely still means what it always meant.
+func TestAFlagPassedEmptyIsUsage(t *testing.T) {
+	old := stdinIsTerminal
+	stdinIsTerminal = func() bool { return true }
+	t.Cleanup(func() { stdinIsTerminal = old })
+	for _, flag := range []string{"--resume", "--model", "--cwd", "--socket", "--mode", "--thinking"} {
+		t.Run(flag, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			fp := &fakeProvider{script: [][]provider.Part{say("ok")}}
+			root := newRoot("test", testBuilder(t, fp))
+			var out, errb bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&errb)
+			root.SetArgs([]string{"-p", flag, "", "hello"})
+			err := root.ExecuteContext(context.Background())
+			var ee ExitError
+			if !errorsAs(err, &ee) || ee.Code != 2 {
+				t.Fatalf("%s \"\" = %v, want usage; stdout %q stderr %q", flag, err, out.String(), errb.String())
+			}
+			if !strings.Contains(errb.String(), flag) {
+				t.Errorf("the refusal never names %s: %q", flag, errb.String())
+			}
+		})
+	}
+}
+
+// TestTheAnswerCannotDriveTheTerminal: the text a headless run prints came from a model,
+// and a model reads pages that carry whatever somebody wrote on them. Printed raw to a
+// terminal, an OSC sequence in that text sets the title bar, CSI 2J clears the screen and
+// OSC 52 writes the clipboard on terminals that answer it. The client's own transcript has
+// sanitized plugin and model text all along (spanText); the headless printer did not.
+//
+// A pipe is left alone: the consumer there is a program, and a script asking for the answer
+// gets the bytes the model produced.
+func TestTheAnswerCannotDriveTheTerminal(t *testing.T) {
+	const payload = "before\x1b]0;pwned\x07\x1b[2Jafter"
+	t.Run("to a terminal", func(t *testing.T) {
+		if got, want := answerFor(payload, true), "beforeafter"; got != want {
+			t.Errorf("printed %q to a terminal, want %q", got, want)
+		}
+	})
+	t.Run("to a pipe", func(t *testing.T) {
+		if got := answerFor(payload, false); got != payload {
+			t.Errorf("printed %q to a pipe, want the bytes the model produced", got)
+		}
+	})
+	t.Run("ordinary text is untouched", func(t *testing.T) {
+		const plain = "a line\nand another\twith a tab"
+		if got := answerFor(plain, true); got != plain {
+			t.Errorf("printed %q, want %q", got, plain)
+		}
+	})
+}
+
+func answerFor(s string, terminal bool) string {
+	return answerText(s, terminal)
+}
