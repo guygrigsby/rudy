@@ -8,9 +8,9 @@
              `|_|-|_|
 
 A coding agent harness in Go. One binary that runs a model-driven loop over a
-workspace with tools, sessions, permissions and plugins, fronted by a
-terminal client the owner controls down to the glyph, and runnable headless
-or as a server without changing the loop.
+workspace with tools, sessions, permissions and plugins, fronted by a terminal
+client the owner controls down to the glyph. The same loop runs headless or as
+a server.
 
 This build is the kernel, the terminal client, the headless printer and the
 server.
@@ -257,7 +257,7 @@ on a `0600` socket, and every connection's peer uid is checked with
 boundary everything is trusted, deliberately:
 
 - Any process running as you can drive any live session by id: submit a turn,
-  interrupt it, compact, close, change the model, and run `session.shell`,
+  interrupt it, compact, close, change the model and run `session.shell`,
   which runs a command without asking the Gate because the operator typed it
   (ADR 0023). Being attached is not a permission (`rudy-jkz`). Rudy is not
   what stands between a machine that is already compromised and the rest of

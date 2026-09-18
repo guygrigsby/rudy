@@ -30,7 +30,7 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
   re-marshal them.
 - `config.toml` is the operator's. The harness reads it and adds to it: `rudy
   config sync`, which `make install` runs, writes keys that are absent with the
-  comment that says what each is for, and changes no value, comment or ordering
+  comment that says what each is for and changes no value, comment or ordering
   that is already there (ADR 0021). Nothing else writes it; commands that
   persist state (`mcp add`, `plugin install`) write their own dedicated files.
   XDG paths, `XDG_CONFIG_HOME` honored first, default `~/.config/rudy`.
@@ -39,7 +39,7 @@ v2 client, plugins linked in or spawned, sessions as append-only JSONL logs.
   A new key means a default, a catalogue entry, a contracts row and a
   regenerated example; the guards in `internal/config` fail until all four
   agree.
-- CLI is noun then verb (`rudy skills migrate`), collection nouns plural, and a
+- CLI is noun then verb (`rudy skills migrate`) and collection nouns are plural. A
   top-level command that acts without a verb is named in `internal/cli/shape_test.go`
   with a reason. Those tests are the rule; adding a verb means adding it to their
   vocabulary. Long flags take two dashes. ADR 0022.
@@ -89,9 +89,9 @@ bd close <id>         # Complete work
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Use `bd` for ALL task tracking. Do NOT use TodoWrite, TaskCreate or markdown TODO lists
 - Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use `bd remember` for persistent knowledge. Do NOT use MEMORY.md files
 
 ## Session Completion
 
