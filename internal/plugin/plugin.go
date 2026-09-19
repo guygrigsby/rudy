@@ -136,7 +136,10 @@ type Host interface {
 	// SetWidget replaces this plugin's widget under key. An unknown slot is refused.
 	SetWidget(key string, slot WidgetSlot, content []Span) error
 
-	// Note appends a note entry to a live session. ErrNoServer before attach.
+	// Note appends a note entry to a live session. ErrNoServer before attach, and an error
+	// for a session nobody holds live any more: nothing keeps a session open for a plugin's
+	// background work, so work started from session_closed has no log left to write to and
+	// reports through Notice instead (ADR 0041).
 	Note(sessionID ulid.ULID, text string, role session.NoteRole) error
 	// Connect returns a client authenticated as caller class plugin. ErrNoServer before
 	// attach. The caller owns the client and must Close it.

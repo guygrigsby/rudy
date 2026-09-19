@@ -55,6 +55,7 @@ type recorder struct {
 	prompts  []string
 	promptSy []string // the session id each prompt was summarized for
 	err      error
+	noteErr  error // non-nil makes every note fail, the way a closed session's does
 
 	gate    chan struct{} // non-nil makes summarize block until it is closed
 	entered chan struct{} // closed the first time a summarize call reaches the gate
@@ -99,8 +100,20 @@ func (r *recorder) hold() (entered <-chan struct{}, release func()) {
 func (r *recorder) note(_ ulid.ULID, pluginName, text string, role session.NoteRole) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.noteErr != nil {
+		return r.noteErr
+	}
 	r.notes = append(r.notes, session.Note{Plugin: pluginName, Text: text, Role: role})
 	return nil
+}
+
+// sessionGone is the server having closed the session log: every note from here on comes back
+// the way the real one does, not_found, which is what background work started from
+// session_closed always finds (ADR 0041).
+func (r *recorder) sessionGone() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.noteErr = errors.New("session not open: " + fixtureSession)
 }
 
 func (r *recorder) notice(text string) {
@@ -676,6 +689,45 @@ func TestSessionClosedFinalizesTheSummary(t *testing.T) {
 	}
 	if c.Status != "stable" {
 		t.Errorf("status %q, want stable", c.Status)
+	}
+}
+
+// TestFinalizeFoldFailureReachesTheOperator: the finalize fold finishes seconds after the
+// server closed the session log, so its note comes back not_found and the session can never
+// hear it again (rudy-6zu, ADR 0041). A failure must not go down with the note: it goes to the
+// notice sink, which is the operator's stderr and the log file.
+func TestFinalizeFoldFailureReachesTheOperator(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	h.open(fixtureProject)
+	h.rec.fail(errors.New("boom"))
+	h.rec.sessionGone()
+	h.closed()
+	h.settle()
+	if notes := h.rec.takeNotes(); len(notes) != 0 {
+		t.Fatalf("notes %+v; the session log is closed by the time a finalize fold reports", notes)
+	}
+	if n := h.rec.noticed("memory: fold failed: boom"); n != 1 {
+		t.Fatalf("noticed the failure %d times, want 1", n)
+	}
+}
+
+// TestFinalizeFoldSuccessSaysNothingToTheOperator is the other half of ADR 0041: a muted note
+// is display for a client that has already gone, and a fallback that promoted it to the
+// operator's stderr would put a line under every headless run for nothing.
+func TestFinalizeFoldSuccessSaysNothingToTheOperator(t *testing.T) {
+	h := newHarness(t, map[string]int{"observe_after_tokens": 1})
+	h.open(fixtureProject)
+	h.rec.sessionGone()
+	h.closed()
+	h.settle()
+	if notes := h.rec.takeNotes(); len(notes) != 0 {
+		t.Fatalf("notes %+v; the session log is closed by the time a finalize fold reports", notes)
+	}
+	if n := h.rec.noticed("memory: folded"); n != 0 {
+		t.Fatalf("a muted note reached the operator %d times", n)
+	}
+	if c := h.summary(); c == nil || c.Status != "stable" {
+		t.Fatalf("the fold itself did not finalize: %+v", c)
 	}
 }
 

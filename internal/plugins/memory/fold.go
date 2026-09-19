@@ -207,12 +207,21 @@ func (p *memPlugin) guard(sid, what string, fn func()) {
 	fn()
 }
 
-// note appends to the session log, dropping the result: a note that cannot be written is
-// display only and must not turn into a second failure on top of the one it reports.
+// note appends to the session log, or says it to the operator when there is no log to append
+// to. A fold started from session_closed finishes after the server has closed the session, and
+// nothing holds a session open for a plugin's background work (ADR 0041), so every note a
+// finalize fold writes comes back not_found. Dropping that is what lost every finalize
+// failure and every panic a fold recovered from.
+//
+// Only warn and error fall back. A muted note is display for a client that is no longer there,
+// and a fallback that carried it to the operator's stderr would print a line under every
+// headless run to say nothing went wrong.
 func (p *memPlugin) note(sid, text string, role session.NoteRole) {
 	id, err := ulid.Parse(sid)
-	if err != nil {
+	if err == nil && p.host.Note(id, text, role) == nil {
 		return
 	}
-	_ = p.host.Note(id, text, role)
+	if role == session.NoteWarn || role == session.NoteError {
+		p.host.Notice(text)
+	}
 }

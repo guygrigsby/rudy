@@ -11,7 +11,10 @@
 //
 // Nothing slow happens on a hook's or a tool's own goroutine. A fold makes a model call and a
 // write job pushes to a git remote, either of which can take minutes; both run in the
-// background and report through notes, and Close is what waits for them.
+// background and report through notes, and Close is what waits for them. The finalize fold
+// outlives its session, whose log is closed as soon as the session_closed handlers return, so
+// its notes have nowhere to land: what it has to say about a failure goes to the operator
+// instead, and the summary it wrote is what says it ran (ADR 0041).
 package memory
 
 import (
@@ -186,7 +189,8 @@ func (p *memPlugin) onTurnCompleted(ctx context.Context, call plugin.HookCall) (
 
 // onClosed queues the finalize fold, which promotes the summary out of draft, and hands the
 // session's bookkeeping to it: whoever runs last forgets the session, so a finalize waiting
-// behind a running fold still knows what project it is for.
+// behind a running fold still knows what project it is for. The server closes the session log
+// as soon as this returns, so nothing that fold says reaches the session (ADR 0041).
 func (p *memPlugin) onClosed(ctx context.Context, call plugin.HookCall) (any, error) {
 	payload, ok := call.Payload.(*plugin.SessionClosedPayload)
 	if !ok || payload == nil {
