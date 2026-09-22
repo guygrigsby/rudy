@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +82,106 @@ func TestSubmitResponseEchoesBeforeItsNotification(t *testing.T) {
 	})
 	if rows := h.m.tr.Rows(); len(rows) != 1 {
 		t.Fatalf("entry.appended duplicated the submitted row: %+v", rows)
+	}
+}
+
+func scrollHarnessAwayFromLive(t *testing.T, h *harness) {
+	t.Helper()
+	for i := range 60 {
+		h.appended(session.UserMessage{
+			Source: session.SourceTyped,
+			Content: []session.Block{
+				session.TextBlock("old row " + strconv.Itoa(i)),
+			},
+		})
+	}
+	h.view()
+	h.press("pageUp")
+	if h.m.vp.AtBottom() {
+		t.Fatal("pageUp left the viewport at the live edge")
+	}
+}
+
+func TestAcceptedSubmitReturnsAltscreenToLiveTurn(t *testing.T) {
+	for _, source := range []session.Source{session.SourceTyped, session.SourceSteer} {
+		t.Run(string(source), func(t *testing.T) {
+			h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+			scrollHarnessAwayFromLive(t, h)
+
+			turnID := session.NewID()
+			msg := session.UserMessage{
+				Source:  source,
+				Content: []session.Block{session.TextBlock("newest prompt")},
+			}
+			h.m.submitText("newest prompt", source)
+			h.view()
+			result, err := json.Marshal(protocol.SessionSubmitResult{TurnID: turnID.String()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.update(CallResultMsg{
+				Method: protocol.MethodSessionSubmit, Result: result, Submitted: &msg,
+			})
+			if source == session.SourceSteer {
+				h.appended(msg)
+			}
+			h.appended(session.AssistantMessage{
+				Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+				Content: []session.Block{
+					session.ToolUseBlock("tool", "bash", json.RawMessage(`{"command":"pwd"}`)),
+				},
+			})
+
+			got := ansi.Strip(h.view())
+			if !strings.Contains(got, "› newest prompt") || !strings.Contains(got, "bash  pwd") {
+				t.Fatalf("accepted submit did not return to live output:\n%s", got)
+			}
+			if !h.m.vp.AtBottom() {
+				t.Fatal("accepted submit did not restore viewport following")
+			}
+		})
+	}
+}
+
+func TestSubmitReturnsAltscreenToLiveEdgeBeforeResponse(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	scrollHarnessAwayFromLive(t, h)
+
+	h.typeText("newest prompt")
+	if cmd := h.press("enter"); cmd == nil {
+		t.Fatal("Enter did not start session.submit")
+	}
+	h.view()
+	if !h.m.vp.AtBottom() {
+		t.Fatal("Enter waited for the submit response before returning to live output")
+	}
+}
+
+func TestScrolledAltscreenSubmitFollowsTheRealTurn(t *testing.T) {
+	h := newAppHarness(t, scripted{toolCall("read", `{"path":"a.go"}`), text("done")})
+	for i := range 60 {
+		h.m.entry(entry(t, session.UserMessage{
+			Source: session.SourceTyped,
+			Content: []session.Block{
+				session.TextBlock("old row " + strconv.Itoa(i)),
+			},
+		}))
+	}
+	h.view()
+	h.press("pageUp")
+	if h.m.vp.AtBottom() {
+		t.Fatal("pageUp left the viewport at the live edge")
+	}
+
+	h.typeText("read the file")
+	h.press("enter")
+	h.waitTurn(stateCompleted)
+	got := ansi.Strip(h.view())
+	if !strings.Contains(got, "› read the file") || !strings.Contains(got, "read  a.go") {
+		t.Fatalf("real turn did not stay on live output:\n%s", got)
+	}
+	if !h.m.vp.AtBottom() {
+		t.Fatal("real turn did not leave the viewport following")
 	}
 }
 

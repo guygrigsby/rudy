@@ -158,6 +158,10 @@ type Model struct {
 	// vp scrolls the transcript in altscreen. Inline rendering has no viewport: the
 	// terminal's own scrollback is the scroll.
 	vp viewport.Model
+	// followLive records that altscreen is following the live edge. Keeping this explicit
+	// survives layout changes such as the turn status appearing, which can make the
+	// viewport's old bottom offset look scrolled before its next composition.
+	followLive bool
 	// spin is the glyph the turn status item draws while a turn runs, and spinning is
 	// whether its tick loop is armed: a client at rest schedules nothing (status.go).
 	spin     spinner.Model
@@ -1399,6 +1403,7 @@ func (m *Model) wheel(b tea.MouseButton) {
 	case tea.MouseWheelDown:
 		m.vp.ScrollDown(m.vp.MouseWheelDelta)
 	}
+	m.followLive = m.vp.AtBottom()
 }
 
 // scroll moves the viewport for one tui.altScreen action and reports whether it did.
@@ -1432,6 +1437,7 @@ func (m *Model) scroll(a keys.Action) bool {
 	default:
 		return false
 	}
+	m.followLive = m.vp.AtBottom()
 	return true
 }
 
@@ -1619,11 +1625,12 @@ func (m *Model) transcriptBlock(h int) ([]string, []*transcript.Row) {
 	// A viewport sitting at the bottom follows the rows that land under it; one the user
 	// scrolled up stays where they left it. Read before the content changes: afterwards
 	// every offset short of the new bottom looks scrolled.
-	follow := m.vp.AtBottom()
+	follow := m.followLive || m.vp.AtBottom()
 	m.vp.SetContentLines(content)
 	if follow {
 		m.vp.GotoBottom()
 	}
+	m.followLive = m.vp.AtBottom()
 	view := strings.Split(m.vp.View(), "\n")
 	rows := make([]*transcript.Row, len(view))
 	for i := range view {

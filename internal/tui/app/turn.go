@@ -525,6 +525,10 @@ func (m *Model) submit() tea.Cmd {
 
 // submitText sends one message as a turn's content.
 func (m *Model) submitText(text string, source session.Source) tea.Cmd {
+	// Enter means return to the live edge before the asynchronous response or its
+	// notifications can win the render race. Passive entries still preserve a viewport
+	// the user scrolled away from; a local submit is explicit intent to watch the turn.
+	m.followLive = !m.inline()
 	return m.callSubmit(session.UserMessage{
 		Content: []session.Block{session.TextBlock(text)},
 		Source:  source,
