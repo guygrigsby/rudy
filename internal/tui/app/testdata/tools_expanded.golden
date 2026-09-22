@@ -1,6 +1,6 @@
  [38;2;122;162;247m› fix the flaky fork test[m                                                                          
                                                                                                     
-   [38;2;192;202;245mLooking at the test[m[38;2;192;202;245m first.[m                                                                       
+   [38;2;255;255;255mLooking at the test[m[38;2;255;255;255m first.[m                                                                       
                                                                                                     
  [38;2;115;218;202m▾ $ bash  go test ./internal/session -run TestFork -count=3[m                                        
      [38;2;86;95;137m{[m                                                                                              
@@ -16,7 +16,7 @@
      [38;2;86;95;137m}[m                                                                                              
      [38;2;192;202;245mreplaced 1 occurrence in internal/session/fork.go[m                                              
                                                                                                     
-   [38;2;192;202;245mOff by one in the slice bound. Fixed and[m[38;2;192;202;245m green.[m                                                  
+   [38;2;255;255;255mOff by one in the slice bound. Fixed and[m[38;2;255;255;255m green.[m                                                  
                                                                                                     
                                                                                                     
                                                                                                     

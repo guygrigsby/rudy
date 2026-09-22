@@ -147,11 +147,13 @@ type UIConfig struct {
 // hand, in ui.theme's case alongside the "name" key, which is config's alone (a theme
 // file has no use for it).
 var themeDefaults = map[string]string{
-	"accent":    "#7aa2f7",
-	"text":      "#c0caf5",
-	"muted":     "#565f89",
-	"user":      "accent",
-	"assistant": "text",
+	"accent": "#7aa2f7",
+	"text":   "#c0caf5",
+	"muted":  "#565f89",
+	"user":   "accent",
+	// White, not the text blue-white: the one thing on the screen the agent is saying
+	// reads as the brightest thing on it.
+	"assistant": "#ffffff",
 	// Teal, where a tool row used to be muted: what the agent did is not chrome, and the
 	// transcript reads better when the doing is one colour and the frame another.
 	"tool":     "#73daca",
