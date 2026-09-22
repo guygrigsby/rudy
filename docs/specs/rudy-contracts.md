@@ -508,8 +508,10 @@ Refreshed on `session.open`, on picker open and on a `not_found` model error fro
 ### config.toml
 
 Every key, its type, default and meaning. A missing key takes the default. Unknown keys are
-ignored; refusing them at load with the key path named is pass 3: not yet implemented (bead
-rudy-k0.27).
+ignored by the decoder and warned about by the linter: `config.Lint` runs on every start and
+names each key or table rudy does not read, with its line and, where there is one, the key or
+nesting it meant. `rudy config lint` is the same pass on demand. Findings are warnings and
+the config still loads; a file that will not parse is the one error (ADR 0044).
 
 The socket is not among them: it is `Paths.Socket()`, overridden by `--socket` and by
 nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the unknown ones.

@@ -164,6 +164,18 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		plain(text)
 		logger.Warn(text)
 	}
+	// Every start lints the file, and every finding is a warning: the config loaded, and
+	// what it loaded is what the finding describes. viper drops a key it does not know
+	// without a word, so a table written one level too shallow is configuration somebody
+	// wrote and the harness ignores, and the only way that is ever heard about is here
+	// (ADR 0044).
+	if findings, lerr := config.Lint(paths.ConfigFile()); lerr != nil {
+		notice(lerr.Error())
+	} else {
+		for _, f := range findings {
+			notice(fmt.Sprintf("%s:%d: %s", paths.ConfigFile(), f.Line, f.Text))
+		}
+	}
 	plugins := plugin.NewRegistry(cfg.Plugins, notice)
 	plugins.Disable(cfg.PluginsDisabled...)
 	// The provider registry is built here rather than below because the memory plugin folds

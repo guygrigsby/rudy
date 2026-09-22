@@ -235,7 +235,7 @@ type Config struct {
 	// Plugins and PluginsDisabled are filled by hand from the raw [plugins] table after
 	// Unmarshal, since "disabled" is a sibling key of the per-plugin tables under the same
 	// [plugins] section rather than a table itself; mapstructure has no way to split that.
-	Plugins         map[string]map[string]any `mapstructure:"-"`
+	Plugins         map[string]map[string]any `mapstructure:"-" toml:"plugins"`
 	PluginsDisabled []string                  `mapstructure:"-"`
 	Skills          struct {
 		Dirs        []string `mapstructure:"dirs"`
@@ -269,7 +269,7 @@ type Config struct {
 	// Keys is the [keys] table: pi action id to bound keys. Filled by hand from the raw
 	// TOML, like Plugins above, because viper lowercases map keys and pi's action ids
 	// are case-sensitive (app.model.cycleForward).
-	Keys map[string][]string `mapstructure:"-"`
+	Keys map[string][]string `mapstructure:"-" toml:"keys"`
 	// ConfigDir is paths.Config, filled by Load. Anything that reads a file next to
 	// config.toml (agent definitions) has the Config but not the Paths.
 	ConfigDir string `mapstructure:"-"`

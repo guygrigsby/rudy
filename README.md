@@ -80,6 +80,7 @@ each default to `~/.config`, `~/.local/share` and `~/.cache`, plus `/rudy`.
     rudy config example                   # every key, its default and what it is for
     rudy config sync                      # add the keys your file is missing
     rudy config sync --dry-run            # say what it would add and write nothing
+    rudy config lint                      # name what your file sets that rudy does not read
 
 `make install` runs `rudy config sync`, so a key added by a new release reaches your
 file with the comment that says what it is for. A value you have already set is never

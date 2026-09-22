@@ -62,14 +62,33 @@ func Sync(path string, dry bool) (SyncResult, error) {
 	return res, nil
 }
 
-// keysIn is every key the file already sets, as full dotted keys. Comments and blank lines
-// say nothing, and a value spread over several lines (an array) is skipped whole so its
-// contents are never read as keys.
+// keysIn is every key the file already sets, as full dotted keys.
 func keysIn(lines []string) map[string]bool {
 	have := map[string]bool{}
-	table := ""
+	for _, e := range entries(lines) {
+		if !e.table {
+			have[strings.Join(e.path, ".")] = true
+		}
+	}
+	return have
+}
+
+// entry is a line that names something: a table header, or a key the file sets. Both carry
+// the line they are written on, which is what a lint finding points at.
+type entry struct {
+	line  int
+	path  []string
+	table bool
+}
+
+// entries is every table header and key in the file, in the order they are written.
+// Comments and blank lines say nothing, and a value spread over several lines (an array) is
+// skipped whole so its contents are never read as keys.
+func entries(lines []string) []entry {
+	var out []entry
+	var table []string
 	depth := 0
-	for _, raw := range lines {
+	for i, raw := range lines {
 		line := strings.TrimSpace(stripComment(raw))
 		if depth > 0 {
 			depth += brackets(line)
@@ -78,19 +97,45 @@ func keysIn(lines []string) map[string]bool {
 		switch {
 		case line == "":
 		case strings.HasPrefix(line, "["):
-			if end := strings.Index(line, "]"); end > 0 {
-				table = strings.TrimSpace(line[1:end])
+			end := strings.LastIndex(line, "]")
+			if end <= 0 {
+				continue
 			}
+			table = splitKey(strings.Trim(line[:end+1], "[]"))
+			out = append(out, entry{line: i + 1, path: table, table: true})
 		default:
 			name, _, ok := strings.Cut(line, "=")
 			if !ok {
 				continue
 			}
-			have[join2(table, unquoteKey(strings.TrimSpace(name)))] = true
+			key := append(append([]string{}, table...), splitKey(strings.TrimSpace(name))...)
+			out = append(out, entry{line: i + 1, path: key})
 			depth += brackets(line)
 		}
 	}
-	return have
+	return out
+}
+
+// splitKey is a dotted key as its segments, leaving a quoted one whole and unquoted: a
+// [keys] entry writes an action id like "app.model.select", which is one name and not three.
+func splitKey(s string) []string {
+	var out []string
+	var cur strings.Builder
+	quote := rune(0)
+	for _, r := range s {
+		switch {
+		case quote == 0 && (r == '"' || r == '\''):
+			quote = r
+		case quote == r:
+			quote = 0
+		case r == '.' && quote == 0:
+			out = append(out, strings.TrimSpace(cur.String()))
+			cur.Reset()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	return append(out, strings.TrimSpace(cur.String()))
 }
 
 // merge writes the missing keys into the lines and answers the new file and what it added.
@@ -244,18 +289,4 @@ func brackets(line string) int {
 		}
 	}
 	return depth
-}
-
-// join2 is a table and a key as one dotted key.
-func join2(table, key string) string {
-	if table == "" {
-		return key
-	}
-	return table + "." + key
-}
-
-// unquoteKey drops the quotes a TOML key may carry, which is how a [keys] entry writes an
-// action id.
-func unquoteKey(k string) string {
-	return strings.Trim(k, `"'`)
 }

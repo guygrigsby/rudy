@@ -19,7 +19,43 @@ func newConfigCmd() *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE:  func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
-	cmd.AddCommand(newConfigPathCmd(), newConfigExampleCmd(), newConfigSyncCmd())
+	cmd.AddCommand(newConfigPathCmd(), newConfigExampleCmd(), newConfigSyncCmd(), newConfigLintCmd())
+	return cmd
+}
+
+// newConfigLintCmd is `rudy config lint`: what the file says that rudy does not read. It
+// goes to config.Lint and never to Load, since the file that needs diagnosing is exactly
+// the file Load may refuse, and the one command that explains it has to run anyway.
+func newConfigLintCmd() *cobra.Command {
+	var path string
+	cmd := &cobra.Command{
+		Use:   "lint",
+		Short: "report what config.toml sets that rudy does not read",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			file := path
+			if file == "" {
+				paths, err := configPaths()
+				if err != nil {
+					return err
+				}
+				file = paths.ConfigFile()
+			}
+			findings, err := config.Lint(file)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			for _, f := range findings {
+				_, _ = fmt.Fprintf(out, "%s:%d: %s\n", file, f.Line, f.Text)
+			}
+			if len(findings) == 0 {
+				_, _ = fmt.Fprintf(out, "%s: rudy reads every key in it\n", file)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&path, "path", "", "lint this file instead of the one rudy reads")
 	return cmd
 }
 

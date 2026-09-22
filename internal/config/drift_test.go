@@ -160,7 +160,7 @@ func configSection(t *testing.T) []string {
 // to run these, so they have to exist.
 func TestTheReadmeNamesTheConfigCommands(t *testing.T) {
 	readme := repoFile(t, "README.md")
-	for _, cmd := range []string{"rudy config sync", "rudy config example"} {
+	for _, cmd := range []string{"rudy config sync", "rudy config example", "rudy config lint"} {
 		if !strings.Contains(readme, cmd) {
 			t.Errorf("README.md does not mention %q; a command nobody is told about is a command nobody runs", cmd)
 		}
