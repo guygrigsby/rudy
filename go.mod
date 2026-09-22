@@ -7,7 +7,7 @@ require (
 	charm.land/bubbletea/v2 v2.0.9
 	charm.land/glamour/v2 v2.0.1
 	charm.land/lipgloss/v2 v2.0.6
-	github.com/aeryx-ai/memory/memory-go v0.0.0-20260909023115-9f6fc726eeac
+	github.com/aeryx-ai/memory/memory-go v0.0.0-20260922000120-ce601d3bc6a1
 	github.com/alecthomas/chroma/v2 v2.27.0
 	github.com/anthropics/anthropic-sdk-go v1.71.0
 	github.com/aymanbagabas/go-udiff v0.4.1
