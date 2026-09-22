@@ -233,11 +233,12 @@ in the workspace cell, the model, the context, one per tool on a tool row and
 one per notice level. Status under the input, vim
 mode first and `turn` last: a spinner from `[ui.spinner]` and one word for what the turn is doing, drawn over the composer by `ui.status.above_editor` rather than under it
 (`thinking` until an answer streams, then `streaming`, `tool`, `steering`,
-`waiting`), drawing nothing at rest. Enter or a click expands a row, and the row's marker says which way it is:
+`waiting`), drawing nothing at rest. Enter or a click without movement expands a row, and the row's marker says which way it is:
 pointing right while its result is folded, down while it is open. A click is a
-mouse report, which is what takes a drag away from the terminal's own selection,
-so `ui.mouse = "off"` gives selection back and leaves the keyboard to do the
-expanding. A permission
+mouse report. Rudy distinguishes it from a drag, highlights the drag selection
+and copies its plain text through OSC 52 on release. `ui.mouse = "off"` gives
+every gesture back to the terminal and leaves the keyboard to do the expanding.
+Inline always leaves mouse selection and scrolling to the terminal. A permission
 question renders inline where the tool row would be. Assistant markdown renders
 through glamour with chroma on fences, sanitized on the way in so nothing a model
 wrote can move the cursor.
@@ -248,7 +249,7 @@ Every choice is a config field with the default that produces that screen:
 [ui]
 render = "altscreen"
 vim = true
-mouse = "click"    # off leaves selection to the terminal
+mouse = "click"    # off leaves every mouse gesture to the terminal
 double_press_ms = 500
 
 [ui.layout]

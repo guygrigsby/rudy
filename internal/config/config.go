@@ -121,16 +121,12 @@ type UIConfig struct {
 	Theme      map[string]string `mapstructure:"theme"`
 	// Icons holds ui.icons.set plus per-name overrides, merged the same way Theme is.
 	Icons map[string]string `mapstructure:"icons"`
-	// Mouse is what the client asks the terminal to report: "off" leaves the mouse to the
-	// terminal, so a drag selects text to copy as it does anywhere else; "click" reports
-	// clicks and the wheel, which is what expands a tool row and scrolls the transcript;
-	// "all" reports movement too, which nothing here uses yet.
-	//
-	// Off is the default: copying an error out of the transcript is a daily thing, and a
-	// client that takes the mouse to expand a row nobody clicks has taken the more useful
-	// half. With reporting on, a terminal's own selection is one modifier away, and which
-	// one is the terminal's business: Shift in xterm, Ghostty, WezTerm and most others,
-	// Option in Terminal.app and iTerm2.
+	// Mouse is what the client asks the terminal to report. Click is the default: the
+	// client owns wheel and left-button gestures, distinguishes a release without movement
+	// from a drag, highlights and copies the drag through OSC 52 and toggles a tool row only
+	// for the click. Off leaves every mouse gesture to the terminal. All additionally
+	// reports movement when no button is held. Inline always leaves the mouse to the
+	// terminal's own scrollback.
 	Mouse string `mapstructure:"mouse"`
 	// Cats draws a random cat face in the status line's cat cell, one for the life of the
 	// client. False leaves the cell empty wherever ui.status.items placed it.
@@ -331,7 +327,7 @@ func Defaults() map[string]any {
 		"ui.spinner.frames":                []string{},
 		"ui.spinner.interval_ms":           0,
 		"ui.cats":                          true,
-		"ui.mouse":                         "off",
+		"ui.mouse":                         "click",
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,

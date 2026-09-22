@@ -123,10 +123,10 @@ Icons are Nerd Font glyphs by default: the branch in the workspace cell, the
 model, the context and one per tool. A terminal without a patched font wants
 `ui.icons.set = "unicode"`, and `ui.icons.<name> = ""` turns any single one off.
 The status line wears a cat face for the run, which `ui.cats = false` takes away.
-Mouse reporting is on, so a click expands a row and the wheel scrolls; that is
-also what stops a drag from selecting text, so hold Option on macOS or Shift
-elsewhere to select anyway, or set `ui.mouse = "off"` to leave the mouse to the
-terminal entirely.
+Mouse reporting is on in full-screen mode. The wheel scrolls, a drag highlights
+and copies text on release, and a click without movement expands a tool row.
+Set `ui.mouse = "off"` to leave every mouse gesture to the terminal. Inline mode
+always leaves the mouse to the terminal because its scrollback belongs there.
 
 Every render choice is a config field under `[ui]` with a default, listed in
 `docs/specs/rudy-contracts.md`; `ui.render = "inline"` swaps the full screen for

@@ -162,6 +162,9 @@ type Model struct {
 	// survives layout changes such as the turn status appearing, which can make the
 	// viewport's old bottom offset look scrolled before its next composition.
 	followLive bool
+	// mouse separates a click from a drag, highlights drag-selected text and supplies the
+	// exact plain text copied on release (mouse.go).
+	mouse mouseSelection
 	// spin is the glyph the turn status item draws while a turn runs, and spinning is
 	// whether its tick loop is armed: a client at rest schedules nothing (status.go).
 	spin     spinner.Model
@@ -412,9 +415,15 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		return m, m.key(msg)
 	case tea.MouseClickMsg:
-		m.click(msg.Y)
+		m.mousePressed(msg)
 		return m, nil
+	case tea.MouseMotionMsg:
+		m.mouseMoved(msg)
+		return m, nil
+	case tea.MouseReleaseMsg:
+		return m, m.mouseReleased(msg)
 	case tea.MouseWheelMsg:
+		m.mouse = mouseSelection{}
 		m.wheel(msg.Button)
 		return m, nil
 	case spinner.TickMsg:
@@ -1480,16 +1489,26 @@ func (m *Model) spinTicked(msg spinner.TickMsg) tea.Cmd {
 // follows ui.render without a caller having to set it.
 func (m *Model) View() tea.View {
 	lines, _ := m.compose()
+	if m.mouse.down && m.mouse.dragged {
+		// Hold the frame under an active drag so streaming cannot make the highlight and
+		// copied snapshot name different text. Release copies it and returns to the live
+		// frame.
+		lines = m.highlightSelection(slices.Clone(m.mouse.lines))
+	}
 	v := tea.NewView(strings.Join(lines, "\n"))
 	v.AltScreen = !m.inline()
 	v.MouseMode = m.mouseMode()
 	return v
 }
 
-// mouseMode is ui.mouse: what the client asks the terminal to report. Reporting is what
-// takes a drag away from the terminal's own selection, so it is a config field with three
-// values rather than something the client decides for everybody (ADR 0025).
+// mouseMode is ui.mouse: whether altscreen owns click, drag and wheel gestures. Inline
+// always leaves them to the terminal scrollback (ADR 0043).
 func (m *Model) mouseMode() tea.MouseMode {
+	// Inline lives in the terminal's native scrollback. Reporting would capture wheel and
+	// drag events that only the terminal can apply to that scrollback.
+	if m.inline() {
+		return tea.MouseModeNone
+	}
 	switch m.cfg.UI.Mouse {
 	case mouseOff:
 		return tea.MouseModeNone

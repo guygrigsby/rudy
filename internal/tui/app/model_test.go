@@ -758,10 +758,15 @@ func TestMouseClickTogglesTheToolRowUnderIt(t *testing.T) {
 				y += h.m.height - len(lines)
 			}
 			h.update(tea.MouseClickMsg{X: 2, Y: y, Button: tea.MouseLeft})
+			if rows := h.m.tr.Rows(); len(rows) != 1 || rows[0].Expanded {
+				t.Fatalf("mouse press expanded before it became a click: %+v", rows)
+			}
+			h.update(tea.MouseReleaseMsg{X: 2, Y: y, Button: tea.MouseLeft})
 			if rows := h.m.tr.Rows(); len(rows) != 1 || !rows[0].Expanded {
 				t.Fatalf("click at terminal row %d (frame row %d) did not expand: %+v", y, row, rows)
 			}
 			h.update(tea.MouseClickMsg{X: 2, Y: y, Button: tea.MouseLeft})
+			h.update(tea.MouseReleaseMsg{X: 2, Y: y, Button: tea.MouseLeft})
 			if rows := h.m.tr.Rows(); rows[0].Expanded {
 				t.Fatal("a second click collapses")
 			}
@@ -769,11 +774,135 @@ func TestMouseClickTogglesTheToolRowUnderIt(t *testing.T) {
 			// not own and must not act on.
 			if render == "inline" {
 				h.update(tea.MouseClickMsg{X: 2, Y: 0, Button: tea.MouseLeft})
+				h.update(tea.MouseReleaseMsg{X: 2, Y: 0, Button: tea.MouseLeft})
 				if rows := h.m.tr.Rows(); rows[0].Expanded {
 					t.Fatal("a click above the frame must do nothing")
 				}
 			}
 		})
+	}
+}
+
+func TestMouseDragSelectsAndCopiesWithoutTogglingToolRow(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	h.appended(session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+		Content: []session.Block{
+			session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`)),
+		},
+	})
+	h.appended(session.ToolResult{
+		ToolUseID: "t1", Outcome: session.OutcomeOK, DurationMS: 3,
+		Content: []session.Block{session.TextBlock("one\ntwo\nthree")},
+	})
+	lines := h.lines()
+	row, start := -1, -1
+	const selected = "bash  ls"
+	for i, line := range lines {
+		plain := ansi.Strip(line)
+		if x := strings.Index(plain, selected); x >= 0 {
+			row, start = i, ansi.StringWidth(plain[:x])
+			break
+		}
+	}
+	if row < 0 {
+		t.Fatalf("no tool row in\n%s", h.view())
+	}
+	end := start + len(selected) - 1
+	h.update(tea.MouseClickMsg{X: start, Y: row, Button: tea.MouseLeft})
+	h.update(tea.MouseMotionMsg{X: end, Y: row, Button: tea.MouseLeft})
+	if rows := h.m.tr.Rows(); len(rows) != 1 || rows[0].Expanded {
+		t.Fatalf("drag expanded the tool row: %+v", rows)
+	}
+	if got := h.view(); !strings.Contains(got, "\x1b[7m") {
+		t.Fatalf("drag did not highlight the selection:\n%s", got)
+	}
+	// Streaming can repaint the frame between motion and release. Copy the cells the
+	// gesture began over, not whatever moved under the same screen coordinates later.
+	for i := range 40 {
+		h.appended(session.UserMessage{
+			Source:  session.SourceTyped,
+			Content: []session.Block{session.TextBlock("later row " + strconv.Itoa(i))},
+		})
+	}
+	during := h.view()
+	if !strings.Contains(during, "\x1b[7m") || !strings.Contains(ansi.Strip(during), selected) {
+		t.Fatalf("streaming changed the text under the active highlight:\n%s", during)
+	}
+	cmd := h.update(tea.MouseReleaseMsg{X: end, Y: row, Button: tea.MouseLeft})
+	if rows := h.m.tr.Rows(); rows[0].Expanded {
+		t.Fatalf("drag release expanded the tool row: %+v", rows)
+	}
+	if got := fmt.Sprint(runCmd(t, cmd)); got != selected {
+		t.Fatalf("clipboard got %q, want %q", got, selected)
+	}
+	if got := h.view(); strings.Contains(got, "\x1b[7m") {
+		t.Fatalf("selection highlighted newer text after its captured frame changed:\n%s", got)
+	}
+}
+
+func TestMouseReleaseWithoutButtonCompletesTheClick(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	h.appended(session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+		Content: []session.Block{
+			session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`)),
+		},
+	})
+	row := -1
+	for i, line := range h.lines() {
+		if strings.Contains(ansi.Strip(line), "bash  ls") {
+			row = i
+			break
+		}
+	}
+	if row < 0 {
+		t.Fatal("tool row was not visible")
+	}
+	h.update(tea.MouseClickMsg{X: 2, Y: row, Button: tea.MouseLeft})
+	h.update(tea.MouseReleaseMsg{X: 2, Y: row, Button: tea.MouseNone})
+	if rows := h.m.tr.Rows(); len(rows) != 1 || !rows[0].Expanded {
+		t.Fatalf("buttonless release did not finish the click: %+v", rows)
+	}
+}
+
+func TestMouseClickKeepsTheToolTargetFromItsPressFrame(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	h.appended(session.AssistantMessage{
+		Model: testRef, Thinking: session.ThinkingHigh, StopReason: session.StopToolUse,
+		Content: []session.Block{
+			session.ToolUseBlock("t1", "bash", json.RawMessage(`{"command":"ls"}`)),
+		},
+	})
+	row := -1
+	for i, line := range h.lines() {
+		if strings.Contains(ansi.Strip(line), "bash  ls") {
+			row = i
+			break
+		}
+	}
+	if row < 0 {
+		t.Fatal("tool row was not visible")
+	}
+	h.update(tea.MouseClickMsg{X: 2, Y: row, Button: tea.MouseLeft})
+	for i := range 40 {
+		h.appended(session.UserMessage{
+			Source:  session.SourceTyped,
+			Content: []session.Block{session.TextBlock("later row " + strconv.Itoa(i))},
+		})
+	}
+	h.update(tea.MouseReleaseMsg{X: 2, Y: row, Button: tea.MouseLeft})
+	found := false
+	for _, transcriptRow := range h.m.tr.Rows() {
+		if transcriptRow.Key == "t1" {
+			found = true
+			if !transcriptRow.Expanded {
+				t.Fatal("click release did not toggle the tool captured on press")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("captured tool row disappeared from the transcript")
 	}
 }
 
@@ -785,16 +914,47 @@ func TestMouseWheelScrollsTheAltscreenOnly(t *testing.T) {
 				h.appended(session.UserMessage{Source: session.SourceTyped, Content: []session.Block{session.TextBlock("line")}})
 			}
 			h.view() // the viewport sizes itself while composing
+			before := h.m.vp.YOffset()
+			h.update(tea.MouseWheelMsg{Y: -1, Button: tea.MouseWheelUp})
+			afterUp := h.m.vp.YOffset()
 			h.update(tea.MouseWheelMsg{Y: 1, Button: tea.MouseWheelDown})
-			scrolled := h.m.vp.YOffset() > 0
-			if scrolled != (render == "altscreen") {
-				t.Fatalf("%s scrolled %v at offset %d", render, scrolled, h.m.vp.YOffset())
+			afterDown := h.m.vp.YOffset()
+			if render == "altscreen" && (afterUp >= before || afterDown <= afterUp) {
+				t.Fatalf("wheel did not move altscreen: before %d, up %d, down %d", before, afterUp, afterDown)
+			}
+			if render == "inline" && (afterUp != before || afterDown != before) {
+				t.Fatalf("wheel moved inline viewport: before %d, up %d, down %d", before, afterUp, afterDown)
 			}
 			if render == "altscreen" && !h.m.View().AltScreen {
 				t.Error("altscreen config must set the view's AltScreen")
 			}
 			if render == "inline" && h.m.View().AltScreen {
 				t.Error("inline config must not set AltScreen")
+			}
+		})
+	}
+}
+
+func TestMouseReportingFollowsConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		render     string
+		configured string
+		want       tea.MouseMode
+	}{
+		{"default", renderAltscreen, "", tea.MouseModeCellMotion},
+		{"off", renderAltscreen, mouseOff, tea.MouseModeNone},
+		{"all", renderAltscreen, mouseAll, tea.MouseModeAllMotion},
+		{"inline", "inline", "", tea.MouseModeNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			over := map[string]any{"ui.render": tc.render}
+			if tc.configured != "" {
+				over["ui.mouse"] = tc.configured
+			}
+			h := newHarness(t, over)
+			if got := h.m.View().MouseMode; got != tc.want {
+				t.Fatalf("ui.mouse %q produced mode %v, want %v", tc.configured, got, tc.want)
 			}
 		})
 	}
