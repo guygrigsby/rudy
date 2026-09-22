@@ -714,7 +714,7 @@ func (f *fanout) ToolStateChanged(turnID, toolUseID, name string, state turn.Too
 }
 
 // firstAppendSignal wraps an Observer so the first EntryAppended call also sends the entry,
-// once, on started before delegating. turn.Runner.Run appends the user_message as its very
+// once, on started after delegating. turn.Runner.Run appends the user_message as its very
 // first action, synchronously and before any provider call (see turn.Runner.Run), so this is
 // how startTurn learns a fresh turn's id, the id of that entry, without waiting for the turn
 // itself, which can run for as long as the provider and any tool calls take. started is
@@ -735,8 +735,8 @@ type firstAppendSignal struct {
 }
 
 func (o *firstAppendSignal) EntryAppended(e session.Entry) {
-	o.once.Do(func() { o.started <- e })
 	o.Observer.EntryAppended(e)
+	o.once.Do(func() { o.started <- e })
 }
 
 func (o *firstAppendSignal) StateChanged(turnID string, s turn.State) {

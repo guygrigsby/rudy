@@ -139,6 +139,53 @@ func TestMarkStartingBeforeAnyObserverCallback(t *testing.T) {
 	}
 }
 
+// TestFirstAppendReachesTheClientBeforeSubmitReturns guards the ordering between the
+// user_message notification and the session.submit response. startTurn returns as soon as
+// firstAppendSignal publishes started, so publishing it before the wrapped observer has
+// queued entry.appended lets the TUI start its thinking spinner over an empty transcript.
+func TestFirstAppendReachesTheClientBeforeSubmitReturns(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	wrapped := &blockingEntryObserver{entered: entered, release: release}
+	signal := &firstAppendSignal{
+		Observer: wrapped,
+		started:  make(chan session.Entry, 1),
+		failed:   make(chan struct{}),
+	}
+	e := session.Entry{ID: session.NewID(), Kind: session.KindUserMessage}
+	done := make(chan struct{})
+	go func() {
+		signal.EntryAppended(e)
+		close(done)
+	}()
+
+	<-entered
+	select {
+	case <-signal.started:
+		t.Fatal("session.submit may return before entry.appended is queued")
+	default:
+	}
+	close(release)
+	<-done
+	if got := <-signal.started; got.ID != e.ID {
+		t.Fatalf("started entry = %s, want %s", got.ID, e.ID)
+	}
+}
+
+type blockingEntryObserver struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (o *blockingEntryObserver) EntryAppended(session.Entry) {
+	close(o.entered)
+	<-o.release
+}
+
+func (*blockingEntryObserver) Delta(string, provider.Part)                             {}
+func (*blockingEntryObserver) StateChanged(string, turn.State)                         {}
+func (*blockingEntryObserver) ToolStateChanged(string, string, string, turn.ToolState) {}
+
 // TestAskersNeverIncludeAPluginConnection: a plugin connection can send a hello of its own,
 // and the one that opened a child session is the connection subscribed to it. Routing that
 // child's permission question there would park it behind the tool call it is the answer to,

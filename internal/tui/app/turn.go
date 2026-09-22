@@ -525,10 +525,9 @@ func (m *Model) submit() tea.Cmd {
 
 // submitText sends one message as a turn's content.
 func (m *Model) submitText(text string, source session.Source) tea.Cmd {
-	return m.call(protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
-		SessionID: m.session.SessionID,
-		Content:   []session.Block{session.TextBlock(text)},
-		Source:    source,
+	return m.callSubmit(session.UserMessage{
+		Content: []session.Block{session.TextBlock(text)},
+		Source:  source,
 	})
 }
 

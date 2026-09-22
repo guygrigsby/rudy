@@ -3,6 +3,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
+	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/input"
 	"github.com/guygrigsby/rudy/internal/tui/transcript"
@@ -46,6 +48,85 @@ func TestSubmitStreamsAndCommitsInline(t *testing.T) {
 	}
 	if h.editor().Text() != "" {
 		t.Errorf("editor cleared on submit, holds %q", h.editor().Text())
+	}
+}
+
+// TestSubmitResponseEchoesBeforeItsNotification isolates the response-notification race:
+// both arrive through independent Bubble Tea commands, so the accepted response has to make
+// the typed row visible even when entry.appended has not reached Update yet. The later entry
+// uses the same authoritative id and must not duplicate it.
+func TestSubmitResponseEchoesBeforeItsNotification(t *testing.T) {
+	h := newHarness(t, nil)
+	turnID := session.NewID()
+	msg := session.UserMessage{
+		Source:  session.SourceTyped,
+		Content: []session.Block{session.TextBlock("show me the message")},
+	}
+	result, err := json.Marshal(protocol.SessionSubmitResult{TurnID: turnID.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.update(CallResultMsg{
+		Method: protocol.MethodSessionSubmit, Result: result, Submitted: &msg,
+	})
+	if got := ansi.Strip(h.view()); !strings.Contains(got, "› show me the message") {
+		t.Fatalf("submit response started thinking before it echoed the message:\n%s", got)
+	}
+
+	h.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{
+		SessionID: h.m.session.SessionID,
+		Entry: session.Entry{
+			ID: turnID, Kind: session.KindUserMessage, Payload: msg,
+		},
+	})
+	if rows := h.m.tr.Rows(); len(rows) != 1 {
+		t.Fatalf("entry.appended duplicated the submitted row: %+v", rows)
+	}
+}
+
+// TestSubmitResponseFromThePreviousSessionIsIgnored covers a call that outlives a session
+// switch. Its response belongs to the session it submitted to and must not put that prompt or
+// turn state into the newly displayed session.
+func TestSubmitResponseFromThePreviousSessionIsIgnored(t *testing.T) {
+	h := newHarness(t, nil)
+	previous := h.m.session.SessionID
+	h.m.session.SessionID = session.NewID().String()
+	msg := session.UserMessage{
+		Source:  session.SourceTyped,
+		Content: []session.Block{session.TextBlock("old session prompt")},
+	}
+	result, err := json.Marshal(protocol.SessionSubmitResult{TurnID: session.NewID().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.update(CallResultMsg{
+		Method: protocol.MethodSessionSubmit, SessionID: previous,
+		Result: result, Submitted: &msg,
+	})
+	if rows := h.m.tr.Rows(); len(rows) != 0 {
+		t.Fatalf("old session response changed the new transcript: %+v", rows)
+	}
+	if h.m.turn.state != "" {
+		t.Fatalf("old session response started the new session's turn: %+v", h.m.turn)
+	}
+}
+
+// TestSubmittedMessageAppearsBeforeThinking drives Enter through the real client and server.
+// The provider emits nothing, so the only transcript row available while the status says
+// thinking is the user_message that session.submit appended.
+func TestSubmittedMessageAppearsBeforeThinking(t *testing.T) {
+	blocked := func(ctx context.Context, _ string, _ func(provider.Part) error) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	h := newAppHarness(t, scripted{blocked})
+	h.typeText("show me the message")
+	h.press("enter")
+	h.waitTurn(stateStreaming)
+
+	view := ansi.Strip(h.view())
+	if !strings.Contains(view, "› show me the message") {
+		t.Fatalf("turn started thinking before the submitted message appeared:\n%s", view)
 	}
 }
 

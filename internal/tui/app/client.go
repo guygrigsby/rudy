@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/guygrigsby/rudy/internal/protocol"
+	"github.com/guygrigsby/rudy/internal/session"
 )
 
 // NotificationMsg is one server notification on its way into the update loop.
@@ -23,13 +24,18 @@ type DisconnectedMsg struct{ Err error }
 // the goroutine that made the call: the model is owned by the update loop and nothing
 // else may touch it. Result is the raw result, which the case for the method decodes.
 type CallResultMsg struct {
-	Method string
+	Method    string
+	SessionID string
 	// Name is what the call was about when the method alone does not say: the command a
 	// command.run ran. The answer does not carry it, and a client that has to know which
 	// answer was /help's cannot read it back off the wire.
 	Name   string
 	Result json.RawMessage
 	Err    error
+	// Submitted is the typed message session.submit accepted. Its response carries the
+	// authoritative turn id, which is also a fresh turn's user_message entry id, so the
+	// update loop can draw that row before the independently pumped notification lands.
+	Submitted *session.UserMessage
 }
 
 // pump reads one notification and hands it over, or reports the connection gone. It reads
@@ -61,5 +67,25 @@ func (m *Model) callNamed(method, name string, params any) tea.Cmd {
 		var raw json.RawMessage
 		err := c.Call(context.Background(), method, params, &raw)
 		return CallResultMsg{Method: method, Name: name, Result: raw, Err: err}
+	}
+}
+
+// callSubmit keeps the submitted value beside the response. Notifications and responses
+// are delivered by independent Bubble Tea commands, so entry.appended may already be queued
+// while the response wins the race into Update.
+func (m *Model) callSubmit(msg session.UserMessage) tea.Cmd {
+	c := m.cl
+	sid := m.session.SessionID
+	return func() tea.Msg {
+		var raw json.RawMessage
+		err := c.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+			SessionID: sid,
+			Content:   msg.Content,
+			Source:    msg.Source,
+		}, &raw)
+		return CallResultMsg{
+			Method: protocol.MethodSessionSubmit, SessionID: sid,
+			Result: raw, Err: err, Submitted: &msg,
+		}
 	}
 }

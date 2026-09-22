@@ -27,6 +27,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
@@ -664,6 +665,12 @@ func (m *Model) entry(e session.Entry) tea.Cmd {
 // reads (session.interrupt, session.answer, session.close) has no case: a failure is
 // already a notice above, and the turn's own notifications carry the rest.
 func (m *Model) callResult(r CallResultMsg) tea.Cmd {
+	// A request can outlive a session switch. Session-scoped notifications carry their
+	// origin on the wire and notification drops another session's above; a response needs
+	// the same gate before it can fold retained request data into the displayed transcript.
+	if r.SessionID != "" && r.SessionID != m.session.SessionID {
+		return nil
+	}
 	if r.Err != nil {
 		return m.callFailed(r)
 	}
@@ -707,7 +714,18 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		if !m.result(r, &res) {
 			return nil
 		}
-		return m.started(res.TurnID)
+		var echo tea.Cmd
+		if r.Submitted != nil && r.Submitted.Source == session.SourceTyped {
+			id, err := ulid.ParseStrict(res.TurnID)
+			if err != nil {
+				m.note(levelError, protocol.MethodSessionSubmit+": invalid turn id: "+err.Error())
+				return nil
+			}
+			echo = m.entry(session.Entry{
+				ID: id, Kind: session.KindUserMessage, Payload: *r.Submitted,
+			})
+		}
+		return tea.Batch(echo, m.started(res.TurnID))
 	case protocol.MethodCommandList:
 		var res protocol.CommandListResult
 		if !m.result(r, &res) {
