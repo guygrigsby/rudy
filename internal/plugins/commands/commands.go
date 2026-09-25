@@ -72,6 +72,9 @@ func (cmdPlugin) Init(ctx context.Context, h plugin.Host) error {
 			}
 			return plugin.Fork{AtEntryID: at}, nil
 		}},
+		{Name: "clear", Description: "Clear all context: start a fresh session here, keeping the model, mode and thinking level", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
+			return plugin.NewSession{}, nil
+		}},
 		{Name: "plugins", Description: "List loaded plugins and their state", Run: func(ctx context.Context, c plugin.CommandCall) (plugin.Action, error) {
 			var b strings.Builder
 			for _, s := range h.Statuses() {

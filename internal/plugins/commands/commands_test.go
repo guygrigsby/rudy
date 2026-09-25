@@ -20,8 +20,8 @@ func register(t *testing.T, h *plugintest.Host) map[string]plugin.Command {
 	if err := New().Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
-	if len(h.RegisteredCommands) != 6 {
-		t.Fatalf("registered %d commands, want 6: %+v", len(h.RegisteredCommands), h.RegisteredCommands)
+	if len(h.RegisteredCommands) != 7 {
+		t.Fatalf("registered %d commands, want 7: %+v", len(h.RegisteredCommands), h.RegisteredCommands)
 	}
 	byName := map[string]plugin.Command{}
 	for _, c := range h.RegisteredCommands {
@@ -109,6 +109,7 @@ func TestHelpCommandListsTheRegistryInOrder(t *testing.T) {
 		"/permissions  Show or set how rudy asks before an unsafe tool: /permissions [strict|permissive|off]\n" +
 		"/rename  Name this session: /rename <name>\n" +
 		"/fork  Fork this session at an entry: /fork [entry id], default the newest\n" +
+		"/clear  Clear all context: start a fresh session here, keeping the model, mode and thinking level\n" +
 		"/plugins  List loaded plugins and their state"
 	if n.Text != want {
 		t.Fatalf("/help text =\n%s\nwant\n%s", n.Text, want)
@@ -186,6 +187,20 @@ func TestForkCommand(t *testing.T) {
 
 	if _, err := cmds["fork"].Run(context.Background(), plugin.CommandCall{Args: "nope"}); err == nil {
 		t.Fatal("/fork nope: want an error, got nil")
+	}
+}
+
+// TestClearCommand: /clear takes no argument and asks the server for a fresh session. What
+// the server does with NewSession is the command.run side's test (server package); here the
+// command is only the mapping.
+func TestClearCommand(t *testing.T) {
+	cmds := register(t, &plugintest.Host{Name: "commands"})
+	act, err := cmds["clear"].Run(context.Background(), plugin.CommandCall{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := act.(plugin.NewSession); !ok {
+		t.Fatalf("action %#v", act)
 	}
 }
 

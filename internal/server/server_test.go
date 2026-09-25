@@ -969,6 +969,90 @@ func TestCommandRunForksAtTheNewestEntry(t *testing.T) {
 	}
 }
 
+// TestClearCommandOpensAFreshSession: /clear answers command.run with the id of a brand-new
+// session that carries the old one's workspace, model, mode and thinking level and nothing
+// else: the conversation, the title and every entry before it stay behind in the old log,
+// and the old session is detached so it closes once nothing else holds it.
+func TestClearCommandOpensAFreshSession(t *testing.T) {
+	prov := &scriptProvider{textOnly: true}
+	h := newHarnessWith(t, prov, commands.New(), namedModelPlugin{"aperture", "other"})
+	cl := h.dial(t, false)
+	info := h.open(t, cl)
+	ctx := context.Background()
+
+	runTurn(t, cl, info.SessionID, "go")
+	for _, p := range []struct {
+		method string
+		params any
+	}{
+		{protocol.MethodSessionSetModel, protocol.SessionSetModelParams{SessionID: info.SessionID, Model: "aperture:other"}},
+		{protocol.MethodSessionSetTitle, protocol.SessionSetTitleParams{SessionID: info.SessionID, Title: "kept nowhere"}},
+	} {
+		var er server.EntryIDResult
+		if err := cl.Call(ctx, p.method, p.params, &er); err != nil {
+			t.Fatalf("%s: %v", p.method, err)
+		}
+	}
+
+	var res protocol.CommandRunResult
+	if err := cl.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{
+		SessionID: info.SessionID, Name: "clear",
+	}, &res); err != nil {
+		t.Fatalf("/clear: %v", err)
+	}
+	if res.SessionID == "" || res.SessionID == info.SessionID {
+		t.Fatalf("result %+v", res)
+	}
+	if res.Notice != "cleared; new session "+res.SessionID {
+		t.Fatalf("notice %q", res.Notice)
+	}
+
+	// The fresh session replays as exactly its session_opened: the conversation did not
+	// follow, and neither did the title. Draining one notification at a time races the
+	// replay's ordering against the next assert, so read the session's whole entry stream
+	// from a fresh subscriber instead: a second connection sees the same live session.
+	cl2 := h.dial(t, false)
+	var resumed protocol.SessionInfo
+	if err := cl2.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: res.SessionID}, &resumed); err != nil {
+		t.Fatalf("resume the new session: %v", err)
+	}
+	ns := drain(t, cl2, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyEntryAppended {
+			return false
+		}
+		var ea protocol.EntryAppended
+		_ = json.Unmarshal(n.Params, &ea)
+		return ea.SessionID == res.SessionID
+	})
+	es := entries(t, ns)
+	if len(es) != 1 {
+		t.Fatalf("fresh session replayed %d entries, want just session_opened", len(es))
+	}
+	opened, ok := es[0].Payload.(session.SessionOpened)
+	if !ok {
+		t.Fatalf("first entry kind = %v, want session_opened", es[0].Kind)
+	}
+	if opened.Model.String() != "aperture:other" {
+		t.Fatalf("model = %v, want the one set before /clear", opened.Model)
+	}
+	if resumed.Workspace.Root != info.Workspace.Root {
+		t.Fatalf("workspace = %v, want the old session's %v", resumed.Workspace, info.Workspace)
+	}
+	if resumed.Title != "" {
+		t.Fatalf("title %q followed the clear", resumed.Title)
+	}
+
+	// The old session was detached in the same call, so it closed once nothing else held
+	// it: resuming it loads it cold, and its log is whole.
+	var rerr *protocol.Error
+	if err := cl.Call(ctx, protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &protocol.SessionInfo{}); err != nil {
+		rerr = err.(*protocol.Error)
+	}
+	if rerr != nil {
+		t.Fatalf("old session did not survive as a log: %v", rerr)
+	}
+}
+
 // TestSetTitleRefusedDuringActiveTurn exercises session.set_title while a turn is running:
 // the runner's goroutine is concurrently touching the session (parked in Provider.Complete)
 // on its own goroutine while this call runs on the connection's, so -race must see no race and

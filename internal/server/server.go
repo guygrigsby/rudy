@@ -1253,6 +1253,41 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 		notice := "forked to " + info.SessionID
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
 		return protocol.CommandRunResult{SessionID: info.SessionID, Notice: notice}, nil
+	case plugin.NewSession:
+		// A fresh session in the same workspace, carrying the current model, mode and
+		// thinking level but no title and no entries: /clear. The agent is not carried: a
+		// subagent's session has a parent to answer to, so the command refuses one rather
+		// than open a root it could never report through, and any other named agent is the
+		// definition's own default again.
+		ls.mu.Lock()
+		st, _ := ls.mirroredState()
+		if ls.runner != nil && isActive(st) {
+			ls.mu.Unlock()
+			return nil, perr(protocol.CodeConflict, "a turn is active")
+		}
+		view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
+		child := ls.parent != nil
+		ls.mu.Unlock()
+		if child {
+			return nil, perr(protocol.CodeRefusedByInvariant, "a subagent session cannot be cleared")
+		}
+		res, e := s.open(cn, protocol.SessionOpenParams{
+			Cwd:      view.Workspace.Root,
+			Model:    view.Model.String(),
+			Mode:     string(view.Mode),
+			Thinking: string(view.Thinking),
+		})
+		if e != nil {
+			return nil, e
+		}
+		info := res.(protocol.SessionInfo)
+		// installAndAttach already subscribed cn to the new session, so the old one is let
+		// go here: leaving it held would keep the whole conversation live in memory for the
+		// life of the connection.
+		s.detach(cn, ls)
+		notice := "cleared; new session " + info.SessionID
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
+		return protocol.CommandRunResult{SessionID: info.SessionID, Notice: notice}, nil
 	default:
 		return protocol.CommandRunResult{}, nil
 	}

@@ -90,6 +90,11 @@ type SetTitle struct{ Title string }
 // body of session.fork. An empty AtEntryID means the newest entry of any kind.
 type Fork struct{ AtEntryID string }
 
+// NewSession has the server open a fresh session in this session's workspace with its model,
+// mode and thinking level, attach the caller to it and close the old session. It is /clear's
+// action: the conversation's log stays on disk and nothing carries over.
+type NewSession struct{}
+
 type NoAction struct{}
 
 func (SubmitPrompt) isAction() {}
@@ -99,6 +104,7 @@ func (SetModel) isAction()     {}
 func (SetMode) isAction()      {}
 func (SetTitle) isAction()     {}
 func (Fork) isAction()         {}
+func (NewSession) isAction()   {}
 func (NoAction) isAction()     {}
 
 type CommandCall struct {
