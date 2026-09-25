@@ -76,7 +76,7 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
 	label := upstreamLabels(mr.Data)
 	for _, m := range mr.Data {
 		mo := c.toModel(m)
-		mo.Upstream = label[route(m)]
+		mo.Upstream = upstreamLabel(m, label)
 		out = append(out, mo)
 	}
 	slices.SortFunc(out, func(a, b provider.Model) int {
@@ -122,14 +122,26 @@ func route(m wireModel) string {
 	return ""
 }
 
+// upstreamLabel names who actually serves one model. The endpoint's per-model `provider`
+// metadata is the first word on that: a name, then an id. A model that says nothing about
+// itself takes its route's label, which is what an older aperture gave every model; one
+// route was one upstream then.
+func upstreamLabel(m wireModel, routes map[string]string) string {
+	p := m.Metadata.Provider
+	for _, s := range []string{p.Name, p.ID} {
+		if s = strings.TrimSpace(s); s != "" {
+			return s
+		}
+	}
+	return routes[route(m)]
+}
+
 // upstreamLabels names each route the way the endpoint names it, over the whole listing
-// rather than per model: an aperture puts the vendor in `provider.id` and leaves the name
-// empty for some models on a route, so the three deepseek ids on "default" read as DeepSeek
-// while the twelve ClinePass ids beside them, on that same route, read as ClinePass. A
-// route is one upstream, so it gets one name: the first non-empty `name` on it, then the
-// first non-empty `id`, then the route's own spelling.
-//
-// Getting this wrong sent somebody to a model to stay off a quota that spent it.
+// rather than per model. It is the fallback for a model whose own `provider` metadata is
+// empty: the first non-empty `name` on the route, then the first non-empty `id`, then the
+// route's own spelling. Reading a model's vendor id as the answer called three deepseek
+// ids on "default" DeepSeek while the ClinePass models beside them served them, and a
+// person picking one to stay off their ClinePass quota spent it.
 func upstreamLabels(all []wireModel) map[string]string {
 	names, ids := map[string]string{}, map[string]string{}
 	for _, m := range all {

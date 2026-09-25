@@ -101,17 +101,20 @@ func TestListModelsErrorStatus(t *testing.T) {
 // TestUpstreamNamesWhoActuallyServesTheModel: an aperture fronts OpenRouter, ClinePass and
 // OpenAI, and every id looks like the proxy's own until the metadata is read.
 //
-// The route is `upstream`, not `id`: this endpoint puts the model's vendor in the id and
-// leaves the name empty for the three deepseek models, which take the same "default" route
-// the ClinePass ones do. Reading the id called them DeepSeek, and a person picking one to
-// stay off their ClinePass quota spent it instead.
+// Per-model `provider` metadata is the first word on who serves an id: one route can front
+// several vendors (this endpoint's "default" fronts ClinePass, OpenAI and trig), so the
+// route-wide label is only the fallback for a model that says nothing about itself. An
+// older shape put the vendor in `id` with no per-model name at all; reading it as the
+// answer called three deepseek ids on "default" DeepSeek while the ClinePass models beside
+// them served them, and a person picking one to stay off their ClinePass quota spent it.
 func TestUpstreamNamesWhoActuallyServesTheModel(t *testing.T) {
 	const body = `{"data":[
 	 {"id":"anthropic/claude-fable-5","display_name":"Claude Fable 5","context_window_tokens":1000000,
 	  "metadata":{"provider":{"id":"openrouter","name":"OpenRouter","upstream":"openrouter"}}},
 	 {"id":"cline-pass/kimi-k3","display_name":"Kimi K3","context_window_tokens":1048576,
-	  "metadata":{"provider":{"id":"Cline","name":"ClinePass","upstream":"default"}}},
-	 {"id":"deepseek-chat","metadata":{"provider":{"id":"DeepSeek","name":"","upstream":"default"}}},
+	  "metadata":{"provider":{"id":"ClinePass","name":"","upstream":"default"}}},
+	 {"id":"gpt-5.5","metadata":{"provider":{"id":"openai-sub","name":"OpenAI (Subscription)","upstream":"default"}}},
+	 {"id":"qwen-27b","metadata":{"provider":{"id":"trig","name":"trig","upstream":"default"}}},
 	 {"id":"spooled","metadata":{"provider":{"id":"aperture","name":"Aperture","upstream":"spool"}}},
 	 {"id":"unrouted","metadata":{"provider":{"id":"Groq","name":""}}},
 	 {"id":"gpt-6","owned_by":"openai"}
@@ -123,11 +126,12 @@ func TestUpstreamNamesWhoActuallyServesTheModel(t *testing.T) {
 	}
 	want := map[string]string{
 		"anthropic/claude-fable-5": "OpenRouter",
-		"cline-pass/kimi-k3":       "ClinePass",
-		// The same route as the ClinePass models, so the same answer: what serves it is
-		// not what made it.
-		"deepseek-chat": "ClinePass",
-		"spooled":       "Aperture",
+		// No per-model name, so the per-model id: what serves it, not what made it.
+		"cline-pass/kimi-k3": "ClinePass",
+		// The same route, a different per-model name: the route is not one upstream.
+		"gpt-5.5":  "OpenAI (Subscription)",
+		"qwen-27b": "trig",
+		"spooled":  "Aperture",
 		// A route nothing on it names is named by what the endpoint did say about it.
 		"unrouted": "Groq",
 		// A plain OpenAI server says nothing, and nothing is what the model carries.
