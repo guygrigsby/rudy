@@ -462,10 +462,12 @@ Value object. Token counts for one completion.
 
 | Field | Type | Meaning |
 |---|---|---|
-| `inputTokens` | int | Prompt tokens |
+| `inputTokens` | int | Uncached prompt tokens |
 | `outputTokens` | int | Generated tokens |
 | `cacheReadTokens` | int | Tokens served from provider prompt cache |
 | `cacheWriteTokens` | int | Tokens written to provider prompt cache |
+
+The three input buckets are disjoint. Their sum is the full prompt token count.
 
 ## PermissionMode
 

@@ -25,11 +25,19 @@ type SyncResult struct {
 	Created bool
 	// Added are the keys written, in the order the catalogue lists them.
 	Added []string
+	// ThemeWritten is themes/default.toml having been written next to the
+	// config file: it did not exist, and now it carries every role at its
+	// default. Never true for a file that was already there, which is an
+	// operator's own and sync's to leave alone (ADR 0042).
+	ThemeWritten bool
 }
 
 // Sync merges the missing keys into path. dry reports what it would do and writes nothing.
 func Sync(path string, dry bool) (SyncResult, error) {
 	res := SyncResult{Path: path}
+	if err := syncDefaultTheme(filepath.Join(filepath.Dir(path), "themes", "default.toml"), dry, &res); err != nil {
+		return res, err
+	}
 	body, err := os.ReadFile(path)
 	switch {
 	case os.IsNotExist(err):
@@ -60,6 +68,29 @@ func Sync(path string, dry bool) (SyncResult, error) {
 		return res, fmt.Errorf("config sync: %w", err)
 	}
 	return res, nil
+}
+
+// syncDefaultTheme is the same promise as Sync, one directory over: a
+// themes/default.toml that is not there is written with every role at its
+// default so a person has all the options in front of them, and one that is
+// there is not read a second time, let alone changed (ADR 0042).
+func syncDefaultTheme(path string, dry bool, res *SyncResult) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("config sync: %w", err)
+	}
+	res.ThemeWritten = true
+	if dry {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("config sync: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(DefaultThemeExample()), 0o600); err != nil {
+		return fmt.Errorf("config sync: %w", err)
+	}
+	return nil
 }
 
 // keysIn is every key the file already sets, as full dotted keys.

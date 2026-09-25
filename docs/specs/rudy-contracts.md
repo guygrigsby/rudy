@@ -31,7 +31,7 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `Workspace` | `{root: string, git_root: string, project_id: string}`; `git_root` empty means not a git repo |
 | `ContentBlock` | one of `{type:"text", text}`, `{type:"image", media_type, sha256}` where `sha256` is the hex digest naming `blobs/<sha256>` in the session dir, stored byte-exact; inline image bytes never appear in the log, `{type:"thinking", text, signature}` where `signature` is the provider's opaque bytes verbatim, `{type:"tool_use", id, name, input}` where `input` is raw JSON bytes verbatim |
 | `Span` | `{text: string, role: string}`; `role` is a theme role name |
-| `Usage` | `{input: int, output: int, cache_read: int, cache_write: int}` |
+| `Usage` | `{input: int, output: int, cache_read: int, cache_write: int}`; the input buckets are disjoint: `input` is uncached prompt tokens, so `input + cache_read + cache_write` is the full prompt |
 | `Entry` | `{id: ulid, at: rfc3339nano, kind: EntryKind, ...payload}`; payloads in the record layer |
 | `Model` | `{provider, id, display_name, upstream, context_window: int, max_output: int, pricing}`; `upstream` is who actually serves the model when the endpoint is a proxy: the route it takes, named as the endpoint names that route, comma separated when it serves the id over more than one and absent when it names none; `context_window` and `max_output` zero mean unknown; `pricing` is `{input, output, cache_read, cache_write}` as decimal strings in USD per token and is absent when no source supplied it |
 | `SessionSummary` | `{id, opened_at, workspace, model, forked, parent_session_id, last_entry_at, title, entry_count}`; `parent_session_id` empty means root, `forked` is true when the session began as a fork; `last_entry_at`, `title` and `entry_count` are pass 3: not yet reported, the store does not compute them and `session.list` omits them |
@@ -364,11 +364,11 @@ A version 1 log that does carry `tools` is a different case and is not covered b
 | `model` | ModelRef | no | the model that produced it; recorded because the selection can change mid-session and the usage belongs to this model |
 | `thinking` | ThinkingLevel | no | level in effect |
 | `content` | [ContentBlock text, thinking or tool_use] | no | may be empty when `stop_reason` is `interrupted` before any delta |
-| `usage` | Usage | no | verbatim from the provider; zeros when the provider sent none |
+| `usage` | Usage | no | the provider's counts normalized into the common disjoint buckets; zeros when the provider sent none |
 | `stop_reason` | `end_turn`, `tool_use`, `max_tokens`, `interrupted`, `refused`, `other` | no | domain classification |
 | `stop_reason_raw` | string | no | the provider's own value; empty for `interrupted` |
 
-`usage` is a verbatim external fact, stored rather than derived because the provider is the only source and totals are summed from these rows.
+`usage` is an external fact normalized by the provider codec, then stored because the provider is the only source and totals are summed from these rows.
 
 ```json
 {"id":"01K4M0A9...","at":"...","kind":"assistant_message","model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"thinking":"high","content":[{"type":"text","text":"Looking at the test first."},{"type":"tool_use","id":"toolu_01","name":"bash","input":{"command":"go test ./internal/session -run TestFork -count=3"}}],"usage":{"input":1200,"output":80,"cache_read":0,"cache_write":0},"stop_reason":"tool_use","stop_reason_raw":"tool_calls"}
@@ -595,6 +595,8 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 ### themes/<name>.toml
 
 Roles, every one required in a theme file or the built-in default applies: `accent`, `text`, `muted`, `user`, `assistant`, `tool`, `success`, `error`, `warning`, `diff_add`, `diff_del`, `shell`, `status`, `spinner`, `code`. A value is a hex color, a role name, or for `code` a `chroma:<style>` name. No role paints a background.
+
+`rudy config sync` writes `themes/default.toml` when it is absent: every role at its built-in default, with the sentence above it that says what it paints, so a person has every option in front of them instead of a value that lives only in the binary. Once written it is a file like any other theme: sync never overwrites it, and loading still treats the name `default` as the built-in, so an edit to the file is a palette a person picks by name, not a silent change to the default.
 
 ### plugins/<name>/plugin.toml
 

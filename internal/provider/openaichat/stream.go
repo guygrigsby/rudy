@@ -52,18 +52,29 @@ type wireUsage struct {
 	CompletionTokens         int64 `json:"completion_tokens"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	PromptTokensDetails      *struct {
-		CachedTokens int64 `json:"cached_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
 	} `json:"prompt_tokens_details"`
 }
 
 func (u *wireUsage) usage() session.Usage {
-	out := session.Usage{
-		Input:      u.PromptTokens,
-		Output:     u.CompletionTokens,
-		CacheWrite: u.CacheCreationInputTokens,
-	}
+	cacheRead := int64(0)
+	cacheWrite := u.CacheCreationInputTokens
 	if u.PromptTokensDetails != nil {
-		out.CacheRead = u.PromptTokensDetails.CachedTokens
+		cacheRead = u.PromptTokensDetails.CachedTokens
+		// OpenAI-compatible endpoints report cache writes either here or in the
+		// top-level Anthropic-shaped extension. They name one bucket, not two.
+		if cacheWrite == 0 {
+			cacheWrite = u.PromptTokensDetails.CacheWriteTokens
+		}
+	}
+	out := session.Usage{
+		// prompt_tokens includes both cache buckets. Usage keeps its input buckets
+		// disjoint because pricing, context display and compaction add them.
+		Input:      u.PromptTokens - cacheRead - cacheWrite,
+		Output:     u.CompletionTokens,
+		CacheRead:  cacheRead,
+		CacheWrite: cacheWrite,
 	}
 	return out
 }
