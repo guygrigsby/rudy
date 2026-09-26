@@ -499,6 +499,35 @@ func TestRunToolFlowStrictAskerAllows(t *testing.T) {
 	}
 }
 
+// A tool that runs and says nothing (an empty-output bash, an MCP tool with no content)
+// must append a tool_result with empty content, which the log accepts. The old fallback
+// synthesized a text block with "", and the log refused the turn with "text block: empty
+// text" — the failure that recurred in the wild.
+func TestRunToolEmptyContentAppendsEmptyResult(t *testing.T) {
+	s := openTestSession(t, session.ModePermissive)
+	silent := echoTool(tool.Safe, "bash")
+	silent.Invoke = func(context.Context, tool.Call) (tool.Result, error) { return tool.Result{}, nil }
+	p := &scripted{scripts: [][]provider.Part{
+		append(toolCall("tu1", "bash", `{"command":"true"}`), stop(session.StopToolUse, "tool_calls")),
+		{text("done"), stop(session.StopEndTurn, "stop")},
+	}}
+	rec := &recorder{}
+	r := newRunner(t, s, p, toolSet{"bash": silent}, nil, rec)
+	if err := r.Run(context.Background(), userMsg(session.SourceTyped, "go")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var trs []session.ToolResult
+	for _, pl := range rec.payloads(session.KindToolResult) {
+		trs = append(trs, pl.(session.ToolResult))
+	}
+	if len(trs) != 1 {
+		t.Fatalf("tool results = %d, want 1", len(trs))
+	}
+	if trs[0].Outcome != session.OutcomeOK || len(trs[0].Content) != 0 {
+		t.Fatalf("tool result %+v", trs[0])
+	}
+}
+
 func TestRunToolDenied(t *testing.T) {
 	s := openTestSession(t, session.ModeStrict)
 	invoked := false
@@ -1711,5 +1740,26 @@ func TestAccumulatorSignatureWithoutThinkingOpensABlock(t *testing.T) {
 	}
 	if got := a.blocks(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("blocks %+v\nwant   %+v", got, want)
+	}
+}
+
+// An empty text delta must never open a text block: the log refuses a text block with ""
+// (turn_failed "session: invariant: text block: empty text"). One that lands first or right
+// after a tool_use is exactly the case that built the bad block; the same delta into an open
+// text block is a no-op.
+func TestAccumulatorDropsEmptyTextDelta(t *testing.T) {
+	leading := newAccumulator()
+	leading.add(provider.Part{Type: provider.PartTextDelta, Text: ""})
+	leading.add(provider.Part{Type: provider.PartTextDelta, Text: "hi"})
+	if got := leading.blocks(); !reflect.DeepEqual(got, []session.Block{{Type: session.BlockText, Text: "hi"}}) {
+		t.Fatalf("leading empty delta: blocks %+v", got)
+	}
+
+	between := newAccumulator()
+	between.add(provider.Part{Type: provider.PartToolUseStart, ID: "tu1", Name: "bash"})
+	between.add(provider.Part{Type: provider.PartToolUseEnd, ID: "tu1"})
+	between.add(provider.Part{Type: provider.PartTextDelta, Text: ""})
+	if got := between.blocks(); len(got) != 1 || got[0].Type != session.BlockToolUse {
+		t.Fatalf("empty delta after tool_use: blocks %+v", got)
 	}
 }

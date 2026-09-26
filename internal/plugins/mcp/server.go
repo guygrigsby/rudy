@@ -166,9 +166,8 @@ func (s *server) call(ctx context.Context, name string, input json.RawMessage) (
 			blocks = append(blocks, session.TextBlock(fmt.Sprintf("[unsupported content %T]", c)))
 		}
 	}
-	if len(blocks) == 0 {
-		blocks = []session.Block{session.TextBlock("")}
-	}
+	// A tool with nothing to say returns no block: tool_result.content may be empty, and a
+	// synthesized empty text block is the one shape the log refuses.
 	return tool.Result{Content: blocks, IsError: res.IsError}, nil
 }
 

@@ -713,9 +713,9 @@ func (r *Runner) runTool(ctx context.Context, tu session.Block) toolOutcome {
 	case res.IsError:
 		outcome = session.OutcomeError
 	}
-	if len(content) == 0 {
-		content = []session.Block{session.TextBlock("")}
-	}
+	// content may be empty here (a tool that ran and said nothing): the log accepts an
+	// empty tool_result content list and refuses only an empty *text block*, which is the
+	// one thing this must not synthesize.
 	if _, err := r.appendToolResult(ctx, session.ToolResult{ToolUseID: tu.ID, Outcome: outcome, Content: content, DurationMS: dur}); err != nil {
 		return toolOutcome{class: session.ErrInternal, err: err}
 	}
@@ -1074,6 +1074,13 @@ func (a *accumulator) add(p provider.Part) {
 }
 
 func (a *accumulator) appendText(t session.BlockType, s string) {
+	// A codec can forward an empty delta (anthropicmsgs emits whatever the wire
+	// carries). On its own it would open a block whose text is "", which
+	// Block.Validate refuses; the delta carries nothing, so drop it. Concatenating
+	// "" into an open block is a no-op and falls out of the same guard.
+	if s == "" {
+		return
+	}
 	n := len(a.blocksOut)
 	if n > 0 && a.blocksOut[n-1].Type == t {
 		a.blocksOut[n-1].Text += s

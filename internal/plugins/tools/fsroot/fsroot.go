@@ -106,7 +106,13 @@ func IsBinary(b []byte) bool {
 	return bytes.IndexByte(b[:n], 0) >= 0
 }
 
+// Text is a successful result carrying s. An empty s yields no content block: the log
+// refuses a text block with "" (turn_failed "text block: empty text"), and a command that
+// succeeded silently has nothing to say. tool_result.content may be empty.
 func Text(s string) tool.Result {
+	if s == "" {
+		return tool.Result{}
+	}
 	return tool.Result{Content: []session.Block{session.TextBlock(s)}}
 }
 
