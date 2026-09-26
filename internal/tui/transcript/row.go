@@ -51,6 +51,11 @@ type Row struct {
 	// Expanded is a tool row the user opened. Options.ToolCollapsed decides the default,
 	// so a row with Expanded false still renders open when ToolCollapsed is false.
 	Expanded bool
+	// GroupExpanded is a tool row the user opened out of the fold a run of consecutive
+	// tool rows collapses into (Options.ToolGrouped). It is separate from Expanded, which
+	// opens the row's own input and result, so a click on a folded group shows every row
+	// in it, each still folded to its own summary and preview.
+	GroupExpanded bool
 	// Thinking marks an assistant row carrying thinking rather than answer text. On a
 	// live row it is also the spinner flag: it is set as soon as thinking deltas arrive,
 	// whether or not ShowThinking lets the text through.
@@ -86,8 +91,12 @@ type Row struct {
 // Options are the [ui.transcript] and [ui.diff] render choices, one field per config key
 // (docs/specs/2026-09-07-rudy-design.md, Client).
 type Options struct {
-	Width            int
-	ToolCollapsed    bool
+	Width         int
+	ToolCollapsed bool
+	// ToolGrouped folds a run of two or more consecutive tool rows, nothing else between
+	// them, into one line naming each tool and its count. A click or ctrl+o on any row of
+	// the run opens the whole run, each row drawn on its own again.
+	ToolGrouped      bool
 	ToolPreviewLines int
 	ShowThinking     bool
 	UserPrefix       string

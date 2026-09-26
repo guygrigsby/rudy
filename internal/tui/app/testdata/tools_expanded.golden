@@ -2,21 +2,21 @@
                                                                                                     
    [38;2;255;255;255mLooking at the test[m[38;2;255;255;255m first.[m                                                                       
                                                                                                     
- [38;2;115;218;202m▾ $ bash  go test ./internal/session -run TestFork -count=3[m                                        
-     [38;2;86;95;137m{[m                                                                                              
-     [38;2;86;95;137m  "command": "go test ./internal/session -run TestFork -count=3"[m                               
-     [38;2;86;95;137m}[m                                                                                              
-     [38;2;192;202;245m--- FAIL: TestFork (0.01s)[m                                                                     
-     [38;2;192;202;245mfork_test.go:41: want 3 entries, got 2[m                                                         
- [38;2;115;218;202m▾ ✎ edit  internal/session/fork.go[m                                                                 
-     [38;2;86;95;137m{[m                                                                                              
-     [38;2;86;95;137m  "path": "internal/session/fork.go",[m                                                          
-     [38;2;86;95;137m  "old": "\tentries := s.entries[:at]\n",[m                                                      
-     [38;2;86;95;137m  "new": "\tentries := s.entries[:at+1]\n"[m                                                     
-     [38;2;86;95;137m}[m                                                                                              
-     [38;2;192;202;245mreplaced 1 occurrence in internal/session/fork.go[m                                              
+ [38;2;115;218;202m▸ bash ×1, edit ×1[m                                                                                 
                                                                                                     
    [38;2;255;255;255mOff by one in the slice bound. Fixed and[m[38;2;255;255;255m green.[m                                                  
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
+                                                                                                    
                                                                                                     
                                                                                                     
                                                                                                     

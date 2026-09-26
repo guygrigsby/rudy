@@ -213,7 +213,9 @@ func TestGoldenToolsExpanded(t *testing.T) {
 }
 
 func TestGoldenDiffBackground(t *testing.T) {
-	golden(t, "diff_background", screen(t, map[string]any{"ui.diff.style": "background"}, nil))
+	// Grouping folds the rows the painted diff lives on, so this pins the style with the
+	// fold off: what it gates is how a diff paints, not whether it folds.
+	golden(t, "diff_background", screen(t, map[string]any{"ui.diff.style": "background", "ui.transcript.tool_grouped": false}, nil))
 }
 
 func TestGoldenThinkingShown(t *testing.T) {

@@ -272,6 +272,7 @@ max_width = 120
 
 [ui.transcript]
 tool_collapsed = true
+tool_grouped = true
 tool_preview_lines = 2
 thinking = "hidden"
 user_prefix = "›"

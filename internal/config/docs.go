@@ -229,6 +229,7 @@ var Sections = []Section{
 		Comment: []string{"Rows: what a tool call folds to, and what an assistant message looks like."},
 		Keys: []Doc{
 			{Key: "ui.transcript.tool_collapsed", Comment: "False opens every tool row."},
+			{Key: "ui.transcript.tool_grouped", Comment: "A run of consecutive tool rows folds into one line. False draws each row on its own."},
 			{Key: "ui.transcript.tool_preview_lines", Comment: "Lines of a tool's result shown under a collapsed row."},
 			{Key: "ui.transcript.thinking", Comment: "hidden or shown. ctrl+t toggles it for one run.", Example: `"shown"`},
 			{Key: "ui.transcript.user_prefix", Comment: "The glyph a user message opens with."},

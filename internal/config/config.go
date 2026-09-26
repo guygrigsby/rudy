@@ -33,6 +33,7 @@ type LayoutConfig struct {
 // TranscriptConfig is the [ui.transcript] table.
 type TranscriptConfig struct {
 	ToolCollapsed    bool   `mapstructure:"tool_collapsed"`
+	ToolGrouped      bool   `mapstructure:"tool_grouped"`
 	ToolPreviewLines int    `mapstructure:"tool_preview_lines"`
 	Thinking         string `mapstructure:"thinking"`
 	UserPrefix       string `mapstructure:"user_prefix"`
@@ -331,6 +332,7 @@ func Defaults() map[string]any {
 		"ui.vim":                           true,
 		"ui.layout.slots":                  []string{"transcript", "input", "status"},
 		"ui.transcript.tool_collapsed":     true,
+		"ui.transcript.tool_grouped":       true,
 		"ui.transcript.tool_preview_lines": 2,
 		"ui.transcript.thinking":           "hidden",
 		"ui.transcript.user_prefix":        "›",

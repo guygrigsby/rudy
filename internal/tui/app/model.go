@@ -331,6 +331,7 @@ func (m *Model) newTranscript() *transcript.Transcript {
 	return transcript.New(transcript.Options{
 		Width:            m.width,
 		ToolCollapsed:    m.cfg.UI.Transcript.ToolCollapsed,
+		ToolGrouped:      m.cfg.UI.Transcript.ToolGrouped,
 		ToolPreviewLines: m.cfg.UI.Transcript.ToolPreviewLines,
 		ShowThinking:     m.showThinking,
 		UserPrefix:       m.cfg.UI.Transcript.UserPrefix,

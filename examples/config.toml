@@ -192,6 +192,8 @@ interval_ms = 0
 [ui.transcript]
 # False opens every tool row.
 tool_collapsed = true
+# A run of consecutive tool rows folds into one line. False draws each row on its own.
+tool_grouped = true
 # Lines of a tool's result shown under a collapsed row.
 tool_preview_lines = 2
 # hidden or shown. ctrl+t toggles it for one run.

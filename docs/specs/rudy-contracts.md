@@ -546,6 +546,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `ui.vim` | bool | true | |
 | `ui.layout.slots` | [string] | `["transcript", "input", "status"]` | order top to bottom; `header` may be added |
 | `ui.transcript.tool_collapsed` | bool | true | |
+| `ui.transcript.tool_grouped` | bool | true | a run of two or more consecutive tool rows with no other row between them folds into one group line naming each tool and its count, opening with the same toggle a tool row does; a question standing in a row's place or a call still running keeps the run ungrouped until it settles |
 | `ui.transcript.tool_preview_lines` | int | 2 | |
 | `ui.transcript.thinking` | `hidden`, `shown` | `hidden` | |
 | `ui.transcript.user_prefix` | string | `›` | |

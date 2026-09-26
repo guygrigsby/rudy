@@ -147,14 +147,62 @@ func (t *Transcript) SetWidth(w int) {
 }
 
 // Toggle expands or collapses the tool row named by key and reports whether it is now
-// expanded. Any other key, or none, is false.
+// expanded. Any other key, or none, is false. A row folded into a group (ToolGrouped)
+// toggles the whole group instead: its line is the only one on screen to click, and
+// opening it shows every row of the run, each still folded to its own summary.
 func (t *Transcript) Toggle(key string) bool {
 	r := t.byKey[key]
 	if r == nil || r.Kind != RowTool {
 		return false
 	}
+	if t.opts.ToolGrouped && !r.GroupExpanded && t.grouped(r) {
+		for _, g := range t.groupOf(r) {
+			g.GroupExpanded = true
+		}
+		return true
+	}
 	r.Expanded = !r.Expanded
 	return r.Expanded
+}
+
+// grouped reports whether r is folded into a run of consecutive tool rows.
+func (t *Transcript) grouped(r *Row) bool {
+	return len(t.groupOf(r)) > 1
+}
+
+// groupOf is the run of consecutive tool rows r stands in, in row order, or nil when the
+// run does not fold: fewer than two settled tool rows in a row, a question standing in one
+// of their places, or a call still running. Anything on screen between two tool rows, a
+// blank line excepted, ends the run, and so does a different origin: a subagent's run
+// folds under its own indent and never into the parent's.
+func (t *Transcript) groupOf(r *Row) []*Row {
+	i := slices.Index(t.rows, r)
+	if i < 0 {
+		return nil
+	}
+	lo, hi := i, i+1
+	for lo > 0 && foldsWith(t.rows[lo-1], r) {
+		lo--
+	}
+	for hi < len(t.rows) && foldsWith(t.rows[hi], r) {
+		hi++
+	}
+	if hi-lo < 2 {
+		return nil
+	}
+	for _, g := range t.rows[lo:hi] {
+		if g.Result == nil || t.byKey[origin{sessionID: g.SessionID}.key(promptKey(g.ToolUse.ID))] != nil {
+			return nil
+		}
+	}
+	return t.rows[lo:hi]
+}
+
+// foldsWith reports whether other can stand next to r in one folded run: a tool row of the
+// same origin, not one the user has opened out of the fold.
+func foldsWith(other, r *Row) bool {
+	return other.Kind == RowTool && !other.GroupExpanded &&
+		other.SessionID == r.SessionID && other.ParentToolUseID == r.ParentToolUseID
 }
 
 // Apply folds one entry in and returns the keys of the rows it added or changed. An
@@ -716,11 +764,27 @@ func (t *Transcript) Wrap(role theme.Role, text string) []string {
 }
 
 // layout renders rows in order with the gaps between them, one Line per drawn line. A row
-// that renders nothing takes no line and no gap.
+// that renders nothing takes no line and no gap. When ToolGrouped folds a run of
+// consecutive tool rows, the run's first row draws the fold line and takes the click for
+// the whole run; the rest of the run takes no line.
 func (t *Transcript) layout(rows []*Row) []Line {
 	var out []Line
 	var prev *Row
 	for _, r := range rows {
+		if t.opts.ToolGrouped && !r.GroupExpanded && r.Kind == RowTool {
+			if group := t.groupOf(r); len(group) > 1 {
+				if group[0] != r {
+					// Folded under the run's first row, whose fold line stands for it.
+					continue
+				}
+				for _, blank := range t.gap(prev, r) {
+					out = append(out, Line{Text: blank})
+				}
+				out = append(out, Line{Text: t.groupLine(group), Row: r})
+				prev = r
+				continue
+			}
+		}
 		rl := t.Render(r)
 		if len(rl) == 0 {
 			continue

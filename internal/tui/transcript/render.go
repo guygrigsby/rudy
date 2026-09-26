@@ -387,6 +387,32 @@ func (t *Transcript) disclosure(r *Row) string {
 	return ""
 }
 
+// groupLine is the fold line a run of consecutive tool rows collapses into
+// (Options.ToolGrouped): the disclosure marker, then each tool in the run with its count
+// in order of first appearance ("grep ×5, read ×4, bash ×3"). It draws in the group
+// leader's own indent, which a subagent's run carries, and the click on it reaches the
+// leader's key, which Toggle reads as the whole run's.
+func (t *Transcript) groupLine(group []*Row) string {
+	var names []string
+	counts := map[string]int{}
+	for _, r := range group {
+		name := r.ToolUse.Name
+		if counts[name] == 0 {
+			names = append(names, name)
+		}
+		counts[name]++
+	}
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s ×%d", name, counts[name]))
+	}
+	marker := ""
+	if g := t.opts.Icons.Get(icons.Collapsed); g != "" {
+		marker = g + " "
+	}
+	return t.line(theme.RoleTool, rowIndent(group[0]), marker+strings.Join(parts, ", "), false)
+}
+
 // summary is a tool call in one line: the field that says what it does for the built-in
 // tools, the head of the raw input for anything else, including a tool whose input is
 // still streaming and so does not parse yet.
