@@ -1,6 +1,10 @@
 # rudy domain model
 
-Pass 3 adds explicit terminal proof to the Server lifecycle for protocol-owned daemon replacement. The model still spans Session (core), Provider, Plugin and Hosts. Client is conformist and renders from the Session protocol; it holds no domain model beyond the transcript view. Memory is an external Go module imported by the memory plugin; nothing in it is modeled here.
+Pass 4 adds Agent Runtime for Codex App Server (ADR 0045). Session now selects
+native Provider execution or runtime-owned execution. Client remains conformist
+and renders from the Session protocol; it holds no domain model beyond the
+transcript view. Memory is an external Go module imported by the memory plugin;
+nothing in it is modeled here.
 
 ## Contexts
 
@@ -17,6 +21,13 @@ flowchart TB
         Provider
         Model
         RegistrySnapshot
+    end
+    subgraph AR["Agent Runtime"]
+        AgentRuntime
+        CodexRuntime
+        CodexThreadLink
+        LoginAttempt
+        RuntimeProjection
     end
     subgraph PL["Plugin"]
         Plugin
@@ -41,11 +52,21 @@ flowchart TB
     Placement -.-> Workspace
     MEM[["memory-go<br/>(external module)"]] -.-> Plugin
     Turn --> Provider
+    Session --> AgentRuntime
+    CodexRuntime --> CodexThreadLink
+    CodexRuntime --> LoginAttempt
+    CodexRuntime --> RuntimeProjection
     Turn --> Tool
     Session --> AgentDefinition
 ```
 
-Turn drives a completion through Provider and invokes Tools registered by Plugins. Server owns the process-lifetime Session runtime. Session runs a child Session under an AgentDefinition for a subagent. Hosts reaches Server only through the published protocol and never introduces Host into the kernel. The registry snapshot crosses from Provider into Session as the set of selectable models. Nothing else crosses.
+A native Turn drives a completion through Provider and invokes Tools registered
+by Plugins. A runtime Session delegates thread and turn execution through
+AgentRuntime. Server owns both process lifecycles. Session runs a child Session
+under an AgentDefinition for a subagent. Hosts reaches Server only through the
+published protocol and never introduces Host into the kernel. The registry
+snapshot crosses from Provider and AgentRuntime into Session as the set of
+selectable models. Nothing else crosses.
 
 ## Server
 
@@ -103,21 +124,29 @@ Domain service in Session. Owns the boundary between the protocol acknowledgemen
 
 ## Session
 
-Entity, aggregate root. One conversation over one workspace, persisted as an append-only log of Entries. All mutable state (model, mode, thinking level, title, usage) is derived from the log, never stored beside it.
+Entity, aggregate root. One conversation over one workspace. Its execution kind
+is immutable. A native Session's append-only Entries are its canonical history.
+A runtime Session's AgentRuntime thread is canonical and Entries retain only
+local control and approval facts.
 
 ### Fields
 
 | Field | Type | Meaning |
 |---|---|---|
 | `id` | ULID | Identity. The directory name under the sessions root |
-| `entries` | `[]Entry` | The ordered log. Append-only. For a forked session, the parent's entries precede the first local entry and are read from the parent at load, never copied |
+| `execution` | `SessionExecution` | Native Provider execution or a named AgentRuntime execution; fixed by the model owner when opened |
+| `entries` | `[]Entry` | The ordered local log. Append-only. Native forks read inherited parent entries; runtime projections never enter this collection |
 | `parent` | `*ForkRef` | Absent on a root session. Present on a fork: the parent session id and the parent entry id forked at. Absence means this session owns all its entries |
 
 ### Behaviors
 
 - `Append(Entry) error` writes one entry to `entries.jsonl`, fsyncs and returns. Refuses an entry whose kind or ordering violates an invariant below.
-- `Fork(atEntryID) (Session, error)` creates a new Session whose first local entry is a `fork_point` naming this session and `atEntryID`.
-- `RequestContext() []Entry` returns the entries the next completion sees: the newest `compaction` entry, then every entry after the last one it covers, in log order, with older compactions dropped. The entries between a compaction's `last_entry_id` and the compaction itself, the turn that was running when it happened, are kept. Every entry when there is no compaction. Derived, never stored.
+- `Fork(atEntryID) (Session, error)` creates a native child at the named Entry,
+  or asks the AgentRuntime to fork the canonical thread and binds the returned
+  new thread to the child. A runtime child never inherits the parent's link.
+- `RequestContext() []Entry` returns the entries a native completion sees: the newest `compaction` entry, then every entry after the last one it covers, in log order, with older compactions dropped. The entries between a compaction's `last_entry_id` and the compaction itself, the turn that was running when it happened, are kept. Every entry when there is no compaction. Runtime execution never calls it.
+- `Projection() []ProjectedEntry` asks the AgentRuntime for canonical history
+  and derives stable client rows. Native execution derives rows from Entries.
 - `Model() ModelRef` returns the ref from the most recent `session_opened` or `model_change`.
 - `Mode() PermissionMode` returns the mode from the most recent `session_opened` or `mode_change`.
 - `ThinkingLevel() ThinkingLevel` returns the level from the most recent `session_opened` or a thinking change.
@@ -128,9 +157,16 @@ Entity, aggregate root. One conversation over one workspace, persisted as an app
 ### Invariants
 
 - The first entry of a root session is `session_opened`. The first local entry of a fork is `fork_point`.
+- `execution.kind` never changes after `session_opened`.
+- A runtime Session has at most one ThreadLink, and its runtime name equals
+  `execution.runtimeName`.
+- A runtime fork owns a newly returned runtime thread id and never reads its
+  parent's `runtime.toml` as its own.
 - `fork_point` appears at most once, and only as the first local entry. Any later `fork_point` is refused.
 - An `assistant_message` carrying a `tool_use` block for an unsafe tool is followed by a `permission_decision` for that tool_use id before any `tool_result` for it. The gate appends and fsyncs the allow decision before the tool runs.
 - Every `permission_decision` with decision `allow` is eventually paired with a `tool_result` for the same tool_use id. On load, an allow with no matching result gets a synthesized `tool_result` with outcome `lost`.
+- Every runtime approval response that grants authority is preceded by a
+  fsynced `runtime_permission_decision` bound to that exact runtime request.
 - Entry payloads that carry provider bytes (tool_use input, thinking signatures, tool result content) are stored byte-exact and never re-marshaled.
 - At most one Turn is active per Session at any time.
 - An allowance matches a later tool_use only on `Matcher` equality: same tool and same prefix. A looser match is refused.
@@ -145,11 +181,27 @@ A Session has no lifecycle state machine of its own; its state is the fold of it
 | With | Kind | Cardinality |
 |---|---|---|
 | `Entry` | has-a (owned) | 1 to n, n >= 1 |
-| `Turn` | has-a (owned) | 1 to 0..1 |
+| `Turn` | has-a (owned) | native: 1 to 0..1 |
+| `AgentRuntime` | delegates-to | runtime: n to 1 |
+| `CodexThreadLink` | has-a (owned) | runtime: 1 to 0..1 before first submit, then 1 to 1 |
 | `Session` (parent) | references | n to 0..1 |
 | `Session` (child fork) | references | 1 to n |
 | `Workspace` | has-a (owned) | 1 to 1 |
 | `AgentDefinition` | references | n to 0..1 |
+
+## SessionExecution
+
+Value object, a closed sum fixed when the Session opens.
+
+| Variant | Fields | Meaning |
+|---|---|---|
+| `native` | `providerName string` | Rudy owns the loop and the Provider returns completions |
+| `runtime` | `runtimeName string` | The named AgentRuntime owns threads, turns, history and tools |
+
+The selected model's registry owner constructs this value. `codex:<model>`
+constructs `runtime{runtimeName:"codex"}`. A configured runtime model may open
+before authentication or successful discovery so `/login` has a Session from
+which to run.
 
 ## Entry
 
@@ -187,6 +239,7 @@ Value object, payload of a `session_opened` entry.
 | `rudyVersion` | string | The rudy version that opened the session |
 | `workspace` | `Workspace` | The workspace this session runs over |
 | `model` | `ModelRef` | The model selected at open |
+| `execution` | `SessionExecution` | Fixed execution kind. Present from schema version 3; older logs infer `native` from `model.provider` |
 | `thinking` | `ThinkingLevel` | The thinking level at open |
 | `mode` | `PermissionMode` | The permission mode at open |
 | `agent` | string | The agent definition name this session runs under; `default` when none |
@@ -240,6 +293,34 @@ Value object, payload of a `permission_decision` entry. Records what happened, w
 | `scope` | `Scope` | once or session; `session` only ever comes from an asker allow |
 | `reason` | string | Never empty. The asker's text, the hook's reason or the rule name; for `no_asker` the fixed string `no asker attached` |
 | `input` | bytes | The input the tool ran with when a `before_tool` hook modified it; absent otherwise. Kept byte for byte, so the log shows exactly what the call carried when it differs from the `tool_use` block |
+
+## RuntimePermissionDecision
+
+Value object, payload of a `runtime_permission_decision` entry. It is the local
+durable evidence written before Rudy grants an AgentRuntime approval. It is not
+projected into model-visible runtime history.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `runtime` | string | Registered AgentRuntime name |
+| `threadID` | string | Verified canonical runtime thread |
+| `turnID` | string | Verified active runtime turn |
+| `itemID` | string | Runtime item requesting authority |
+| `requestID` | string | Canonical text form of the upstream request id; unique while the runtime connection lives |
+| `kind` | `command`, `file_change`, `permissions` | Approval request family |
+| `decision` | `Decision` | `allow` or `deny` |
+| `decidedBy` | `RuntimeDecidedBy` | Asker or fail-closed rule |
+| `scope` | `Scope` | `once` or `session`; session requires an explicit asker choice |
+| `reason` | string | Non-empty answer or fail-closed reason |
+
+The five-part binding `(runtime, threadID, turnID, itemID, requestID)` is unique
+within a Session. Only an allow is fsynced before its upstream response. Denies
+are appended before their response but may use the normal turn-boundary flush.
+
+## RuntimeDecidedBy
+
+Closed enum: `asker`, `no_asker`, `disconnect`, `timeout`, `stale`,
+`runtime_failure`, `shutdown`.
 
 ## Matcher
 
@@ -587,6 +668,8 @@ Enumeration.
 | `provider` | The provider returned an error after retries |
 | `transport` | The connection failed |
 | `plugin` | A plugin fault: a panic or a programming error in a tool, not a tool that ran and reported an error |
+| `runtime` | An AgentRuntime returned a redacted error |
+| `ambiguous` | A non-idempotent runtime request lost its response and was not replayed |
 | `internal` | A rudy fault |
 
 ## EntryKind
@@ -600,6 +683,7 @@ Enumeration. The closed set of entry payloads.
 | `user_message` | `UserMessage` |
 | `assistant_message` | `AssistantMessage` |
 | `permission_decision` | `PermissionDecision` |
+| `runtime_permission_decision` | `RuntimePermissionDecision` |
 | `tool_result` | `ToolResult` |
 | `model_change` | `ModelChange` |
 | `mode_change` | `ModeChange` |
@@ -609,6 +693,206 @@ Enumeration. The closed set of entry payloads.
 | `turn_interrupted` | `TurnInterrupted` |
 | `turn_failed` | `TurnFailed` |
 | `note` | `Note` |
+
+## AgentRuntime
+
+Entity, identity by registered name. Execution backend that owns canonical
+threads, turns, model-facing history and tools.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | Unique registry name and model namespace |
+| `state` | `RuntimeState` | Process capability state |
+| `account` | `AccountState` | Latest runtime-reported account state, derived and never stored |
+
+### Behaviors
+
+- `ReadAccount`, `StartLogin` and `CancelLogin` manage runtime authentication.
+- `ListModels` returns models owned by this runtime.
+- `StartThread`, `ResumeThread`, `ForkThread` and `ReadThread` manage canonical
+  runtime history.
+- `StartTurn`, `SteerTurn` and `InterruptTurn` drive runtime-owned execution.
+- `AnswerApproval` resolves one verified pending RuntimeApproval.
+
+### Invariants
+
+- `name` is unique across AgentRuntimes and Provider model namespaces.
+- A thread id belongs to at most one live Rudy Session in one kernel.
+- No vendor request or response type crosses this boundary.
+- Non-idempotent operations are never automatically replayed after an
+  ambiguous response.
+
+### Relationships
+
+| With | Kind | Cardinality |
+|---|---|---|
+| `Session` | serves | 1 to 0..n |
+| `Model` | has-a | 1 to 0..n |
+| `Plugin` | registered-by | n to 1 |
+
+## CodexRuntime
+
+Entity, aggregate root for one process-lifetime App Server connection. It is
+the `codex` AgentRuntime implementation and anti-corruption layer.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `state` | `RuntimeState` | `stopped`, `starting`, `ready` or `failed` |
+| `version` | semantic version or empty | Verified CLI version while ready |
+| `attempts` | `map[loginID]LoginAttempt` | Live login attempts only |
+| `links` | `map[sessionID]CodexThreadLink` | Loaded and verified session bindings |
+| `approvals` | `map[requestID]RuntimeApproval` | Pending inbound App Server requests |
+
+### Behaviors
+
+- `Start()` resolves `codex` from `PATH`, verifies the minimum version, starts
+  `codex app-server`, initializes the peer and moves to ready.
+- `Fail(reason)` denies pending approvals, fails the active operation and moves
+  to failed before a bounded-backoff restart when an attached Session needs it.
+- `Reconcile()` resumes and reads every linked thread after restart without
+  replaying the lost operation.
+
+### Invariants
+
+- At most one App Server process exists per Rudy kernel.
+- No request except `initialize` is sent before `initialized`.
+- All event routing uses a previously verified link and active turn binding.
+- Raw stderr, credentials and vendor error payloads never cross the ACL.
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> stopped
+    stopped --> starting: first operation
+    starting --> ready: initialized
+    starting --> failed: spawn, version or initialize failure
+    ready --> failed: EOF or protocol fault
+    failed --> starting: attached runtime session needs retry
+    ready --> stopped: kernel shutdown
+    failed --> stopped: kernel shutdown
+```
+
+## RuntimeState
+
+Closed enum: `stopped`, `starting`, `ready`, `failed`.
+
+## CodexThreadLink
+
+Entity, identity by Rudy Session id. Durable one-to-one binding to canonical
+Codex history.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `sessionID` | ULID | Owning Rudy Session; implied by the containing directory on disk |
+| `runtime` | string | Always `codex` for this type |
+| `threadID` | string | Non-empty id returned by App Server |
+
+The link is written atomically and fsynced before the first turn starts. It is
+never inherited by a fork. A process crash after `thread/start` responds but
+before the link is durable may leave an unreferenced Codex thread, never a
+cross-link or duplicated turn.
+
+## LoginAttempt
+
+Ephemeral entity, identity by App Server login id. Owned by CodexRuntime and
+bound to the client connection that invoked `/login`.
+
+### Fields
+
+| Field | Type | Meaning |
+|---|---|---|
+| `loginID` | string | Correlation id returned by App Server |
+| `mode` | `browser`, `device` | Login mechanism |
+| `state` | `LoginState` | Current lifecycle state |
+| `clientID` | connection identity | Sole recipient of its challenge and completion |
+
+### States
+
+```mermaid
+stateDiagram-v2
+    [*] --> starting
+    starting --> challenged: start response matched
+    starting --> succeeded: buffered completion matched
+    challenged --> succeeded: completed success
+    challenged --> failed: completed failure
+    challenged --> cancelled: cancel or client disconnect
+    failed --> [*]
+    succeeded --> [*]
+    cancelled --> [*]
+```
+
+Browser fallback cancels the browser LoginAttempt before constructing a device
+attempt. `account/updated` cannot transition this entity because it has no login
+id.
+
+## LoginState
+
+Closed enum: `starting`, `challenged`, `succeeded`, `failed`, `cancelled`.
+
+## AuthChallenge
+
+Value object returned only to the invoking client.
+
+| Variant | Fields |
+|---|---|
+| `browser` | `runtime`, `loginID`, `url` |
+| `device` | `runtime`, `loginID`, `verificationURL`, `userCode` |
+
+It contains no token. It is never logged, broadcast or appended as an Entry.
+
+## AccountState
+
+Derived value object: `runtime`, `authenticated bool`, `authMode string` and
+`planType string`. `authMode` and `planType` are empty when unauthenticated.
+It contains no credential material and is refreshed from `account/read` after
+login completion.
+
+## RuntimeApproval
+
+Ephemeral entity, identity by upstream request id within one Codex connection.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `requestID` | string | Canonical upstream request id |
+| `sessionID` | ULID | Rudy Session selected from the verified thread link |
+| `threadID` | string | Verified Codex thread |
+| `turnID` | string | Verified active Codex turn |
+| `itemID` | string | Requesting Codex item |
+| `kind` | `command`, `file_change`, `permissions`, `user_input`, `elicitation` | Request family |
+| `state` | `pending`, `answered`, `resolved` | Lifecycle |
+
+An allow answer first appends and fsyncs RuntimePermissionDecision. No asker,
+disconnect, timeout, stale binding, process loss and unsupported kind deny or
+cancel. A repeated answer is refused.
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: verified inbound request
+    pending --> answered: first bound answer
+    pending --> resolved: fail closed or upstream resolves first
+    answered --> resolved: upstream request resolved
+    resolved --> [*]
+```
+
+## RuntimeProjector
+
+Domain service. Converts canonical runtime thread items and live events into
+`ProjectedEntry` values for clients. It replaces deltas with completed items,
+treats runtime turn completion as terminal and derives each id from runtime,
+thread, turn, item and projection kind. It never writes projection content to
+the Session log or sends it back to the runtime.
+
+## ProjectedEntry
+
+Derived value object with the client-facing Entry shape plus its runtime
+binding. Its id is a deterministic ULID-shaped 128-bit digest, stable across
+read and live paths. It is not subject to the append-order monotonicity
+invariant of stored Entry ids.
 
 ## Provider
 
@@ -642,35 +926,39 @@ Providers are configured, not mutated at runtime. Behavior lives on Registry and
 
 ## Model
 
-Entity, identity by provider plus id. One model offered by one provider.
+Entity, identity by owner name plus id. One model offered by a Provider or
+AgentRuntime.
 
 ### Fields
 
 | Field | Type | Meaning |
 |---|---|---|
-| `provider` | string | The owning provider name |
-| `id` | string | The model id from `/v1/models` |
-| `displayName` | string | Human label from `/v1/models` display_name |
+| `provider` | string | Stable protocol field naming the Provider or AgentRuntime owner; retained for wire compatibility |
+| `ownerKind` | `provider`, `runtime` | Which execution port owns the model |
+| `id` | string | Model id reported by the owner |
+| `displayName` | string | Human label reported by the owner |
 | `upstream` | string | Who actually serves the model when the provider is a proxy: the route from `metadata.provider.upstream`, named the way the endpoint names that route elsewhere in the same listing. Not `provider.id`, which is as often the model's vendor as the route. Comma separated when the endpoint serves the id over more than one route. Empty when it names none |
-| `contextWindow` | int | Max context tokens from context_window_tokens |
-| `maxOutput` | int | Max output tokens from max_output_tokens |
+| `contextWindow` | int | Max context tokens; zero means the owner did not report it |
+| `maxOutput` | int | Max output tokens; zero means the owner did not report it |
 | `inputPrice` | Decimal | Cost per input token |
 | `outputPrice` | Decimal | Cost per output token |
 | `cacheReadPrice` | Decimal | Cost per cached input token. Zero when the provider prices none |
 | `capabilities` | `Capabilities` | What the model supports. Enriched from catwalk keyed by id; empty when no match (see open list) |
+| `reasoningEfforts` | `[]string` | Ordered efforts reported by an AgentRuntime; empty when the owner reports none |
 
 ### Invariants
 
 - The pair (`provider`, `id`) is unique within a snapshot. A proxy that serves one id from
   two upstreams lists the pair each time, and the registry folds those into one entry
   naming both: the ref cannot address one of them, so they are one model (rudy-aol).
-- `contextWindow` greater than zero. A model reporting no window is refused into the snapshot.
+- `contextWindow` and `maxOutput` are non-negative. Zero means unknown.
 
 ### Relationships
 
 | With | Kind | Cardinality |
 |---|---|---|
 | `Provider` | owned by | n to 1 |
+| `AgentRuntime` | owned by | n to 0..1, exactly one owner across Provider and AgentRuntime |
 | `RegistrySnapshot` | owned by | n to 1 |
 
 ## RegistrySnapshot
@@ -686,7 +974,10 @@ Entity, aggregate root. The set of models discovered from all providers at one p
 
 ### Behaviors
 
-- `Refresh(ctx) error` calls each provider's `/v1/models`, rebuilds `models` and rewrites the cache. Triggered on session open, on picker open, and on a model-not-found error. Never on a timer.
+- `Refresh(ctx) error` calls each Provider's `/v1/models` and each
+  AgentRuntime's model listing, rebuilds `models` and rewrites the cache.
+  Triggered on session open, picker open, model-not-found and runtime login
+  completion. Never on a timer.
 - `Lookup(ModelRef) (Model, bool)` finds a model by provider and id.
 
 ### Invariants
@@ -699,6 +990,7 @@ Entity, aggregate root. The set of models discovered from all providers at one p
 |---|---|---|
 | `Model` | has-a (owned) | 1 to n |
 | `Provider` | references | n to n |
+| `AgentRuntime` | references | n to n |
 
 ## CompletionRequest
 
@@ -780,6 +1072,7 @@ Entity, identity by name. A unit that extends the kernel, whether linked into th
 - `RegisterWidget(Widget) error` adds a widget owned by this plugin.
 - `RegisterStatusItem(StatusItem) error` adds a status item owned by this plugin.
 - `RegisterProvider(Provider) error` adds a provider.
+- `RegisterRuntime(AgentRuntime) error` adds an agent runtime.
 - `Fail(reason)` moves the plugin to failed and records the reason.
 - `Stop()` moves the plugin to stopped and releases its registrations.
 
@@ -813,6 +1106,7 @@ stateDiagram-v2
 | `Widget` | has-a (owned) | 1 to n |
 | `StatusItem` | has-a (owned) | 1 to n |
 | `Provider` | references | 1 to n |
+| `AgentRuntime` | references | 1 to n |
 
 ## Tool
 
@@ -859,6 +1153,14 @@ Entity, identity by name. A client-facing command.
 | `description` | string | One-line help |
 | `argHint` | string | Argument hint for completion. Empty string means no arguments |
 
+### Behaviors
+
+- `Run(CommandContext, args) CommandAction` returns one closed action. The
+  `AuthChallenge` action is caller-private and bypasses transcript broadcast.
+
+`CommandAction` variants are `SubmitPrompt`, `Notice`, `Compact`, `SetModel`,
+`SetMode`, `SetTitle`, `Fork`, `NewSession`, `AuthChallenge` and `NoAction`.
+
 ### Relationships
 
 | With | Kind | Cardinality |
@@ -897,6 +1199,10 @@ Enumeration. The closed set of lifecycle attachment points.
 | `before_compaction` | When the Compactor decides to compact, before it asks the model | A summary; the first non-empty one is used and the model is not asked |
 | `turn_completed` | After a turn ends | Nothing |
 | `session_closed` | Before a session closes | Nothing |
+
+Only `turn_completed` and `session_closed` fire for runtime execution. Other
+hook returns modify Rudy-owned loop state and have no faithful runtime-owned
+equivalent.
 
 ## Widget
 

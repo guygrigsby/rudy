@@ -1,6 +1,6 @@
 # rudy design
 
-- Status: approved in design session, pass 1
+- Status: approved in design session, pass 2
 - Date: 2026-09-07
 - Companion artifacts: [context map](rudy-context-map.md), [domain model](rudy-domain-model.md), [contracts](rudy-contracts.md), [ADRs](../adr/)
 
@@ -28,12 +28,14 @@ from what the owner had to patch into pi.
 - Skills, agent definitions and memory come from `~/.agents`, shared with every
   other harness on the machine.
 - vim editing in the prompt by default.
+- A Codex-backed session can authenticate with `/login` and use the owner's
+  ChatGPT subscription without Rudy storing OpenAI credentials.
 
 ## Non-goals for v1
 
-- Claude subscription login. Every model the owner runs arrives through the
-  aperture proxy or a local server. Third-party OAuth is a policy violation
-  regardless.
+- Unsupported third-party subscription OAuth, including Claude subscription
+  login. OpenAI's supported ChatGPT flow through Codex App Server is the one
+  subscription path in scope. Rudy never reads its credentials.
 - Allow and deny rule patterns for permissions. Modes only.
 - LSP, tree-sitter, sandboxing, ACP for editors. Each is a plugin slot left
   open, not a v1 deliverable.
@@ -56,12 +58,14 @@ flowchart LR
         GATE["gate"]
         REG["plugin registry"]
         PORT["provider port"]
+        RPORT["agent runtime port"]
         CFG["config, workspace"]
     end
     subgraph plugins["plugins, linked or spawned"]
         TOOLS["tools: read write edit bash grep glob"]
         CMDS["slash commands"]
         PROV["providers: anthropic_messages openai_chat clinepass"]
+        CODEX["runtime: codex app-server"]
         EXT["skills hooks subagents compaction mcp memory"]
     end
     TUI -- "JSON-RPC, in-memory or unix socket" --> SRV
@@ -71,11 +75,14 @@ flowchart LR
     LOOP --> LOG
     LOOP --> GATE
     LOOP --> PORT
+    SRV --> RPORT
     REG --> TOOLS
     REG --> CMDS
     REG --> PROV
+    REG --> CODEX
     REG --> EXT
     PROV --> PORT
+    CODEX --> RPORT
     SRV -- "JSON-RPC over stdio" --> EXT
 ```
 
@@ -109,6 +116,13 @@ allow entry with no result gets a `tool_result` with outcome `lost`. Tool inputs
 and thinking signatures are stored as raw bytes. ADR 0004, entry kinds and the
 Turn state machine in the [domain model](rudy-domain-model.md).
 
+A session whose selected model belongs to an AgentRuntime delegates threads,
+turns, model-facing history and tools to that runtime. Its `runtime.toml` binds
+the Rudy session to the runtime's canonical thread. `entries.jsonl` keeps local
+control facts and fsynced approval decisions, not copied runtime messages. The
+client transcript is a deterministic projection of the runtime thread. See
+[Codex App Server runtime](codex-app-server-runtime.md) and ADR 0045.
+
 ## Permissions
 
 Three modes, an enumeration. ADR 0009.
@@ -126,6 +140,11 @@ session allowances live only in the log and are rebuilt from it on resume. A
 client declares whether it can act as asker in its `client.hello`, so the gate
 knows before the first tool call whether strict mode will ask or deny. The
 dangerous set for permissive mode is open.
+
+An AgentRuntime may execute tools itself, but it does not bypass this trust
+boundary. Each approval request is bound to its Session, thread, turn, item and
+upstream request id. Rudy appends and fsyncs a `runtime_permission_decision`
+before returning an allow. No asker and any stale or broken binding deny.
 
 ## Providers and registry
 
@@ -146,12 +165,19 @@ Every request carries `X-Rudy-Session` and a User-Agent naming rudy, its
 version and the platform. Transient failures retry with backoff and honor
 `Retry-After` in both forms.
 
+An AgentRuntime is a separate port for a backend that owns the agent loop. The
+first is `codex`, backed by one lazy `codex app-server` stdio process per kernel.
+It owns canonical threads and exposes ChatGPT login, models, turns, tools and
+approval requests. Models keep the `owner:model` spelling, so Codex models are
+`codex:<model-id>`. The registry records whether each model owner is a Provider
+or AgentRuntime; an App Server model may have unknown context and pricing.
+
 ## Plugins
 
 Linked plugins are Go packages compiled in. Spawned plugins are subprocesses
 speaking the protocol over stdio, any language. Both implement one interface;
 the protocol is a transport over it. A plugin registers tools, slash commands,
-hook handlers, widgets, status items and providers. A duplicate tool name is
+hook handlers, widgets, status items, providers and agent runtimes. A duplicate tool name is
 refused with a notice and the plugin still loads. The first built-in slash
 command is `/init`, the Claude Code shape: it inspects the workspace and writes
 `./AGENTS.md`, and `rudy -p "/init"` runs it headless.
@@ -160,6 +186,10 @@ Hook points, a closed set: `session_opened`, `before_turn`, `before_request`,
 `after_response`, `before_tool`, `after_tool`, `turn_completed`,
 `session_closed`. What each handler may return is in the
 [contracts](rudy-contracts.md).
+
+Hooks whose return changes Rudy's loop are native-only. Runtime sessions fire
+only `turn_completed` and `session_closed`; runtime approvals use their own
+bound contract rather than tool hooks.
 
 Spawned plugin manifests are discovered from `$XDG_DATA_HOME/rudy/plugins/`
 (what `rudy plugins install` writes), then `$XDG_CONFIG_HOME/rudy/plugins/`,
@@ -370,6 +400,12 @@ client, detaching from a daemon and ending an embedded server with the process,
 and `/scoped-models` chooses the set `ctrl+p` cycles through, space toggling a
 row and an empty set meaning the whole registry. ADR 0015, ADR 0020.
 
+`/login` is supplied by the Codex runtime plugin. A local TUI opens the returned
+browser challenge. Failure cancels that attempt and returns a device-code
+challenge. Remote and headless clients request device login directly. Login
+challenges are private to the invoking connection and are never transcript
+entries. Account-state updates contain no credential material.
+
 ## CLI
 
 Cobra with Viper. Noun then verb: `rudy skills migrate`, never
@@ -399,6 +435,10 @@ dedicated files and nothing else.
   idle.
 - A spawned plugin that dies is marked failed with its stderr tail in a notice;
   its tools disappear from the next request; the session continues.
+- Codex App Server stderr is redacted before bounded logging. Process loss
+  fails the active operation, denies pending approvals, restarts with backoff
+  while attached sessions need it and reconciles canonical threads. A lost
+  non-idempotent request is never replayed.
 - A killed tool records outcome `killed` and its partial output.
 - `rudy serve` sessions survive client exit while a turn runs; a client
   reattaches by replaying entries, hearing the current turn state and any
@@ -417,6 +457,10 @@ dedicated files and nothing else.
   expanded rows, diff, permission prompt, each vim mode in the status line).
 - memory-go: byte-for-byte goldens against the Node implementation's outputs.
 - Gate: table tests over mode times safety class times asker presence.
+- Codex runtime: version-pinned App Server fixtures and a fake subprocess cover
+  login, models, thread resume and fork, live projection, approval binding,
+  fail-closed behavior, redaction, restart and ambiguous non-retry. A real-path
+  client test covers `/login`, turn, approval and cold resume.
 
 ## Dependencies, pinned exactly
 
@@ -426,6 +470,7 @@ dedicated files and nothing else.
 | highlight, diff | `github.com/alecthomas/chroma/v2` 2.27.0, `github.com/aymanbagabas/go-udiff` 0.4.1 |
 | terminal extras | `github.com/charmbracelet/x/ansi` 0.11.8, `golang.design/x/clipboard` 0.9.0, `github.com/charmbracelet/x/xpty` 0.1.4 |
 | providers | `github.com/anthropics/anthropic-sdk-go` 1.71.0; `openai_chat` codec on `net/http` with the SSE reader lifted from the owner's `llm` module |
+| Codex runtime | external `codex` executable from `PATH`, version 0.155.1 or newer; App Server JSONL over stdio, no linked SDK |
 | enrichment | `charm.land/catwalk` embedded data |
 | MCP | `github.com/modelcontextprotocol/go-sdk` 1.7.0 |
 | CLI, config | `github.com/spf13/cobra`, `github.com/spf13/viper`, `github.com/pelletier/go-toml/v2` |
