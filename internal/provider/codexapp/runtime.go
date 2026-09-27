@@ -25,6 +25,9 @@ type wireTurn struct {
 }
 
 func (c *Client) StartThread(ctx context.Context, request agentruntime.StartThreadRequest) (agentruntime.ThreadRef, error) {
+	if err := requireStrictMode(request.Mode); err != nil {
+		return agentruntime.ThreadRef{}, err
+	}
 	if err := c.Start(ctx); err != nil {
 		return agentruntime.ThreadRef{}, err
 	}
@@ -33,9 +36,13 @@ func (c *Client) StartThread(ctx context.Context, request agentruntime.StartThre
 	}
 	params := map[string]any{
 		"cwd": request.Workspace.Root, "model": request.Model.Model, "approvalPolicy": approvalPolicy(request.Mode),
+		"permissions": threadPermissions(request.Mode),
 	}
-	if sandbox := threadSandbox(request.Mode); sandbox != "" {
-		params["sandbox"] = sandbox
+	if reviewer := approvalsReviewer(request.Mode); reviewer != "" {
+		params["approvalsReviewer"] = reviewer
+	}
+	if config := strictThreadConfig(request.Mode); config != nil {
+		params["config"] = config
 	}
 	err := c.callMutation(ctx, methodThreadStart, params, &response)
 	if err != nil {
@@ -47,6 +54,13 @@ func (c *Client) StartThread(ctx context.Context, request agentruntime.StartThre
 	return agentruntime.ThreadRef{Runtime: c.Name(), SessionID: request.SessionID, ThreadID: response.Thread.ID}, nil
 }
 
+func requireStrictMode(mode session.Mode) error {
+	if mode == "" || mode == session.ModeStrict {
+		return nil
+	}
+	return fmt.Errorf("codex runtime requires strict permission mode, got %q", mode)
+}
+
 func (c *Client) ResumeThread(ctx context.Context, ref agentruntime.ThreadRef) error {
 	if err := c.Start(ctx); err != nil {
 		return err
@@ -54,7 +68,9 @@ func (c *Client) ResumeThread(ctx context.Context, ref agentruntime.ThreadRef) e
 	var response struct {
 		Thread wireThread `json:"thread"`
 	}
-	if err := c.call(ctx, methodThreadResume, map[string]any{"threadId": ref.ThreadID}, &response); err != nil {
+	params := strictThreadParams()
+	params["threadId"] = ref.ThreadID
+	if err := c.call(ctx, methodThreadResume, params, &response); err != nil {
 		return err
 	}
 	if response.Thread.ID != ref.ThreadID {
@@ -70,7 +86,9 @@ func (c *Client) ForkThread(ctx context.Context, ref agentruntime.ThreadRef) (ag
 	var response struct {
 		Thread wireThread `json:"thread"`
 	}
-	if err := c.callMutation(ctx, methodThreadFork, map[string]any{"threadId": ref.ThreadID}, &response); err != nil {
+	params := strictThreadParams()
+	params["threadId"] = ref.ThreadID
+	if err := c.callMutation(ctx, methodThreadFork, params, &response); err != nil {
 		return agentruntime.ThreadRef{}, err
 	}
 	if response.Thread.ID == "" {
@@ -135,33 +153,34 @@ func (c *Client) InterruptTurn(ctx context.Context, ref agentruntime.TurnRef) er
 }
 
 func approvalPolicy(mode session.Mode) string {
-	switch mode {
-	case session.ModePermissive:
-		return "on-request"
-	case session.ModeOff:
-		return "never"
-	default:
-		return "untrusted"
+	return "on-request"
+}
+
+func threadPermissions(mode session.Mode) string {
+	return "rudy_strict"
+}
+
+func approvalsReviewer(mode session.Mode) string {
+	return "user"
+}
+
+func strictThreadConfig(mode session.Mode) map[string]any {
+	return map[string]any{
+		"features.apps":                      false,
+		"features.exec_permission_approvals": true,
+		"features.plugins":                   false,
+		"features.remote_plugin":             false,
+		"features.request_permissions_tool":  true,
 	}
 }
 
-type sandboxPolicy struct {
-	Type          string `json:"type"`
-	NetworkAccess bool   `json:"networkAccess"`
-}
-
-func threadSandbox(mode session.Mode) string {
-	if mode == session.ModeStrict {
-		return "read-only"
+func strictThreadParams() map[string]any {
+	return map[string]any{
+		"approvalPolicy":    approvalPolicy(session.ModeStrict),
+		"approvalsReviewer": approvalsReviewer(session.ModeStrict),
+		"config":            strictThreadConfig(session.ModeStrict),
+		"permissions":       threadPermissions(session.ModeStrict),
 	}
-	return ""
-}
-
-func turnSandboxPolicy(mode session.Mode) *sandboxPolicy {
-	if mode == session.ModeStrict {
-		return &sandboxPolicy{Type: "readOnly", NetworkAccess: false}
-	}
-	return nil
 }
 
 func translateThread(raw wireThread) (agentruntime.Thread, error) {

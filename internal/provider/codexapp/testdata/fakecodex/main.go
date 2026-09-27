@@ -145,6 +145,10 @@ func fakeDataPath(environmentName, fileName string) string {
 func (s *fakeServer) handle(message envelope) {
 	switch message.Method {
 	case "initialize":
+		if err := validateInitialize(message.Params); err != nil {
+			s.writeError(message.ID, err)
+			return
+		}
 		s.write(message.ID, map[string]any{
 			"codexHome": "/tmp/codex", "platformFamily": "unix",
 			"platformOs": "macos", "userAgent": "fake-codex",
@@ -166,6 +170,10 @@ func (s *fakeServer) handle(message envelope) {
 	case "model/list":
 		s.writeModels(message)
 	case "thread/start":
+		if err := validateStrictThreadStart(message.Params); err != nil {
+			s.writeError(message.ID, err)
+			return
+		}
 		thread := fakeThread{ID: "thread-1"}
 		s.storeThread(thread)
 		if invalidMutation(message.Method) {
@@ -173,6 +181,10 @@ func (s *fakeServer) handle(message envelope) {
 		}
 		s.write(message.ID, map[string]any{"thread": thread})
 	case "thread/resume":
+		if err := validateStrictThreadRestore(message.Params); err != nil {
+			s.writeError(message.ID, err)
+			return
+		}
 		thread := s.threadFrom(message.Params)
 		s.write(message.ID, map[string]any{"thread": thread})
 	case "thread/read":
@@ -182,6 +194,10 @@ func (s *fakeServer) handle(message envelope) {
 		}
 		s.write(message.ID, map[string]any{"thread": thread})
 	case "turn/start":
+		if err := validateStrictTurnStart(message.Params); err != nil {
+			s.writeError(message.ID, err)
+			return
+		}
 		if invalidMutation(message.Method) {
 			s.write(message.ID, map[string]any{"turn": map[string]any{}})
 			return
@@ -196,6 +212,10 @@ func (s *fakeServer) handle(message envelope) {
 		}
 		s.write(message.ID, map[string]any{"turnId": turnID})
 	case "thread/fork":
+		if err := validateStrictThreadRestore(message.Params); err != nil {
+			s.writeError(message.ID, err)
+			return
+		}
 		thread := fakeThread{ID: "thread-fork"}
 		s.storeThread(thread)
 		if invalidMutation(message.Method) {
@@ -411,6 +431,81 @@ func (s *fakeServer) request(id int, method string, params any) {
 
 func (s *fakeServer) write(id json.RawMessage, result any) {
 	s.writeEnvelope(map[string]any{"id": id, "result": result})
+}
+
+func (s *fakeServer) writeError(id json.RawMessage, err error) {
+	s.writeEnvelope(map[string]any{"id": id, "error": map[string]any{"code": -32602, "message": err.Error()}})
+}
+
+func validateInitialize(raw json.RawMessage) error {
+	var params struct {
+		Capabilities struct {
+			ExperimentalAPI bool `json:"experimentalApi"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return err
+	}
+	if !params.Capabilities.ExperimentalAPI {
+		return errors.New("experimental API capability missing")
+	}
+	return nil
+}
+
+func validateStrictThreadStart(raw json.RawMessage) error {
+	var params struct {
+		ApprovalPolicy    string         `json:"approvalPolicy"`
+		ApprovalsReviewer string         `json:"approvalsReviewer"`
+		Sandbox           string         `json:"sandbox"`
+		Permissions       string         `json:"permissions"`
+		Config            map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return err
+	}
+	if params.ApprovalPolicy != "on-request" || params.ApprovalsReviewer != "user" || params.Sandbox != "" || params.Permissions != "rudy_strict" ||
+		params.Config["features.apps"] != false || params.Config["features.exec_permission_approvals"] != true ||
+		params.Config["features.plugins"] != false || params.Config["features.remote_plugin"] != false ||
+		params.Config["features.request_permissions_tool"] != true {
+		return fmt.Errorf("strict thread policy missing: %+v", params)
+	}
+	return nil
+}
+
+func validateStrictThreadRestore(raw json.RawMessage) error {
+	var params struct {
+		ApprovalPolicy    string         `json:"approvalPolicy"`
+		ApprovalsReviewer string         `json:"approvalsReviewer"`
+		Permissions       string         `json:"permissions"`
+		Sandbox           string         `json:"sandbox"`
+		Config            map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return err
+	}
+	if params.ApprovalPolicy != "on-request" || params.ApprovalsReviewer != "user" || params.Permissions != "rudy_strict" || params.Sandbox != "" ||
+		params.Config["features.apps"] != false || params.Config["features.exec_permission_approvals"] != true ||
+		params.Config["features.plugins"] != false || params.Config["features.remote_plugin"] != false ||
+		params.Config["features.request_permissions_tool"] != true {
+		return fmt.Errorf("strict restored thread policy missing: %+v", params)
+	}
+	return nil
+}
+
+func validateStrictTurnStart(raw json.RawMessage) error {
+	var params struct {
+		ApprovalPolicy    string          `json:"approvalPolicy"`
+		ApprovalsReviewer string          `json:"approvalsReviewer"`
+		Permissions       string          `json:"permissions"`
+		SandboxPolicy     json.RawMessage `json:"sandboxPolicy"`
+	}
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return err
+	}
+	if params.ApprovalPolicy != "on-request" || params.ApprovalsReviewer != "user" || params.Permissions != "rudy_strict" || len(params.SandboxPolicy) != 0 {
+		return fmt.Errorf("strict turn policy missing: %+v", params)
+	}
+	return nil
 }
 
 func (s *fakeServer) writeEnvelope(value any) {

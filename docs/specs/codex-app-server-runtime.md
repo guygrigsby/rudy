@@ -2,7 +2,7 @@
 
 - Status: approved in design session
 - Date: 2026-09-26
-- Minimum Codex CLI: 0.155.1
+- Reviewed Codex CLI: exactly 0.155.1
 - Companion artifacts: [context map](rudy-context-map.md), [domain model](rudy-domain-model.md), [contracts](rudy-contracts.md), [ADR 0045](../adr/0045-codex-app-server-runtime.md)
 
 ## Outcome
@@ -49,7 +49,7 @@ private registration path.
 
 One lazy `codex app-server` subprocess serves one Rudy kernel process. The
 first account, model or thread operation starts it. Rudy resolves `codex` from
-`PATH`, requires version 0.155.1 or newer, starts it with argv rather than a
+`PATH`, requires exactly version 0.155.1, starts it with argv rather than a
 shell and speaks newline-delimited JSON on stdio.
 
 The operational environment allowlist is `CODEX_HOME`, `HOME`, `PATH`, `SHELL`,
@@ -59,6 +59,16 @@ variables when they exist. Explicit process overrides replace or add individual
 variables. No other variable from the Rudy process crosses into Codex, so
 provider keys and service credentials cannot become ambient input to Codex
 tools (ADR 0047).
+The built-in runtime forces `CODEX_HOME` to `$XDG_DATA_HOME/rudy/codex`; an
+ambient or explicit process value cannot replace it. Codex owns the account
+files there. Rudy owns an exact `config.toml` defining the `rudy_strict`
+permission profile: minimal system paths and project roots are readable,
+dedicated and ambient Codex account homes are denied and network is disabled.
+A different `config.toml` or any `rules` path fails every
+operation closed. System and managed policy remain higher authority. Workspace
+project configuration remains untrusted because the dedicated home carries no
+project trust from another Codex client. The App Server process starts in the
+dedicated home; each thread receives its workspace explicitly (ADR 0049).
 
 The App Server connection has its own codec and bidirectional peer. App Server
 omits the JSON-RPC `jsonrpc` member. Rudy sends exactly one `initialize`, then
@@ -117,9 +127,10 @@ A new challenge for the same runtime supersedes the prior login id in that
 client. A late browser-opener result for the superseded id cannot start a
 second device attempt or cancel the device code already shown.
 
-Rudy stores no access token, refresh token, cookie, authorization code or
-client secret. Codex owns token persistence and refresh. Auth URLs and device
-codes exist only in the live challenge and are not written to session logs.
+Rudy never reads, copies or serializes an access token, refresh token, cookie,
+authorization code or client secret. Codex owns token persistence and refresh
+inside the dedicated Codex home. Auth URLs and device codes exist only in the
+live challenge and are not written to session logs.
 
 ## Models
 
@@ -132,12 +143,17 @@ The current Rudy runtime submit path sends text only, so an advertised image
 input modality does not set Rudy's `vision` capability until image submission
 is supported end to end.
 
-`strict`, `permissive` and `off` map to App Server approval policies
-`untrusted`, `on-request` and `never`. Strict mode also forces `read-only` at
-`thread/start` and `{type:"readOnly",networkAccess:false}` at `turn/start`, so
-workspace writes, network access and unsandboxed commands cross Rudy's durable
-approval boundary. Permissive and off modes leave the App Server sandbox policy
-to the operator's Codex configuration. Thinking targets `minimal`, `low`,
+Strict mode selects the `rudy_strict` permission profile and `on-request`
+approval policy at thread start, resume, fork and every turn. It routes review
+to `user`, enables scoped exec and permission requests and disables App Server
+apps, plugins and remote plugins. Rudy rejects any requested filesystem grant
+at or below the dedicated or ambient Codex account homes, including paths that
+resolve there through a symlink. The base profile reads only minimal system
+paths and project roots. App Server 0.155.1 does not expose paths in file-change
+approval requests, so Rudy denies those opaque requests; Codex must request a
+validated scoped permission first. Codex runtime sessions reject `permissive`
+and `off`; supporting them would let one session persist authority that
+bypasses a later strict session. Thinking targets `minimal`, `low`,
 `medium` and `high`; an unsupported target falls to the nearest advertised
 lower effort or the lowest advertised effort. Rudy does not promote `high` to
 `xhigh`.
@@ -269,12 +285,14 @@ cannot resolve a replacement process's request.
 
 ## Verification
 
-Fixtures are generated from the minimum supported Codex version and committed
+Fixtures are generated from the reviewed Codex version and committed
 without credentials. Tests cover initialization order, both login modes,
 completion races, cancellation before fallback, pagination, thread start,
 resume, fork, turn start, steer, interrupt, item projection, deterministic ids,
 approval binding, durable allow ordering, fail-closed paths, redaction, process
-restart, ambiguous non-retry and process environment isolation.
+restart, ambiguous non-retry and process environment isolation. An opt-in test
+starts the installed 0.155.1 App Server and proves workspace reads succeed while
+workspace writes, network access and reads from both Codex account homes fail.
 
 The real path gate runs a fake App Server binary through the actual subprocess
 transport, then drives `/login`, session creation, a turn, approval and resume

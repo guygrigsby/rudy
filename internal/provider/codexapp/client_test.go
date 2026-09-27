@@ -97,20 +97,24 @@ func TestConcurrentStartProducesOneProcess(t *testing.T) {
 	}
 }
 
-func TestStartRejectsCodexBelowMinimumVersion(t *testing.T) {
-	logPath := filepath.Join(t.TempDir(), "methods")
-	client := codexapp.NewClient(fakeCommand(t,
-		"FAKE_CODEX_LOG="+logPath,
-		"FAKE_CODEX_VERSION=0.154.9",
-	))
-	t.Cleanup(func() { _ = client.Close() })
+func TestStartRejectsUnreviewedCodexVersions(t *testing.T) {
+	for _, version := range []string{"0.154.9", "0.155.2", "0.155.1-dev"} {
+		t.Run(version, func(t *testing.T) {
+			logPath := filepath.Join(t.TempDir(), "methods")
+			client := codexapp.NewClient(fakeCommand(t,
+				"FAKE_CODEX_LOG="+logPath,
+				"FAKE_CODEX_VERSION="+version,
+			))
+			t.Cleanup(func() { _ = client.Close() })
 
-	err := client.Start(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "requires codex-cli >= 0.155.1") {
-		t.Fatalf("Start error = %v, want minimum-version error", err)
-	}
-	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("app server started despite old version: %v", err)
+			err := client.Start(context.Background())
+			if err == nil || !strings.Contains(err.Error(), version) {
+				t.Fatalf("Start error = %v, want reviewed-version error", err)
+			}
+			if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("app server started despite unreviewed version: %v", err)
+			}
+		})
 	}
 }
 
@@ -120,8 +124,14 @@ func TestProcessEnvironmentExcludesAmbientVariables(t *testing.T) {
 		"FAKE_CODEX_ENV_LOG="+envPath,
 		"FAKE_CODEX_FORBID_ENV=RUDY_AMBIENT_SECRET",
 		"RUDY_EXPLICIT_SETTING=enabled",
+		"CODEX_HOME=/explicit/unsafe-home",
 		"SHELL=/explicit/shell",
 	)
+	isolatedHome := filepath.Join(t.TempDir(), "rudy-codex")
+	if err := os.Mkdir(isolatedHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command.CodexHome = isolatedHome
 	t.Setenv("HOME", "/ambient/home")
 	t.Setenv("SHELL", "/ambient/shell")
 	t.Setenv("RUDY_AMBIENT_SECRET", "must-not-cross-process-boundary")
@@ -156,8 +166,38 @@ func TestProcessEnvironmentExcludesAmbientVariables(t *testing.T) {
 	if got, want := environment["SHELL"], "/explicit/shell"; got != want {
 		t.Fatalf("SHELL = %q, want explicit override %q", got, want)
 	}
+	resolvedHome, err := filepath.EvalSymlinks(isolatedHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := environment["CODEX_HOME"]; got != resolvedHome {
+		t.Fatalf("CODEX_HOME = %q, want isolated home %q", got, resolvedHome)
+	}
+	if info, err := os.Stat(isolatedHome); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("isolated CODEX_HOME: info=%v err=%v", info, err)
+	}
 	if got, want := environment["RUDY_EXPLICIT_SETTING"], "enabled"; got != want {
 		t.Fatalf("RUDY_EXPLICIT_SETTING = %q, want %q", got, want)
+	}
+}
+
+func TestStartRejectsAuthorityFilesInDedicatedCodexHome(t *testing.T) {
+	for _, relative := range []string{"config.toml", filepath.Join("rules", "injected.rules")} {
+		t.Run(relative, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, relative)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("injected"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			client := codexapp.NewClient(codexapp.Command{Path: "/does/not/start", CodexHome: home})
+			t.Cleanup(func() { _ = client.Close() })
+			if err := client.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "authority file") {
+				t.Fatalf("Start error = %v, want authority-file rejection", err)
+			}
+		})
 	}
 }
 

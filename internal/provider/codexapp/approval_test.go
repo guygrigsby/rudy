@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,8 +37,13 @@ func (s *approvalSink) RequestApproval(_ context.Context, question agentruntime.
 
 func sendInboundApproval(t *testing.T, sink agentruntime.Sink, payload string) map[string]json.RawMessage {
 	t.Helper()
+	return sendInboundApprovalWithCommand(t, Command{}, sink, payload)
+}
+
+func sendInboundApprovalWithCommand(t *testing.T, command Command, sink agentruntime.Sink, payload string) map[string]json.RawMessage {
+	t.Helper()
 	clientConn, serverConn := net.Pipe()
-	client := NewClient(Command{})
+	client := NewClient(command)
 	client.SetSink(sink)
 	t.Cleanup(func() { _ = client.Close() })
 	peer := newPeer(clientConn, clientConn, clientConn, client.handleRequest, nil)
@@ -68,27 +76,116 @@ func TestCommandApprovalPreservesStringRequestIDAndSessionDecision(t *testing.T)
 	}
 }
 
-func TestFileApprovalPreservesNumericRequestIDAndMapsDecisions(t *testing.T) {
+func TestCommandApprovalCarriesScopedAdditionalPermissions(t *testing.T) {
+	sink := &approvalSink{answer: agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}}
+	response := sendInboundApproval(t, sink, `{"id":43,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"command":"touch result","cwd":"/repo","additionalPermissions":{"fileSystem":{"write":["/repo"]},"network":{"enabled":true}},"availableDecisions":["accept","decline"]}}`)
+	if string(response["result"]) != `{"decision":"accept"}` {
+		t.Fatalf("response = %v", response)
+	}
+	want := []string{`fileSystem:{"write":["/repo"]}`, `network:{"enabled":true}`}
+	if !reflect.DeepEqual(sink.question.Permissions, want) {
+		t.Fatalf("permissions = %v, want %v", sink.question.Permissions, want)
+	}
+}
+
+func TestApprovalRejectsPermissionsInsideCodexHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "codex")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(home, alias); err != nil {
+		t.Fatal(err)
+	}
+	homeJSON, _ := json.Marshal(filepath.Join(home, "config.toml"))
+	aliasJSON, _ := json.Marshal(filepath.Join(alias, "rules", "injected.rules"))
 	tests := []struct {
-		name     string
-		answer   agentruntime.ApprovalAnswer
-		decision string
+		name        string
+		method      string
+		permissions string
+		want        string
 	}{
-		{"once", agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}, "accept"},
-		{"session", agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeSession}, "acceptForSession"},
-		{"deny", agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionDeny, Scope: agentruntime.ScopeOnce}, "decline"},
+		{"legacy write", methodItemCommandExecutionApproval, `{"fileSystem":{"write":[` + string(homeJSON) + `]}}`, `{"decision":"decline"}`},
+		{"explicit entry", methodItemCommandExecutionApproval, `{"fileSystem":{"entries":[{"access":"write","path":{"type":"path","path":` + string(homeJSON) + `}}]}}`, `{"decision":"decline"}`},
+		{"symlink", methodItemCommandExecutionApproval, `{"fileSystem":{"read":[` + string(aliasJSON) + `]}}`, `{"decision":"decline"}`},
+		{"unknown filesystem member", methodItemCommandExecutionApproval, `{"fileSystem":{"futureGrant":` + string(homeJSON) + `}}`, `{"decision":"decline"}`},
+		{"malformed filesystem member", methodItemCommandExecutionApproval, `{"fileSystem":{"entries":"all"}}`, `{"decision":"decline"}`},
+		{"permission request", methodItemPermissionsApproval, `{"fileSystem":{"write":[` + string(homeJSON) + `]}}`, `{"permissions":{}}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			sink := &approvalSink{answer: test.answer}
-			response := sendInboundApproval(t, sink, `{"id":42,"method":"item/fileChange/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"reason":"write file","grantRoot":"/repo"}}`)
-			if string(response["id"]) != `42` || string(response["result"]) != `{"decision":"`+test.decision+`"}` {
-				t.Fatalf("response = %v", response)
+			sink := &approvalSink{answer: agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}}
+			field := "additionalPermissions"
+			if test.method == methodItemPermissionsApproval {
+				field = "permissions"
 			}
-			if sink.question.RequestID != "42" || sink.question.Kind != agentruntime.ApprovalFileChange || sink.question.Reason != "write file" || !reflect.DeepEqual(sink.question.AllowedScopes, []agentruntime.ApprovalScope{agentruntime.ScopeOnce, agentruntime.ScopeSession}) {
-				t.Fatalf("question = %+v", sink.question)
+			payload := `{"id":44,"method":"` + test.method + `","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":"/repo","availableDecisions":["accept","decline"],"` + field + `":` + test.permissions + `}}`
+			response := sendInboundApprovalWithCommand(t, Command{CodexHome: home}, sink, payload)
+			if string(response["result"]) != test.want {
+				t.Fatalf("response = %v, want %s", response, test.want)
+			}
+			if sink.calls != 0 {
+				t.Fatalf("protected permission reached asker %d times", sink.calls)
 			}
 		})
+	}
+	altHome := filepath.Join(filepath.Dir(home), strings.ToUpper(filepath.Base(home)))
+	if altInfo, err := os.Stat(altHome); err == nil {
+		homeInfo, statErr := os.Stat(home)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		if os.SameFile(altInfo, homeInfo) {
+			t.Run("case alias", func(t *testing.T) {
+				protectedJSON, _ := json.Marshal(filepath.Join(altHome, "config.toml"))
+				sink := &approvalSink{answer: agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}}
+				payload := `{"id":46,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":"/repo","availableDecisions":["accept","decline"],"additionalPermissions":{"fileSystem":{"write":[` + string(protectedJSON) + `]}}}}`
+				response := sendInboundApprovalWithCommand(t, Command{CodexHome: home}, sink, payload)
+				if string(response["result"]) != `{"decision":"decline"}` || sink.calls != 0 {
+					t.Fatalf("response = %v, calls = %d", response, sink.calls)
+				}
+			})
+		}
+	}
+	t.Run("file change root", func(t *testing.T) {
+		sink := &approvalSink{answer: agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}}
+		payload := `{"id":45,"method":"item/fileChange/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":"/repo","grantRoot":` + string(homeJSON) + `}}`
+		response := sendInboundApprovalWithCommand(t, Command{CodexHome: home}, sink, payload)
+		if string(response["result"]) != `{"decision":"decline"}` || sink.calls != 0 {
+			t.Fatalf("response = %v, calls = %d", response, sink.calls)
+		}
+	})
+}
+
+func TestApprovalAllowsScopedPermissionOutsideCodexHome(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "missing-operator-home"))
+	t.Setenv("CODEX_HOME", "")
+	home := filepath.Join(root, "codex")
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspaceJSON, _ := json.Marshal(workspace)
+	sink := &approvalSink{answer: agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}}
+	payload := `{"id":47,"method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"cwd":` + string(workspaceJSON) + `,"availableDecisions":["accept","decline"],"additionalPermissions":{"fileSystem":{"write":[` + string(workspaceJSON) + `]}}}}`
+	response := sendInboundApprovalWithCommand(t, Command{CodexHome: home}, sink, payload)
+	if string(response["result"]) != `{"decision":"accept"}` || sink.calls != 1 {
+		t.Fatalf("response = %v, calls = %d", response, sink.calls)
+	}
+}
+
+func TestFileApprovalDeniesOpaqueChanges(t *testing.T) {
+	sink := &approvalSink{answer: agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}}
+	response := sendInboundApproval(t, sink, `{"id":42,"method":"item/fileChange/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","startedAtMs":1,"reason":"write file","grantRoot":"/repo"}}`)
+	if string(response["id"]) != `42` || string(response["result"]) != `{"decision":"decline"}` {
+		t.Fatalf("response = %v", response)
+	}
+	if sink.calls != 0 {
+		t.Fatalf("opaque file approval reached asker %d times", sink.calls)
 	}
 }
 

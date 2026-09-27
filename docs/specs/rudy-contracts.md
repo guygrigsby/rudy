@@ -136,11 +136,17 @@ Server. It sends `initialize` then `initialized`, pages `model/list`, uses
 `thread/resume`, `thread/fork`, `thread/read`, `turn/start`, `turn/steer` and
 `turn/interrupt`, then translates documented events and inbound requests.
 
-Rudy sends App Server approval policy `untrusted`, `on-request` and `never` for
-permission mode `strict`, `permissive` and `off`. Strict sends sandbox mode
-`read-only` on `thread/start` and sandbox policy
-`{type:"readOnly",networkAccess:false}` on every `turn/start`. Permissive and
-off do not override the operator's App Server sandbox configuration.
+Rudy accepts only strict permission mode for Codex. It selects the immutable
+`rudy_strict` profile and `on-request` approval policy at thread start, resume,
+fork and every turn, routes review to `user`, enables
+`features.exec_permission_approvals` and `features.request_permissions_tool`
+and disables `features.apps`, `features.plugins` and
+`features.remote_plugin`. The profile reads only minimal system paths and
+project roots, denies dedicated and ambient Codex account homes and disables
+network. Rudy rejects `permissive` and `off` before
+starting a process or mutating a thread. Every operation requires Rudy's exact
+`config.toml` and rejects any `rules` path. Filesystem grants at or below either
+account home fail closed. Opaque file-change approvals always decline.
 Thinking levels target `minimal`, `low`, `medium` and `high` in that order;
 `off` targets `minimal`. If the target is absent, choose the nearest advertised
 lower effort, or the lowest advertised effort when none is lower. Rudy never
@@ -156,10 +162,11 @@ Unknown inbound requests receive an immediate method error. The supported
 `item/tool/call` request receives `{contentItems:[],success:false}`. These
 schema-valid cancellations expose neither user input nor dynamic tool execution
 and do not call Rudy's approval asker. MCP elicitation is unsupported.
-Command and file requests deny on failure. Permission requests grant an empty
-set on failure. Pending approval UI clears only on request-resolved or terminal
-turn completion. The prompt renders every opaque requested permission member
-before an allow key can grant it.
+Command requests deny on failure. Permission requests grant an empty set on
+failure. File-change requests always decline because 0.155.1 omits their target
+paths. Pending approval UI clears only on request-resolved or terminal turn
+completion. The prompt renders every opaque requested permission member before
+an allow key can grant it.
 
 Pass 9, 2026-09-14: daemon shutdown completion gains explicit terminal proof (ADR 0031). After successful cleanup the retained control connection receives `server.stopped {instance_id, state: "stopped"}` before EOF. Bare EOF means crash, transport loss or failed cleanup and never authorizes replacement. A tentative shutdown claim fences work without moving public Server state. Recorded with the security hardening before final verification.
 
@@ -946,7 +953,7 @@ Every transition traced through protocol, event and record, else a recorded reas
 | PluginRegistry.Register* | `plugin.register_*`, `plugin.set_status` | `CapabilityRegistered`, `CapabilityRejected` | none; capabilities are runtime |
 | Registry.Refresh | `registry.refresh`, implicit on open | `RegistryRefreshed` | `registry.json` |
 | Runtime login | `/login` through `command.run`, runtime login methods and caller-private notifications | `LoginStarted`, `LoginChallenged`, `LoginCompleted` | none; Codex owns credentials and challenges are ephemeral |
-| Runtime process start, fail and lazy restart | the version probe and App Server receive only the documented operational environment allowlist plus explicit process overrides; active turns emit `runtime_failed` and linked Sessions reject submit or fork as `ambiguous` until `session.resume` reads canonical history; the next account, model or thread operation starts a replacement process | `RuntimeFailed`, `RuntimeStarted` | existing `runtime.toml` read on resume; lost non-idempotent calls never replayed |
+| Runtime process start, fail and lazy restart | the version probe and App Server receive only the documented operational environment allowlist plus explicit process overrides; the built-in forces `CODEX_HOME` to `$XDG_DATA_HOME/rudy/codex`; active turns emit `runtime_failed` and linked Sessions reject submit or fork as `ambiguous` until `session.resume` reads canonical history; the next account, model or thread operation starts a replacement process | `RuntimeFailed`, `RuntimeStarted` | existing `runtime.toml` read on resume; lost non-idempotent calls never replayed |
 | session close | `session.close` | `session_closed` hook | none; closing is a connection fact, not a conversation fact |
 
 Invariants and where they are enforced:

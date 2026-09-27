@@ -5,9 +5,9 @@ bullet here is what a person sees when they open the client on that build.
 
 ## 0.2.0
 
-- Runs Codex App Server sessions with browser or device login through `/login`
+- Runs strict Codex App Server sessions with browser or device login through `/login`
 - Resumes Codex threads across client and server restarts
-- Routes Codex command, file and permission approvals through Rudy
+- Routes Codex command and scoped permission approvals through Rudy
 
 ## 0.1.0
 

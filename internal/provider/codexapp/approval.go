@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/guygrigsby/rudy/internal/agentruntime"
@@ -19,7 +21,6 @@ type approvalParams struct {
 	Command                *string            `json:"command"`
 	CWD                    *string            `json:"cwd"`
 	Reason                 *string            `json:"reason"`
-	GrantRoot              *string            `json:"grantRoot"`
 	Kind                   string             `json:"kind"`
 	AvailableDecisions     *[]json.RawMessage `json:"availableDecisions"`
 	NetworkApprovalContext *struct {
@@ -96,6 +97,9 @@ func (c *Client) handleRequest(ctx context.Context, requestID, method string, ra
 			question.Network = []agentruntime.NetworkPermission{{Host: network.Host, Protocol: network.Protocol}}
 		}
 		if len(params.AdditionalPermissions) > 0 && string(params.AdditionalPermissions) != "null" {
+			if protectedPermissionRequest(params.AdditionalPermissions, question.CWD, protectedCodexPaths(c.command)) {
+				return deny, nil
+			}
 			var err error
 			question.Permissions, _, err = permissionMembers(params.AdditionalPermissions)
 			if err != nil {
@@ -103,15 +107,14 @@ func (c *Client) handleRequest(ctx context.Context, requestID, method string, ra
 			}
 		}
 	case methodItemFileChangeApproval:
-		question.Kind = agentruntime.ApprovalFileChange
-		question.AllowedScopes = []agentruntime.ApprovalScope{agentruntime.ScopeOnce, agentruntime.ScopeSession}
-		if params.GrantRoot != nil {
-			question.Summary = *params.GrantRoot
-		}
+		return deny, nil
 	case methodItemPermissionsApproval:
 		question.Kind = agentruntime.ApprovalPermissions
 		question.AllowedScopes = []agentruntime.ApprovalScope{agentruntime.ScopeOnce, agentruntime.ScopeSession}
 		if params.CWD == nil || question.CWD == "" {
+			return deny, nil
+		}
+		if protectedPermissionRequest(params.Permissions, question.CWD, protectedCodexPaths(c.command)) {
 			return deny, nil
 		}
 		var err error
@@ -223,4 +226,135 @@ func permissionMembers(raw json.RawMessage) ([]string, map[string]json.RawMessag
 		members = append(members, name+":"+string(value))
 	}
 	return members, requested, nil
+}
+
+func protectedPermissionRequest(raw json.RawMessage, cwd string, protected []string) bool {
+	if len(protected) == 0 {
+		return false
+	}
+	var members map[string]json.RawMessage
+	if json.Unmarshal(raw, &members) != nil {
+		return true
+	}
+	filesystem, ok := members["fileSystem"]
+	if !ok || string(filesystem) == "null" {
+		return false
+	}
+	var filesystemMembers map[string]json.RawMessage
+	if json.Unmarshal(filesystem, &filesystemMembers) != nil {
+		return true
+	}
+	for name := range filesystemMembers {
+		if !oneOf(name, "read", "write", "entries", "globScanMaxDepth") {
+			return true
+		}
+	}
+	var profile struct {
+		FileSystem *struct {
+			Read    []string `json:"read"`
+			Write   []string `json:"write"`
+			Entries []struct {
+				Access string `json:"access"`
+				Path   struct {
+					Type string `json:"type"`
+					Path string `json:"path"`
+				} `json:"path"`
+			} `json:"entries"`
+		} `json:"fileSystem"`
+	}
+	if json.Unmarshal(raw, &profile) != nil || profile.FileSystem == nil {
+		return true
+	}
+	for _, path := range append(profile.FileSystem.Read, profile.FileSystem.Write...) {
+		if protectedByAnyPath(path, cwd, protected) {
+			return true
+		}
+	}
+	for _, entry := range profile.FileSystem.Entries {
+		if entry.Access == "deny" {
+			continue
+		}
+		if entry.Access != "read" && entry.Access != "write" {
+			return true
+		}
+		if entry.Path.Type != "path" || protectedByAnyPath(entry.Path.Path, cwd, protected) {
+			return true
+		}
+	}
+	return false
+}
+
+func protectedByAnyPath(path, cwd string, protected []string) bool {
+	for _, root := range protected {
+		if protectedPath(path, cwd, root) {
+			return true
+		}
+	}
+	return false
+}
+
+func protectedPath(path, cwd, home string) bool {
+	if home == "" {
+		return false
+	}
+	if path == "" {
+		return true
+	}
+	if !filepath.IsAbs(path) {
+		if cwd == "" || !filepath.IsAbs(cwd) {
+			return true
+		}
+		path = filepath.Join(cwd, path)
+	}
+	path = resolvedPath(path)
+	home = resolvedPath(home)
+	if sameFileAncestor(path, home) {
+		return true
+	}
+	relative, err := filepath.Rel(home, path)
+	return err != nil || relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+}
+
+func sameFileAncestor(path, home string) bool {
+	homeInfo, err := os.Stat(home)
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	for current := path; ; current = filepath.Dir(current) {
+		info, err := os.Stat(current)
+		if err == nil && os.SameFile(info, homeInfo) {
+			return true
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+	}
+}
+
+func resolvedPath(path string) string {
+	path = filepath.Clean(path)
+	current := path
+	var suffix []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := range len(suffix) {
+				resolved = filepath.Join(resolved, suffix[len(suffix)-1-i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return path
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return path
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
 }

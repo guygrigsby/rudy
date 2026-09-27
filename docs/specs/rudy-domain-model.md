@@ -753,7 +753,7 @@ the `codex` AgentRuntime implementation and anti-corruption layer.
 
 ### Behaviors
 
-- `Start()` resolves `codex` from `PATH`, verifies the minimum version, starts
+- `Start()` resolves `codex` from `PATH`, verifies exact version 0.155.1, starts
   `codex app-server`, initializes the peer and moves to ready.
 - `Fail(reason)` cancels pending approvals, marks each active turn failed
   locally and fences its Session as ambiguous. It does not restart on a timer.
@@ -769,8 +769,17 @@ the `codex` AgentRuntime implementation and anti-corruption layer.
 - The version probe and App Server inherit only the documented operational
   environment allowlist plus explicit process overrides. Rudy credentials are
   never ambient Codex process input.
-- Strict permission mode fixes the Codex sandbox to read-only without network
-  and uses `untrusted` approval, so effects require Rudy's durable decision.
+- The built-in runtime forces a dedicated Codex home under Rudy's XDG data
+  directory, separating account persistence from external Codex rules, MCP
+  servers, app approvals and project trust. Rudy requires its exact
+  `config.toml` and rejects any `rules` path there.
+- Strict permission mode selects a minimal-system-read, project-root-read,
+  account-homes-denied, no-network profile with `on-request` human review.
+  Scoped permission requests are enabled; grants into either account home and
+  opaque file-change requests are denied. Apps, plugins and remote plugins are
+  disabled. Codex sessions reject permissive and off mode.
+- System and managed Codex policy remains a trusted operator or organization
+  boundary. Workspace project configuration remains untrusted.
 - Raw stderr, credentials and vendor error payloads never cross the ACL.
 
 ### States

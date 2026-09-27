@@ -418,7 +418,7 @@ func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []erro
 func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cfg.Secrets.File) }
 	return append(BuiltinTools(), webplugin.New(cfg.Web, version, resolve),
-		subagents.New(paths.Config), codexplugin.New(codexapp.NewClient(codexapp.Command{})), initcmd.New(), compactcmd.New(), commands.New(),
+		subagents.New(paths.Config), codexplugin.New(codexapp.NewClient(codexapp.Command{CodexHome: filepath.Join(paths.Data, "codex")})), initcmd.New(), compactcmd.New(), commands.New(),
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
 		newMCPPlugin(cfg, paths, resolve, version),
 		openaichatplugin.New(cfg.Providers, httpc, resolve),

@@ -74,6 +74,9 @@ func (c *Client) Start(ctx context.Context) error {
 	if c.closed {
 		return errors.New("codex app server client is closed")
 	}
+	if err := prepareCodexHome(c.command.CodexHome, c.command.Env); err != nil {
+		return err
+	}
 	if c.process != nil && c.process.peer.alive() {
 		return nil
 	}
@@ -99,7 +102,7 @@ func (c *Client) Start(ctx context.Context) error {
 			"title":   "Rudy",
 			"version": "0",
 		},
-		"capabilities": map[string]bool{"experimentalApi": false},
+		"capabilities": map[string]bool{"experimentalApi": true},
 	}, &initialized)
 	if err == nil {
 		err = process.peer.Notify(methodInitialized, map[string]any{})
@@ -120,6 +123,9 @@ func (c *Client) Start(ctx context.Context) error {
 }
 
 func (c *Client) StartTurn(ctx context.Context, request agentruntime.StartTurnRequest) (agentruntime.TurnRef, error) {
+	if err := requireStrictMode(request.Mode); err != nil {
+		return agentruntime.TurnRef{}, err
+	}
 	if err := c.Start(ctx); err != nil {
 		return agentruntime.TurnRef{}, err
 	}
@@ -129,16 +135,17 @@ func (c *Client) StartTurn(ctx context.Context, request agentruntime.StartTurnRe
 		return agentruntime.TurnRef{}, err
 	}
 	params := struct {
-		ThreadID       string         `json:"threadId"`
-		Input          []userInput    `json:"input"`
-		Model          string         `json:"model,omitempty"`
-		Effort         string         `json:"effort,omitempty"`
-		ApprovalPolicy string         `json:"approvalPolicy,omitempty"`
-		SandboxPolicy  *sandboxPolicy `json:"sandboxPolicy,omitempty"`
+		ThreadID          string      `json:"threadId"`
+		Input             []userInput `json:"input"`
+		Model             string      `json:"model,omitempty"`
+		Effort            string      `json:"effort,omitempty"`
+		ApprovalPolicy    string      `json:"approvalPolicy,omitempty"`
+		ApprovalsReviewer string      `json:"approvalsReviewer,omitempty"`
+		Permissions       string      `json:"permissions,omitempty"`
 	}{
 		ThreadID: request.Thread.ThreadID, Input: input, Model: request.Model.Model,
 		Effort: c.reasoningEffort(request.Model, request.Thinking), ApprovalPolicy: approvalPolicy(request.Mode),
-		SandboxPolicy: turnSandboxPolicy(request.Mode),
+		ApprovalsReviewer: approvalsReviewer(request.Mode), Permissions: threadPermissions(request.Mode),
 	}
 	var response struct {
 		Turn struct {
