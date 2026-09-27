@@ -79,16 +79,25 @@ func (c *Client) ReadThread(ctx context.Context, ref agentruntime.ThreadRef) (ag
 	if err := c.Start(ctx); err != nil {
 		return agentruntime.Thread{}, err
 	}
+	process := c.currentProcess()
+	if process == nil {
+		return agentruntime.Thread{}, errors.New("codex app server process unavailable")
+	}
 	var response struct {
 		Thread wireThread `json:"thread"`
 	}
-	if err := c.call(ctx, methodThreadRead, map[string]any{"threadId": ref.ThreadID, "includeTurns": true}, &response); err != nil {
+	if err := process.peer.Call(ctx, methodThreadRead, map[string]any{"threadId": ref.ThreadID, "includeTurns": true}, &response); err != nil {
 		return agentruntime.Thread{}, err
 	}
 	if response.Thread.ID != ref.ThreadID {
 		return agentruntime.Thread{}, errors.New("codex app server read a different thread")
 	}
-	return translateThread(response.Thread)
+	thread, err := translateThread(response.Thread)
+	if err != nil {
+		return agentruntime.Thread{}, err
+	}
+	c.trackRunningThread(ref, thread, process)
+	return thread, nil
 }
 
 func (c *Client) SteerTurn(ctx context.Context, request agentruntime.SteerTurnRequest) (agentruntime.TurnRef, error) {

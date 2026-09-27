@@ -1,6 +1,7 @@
 # rudy contracts
 
-Pass 10, 2026-09-26: Codex App Server joins as an AgentRuntime (ADR 0045).
+Pass 10, 2026-09-26: Codex App Server joins as an AgentRuntime (ADR 0045,
+revised by ADR 0046 for process recovery).
 Runtime sessions keep canonical conversation history outside Rudy, project it
 for clients and retain only local control and approval evidence. The Pass 10
 rows below replace same-method native assumptions only when
@@ -21,7 +22,7 @@ native sessions. Written before code.
 | `RuntimeTurn` | `{turn_id, status, items:[RuntimeItem], usage:Usage}`; `status` is `running`, `completed`, `interrupted` or `failed` |
 | `RuntimeItem` | `{item_id, type, status, content, command, cwd, output, changes, error}`; every field is present, unused strings and lists are empty, `content` is `[ContentBlock]`, `changes` is `[{path, kind}]`; supported types are `user_message`, `agent_message`, `reasoning`, `command`, `file_change`, `tool`, `plan`, `diff`, `warning`, `error` |
 | `ProjectedEntry` | `{id, at, kind, runtime, thread_id, turn_id, item_id, content, status, usage}`; `id` is a deterministic ULID-shaped digest, `at` is the runtime time or the projection time when absent, unused content is empty; derived and never an `entries.jsonl` record |
-| `RuntimeEvent` | one of `thread_started`, `thread_status`, `turn_started`, `turn_completed`, `item_started`, `item_delta`, `item_completed`, `diff_updated`, `plan_updated`, `usage_updated`, `warning`, `error`, `request_resolved`; each carries `thread_id`, an empty or non-empty `turn_id`, an empty or non-empty `item_id`, `request_id` empty except `request_resolved`, adapter-assigned receive `sequence`, `item:RuntimeItem`, `text`, `status`, `usage`; fields not used by the variant are the stated empty value |
+| `RuntimeEvent` | one of `thread_started`, `thread_status`, `turn_started`, `turn_completed`, `runtime_failed`, `item_started`, `item_delta`, `item_completed`, `diff_updated`, `plan_updated`, `usage_updated`, `warning`, `error`, `request_resolved`; each carries `thread_id`, an empty or non-empty `turn_id`, an empty or non-empty `item_id`, `request_id` empty except `request_resolved`, adapter-assigned receive `sequence`, `item:RuntimeItem`, `text`, `status`, `usage`; `runtime_failed` names the active thread and turn with `status:"failed"`; fields not used by the variant are the stated empty value |
 | `RuntimeApprovalQuestion` | `{runtime, request_id, thread_id, turn_id, item_id, kind, summary, command, cwd, reason, changes:[{path,kind}], network:[{host,protocol,port}], permissions:[string], allowed_scopes:[Scope]}`; `kind` is `command`, `file_change` or `permissions`; display fields may be empty and confer no authority |
 | `RuntimeApprovalAnswer` | `{decision, scope, reason, granted:[string]}`; `decision` is `allow` or `deny`; allow scope must be in `allowed_scopes`, deny always uses `once`; `granted` is used only for a permissions allow and is a subset of the requested permissions |
 
@@ -32,7 +33,7 @@ native sessions. Written before code.
 | `session.open` | resolves the selected model's registry owner and writes `SessionExecution{runtime}`. A configured runtime model may open before login or discovery. It creates no thread. Runtime execution accepts only a root Session under the default agent with absent `tools` narrowing | `unavailable` only when the named runtime is not registered; absence of an HTTP Provider is not an error; `refused_by_invariant` for `parent`, a non-default agent or explicit `tools`, since runtime-owned tools cannot honor Rudy delegation constraints | `session_opened` schema 3 |
 | `session.resume` | loads local control records, resumes a linked runtime thread, reads authoritative history and sends `runtime.entry` projections before the response. An unlinked pre-login session has no runtime history | `runtime_error` when the link exists but cannot be resumed or read | no conversation write |
 | `session.fork` | requires a linked rested thread and `at_entry_id` empty or equal to the newest projected id; calls runtime fork, reads and validates the distinct child thread and projects its canonical history before binding it | `refused_by_invariant` for an older projection, active turn or reused thread id; `ambiguous` on lost fork response; `runtime_error` if the child cannot be read faithfully | child `session_opened`, `fork_point`, `runtime.toml` and replayed child projection |
-| `session.submit` | on the first submit, starts and durably binds a thread before starting a turn; later typed input starts a turn and steer input steers the verified active runtime turn | `runtime_error` unauthenticated or runtime failure; `ambiguous` on lost non-idempotent response, which is never retried | no user or assistant conversation entry |
+| `session.submit` | on the first submit, starts and durably binds a thread before starting a turn; later typed input starts a turn and steer input steers the verified active runtime turn; a process-failed session must resume and read its canonical thread first | `runtime_error` unauthenticated or runtime failure; `ambiguous` on lost non-idempotent response or while canonical reconciliation is required, with no automatic retry | no user or assistant conversation entry |
 | `session.interrupt` | requests runtime turn interruption. The response is acknowledgment; terminal state waits for `turn_completed`. `how:steer` enters client steering and the next submit calls runtime steer only while that same runtime turn remains active; `how:cancel` does not accept later steer | `conflict` when expected runtime turn changed | no conversation write |
 | `session.answer` | native questions only. A runtime question answered here is `not_found` | none | `permission_decision` only |
 | `runtime.approval.answer` | verifies asker, session, active turn and pending request binding, appends the runtime decision, fsyncs an allow, then answers the owning runtime | `unauthorized`, `not_found` or `conflict` on the same rules as `session.answer`, plus `conflict` for any binding mismatch | `runtime_permission_decision` |
@@ -373,7 +374,7 @@ Delivery inside the process is synchronous and ordered per session. Published ev
 | name | aggregate | transition | payload | consumers | delivery | boundary | owner |
 |---|---|---|---|---|---|---|---|
 | `RuntimeStarted` | CodexRuntime | starting to ready | `{runtime, version}` | linked Sessions, clients as account state | sync | internal | AgentRuntime |
-| `RuntimeFailed` | CodexRuntime | starting or ready to failed | `{runtime, reason}` redacted | linked Sessions, restart coordinator, clients as notice | sync | internal | AgentRuntime |
+| `RuntimeFailed` | CodexRuntime | ready to failed with an active turn | `{thread_id, turn_id, status:"failed"}`; runtime identity is bound by the registered sink | linked Session, which marks the turn terminal and fences new work as ambiguous | ordered after preceding notifications for that process | internal | AgentRuntime |
 | `LoginStarted` | LoginAttempt | new to starting | `{runtime, mode, client_id}` with no challenge secret | account coordinator | sync | internal | AgentRuntime |
 | `LoginChallenged` | LoginAttempt | starting to challenged | `AuthChallenge` | invoking connection only | sync | internal | AgentRuntime |
 | `LoginCompleted` | LoginAttempt | starting or challenged to terminal | `{runtime, login_id, success, error}` redacted | invoking connection, Registry refresh on success | sync | internal | AgentRuntime |
@@ -937,7 +938,7 @@ Every transition traced through protocol, event and record, else a recorded reas
 | PluginRegistry.Register* | `plugin.register_*`, `plugin.set_status` | `CapabilityRegistered`, `CapabilityRejected` | none; capabilities are runtime |
 | Registry.Refresh | `registry.refresh`, implicit on open | `RegistryRefreshed` | `registry.json` |
 | Runtime login | `/login` through `command.run`, runtime login methods and caller-private notifications | `LoginStarted`, `LoginChallenged`, `LoginCompleted` | none; Codex owns credentials and challenges are ephemeral |
-| Runtime process fail and restart | runtime calls fail `runtime_error` or `ambiguous`; later calls wait for readiness | `RuntimeFailed`, `RuntimeStarted` | existing `runtime.toml` read for reconciliation; lost non-idempotent calls never replayed |
+| Runtime process fail and lazy restart | active turns emit `runtime_failed` and linked Sessions reject submit or fork as `ambiguous` until `session.resume` reads canonical history; the next account, model or thread operation starts a replacement process | `RuntimeFailed`, `RuntimeStarted` | existing `runtime.toml` read on resume; lost non-idempotent calls never replayed |
 | session close | `session.close` | `session_closed` hook | none; closing is a connection fact, not a conversation fact |
 
 Invariants and where they are enforced:

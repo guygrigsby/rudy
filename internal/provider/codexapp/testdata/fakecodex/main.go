@@ -221,7 +221,7 @@ func (s *fakeServer) startLogin(message envelope) {
 			"type": "chatgptDeviceCode", "loginId": loginID,
 			"verificationUrl": "https://auth.openai.com/device", "userCode": "OPENAI-CODE",
 		})
-		if !early {
+		if !early && os.Getenv("FAKE_CODEX_HOLD_LOGIN_COMPLETION") == "" {
 			s.stateMu.Lock()
 			s.state.Authenticated = true
 			s.persistLocked()

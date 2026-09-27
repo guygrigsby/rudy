@@ -5,6 +5,7 @@ package codexapp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -18,9 +19,12 @@ import (
 type Client struct {
 	command Command
 
-	mu      sync.Mutex
-	process *appProcess
-	closed  bool
+	mu            sync.Mutex
+	process       *appProcess
+	closed        bool
+	turnMu        sync.Mutex
+	activeTurns   map[string]activeTurn
+	finishedTurns map[string]string
 
 	sinkMu sync.RWMutex
 	sink   agentruntime.Sink
@@ -28,7 +32,8 @@ type Client struct {
 	loginMu        sync.Mutex
 	loginStart     chan struct{}
 	activeLogins   map[string]string
-	loginIDs       map[string]string
+	loginIDs       map[string]loginBinding
+	loginProcesses map[string]*appProcess
 	earlyLogins    map[string]wireLoginCompletion
 	finishedLogins map[string]struct{}
 	modelsMu       sync.Mutex
@@ -43,8 +48,11 @@ type Client struct {
 
 func NewClient(command Command) *Client {
 	c := &Client{
-		command: command, activeLogins: map[string]string{}, loginIDs: map[string]string{},
-		earlyLogins: map[string]wireLoginCompletion{}, finishedLogins: map[string]struct{}{},
+		command: command, activeLogins: map[string]string{}, loginIDs: map[string]loginBinding{},
+		loginProcesses: map[string]*appProcess{},
+		activeTurns:    map[string]activeTurn{},
+		finishedTurns:  map[string]string{},
+		earlyLogins:    map[string]wireLoginCompletion{}, finishedLogins: map[string]struct{}{},
 		loginStart: make(chan struct{}, 1), notifications: make(chan wireNotification, 256),
 		dispatchStop: make(chan struct{}), dispatchDone: make(chan struct{}),
 	}
@@ -57,15 +65,25 @@ func (c *Client) Start(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	var failedLogins []failedLogin
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	defer func() {
+		c.mu.Unlock()
+		c.emitFailedLogins(failedLogins)
+	}()
 	if c.closed {
 		return errors.New("codex app server client is closed")
 	}
 	if c.process != nil && c.process.peer.alive() {
 		return nil
 	}
-	process, err := startProcess(ctx, c.command, c.handleRequest, c.enqueueNotification)
+	if c.process != nil {
+		failedLogins = c.collectFailedProcessLogins(c.process)
+	}
+	var process *appProcess
+	process, err := startProcess(ctx, c.command, c.handleRequest, func(method string, params json.RawMessage) {
+		c.enqueueNotificationFrom(process, method, params)
+	})
 	if err != nil {
 		return err
 	}
@@ -92,11 +110,12 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	c.loginMu.Lock()
 	clear(c.activeLogins)
-	clear(c.loginIDs)
+	clear(c.loginProcesses)
 	clear(c.earlyLogins)
 	clear(c.finishedLogins)
 	c.loginMu.Unlock()
 	c.process = process
+	go c.watchProcess(process)
 	return nil
 }
 
@@ -104,6 +123,7 @@ func (c *Client) StartTurn(ctx context.Context, request agentruntime.StartTurnRe
 	if err := c.Start(ctx); err != nil {
 		return agentruntime.TurnRef{}, err
 	}
+	process := c.currentProcess()
 	input, err := turnInput(request.Content)
 	if err != nil {
 		return agentruntime.TurnRef{}, err
@@ -123,13 +143,15 @@ func (c *Client) StartTurn(ctx context.Context, request agentruntime.StartTurnRe
 			ID string `json:"id"`
 		} `json:"turn"`
 	}
-	if err := c.callMutation(ctx, methodTurnStart, params, &response); err != nil {
+	if err := c.callMutationOn(ctx, process, methodTurnStart, params, &response); err != nil {
 		return agentruntime.TurnRef{}, err
 	}
 	if response.Turn.ID == "" {
 		return agentruntime.TurnRef{}, errors.Join(agentruntime.ErrAmbiguous, errors.New("codex app server turn/start returned no turn id"))
 	}
-	return agentruntime.TurnRef{ThreadRef: request.Thread, TurnID: response.Turn.ID}, nil
+	ref := agentruntime.TurnRef{ThreadRef: request.Thread, TurnID: response.Turn.ID}
+	c.trackTurn(ref, process)
+	return ref, nil
 }
 
 func (c *Client) currentProcess() *appProcess {
@@ -157,7 +179,16 @@ func (c *Client) call(ctx context.Context, method string, params, result any) er
 }
 
 func (c *Client) callMutation(ctx context.Context, method string, params, result any) error {
-	err := c.call(ctx, method, params, result)
+	return c.callMutationOn(ctx, c.currentProcess(), method, params, result)
+}
+
+func (c *Client) callMutationOn(ctx context.Context, process *appProcess, method string, params, result any) error {
+	var err error
+	if process == nil {
+		err = &callNotSentError{err: errors.New("codex app server process unavailable")}
+	} else {
+		err = process.peer.Call(ctx, method, params, result)
+	}
 	if err == nil {
 		return nil
 	}

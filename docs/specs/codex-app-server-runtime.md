@@ -58,14 +58,16 @@ omits the JSON-RPC `jsonrpc` member. Rudy sends exactly one `initialize`, then
 client are not reused because they require JSON-RPC 2.0 envelopes and reject
 inbound requests.
 
-Runtime states are `stopped`, `starting`, `ready` and `failed`. EOF fails the
-active operation as ambiguous, denies every pending approval and starts one
-replacement process with bounded exponential backoff when a Codex-backed
-session remains attached. After restart Rudy initializes the connection,
-resumes each linked thread and reads it to reconcile canonical state. Rudy
-never retries `thread/start`, `thread/fork`, `turn/start` or `turn/steer` after
-a lost response because App Server exposes no idempotency key and the lost
-operation may have committed or run tools.
+Runtime states are `stopped`, `starting`, `ready` and `failed`. EOF fails every
+active turn locally, fences its Rudy session as ambiguous and cancels pending
+approval requests. It also fails login challenges owned by that process. The
+next account, model or thread operation starts one replacement process. A
+linked session must call `session.resume`, which
+resumes and reads the canonical thread, before another submit or fork. There
+is no background restart or retry timer. Rudy never replays `thread/start`,
+`thread/fork`, `turn/start` or `turn/steer` after a lost response because App
+Server exposes no idempotency key and the lost operation may have committed
+or run tools (ADR 0046).
 
 Stderr is diagnostic input, not user content. The adapter redacts bearer
 tokens, authorization codes, cookies and URL query values before bounded
@@ -240,8 +242,9 @@ preview.
   canonical thread state before accepting another turn.
 - Model discovery failure uses the last cached Codex models when available and
   reports the stale state.
-- Malformed or cross-routed events fail the affected runtime operation and are
-  never projected into another session.
+- Malformed events naming an active turn fail it locally and require canonical
+  reconciliation. Cross-routed events are discarded and never projected into
+  another session.
 - Unknown App Server error details map to a redacted runtime error. Raw vendor
   payloads do not leave the ACL.
 

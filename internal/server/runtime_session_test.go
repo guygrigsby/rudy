@@ -381,6 +381,38 @@ func TestRuntimeAmbiguousTurnRequiresReadReconciliation(t *testing.T) {
 	}
 }
 
+func TestRuntimeProcessLossRequiresReadReconciliation(t *testing.T) {
+	runtime := &sessionRuntime{}
+	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
+	runtime.links = h.store.RuntimeLinks()
+	client := h.dial(t, true)
+	info := openRuntimeSession(t, client, h.ws, nil)
+	submit := func() error {
+		var result protocol.SessionSubmitResult
+		return client.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+			SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("hello")},
+		}, &result)
+	}
+	if err := submit(); err != nil {
+		t.Fatal(err)
+	}
+	runtime.emit(agentruntime.Event{
+		Type: agentruntime.EventRuntimeFailed, ThreadID: "thread-1", TurnID: "turn-1",
+	})
+	err := submit()
+	var protocolErr *protocol.Error
+	if !errors.As(err, &protocolErr) || protocolErr.Code != protocol.CodeAmbiguous {
+		t.Fatalf("submit after process loss = %v, want ambiguous", err)
+	}
+	var resumed protocol.SessionInfo
+	if err := client.Call(context.Background(), protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if err := submit(); err != nil {
+		t.Fatalf("submit after canonical refresh: %v", err)
+	}
+}
+
 func TestRuntimeCompletionBeforeTurnStartResponseDoesNotResurrectTurn(t *testing.T) {
 	runtime := &sessionRuntime{completeBeforeStartResponse: true}
 	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))

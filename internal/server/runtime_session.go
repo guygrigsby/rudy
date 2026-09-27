@@ -547,6 +547,18 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 	case agentruntime.EventUsageUpdated:
 		rs.usage = event.Usage
 		usage = &protocol.RuntimeUsageUpdated{SessionID: ls.sess.ID().String(), TurnID: event.TurnID, Usage: rs.usage}
+	case agentruntime.EventRuntimeFailed:
+		if event.TurnID == "" || activeID != event.TurnID {
+			rs.mu.Unlock()
+			return
+		}
+		rs.ambiguous = true
+		rs.active = nil
+		rs.terminal = event.TurnID
+		rs.steering = false
+		clear(rs.items)
+		state = &protocol.TurnStateChanged{SessionID: ls.sess.ID().String(), TurnID: event.TurnID, State: string(turn.Failed)}
+		resolvedTurn = event.TurnID
 	case agentruntime.EventTurnCompleted:
 		if event.TurnID == "" || activeID != event.TurnID {
 			rs.mu.Unlock()

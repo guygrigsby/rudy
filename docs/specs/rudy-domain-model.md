@@ -1,6 +1,6 @@
 # rudy domain model
 
-Pass 4 adds Agent Runtime for Codex App Server (ADR 0045). Session now selects
+Pass 4 adds Agent Runtime for Codex App Server (ADR 0045, revised by ADR 0046). Session now selects
 native Provider execution or runtime-owned execution. Client remains conformist
 and renders from the Session protocol; it holds no domain model beyond the
 transcript view. Memory is an external Go module imported by the memory plugin;
@@ -755,10 +755,11 @@ the `codex` AgentRuntime implementation and anti-corruption layer.
 
 - `Start()` resolves `codex` from `PATH`, verifies the minimum version, starts
   `codex app-server`, initializes the peer and moves to ready.
-- `Fail(reason)` denies pending approvals, fails the active operation and moves
-  to failed before a bounded-backoff restart when an attached Session needs it.
-- `Reconcile()` resumes and reads every linked thread after restart without
-  replaying the lost operation.
+- `Fail(reason)` cancels pending approvals, marks each active turn failed
+  locally and fences its Session as ambiguous. It does not restart on a timer.
+- `Start()` on the next account, model or thread operation replaces a failed
+  process. `Reconcile()` is driven by `session.resume`: it resumes and reads
+  that linked thread before another turn or fork, without replaying lost work.
 
 ### Invariants
 
@@ -776,7 +777,7 @@ stateDiagram-v2
     starting --> ready: initialized
     starting --> failed: spawn, version or initialize failure
     ready --> failed: EOF or protocol fault
-    failed --> starting: attached runtime session needs retry
+    failed --> starting: next account, model or thread operation
     ready --> stopped: kernel shutdown
     failed --> stopped: kernel shutdown
 ```

@@ -167,6 +167,7 @@ const (
 	EventThreadStatus    EventType = "thread_status"
 	EventTurnStarted     EventType = "turn_started"
 	EventTurnCompleted   EventType = "turn_completed"
+	EventRuntimeFailed   EventType = "runtime_failed"
 	EventItemStarted     EventType = "item_started"
 	EventItemDelta       EventType = "item_delta"
 	EventItemCompleted   EventType = "item_completed"

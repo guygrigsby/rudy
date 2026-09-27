@@ -21,12 +21,20 @@ type wireNotification struct {
 	method  string
 	params  json.RawMessage
 	barrier chan struct{}
+	process *appProcess
+	dead    *appProcess
 }
 
 type wireLoginCompletion struct {
 	LoginID *string `json:"loginId"`
 	Success bool    `json:"success"`
 	Error   *string `json:"error"`
+	process *appProcess
+}
+
+type loginBinding struct {
+	rawID   string
+	process *appProcess
 }
 
 func (c *Client) Name() string { return "codex" }
@@ -92,6 +100,7 @@ func (c *Client) StartLogin(ctx context.Context, mode agentruntime.LoginMode) (a
 	if err := c.Start(ctx); err != nil {
 		return agentruntime.AuthChallenge{}, err
 	}
+	process := c.currentProcess()
 	var response struct {
 		Type            string `json:"type"`
 		LoginID         string `json:"loginId"`
@@ -99,7 +108,7 @@ func (c *Client) StartLogin(ctx context.Context, mode agentruntime.LoginMode) (a
 		VerificationURL string `json:"verificationUrl"`
 		UserCode        string `json:"userCode"`
 	}
-	if err := c.callMutation(ctx, methodAccountLoginStart, map[string]string{"type": loginType}, &response); err != nil {
+	if err := c.callMutationOn(ctx, process, methodAccountLoginStart, map[string]string{"type": loginType}, &response); err != nil {
 		if errors.Is(err, agentruntime.ErrAmbiguous) {
 			c.abortProcess()
 		}
@@ -139,11 +148,13 @@ func (c *Client) StartLogin(ctx context.Context, mode agentruntime.LoginMode) (a
 	var completion *wireLoginCompletion
 	c.loginMu.Lock()
 	c.activeLogins[response.LoginID] = challenge.LoginID
-	c.loginIDs[challenge.LoginID] = response.LoginID
-	if early, ok := c.earlyLogins[response.LoginID]; ok {
+	c.loginIDs[challenge.LoginID] = loginBinding{rawID: response.LoginID, process: process}
+	c.loginProcesses[response.LoginID] = process
+	if early, ok := c.earlyLogins[response.LoginID]; ok && early.process == process {
 		completion = &early
 		delete(c.earlyLogins, response.LoginID)
 		delete(c.activeLogins, response.LoginID)
+		delete(c.loginProcesses, response.LoginID)
 		c.rememberFinishedLoginLocked(response.LoginID)
 		if early.Success {
 			delete(c.loginIDs, challenge.LoginID)
@@ -152,6 +163,8 @@ func (c *Client) StartLogin(ctx context.Context, mode agentruntime.LoginMode) (a
 	c.loginMu.Unlock()
 	if completion != nil {
 		c.emitLoginCompletion(*completion, challenge.LoginID)
+	} else if !process.peer.alive() {
+		c.enqueueProcessDeath(process)
 	}
 	return challenge, nil
 }
@@ -160,26 +173,35 @@ func (c *Client) CancelLogin(ctx context.Context, loginID string) error {
 	if loginID == "" {
 		return errors.New("codex: login id is required")
 	}
-	if err := c.Start(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	var response struct {
-		Status string `json:"status"`
-	}
 	c.loginMu.Lock()
-	rawLoginID, ok := c.loginIDs[loginID]
+	binding, ok := c.loginIDs[loginID]
 	c.loginMu.Unlock()
 	if !ok {
 		return errors.New("codex: unknown login id")
 	}
-	if err := c.call(ctx, methodAccountLoginCancel, map[string]string{"loginId": rawLoginID}, &response); err != nil {
-		return err
+	if binding.process != nil && binding.process.peer.alive() {
+		var response struct {
+			Status string `json:"status"`
+		}
+		if err := binding.process.peer.Call(ctx, methodAccountLoginCancel, map[string]string{"loginId": binding.rawID}, &response); err != nil && binding.process.peer.alive() {
+			return err
+		}
 	}
 	c.loginMu.Lock()
-	delete(c.activeLogins, rawLoginID)
+	if c.loginProcesses[binding.rawID] == binding.process {
+		delete(c.activeLogins, binding.rawID)
+		delete(c.loginProcesses, binding.rawID)
+	}
 	delete(c.loginIDs, loginID)
-	delete(c.earlyLogins, rawLoginID)
-	c.rememberFinishedLoginLocked(rawLoginID)
+	if early, found := c.earlyLogins[binding.rawID]; found && early.process == binding.process {
+		delete(c.earlyLogins, binding.rawID)
+	}
+	if c.loginProcesses[binding.rawID] == nil {
+		c.rememberFinishedLoginLocked(binding.rawID)
+	}
 	c.loginMu.Unlock()
 	return nil
 }
@@ -241,7 +263,11 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
 }
 
 func (c *Client) enqueueNotification(method string, params json.RawMessage) {
-	notification := wireNotification{method: method, params: append(json.RawMessage(nil), params...)}
+	c.enqueueNotificationFrom(nil, method, params)
+}
+
+func (c *Client) enqueueNotificationFrom(process *appProcess, method string, params json.RawMessage) {
+	notification := wireNotification{method: method, params: append(json.RawMessage(nil), params...), process: process}
 	select {
 	case c.notifications <- notification:
 	case <-c.dispatchStop:
@@ -257,6 +283,11 @@ func (c *Client) dispatchNotifications() {
 				close(notification.barrier)
 				continue
 			}
+			if notification.dead != nil {
+				c.failProcessTurns(notification.dead)
+				c.failProcessLogins(notification.dead)
+				continue
+			}
 			c.handleNotification(notification)
 		case <-c.dispatchStop:
 			return
@@ -267,8 +298,12 @@ func (c *Client) dispatchNotifications() {
 func (c *Client) handleNotification(notification wireNotification) {
 	switch notification.method {
 	case methodAccountLoginCompleted:
+		if notification.process != nil && notification.process != c.currentProcess() {
+			return
+		}
 		var completion wireLoginCompletion
 		if json.Unmarshal(notification.params, &completion) == nil {
+			completion.process = notification.process
 			c.matchLoginCompletion(completion)
 		}
 	case methodAccountUpdated:
@@ -291,7 +326,11 @@ func (c *Client) handleNotification(notification wireNotification) {
 		}
 	default:
 		event, err := translateRuntimeNotification(notification)
-		if err != nil || event == nil {
+		if err != nil {
+			c.failMalformedNotification(notification, err)
+			return
+		}
+		if event == nil || !c.observeTurnEvent(*event, notification.process) {
 			return
 		}
 		event.Sequence = c.eventSequence.Add(1)
@@ -312,10 +351,15 @@ func (c *Client) matchLoginCompletion(completion wireLoginCompletion) {
 		return
 	}
 	loginID, active := c.activeLogins[rawLoginID]
+	if active && c.loginProcesses[rawLoginID] != completion.process {
+		c.loginMu.Unlock()
+		return
+	}
 	if active {
 		delete(c.activeLogins, rawLoginID)
 		c.rememberFinishedLoginLocked(rawLoginID)
 		if completion.Success {
+			delete(c.loginProcesses, rawLoginID)
 			delete(c.loginIDs, loginID)
 		}
 	} else if len(c.earlyLogins) < maxEarlyLoginCompletions {
