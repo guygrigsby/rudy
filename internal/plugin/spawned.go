@@ -876,6 +876,8 @@ func (s *Spawned) runCommand(name string) func(ctx context.Context, call Command
 			return SubmitPrompt{Text: out.Prompt}, nil
 		case out.Notice != "":
 			return Notice{Text: out.Notice}, nil
+		case out.AuthChallenge != nil:
+			return AuthChallenge{Runtime: out.AuthChallenge.Runtime, Mode: out.AuthChallenge.Mode}, nil
 		}
 		return NoAction{}, nil
 	}

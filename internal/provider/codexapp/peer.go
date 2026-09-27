@@ -20,6 +20,11 @@ type callResult struct {
 	err   error
 }
 
+type callNotSentError struct{ err error }
+
+func (e *callNotSentError) Error() string { return e.err.Error() }
+func (e *callNotSentError) Unwrap() error { return e.err }
+
 type peer struct {
 	reader io.Reader
 	writer io.Writer
@@ -48,18 +53,18 @@ func newPeer(reader io.Reader, writer io.Writer, closer io.Closer, onRequest inb
 
 func (p *peer) Call(ctx context.Context, method string, params any, result any) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return &callNotSentError{err: err}
 	}
 	rawParams, err := json.Marshal(params)
 	if err != nil {
-		return fmt.Errorf("codex app server %s params: %w", method, err)
+		return &callNotSentError{err: fmt.Errorf("codex app server %s params: %w", method, err)}
 	}
 
 	p.mu.Lock()
 	if p.err != nil {
 		err := p.err
 		p.mu.Unlock()
-		return err
+		return &callNotSentError{err: err}
 	}
 	p.nextID++
 	id := strconv.FormatUint(p.nextID, 10)

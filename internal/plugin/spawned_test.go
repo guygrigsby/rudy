@@ -143,6 +143,11 @@ func (c *fakeChild) handle(ctx context.Context, req protocol.Request) (any, *pro
 		if p.Args == "prompt" {
 			return protocol.CommandInvokeResult{Prompt: "say hi"}, nil, false
 		}
+		if p.Args == "login" {
+			return protocol.CommandInvokeResult{AuthChallenge: &protocol.RuntimeLoginStartParams{
+				Runtime: "hello", Mode: agentruntime.LoginDevice,
+			}}, nil, false
+		}
 		return protocol.CommandInvokeResult{Notice: "hello from the plugin"}, nil, false
 	case protocol.MethodProviderComplete:
 		var p protocol.ProviderCompleteParams
@@ -505,6 +510,14 @@ func TestSpawnedCommandInvokeMapsActions(t *testing.T) {
 	}
 	n, ok := act.(Notice)
 	if !ok || n.Text != "hello from the plugin" {
+		t.Fatalf("action = %#v", act)
+	}
+	act, err = cmd.Run(context.Background(), CommandCall{Args: "login"})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	auth, ok := act.(AuthChallenge)
+	if !ok || auth.Runtime != "hello" || auth.Mode != agentruntime.LoginDevice {
 		t.Fatalf("action = %#v", act)
 	}
 }

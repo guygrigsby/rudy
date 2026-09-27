@@ -88,16 +88,17 @@ const (
 
 // Notifications, server to client.
 const (
-	NotifyEntryAppended       = "entry.appended"
-	NotifyStreamDelta         = "stream.delta"
-	NotifyTurnState           = "turn.state"
-	NotifyToolState           = "tool.state"
-	NotifyPermissionRequested = "permission.requested"
-	NotifyNotice              = "notice"
-	NotifyStatusUpdated       = "status.updated"
-	NotifyWidgetUpdated       = "widget.updated"
-	NotifyPluginState         = "plugin.state"
-	NotifyServerStopped       = "server.stopped"
+	NotifyEntryAppended         = "entry.appended"
+	NotifyStreamDelta           = "stream.delta"
+	NotifyTurnState             = "turn.state"
+	NotifyToolState             = "tool.state"
+	NotifyPermissionRequested   = "permission.requested"
+	NotifyNotice                = "notice"
+	NotifyStatusUpdated         = "status.updated"
+	NotifyWidgetUpdated         = "widget.updated"
+	NotifyPluginState           = "plugin.state"
+	NotifyServerStopped         = "server.stopped"
+	NotifyRuntimeLoginChallenge = "runtime.login.challenge"
 )
 
 // Span is one run of text with a theme role, the only thing a plugin may put in a status
@@ -342,7 +343,8 @@ type CommandRunResult struct {
 	TurnID string `json:"turn_id,omitempty"`
 	Notice string `json:"notice,omitempty"`
 	// SessionID is set when the command opened another session, a fork.
-	SessionID string `json:"session_id,omitempty"`
+	SessionID     string                      `json:"session_id,omitempty"`
+	AuthChallenge *agentruntime.AuthChallenge `json:"auth_challenge,omitempty"`
 }
 
 type PluginAppendNoteParams struct {
@@ -536,8 +538,9 @@ type CommandInvokeParams struct {
 // CommandInvokeResult is what the command asks the server to do. A non-empty Prompt is
 // submitted as a user message; a non-empty Notice is shown to the client.
 type CommandInvokeResult struct {
-	Prompt string `json:"prompt,omitempty"`
-	Notice string `json:"notice,omitempty"`
+	Prompt        string                   `json:"prompt,omitempty"`
+	Notice        string                   `json:"notice,omitempty"`
+	AuthChallenge *RuntimeLoginStartParams `json:"auth_challenge,omitempty"`
 }
 
 type ProviderCompleteParams struct {

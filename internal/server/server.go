@@ -103,6 +103,11 @@ type Server struct {
 	closing map[ulid.ULID]chan struct{} // sids detach is closing; see detach, loadCold
 	conns   map[int]*conn               // every live connection, for the status and widget broadcasts
 	nextID  int
+
+	loginAttempts  map[runtimeLoginKey]runtimeLoginAttempt
+	pendingLogins  map[runtimeLoginKey]agentruntime.LoginCompletion
+	finishedLogins map[runtimeLoginKey]struct{}
+	accountStates  map[string]agentruntime.AccountState
 }
 
 // New wires a Server. Deps must already be fully populated.
@@ -113,6 +118,8 @@ func New(d Deps) *Server {
 		instanceID: ulid.Make(), state: protocol.ServerStateRunning,
 		shutdownRequested: make(chan struct{}), shutdownComplete: make(chan struct{}), shutdownFailed: make(chan struct{}),
 		live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{},
+		loginAttempts: map[runtimeLoginKey]runtimeLoginAttempt{}, pendingLogins: map[runtimeLoginKey]agentruntime.LoginCompletion{},
+		finishedLogins: map[runtimeLoginKey]struct{}{}, accountStates: map[string]agentruntime.AccountState{},
 	}
 }
 
@@ -170,6 +177,8 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	s.mu.Lock()
 	s.nextID++
 	cn := newConn(s.nextID, c)
+	serveCtx, stopServe := context.WithCancel(ctx)
+	cn.lifetime = serveCtx
 	cn.sameUser = protocol.IsSameUser(c)
 	cn.plugin = name
 	cn.reg = reg
@@ -178,14 +187,25 @@ func (s *Server) serveConn(ctx context.Context, c protocol.Conn, name string, re
 	s.mu.Unlock()
 	slog.Info("server: conn open", "conn", cn.id, "plugin", name)
 
+	defer stopServe()
+	if disconnected := protocol.Disconnected(c); disconnected != nil {
+		go func() {
+			select {
+			case <-disconnected:
+				stopServe()
+			case <-serveCtx.Done():
+			}
+		}()
+	}
 	pumpCtx, stopPump := context.WithCancel(context.Background())
 	cn.abortPump = stopPump
 	go cn.pump(pumpCtx)
-	err := s.serve(ctx, cn)
+	err := s.serve(serveCtx, cn)
 	shutdownControl := errors.Is(err, ErrShutdownRequested)
 	s.mu.Lock()
 	delete(s.conns, cn.id)
 	s.mu.Unlock()
+	s.cancelConnectionLogins(cn)
 	s.detachAll(cn)
 	if !shutdownControl {
 		stopPump()
@@ -244,6 +264,11 @@ func (s *Server) serve(ctx context.Context, cn *conn) error {
 			cn.send(protocol.NewErrorResponse(req.ID, rerr))
 			continue
 		}
+		var afterResponse func()
+		if deferred, ok := result.(deferredResponse); ok {
+			result = deferred.result
+			afterResponse = deferred.after
+		}
 		resp, merr := protocol.NewResponse(req.ID, result)
 		if merr != nil {
 			if req.Method == protocol.MethodServerShutdown {
@@ -264,6 +289,9 @@ func (s *Server) serve(ctx context.Context, cn *conn) error {
 			return ErrShutdownRequested
 		}
 		cn.send(resp)
+		if afterResponse != nil {
+			afterResponse()
+		}
 		if req.Method == protocol.MethodClientHello {
 			// After the response is queued, never before: a client learns the server is
 			// there and then, in the same ordered outbox, what the plugins are showing.
@@ -1324,6 +1352,11 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 		notice := "cleared; new session " + info.SessionID
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "info", Text: notice})
 		return protocol.CommandRunResult{SessionID: info.SessionID, Notice: notice}, nil
+	case plugin.AuthChallenge:
+		if a.Runtime != cmd.Owner {
+			return nil, perr(protocol.CodeUnauthorized, "command cannot start another plugin's runtime login")
+		}
+		return s.startRuntimeLogin(ctx, cn, a)
 	default:
 		return protocol.CommandRunResult{}, nil
 	}

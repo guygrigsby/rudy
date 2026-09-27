@@ -97,17 +97,25 @@ type Fork struct{ AtEntryID string }
 // action: the conversation's log stays on disk and nothing carries over.
 type NewSession struct{}
 
+// AuthChallenge asks the server to start one runtime login attempt for the invoking
+// connection. The server returns the resulting challenge only to that connection.
+type AuthChallenge struct {
+	Runtime string
+	Mode    agentruntime.LoginMode
+}
+
 type NoAction struct{}
 
-func (SubmitPrompt) isAction() {}
-func (Notice) isAction()       {}
-func (Compact) isAction()      {}
-func (SetModel) isAction()     {}
-func (SetMode) isAction()      {}
-func (SetTitle) isAction()     {}
-func (Fork) isAction()         {}
-func (NewSession) isAction()   {}
-func (NoAction) isAction()     {}
+func (SubmitPrompt) isAction()  {}
+func (Notice) isAction()        {}
+func (Compact) isAction()       {}
+func (SetModel) isAction()      {}
+func (SetMode) isAction()       {}
+func (SetTitle) isAction()      {}
+func (Fork) isAction()          {}
+func (NewSession) isAction()    {}
+func (AuthChallenge) isAction() {}
+func (NoAction) isAction()      {}
 
 type CommandCall struct {
 	SessionID ulid.ULID
@@ -124,6 +132,9 @@ type Command struct {
 	Name        string // without the slash
 	Description string
 	Run         func(ctx context.Context, call CommandCall) (Action, error)
+	// Owner is assigned by the registering Host. A plugin cannot nominate another plugin's
+	// runtime for an auth action by forging this field.
+	Owner string
 }
 
 type Host interface {

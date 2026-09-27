@@ -5,9 +5,24 @@ package codexapp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"testing"
 )
+
+func TestPeerMarksCanceledCallAsNotSent(t *testing.T) {
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	peer := newPeer(client, client, client, nil, nil)
+	t.Cleanup(func() { _ = peer.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := peer.Call(ctx, "test/write", map[string]any{}, nil)
+	var notSent *callNotSentError
+	if !errors.As(err, &notSent) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("Call error = %v, want unsent cancellation", err)
+	}
+}
 
 func TestPeerOmitsJSONRPC(t *testing.T) {
 	client, server := net.Pipe()

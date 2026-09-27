@@ -17,6 +17,20 @@ type Conn interface {
 	Close() error
 }
 
+type disconnectNotifier interface {
+	Disconnected() <-chan struct{}
+}
+
+// Disconnected returns a signal that closes when the remote side can no longer send.
+// Transports without that capability return nil.
+func Disconnected(c Conn) <-chan struct{} {
+	notifier, ok := c.(disconnectNotifier)
+	if !ok {
+		return nil
+	}
+	return notifier.Disconnected()
+}
+
 // ErrConnClosed is returned by Send and Recv on a Conn the caller already closed.
 var ErrConnClosed = errors.New("protocol: connection closed")
 
@@ -81,3 +95,5 @@ func (p *pipeConn) Close() error {
 	p.once.Do(func() { close(p.closed) })
 	return nil
 }
+
+func (p *pipeConn) Disconnected() <-chan struct{} { return p.peerClosed }

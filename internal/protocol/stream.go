@@ -41,18 +41,20 @@ type streamConn struct {
 	errMu   sync.Mutex
 	readErr error // why the reader stopped; nil means end of input
 
-	closed chan struct{}
-	once   sync.Once
+	closed       chan struct{}
+	remoteClosed chan struct{}
+	once         sync.Once
 }
 
 // NewStreamConn returns a Conn that reads newline-delimited JSON from r, writes it to w and
 // closes closer on Close. closer may be nil.
 func NewStreamConn(r io.Reader, w io.Writer, closer io.Closer) Conn {
 	c := &streamConn{
-		w:      w,
-		closer: closer,
-		lines:  make(chan json.RawMessage),
-		closed: make(chan struct{}),
+		w:            w,
+		closer:       closer,
+		lines:        make(chan json.RawMessage),
+		closed:       make(chan struct{}),
+		remoteClosed: make(chan struct{}),
 	}
 	go c.read(r)
 	return c
@@ -60,6 +62,7 @@ func NewStreamConn(r io.Reader, w io.Writer, closer io.Closer) Conn {
 
 func (c *streamConn) read(r io.Reader) {
 	defer close(c.lines)
+	defer close(c.remoteClosed)
 	br := bufio.NewReaderSize(r, readBufBytes)
 	for {
 		line, err := readLine(br)
@@ -76,6 +79,8 @@ func (c *streamConn) read(r io.Reader) {
 		}
 	}
 }
+
+func (c *streamConn) Disconnected() <-chan struct{} { return c.remoteClosed }
 
 // readLine returns one newline-terminated line with the terminator and any surrounding
 // space trimmed, or an error. A line over the cap ends the connection.

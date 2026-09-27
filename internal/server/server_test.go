@@ -300,15 +300,39 @@ func newServerAt(t *testing.T, cfg *config.Config, storeDir, socket string, plug
 		Home:     t.TempDir(),
 	})
 	services := srv.PluginServices()
-	services.ProvidersChanged = func(ps []provider.Provider) { reg.SetProviders(ps...) }
+	services.ProvidersChanged = func([]provider.Provider) {
+		reg.SetSources(testModelSources(preg)...)
+	}
+	services.RuntimesChanged = func(runtimes []agentruntime.Runtime) {
+		for _, runtime := range runtimes {
+			runtime.SetSink(srv)
+		}
+		reg.SetSources(testModelSources(preg)...)
+	}
 	preg.SetServices(services)
 	preg.Load(ctx, plugins...)
-	reg.SetProviders(preg.Providers()...)
+	for _, runtime := range preg.Runtimes() {
+		runtime.SetSink(srv)
+	}
+	reg.SetSources(testModelSources(preg)...)
 	if err := reg.Refresh(ctx); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = srv.Shutdown(context.Background()) })
 	return srv, store
+}
+
+func testModelSources(registry *plugin.Registry) []provider.ModelSource {
+	providers := registry.Providers()
+	runtimes := registry.Runtimes()
+	sources := make([]provider.ModelSource, 0, len(providers)+len(runtimes))
+	for _, source := range providers {
+		sources = append(sources, source)
+	}
+	for _, source := range runtimes {
+		sources = append(sources, source)
+	}
+	return sources
 }
 
 func (h *harness) dial(t *testing.T, asker bool) *protocol.Client {

@@ -640,6 +640,7 @@ func (h *host) RegisterTool(t tool.Tool) error {
 }
 
 func (h *host) RegisterCommand(c Command) error {
+	c.Owner = h.name
 	return stageRegister(h, "command", c.Name, c, h.r.commands, h.commands, &h.cmdOrder)
 }
 

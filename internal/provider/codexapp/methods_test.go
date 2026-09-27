@@ -21,3 +21,12 @@ func TestUsedMethodsMatchMinimumVersionCatalogue(t *testing.T) {
 		t.Fatalf("used methods = %v, want %v", got, want)
 	}
 }
+
+func TestNearestEffortNeverPromotesHighToXHigh(t *testing.T) {
+	if got := nearestEffort("high", []string{"low", "medium", "xhigh"}); got != "medium" {
+		t.Fatalf("nearest effort = %q, want medium", got)
+	}
+	if got := nearestEffort("minimal", []string{"low", "medium"}); got != "low" {
+		t.Fatalf("lowest fallback = %q, want low", got)
+	}
+}

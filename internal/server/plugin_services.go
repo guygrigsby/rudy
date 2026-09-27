@@ -9,6 +9,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -132,6 +133,15 @@ func (s *Server) sendConnectState(cn *conn) {
 		})
 	}
 	s.pluginState.Unlock()
+	s.mu.Lock()
+	accounts := make([]agentruntime.AccountState, 0, len(s.accountStates))
+	for _, state := range s.accountStates {
+		accounts = append(accounts, state)
+	}
+	s.mu.Unlock()
+	for _, state := range accounts {
+		cn.notify(protocol.NotifyRuntimeAccountUpdated, state)
+	}
 }
 
 // clientConns is every connection a render notification is worth sending to: the clients.

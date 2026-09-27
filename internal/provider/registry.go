@@ -90,11 +90,39 @@ func (r *Registry) setSources(sources []ModelSource) {
 // previous models; every failure is joined into the returned error. The snapshot is
 // rewritten when at least one provider answered.
 func (r *Registry) Refresh(ctx context.Context) error {
+	return r.refresh(ctx, r.snapshotSources())
+}
+
+// RefreshProviders refreshes HTTP completion providers without starting lazy runtimes.
+func (r *Registry) RefreshProviders(ctx context.Context) error {
+	r.mu.Lock()
+	sources := make([]ModelSource, 0, len(r.order))
+	for _, name := range r.order {
+		if provider := r.providers[name]; provider != nil {
+			sources = append(sources, provider)
+		}
+	}
+	r.mu.Unlock()
+	return r.refresh(ctx, sources)
+}
+
+// RefreshSource refreshes one named model owner and retains its previous models on error.
+func (r *Registry) RefreshSource(ctx context.Context, name string) error {
+	r.mu.Lock()
+	source := r.sources[name]
+	r.mu.Unlock()
+	if source == nil {
+		return fmt.Errorf("provider: model source %q is not registered", name)
+	}
+	return r.refresh(ctx, []ModelSource{source})
+}
+
+func (r *Registry) refresh(ctx context.Context, sources []ModelSource) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errs []error
 	results := map[string][]Model{}
-	for _, p := range r.snapshotSources() {
+	for _, p := range sources {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -186,6 +214,19 @@ func (r *Registry) Models() []Model {
 		return out[i].Ref.Model < out[j].Ref.Model
 	})
 	return collapse(out)
+}
+
+// EnsureModel adds a configured model placeholder when discovery cannot run yet. A later
+// successful refresh from that owner replaces it with authoritative metadata.
+func (r *Registry) EnsureModel(model Model) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, existing := range r.models[model.Ref.Provider] {
+		if existing.Ref == model.Ref {
+			return
+		}
+	}
+	r.models[model.Ref.Provider] = append(r.models[model.Ref.Provider], model)
 }
 
 // upstreamSep joins the upstreams of a model served by more than one.

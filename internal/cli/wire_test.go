@@ -17,6 +17,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/protocol"
@@ -656,6 +657,76 @@ func TestBuildWithNoProvidersNamesTheConfigFile(t *testing.T) {
 		t.Errorf("stderr %q announced a refresh with no provider to refresh from", stderr.String())
 	}
 }
+
+func TestBuildAllowsConfiguredRuntimeBeforeDiscovery(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t))
+	built, err := Build(context.Background(), BuildOptions{
+		Version: "test", Home: base, Stderr: io.Discard,
+		Overrides: map[string]any{"default.provider": "codex", "default.model": "gpt-test"},
+		Plugins:   []plugin.Plugin{runtimeOnlyPlugin{}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Cleanup(func() { _ = built.Close(context.Background()) })
+	if _, ok := built.Plugins.Runtime("codex"); !ok {
+		t.Fatal("codex runtime is not registered")
+	}
+	model, err := built.Registry.Resolve("codex:gpt-test")
+	if err != nil {
+		t.Fatalf("configured runtime model: %v", err)
+	}
+	if model.OwnerKind != provider.OwnerRuntime {
+		t.Fatalf("owner kind = %q, want runtime", model.OwnerKind)
+	}
+}
+
+type runtimeOnlyPlugin struct{}
+
+func (runtimeOnlyPlugin) Name() string { return "codex" }
+func (runtimeOnlyPlugin) Init(_ context.Context, host plugin.Host) error {
+	return host.RegisterRuntime(unavailableRuntime{})
+}
+
+type unavailableRuntime struct{}
+
+func (unavailableRuntime) Name() string { return "codex" }
+func (unavailableRuntime) ListModels(context.Context) ([]provider.Model, error) {
+	return nil, errors.New("login required")
+}
+func (unavailableRuntime) Account(context.Context) (agentruntime.AccountState, error) {
+	return agentruntime.AccountState{Runtime: "codex"}, nil
+}
+func (unavailableRuntime) StartLogin(context.Context, agentruntime.LoginMode) (agentruntime.AuthChallenge, error) {
+	return agentruntime.AuthChallenge{}, errors.New("unused")
+}
+func (unavailableRuntime) CancelLogin(context.Context, string) error { return nil }
+func (unavailableRuntime) StartThread(context.Context, agentruntime.StartThreadRequest) (agentruntime.ThreadRef, error) {
+	return agentruntime.ThreadRef{}, errors.New("unused")
+}
+func (unavailableRuntime) ResumeThread(context.Context, agentruntime.ThreadRef) error {
+	return errors.New("unused")
+}
+func (unavailableRuntime) ForkThread(context.Context, agentruntime.ThreadRef) (agentruntime.ThreadRef, error) {
+	return agentruntime.ThreadRef{}, errors.New("unused")
+}
+func (unavailableRuntime) ReadThread(context.Context, agentruntime.ThreadRef) (agentruntime.Thread, error) {
+	return agentruntime.Thread{}, errors.New("unused")
+}
+func (unavailableRuntime) StartTurn(context.Context, agentruntime.StartTurnRequest) (agentruntime.TurnRef, error) {
+	return agentruntime.TurnRef{}, errors.New("unused")
+}
+func (unavailableRuntime) SteerTurn(context.Context, agentruntime.SteerTurnRequest) (agentruntime.TurnRef, error) {
+	return agentruntime.TurnRef{}, errors.New("unused")
+}
+func (unavailableRuntime) InterruptTurn(context.Context, agentruntime.TurnRef) error {
+	return errors.New("unused")
+}
+func (unavailableRuntime) SetSink(agentruntime.Sink) {}
 
 // TestSummarizeAsksForWhatTheSummaryModelServes: the fold is a provider request like any
 // other, so it resolves max_tokens against its own model. It passed cfg.MaxTokens raw, which

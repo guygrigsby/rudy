@@ -25,7 +25,7 @@ func (e *wireError) Error() string {
 	if e == nil {
 		return "codex app server error"
 	}
-	return fmt.Sprintf("codex app server error %d: %s", e.Code, e.Message)
+	return fmt.Sprintf("codex app server error %d: %s", e.Code, Redact(e.Message))
 }
 
 type inboundHandler func(string, json.RawMessage) (any, error)
