@@ -164,11 +164,14 @@ func fakeCodexProcessEnv(t *testing.T, root, fake string, failBrowser bool) ([]s
 	if err := os.WriteFile(opener, []byte("#!/bin/sh\nexit "+exit+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	methods := filepath.Join(root, "fake-codex.methods")
+	codexHome := filepath.Join(root, "fake-codex-home")
+	if err := os.MkdirAll(codexHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	methods := filepath.Join(codexHome, "fake-codex.methods")
 	extra := envList{
 		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"FAKE_CODEX_LOG=" + methods,
-		"FAKE_CODEX_STATE=" + filepath.Join(root, "fake-codex-state.json"),
+		"CODEX_HOME=" + codexHome,
 	}
 	return extra.With(scratchEnv(root)), methods
 }

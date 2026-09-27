@@ -46,7 +46,8 @@ func fakeCommand(t *testing.T, env ...string) codexapp.Command {
 	if fakeErr != nil {
 		t.Fatal(fakeErr)
 	}
-	return codexapp.Command{Path: fakePath, Env: env}
+	isolated := append([]string{"CODEX_HOME=" + t.TempDir()}, env...)
+	return codexapp.Command{Path: fakePath, Env: isolated}
 }
 
 func TestClientInitializesBeforeAnyOtherRequest(t *testing.T) {

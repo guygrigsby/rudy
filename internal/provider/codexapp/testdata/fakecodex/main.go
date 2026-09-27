@@ -107,15 +107,12 @@ func main() {
 }
 
 func newFakeServer() (*fakeServer, error) {
-	logPath := os.Getenv("FAKE_CODEX_LOG")
-	if logPath == "" {
-		logPath = filepath.Join(os.TempDir(), "rudy-fake-codex.methods")
-	}
+	logPath := fakeDataPath("FAKE_CODEX_LOG", "fake-codex.methods")
 	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	server := &fakeServer{writer: json.NewEncoder(os.Stdout), log: log, path: os.Getenv("FAKE_CODEX_STATE")}
+	server := &fakeServer{writer: json.NewEncoder(os.Stdout), log: log, path: fakeDataPath("FAKE_CODEX_STATE", "fake-codex-state.json")}
 	server.state.Threads = map[string]fakeThread{}
 	if server.path != "" {
 		body, err := os.ReadFile(server.path)
@@ -133,6 +130,16 @@ func newFakeServer() (*fakeServer, error) {
 		server.state.Threads = map[string]fakeThread{}
 	}
 	return server, nil
+}
+
+func fakeDataPath(environmentName, fileName string) string {
+	if path := os.Getenv(environmentName); path != "" {
+		return path
+	}
+	if home := os.Getenv("CODEX_HOME"); home != "" {
+		return filepath.Join(home, fileName)
+	}
+	return filepath.Join(os.TempDir(), "rudy-"+fileName)
 }
 
 func (s *fakeServer) handle(message envelope) {
