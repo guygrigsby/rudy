@@ -221,7 +221,7 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
 				Ref: session.ModelRef{Provider: c.Name(), Model: model.ID}, OwnerKind: provider.OwnerRuntime,
 				DisplayName: model.DisplayName, ReasoningEfforts: efforts,
 				Capabilities: provider.Capabilities{
-					Tools: true, Vision: contains(model.InputModalities, "image"), Reasoning: len(efforts) > 0,
+					Tools: true, Reasoning: len(efforts) > 0,
 				},
 			})
 		}
@@ -238,15 +238,6 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
 	c.models = append([]provider.Model(nil), models...)
 	c.modelsMu.Unlock()
 	return models, nil
-}
-
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 func (c *Client) enqueueNotification(method string, params json.RawMessage) {

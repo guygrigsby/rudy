@@ -267,7 +267,7 @@ func TestListModelsPagesAndMapsCapabilities(t *testing.T) {
 	if first.Ref != (session.ModelRef{Provider: "codex", Model: "gpt-a"}) || first.OwnerKind != provider.OwnerRuntime {
 		t.Fatalf("first model identity = %+v", first)
 	}
-	if !first.Capabilities.Tools || !first.Capabilities.Vision || !first.Capabilities.Reasoning {
+	if !first.Capabilities.Tools || first.Capabilities.Vision || !first.Capabilities.Reasoning {
 		t.Fatalf("first model capabilities = %+v", first.Capabilities)
 	}
 	if got := strings.Join(first.ReasoningEfforts, ","); got != "low,medium,high" {
