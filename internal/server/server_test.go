@@ -305,14 +305,14 @@ func newServerAt(t *testing.T, cfg *config.Config, storeDir, socket string, plug
 	}
 	services.RuntimesChanged = func(runtimes []agentruntime.Runtime) {
 		for _, runtime := range runtimes {
-			runtime.SetSink(srv)
+			runtime.SetSink(srv.RuntimeSink(runtime.Name()))
 		}
 		reg.SetSources(testModelSources(preg)...)
 	}
 	preg.SetServices(services)
 	preg.Load(ctx, plugins...)
 	for _, runtime := range preg.Runtimes() {
-		runtime.SetSink(srv)
+		runtime.SetSink(srv.RuntimeSink(runtime.Name()))
 	}
 	reg.SetSources(testModelSources(preg)...)
 	if err := reg.Refresh(ctx); err != nil {

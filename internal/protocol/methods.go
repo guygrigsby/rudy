@@ -99,6 +99,8 @@ const (
 	NotifyPluginState           = "plugin.state"
 	NotifyServerStopped         = "server.stopped"
 	NotifyRuntimeLoginChallenge = "runtime.login.challenge"
+	NotifyRuntimeEntry          = "runtime.entry"
+	NotifyRuntimeDelta          = "runtime.delta"
 )
 
 // Span is one run of text with a theme role, the only thing a plugin may put in a status
@@ -221,12 +223,28 @@ type ParentRef struct {
 }
 
 type SessionInfo struct {
+	SessionID    string                `json:"session_id"`
+	Workspace    session.Workspace     `json:"workspace"`
+	Model        session.ModelRef      `json:"model"`
+	Mode         session.Mode          `json:"mode"`
+	Thinking     session.ThinkingLevel `json:"thinking"`
+	Title        string                `json:"title"`
+	Execution    session.Execution     `json:"execution"`
+	ThreadLinked bool                  `json:"thread_linked"`
+}
+
+type RuntimeEntryParams struct {
+	SessionID string                      `json:"session_id"`
+	Entry     agentruntime.ProjectedEntry `json:"entry"`
+}
+
+type RuntimeDeltaParams struct {
 	SessionID string                `json:"session_id"`
-	Workspace session.Workspace     `json:"workspace"`
-	Model     session.ModelRef      `json:"model"`
-	Mode      session.Mode          `json:"mode"`
-	Thinking  session.ThinkingLevel `json:"thinking"`
-	Title     string                `json:"title"`
+	TurnID    string                `json:"turn_id"`
+	ItemID    string                `json:"item_id"`
+	Kind      agentruntime.ItemType `json:"kind"`
+	Text      string                `json:"text"`
+	Replace   bool                  `json:"replace"`
 }
 
 type SessionResumeParams struct {

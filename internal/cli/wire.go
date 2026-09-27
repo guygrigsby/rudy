@@ -233,7 +233,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	services.ProvidersChanged = func([]provider.Provider) { syncSources() }
 	services.RuntimesChanged = func(runtimes []agentruntime.Runtime) {
 		for _, runtime := range runtimes {
-			runtime.SetSink(srv)
+			runtime.SetSink(srv.RuntimeSink(runtime.Name()))
 		}
 		syncSources()
 	}
@@ -242,7 +242,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	providers := plugins.Providers()
 	runtimes := plugins.Runtimes()
 	for _, runtime := range runtimes {
-		runtime.SetSink(srv)
+		runtime.SetSink(srv.RuntimeSink(runtime.Name()))
 	}
 	registry.SetSources(modelSources(plugins)...)
 	if err := registry.LoadSnapshot(); err != nil {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -72,6 +73,7 @@ type liveSession struct {
 	pending     map[string]pendingAsk
 	closed      bool     // sess has been closed and removed from Server.live; never touch sess again
 	hookContext []string // what session_opened handlers added to this session's system prompt
+	runtime     *runtimeSessionState
 
 	// asking is the questions currently in front of the operator, keyed by what they ask
 	// rather than by which call asked. Tool calls run concurrently, so several calls can want
@@ -102,11 +104,13 @@ type liveSession struct {
 	// while the session is live, from whichever connection is opening the child.
 	children map[string]bool
 
-	obsMu   sync.Mutex
-	entries []session.Entry
-	conns   []*conn
-	state   turn.State
-	turnID  string
+	obsMu          sync.Mutex
+	entries        []session.Entry
+	conns          []*conn
+	state          turn.State
+	turnID         string
+	runtimeLinked  bool
+	runtimeEntries []agentruntime.ProjectedEntry
 
 	// standing is the permission questions the askers have been asked and none has
 	// answered yet, by tool_use id: what an asker attaching while one stands is owed, and
@@ -416,12 +420,13 @@ func (ls *liveSession) broadcastObsLocked(method string, params any) {
 // permission.requested when the newcomer is an asker, then what each live child of this session
 // is owed, and last the response carrying info.
 type attachment struct {
-	entries    []session.Entry
-	state      *protocol.TurnStateChanged
-	toolStates []protocol.ToolStateChanged
-	standing   []protocol.PermissionRequested
-	children   []childAttachment
-	info       protocol.SessionInfo
+	entries        []session.Entry
+	runtimeEntries []agentruntime.ProjectedEntry
+	state          *protocol.TurnStateChanged
+	toolStates     []protocol.ToolStateChanged
+	standing       []protocol.PermissionRequested
+	children       []childAttachment
+	info           protocol.SessionInfo
 }
 
 // childAttachment is what a connection attaching to a parent is owed about one child of it that
@@ -459,6 +464,8 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 		entries: append([]session.Entry(nil), ls.entries...),
 		info:    deriveInfo(sid, ls.entries),
 	}
+	at.runtimeEntries = append([]agentruntime.ProjectedEntry(nil), ls.runtimeEntries...)
+	at.info.ThreadLinked = ls.runtimeLinked
 	// No turn id yet means the turn is between markStarting and the runner's first append,
 	// so there is nothing truthful to name: the newcomer gets that first StateChanged as a
 	// live notification a moment later instead.
@@ -579,6 +586,10 @@ func deriveInfo(id ulid.ULID, entries []session.Entry) protocol.SessionInfo {
 			info.Model = p.Model
 			info.Mode = p.Mode
 			info.Thinking = p.Thinking
+			info.Execution = p.Execution
+			if !info.Execution.Valid() {
+				info.Execution = session.Execution{Kind: session.ExecutionNative, Provider: p.Model.Provider}
+			}
 		case session.ModelChange:
 			info.Model = p.Model
 		case session.ModeChange:
@@ -626,7 +637,7 @@ func (ls *liveSession) claimCloseIfIdle() bool {
 	}
 	defer ls.mu.Unlock()
 	st, _ := ls.mirroredState()
-	if ls.closed || (ls.runner != nil && isActive(st)) {
+	if ls.closed || isActive(st) {
 		return false
 	}
 	ls.closed = true

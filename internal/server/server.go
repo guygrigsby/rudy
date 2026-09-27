@@ -108,6 +108,7 @@ type Server struct {
 	pendingLogins  map[runtimeLoginKey]agentruntime.LoginCompletion
 	finishedLogins map[runtimeLoginKey]struct{}
 	accountStates  map[string]agentruntime.AccountState
+	runtimeThreads map[runtimeThreadKey]*liveSession
 }
 
 // New wires a Server. Deps must already be fully populated.
@@ -120,6 +121,7 @@ func New(d Deps) *Server {
 		live: map[ulid.ULID]*liveSession{}, conns: map[int]*conn{},
 		loginAttempts: map[runtimeLoginKey]runtimeLoginAttempt{}, pendingLogins: map[runtimeLoginKey]agentruntime.LoginCompletion{},
 		finishedLogins: map[runtimeLoginKey]struct{}{}, accountStates: map[string]agentruntime.AccountState{},
+		runtimeThreads: map[runtimeThreadKey]*liveSession{},
 	}
 }
 
@@ -788,6 +790,13 @@ func (s *Server) handleSubmit(cn *conn, raw json.RawMessage) (any, *protocol.Err
 	if err := session.Validate(msg); err != nil {
 		return nil, perr(protocol.CodeInvalidArgument, err.Error())
 	}
+	if ls.runtime != nil {
+		tid, runtimeErr := s.startRuntimeTurn(cn.lifetime, ls, msg)
+		if runtimeErr != nil {
+			return nil, runtimeErr
+		}
+		return protocol.SessionSubmitResult{TurnID: tid}, nil
+	}
 	tid, e := s.startTurn(ls, msg)
 	if e != nil {
 		return nil, e
@@ -816,6 +825,9 @@ func (s *Server) handleInterrupt(cn *conn, raw json.RawMessage) (any, *protocol.
 	}
 	if !p.How.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "how must be steer or cancel")
+	}
+	if ls.runtime != nil {
+		return s.interruptRuntimeTurn(cn.lifetime, ls, p.How)
 	}
 	ls.mu.Lock()
 	r := ls.runner
@@ -902,8 +914,11 @@ func (s *Server) setModel(ls *liveSession, spec string) (provider.Model, EntryID
 	if ls.closed {
 		return provider.Model{}, EntryIDResult{}, perr(protocol.CodeNotFound, "session closed")
 	}
+	if ls.runtime != nil && (m.OwnerKind != provider.OwnerRuntime || m.Ref.Provider != ls.runtime.name) {
+		return provider.Model{}, EntryIDResult{}, perr(protocol.CodeRefusedByInvariant, "runtime sessions cannot change execution owner")
+	}
 	st, _ := ls.mirroredState()
-	if ls.runner != nil && isActive(st) {
+	if isActive(st) {
 		return provider.Model{}, EntryIDResult{}, perr(protocol.CodeConflict, "a turn is active")
 	}
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
@@ -1015,6 +1030,9 @@ func (s *Server) compactHoldingSession(ctx context.Context, ls *liveSession, ins
 	defer ls.mu.Unlock()
 	if ls.closed {
 		return session.Entry{}, 0, perr(protocol.CodeNotFound, "session closed")
+	}
+	if ls.runtime != nil {
+		return session.Entry{}, 0, perr(protocol.CodeRefusedByInvariant, "runtime sessions do not support compaction")
 	}
 	st, _ := ls.mirroredState()
 	if ls.runner != nil && isActive(st) {
@@ -1162,6 +1180,10 @@ func (s *Server) handleShell(ctx context.Context, raw json.RawMessage) (any, *pr
 	if ls.closed {
 		ls.mu.Unlock()
 		return nil, perr(protocol.CodeNotFound, "session closed")
+	}
+	if ls.runtime != nil {
+		ls.mu.Unlock()
+		return nil, perr(protocol.CodeRefusedByInvariant, "runtime sessions do not support shell drafts")
 	}
 	if st, _ := ls.mirroredState(); ls.runner != nil && isActive(st) {
 		ls.mu.Unlock()
@@ -1325,7 +1347,7 @@ func (s *Server) handleCommandRun(ctx context.Context, cn *conn, raw json.RawMes
 		// definition's own default again.
 		ls.mu.Lock()
 		st, _ := ls.mirroredState()
-		if ls.runner != nil && isActive(st) {
+		if isActive(st) {
 			ls.mu.Unlock()
 			return nil, perr(protocol.CodeConflict, "a turn is active")
 		}
@@ -1390,7 +1412,7 @@ func (s *Server) setEntry(id string, kind session.Kind, f func(view protocol.Ses
 		return nil, perr(protocol.CodeNotFound, "session closed")
 	}
 	st, _ := ls.mirroredState()
-	if ls.runner != nil && isActive(st) {
+	if isActive(st) {
 		return nil, perr(protocol.CodeConflict, "a turn is active")
 	}
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
@@ -1459,6 +1481,19 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	if !mode.Valid() || !thinking.Valid() {
 		return nil, perr(protocol.CodeInvalidArgument, "invalid mode or thinking level")
 	}
+	execution := session.Execution{Kind: session.ExecutionNative, Provider: m.Ref.Provider}
+	var agentRuntime agentruntime.Runtime
+	if m.OwnerKind == provider.OwnerRuntime {
+		execution = session.Execution{Kind: session.ExecutionRuntime, Runtime: m.Ref.Provider}
+		var found bool
+		agentRuntime, found = s.d.Plugins.Runtime(execution.Runtime)
+		if !found {
+			return nil, perr(protocol.CodeUnavailable, "runtime unavailable: "+execution.Runtime)
+		}
+		if parent != nil || def.Name != "default" || p.Tools != nil {
+			return nil, perr(protocol.CodeRefusedByInvariant, "runtime sessions require a root default agent with no explicit tools")
+		}
+	}
 	// Resolved now, while the parent (if any) is still live, and persisted on the entry below:
 	// a resume or a fork brings this session back long after that parent may be gone, and
 	// applyAgentFromLog reads this recorded value rather than trying to recompute it (ADR
@@ -1467,11 +1502,14 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	// log's absent key as "every tool" would be the same escalation one field earlier.
 	allow := resolveTools(parent, def, registeredToolNames(s.d.Plugins, p.Tools))
 	opened := session.SessionOpened{
-		SchemaVersion: 2, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
-		Thinking: thinking, Mode: mode, Agent: def.Name, Tools: allow,
+		SchemaVersion: 3, RudyVersion: s.d.Version, Workspace: ws, Model: m.Ref,
+		Thinking: thinking, Mode: mode, Agent: def.Name, Tools: allow, Execution: execution,
 	}
 	if parent != nil {
 		opened.ParentSessionID, opened.ParentToolUseID = parent.sess.ID().String(), p.Parent.ToolUseID
+		if !parent.claimChild(p.Parent.ToolUseID) {
+			return nil, perr(protocol.CodeConflict, "tool_use "+p.Parent.ToolUseID+" already opened a child session")
+		}
 	}
 	sess, err := session.Open(s.d.Store, opened)
 	if err != nil {
@@ -1479,6 +1517,9 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 	}
 	ls := newLive(sess, m)
 	ls.parent = parent
+	if agentRuntime != nil {
+		ls.runtime = newRuntimeSession(agentRuntime)
+	}
 	if parent != nil && len(ls.entries) > 0 {
 		// session.Open appends session_opened inside itself, before this liveSession
 		// exists, so the ordinary mirror/fanout broadcast (session_live.go) never runs for
@@ -1497,8 +1538,10 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 			SessionID: sess.ID().String(), Entry: ls.entries[0],
 		})
 	}
-	s.applyAgent(ls, def, allow)
-	s.fireSessionOpened(s.ctx, ls, false)
+	if ls.runtime == nil {
+		s.applyAgent(ls, def, allow)
+		s.fireSessionOpened(s.ctx, ls, false)
+	}
 	return s.installAndAttach(cn, ls), nil
 }
 
@@ -1719,10 +1762,6 @@ func (s *Server) parentOf(cn *conn, ref *protocol.ParentRef, ws session.Workspac
 	if root := deriveInfo(parent.sess.ID(), entries).Workspace.Root; ws.Root != root {
 		return nil, perr(protocol.CodeInvalidArgument, "child cwd must be the parent's workspace")
 	}
-	// Claimed last, so a refusal above never spends the one child this tool_use may open.
-	if !parent.claimChild(ref.ToolUseID) {
-		return nil, perr(protocol.CodeConflict, "tool_use "+ref.ToolUseID+" already opened a child session")
-	}
 	return parent, nil
 }
 
@@ -1755,8 +1794,12 @@ func (s *Server) resume(cn *conn, p protocol.SessionResumeParams) (any, *protoco
 	// this process had with itself. loadCold waits out the close that is in flight and
 	// re-opens from disk, so every pass makes progress (rudy-anw).
 	for range resumeAttempts {
-		if _, lerr := s.loadCold(cn, sid); lerr != nil {
+		ls, lerr := s.loadCold(cn, sid)
+		if lerr != nil {
 			return nil, lerr
+		}
+		if rerr := s.refreshRuntimeSession(cn.lifetime, ls); rerr != nil {
+			return nil, rerr
 		}
 		if f := beforeAttachHook.Load(); f != nil {
 			(*f)()
@@ -1796,6 +1839,9 @@ func (s *Server) fork(cn *conn, p protocol.SessionForkParams) (any, *protocol.Er
 // this lock, landing the fork one entry stale. obsMu, which latestEntryID takes, nests inside mu
 // (see liveSession's doc), so taking it here while already holding parent.mu is safe.
 func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.SessionInfo, *protocol.Error) {
+	if parent.runtime != nil {
+		return s.forkRuntimeAt(cn.lifetime, cn, parent, at)
+	}
 	parent.mu.Lock()
 	if at == "" {
 		at = parent.latestEntryID()
@@ -1900,15 +1946,44 @@ func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.E
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "model not in registry: " + sess.Model().String()})
 	}
 	ls := newLive(sess, m)
-	s.applyAgentFromLog(cn, ls)
+	if execution := sess.Execution(); execution.Kind == session.ExecutionRuntime {
+		runtime, ok := s.d.Plugins.Runtime(execution.Runtime)
+		if !ok {
+			_ = sess.Close()
+			return nil, perr(protocol.CodeUnavailable, "runtime unavailable: "+execution.Runtime)
+		}
+		link, linkErr := s.d.Store.RuntimeLinks().Read(sid)
+		if linkErr == nil {
+			if link.Runtime != execution.Runtime {
+				_ = sess.Close()
+				return nil, perr(protocol.CodeInternal, "runtime link does not match session execution")
+			}
+			ref := agentruntime.ThreadRef{Runtime: execution.Runtime, SessionID: sid, ThreadID: link.ThreadID}
+			ls.runtime = newRuntimeSession(runtime)
+			ls.runtime.thread = &ref
+			ls.runtimeLinked = true
+		} else if !errors.Is(linkErr, session.ErrRuntimeLinkNotFound) {
+			_ = sess.Close()
+			return nil, protocol.ErrorFrom(linkErr)
+		} else {
+			ls.runtime = newRuntimeSession(runtime)
+		}
+	} else {
+		s.applyAgentFromLog(cn, ls)
+	}
 	// Every path that brings a session back from disk goes through here, so this is where a
 	// resumed session gets its session_opened, once, whether the caller was resume or fork.
 	// Before the install, not after: loadCold checks s.live before s.loading, so a session
 	// already in s.live is one another connection can attach to and submit a turn on, and
 	// that turn would assemble its system prompt without a context still being computed.
-	s.fireSessionOpened(s.ctx, ls, true)
+	if ls.runtime == nil {
+		s.fireSessionOpened(s.ctx, ls, true)
+	}
 	s.mu.Lock()
 	s.live[sid] = ls
+	if ls.runtime != nil && ls.runtime.thread != nil {
+		s.runtimeThreads[runtimeThreadKey{runtime: ls.runtime.name, threadID: ls.runtime.thread.ThreadID}] = ls
+	}
 	s.mu.Unlock()
 	return ls, nil
 }
@@ -1981,6 +2056,9 @@ func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
 func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInfo {
 	s.mu.Lock()
 	s.live[ls.sess.ID()] = ls
+	if ls.runtime != nil && ls.runtime.thread != nil {
+		s.runtimeThreads[runtimeThreadKey{runtime: ls.runtime.name, threadID: ls.runtime.thread.ThreadID}] = ls
+	}
 	at := ls.subscribeLocked(cn)
 	at.children = s.childAttachmentsLocked(cn, ls)
 	s.mu.Unlock()
@@ -2059,6 +2137,9 @@ func replay(cn *conn, sid ulid.ULID, entries []session.Entry) {
 // above.
 func deliverAttach(cn *conn, sid ulid.ULID, at attachment) {
 	replay(cn, sid, at.entries)
+	for _, entry := range at.runtimeEntries {
+		cn.notify(protocol.NotifyRuntimeEntry, protocol.RuntimeEntryParams{SessionID: sid.String(), Entry: entry})
+	}
 	if at.state != nil {
 		cn.notify(protocol.NotifyTurnState, *at.state)
 	}
@@ -2166,6 +2247,9 @@ func (s *Server) closeIfUnusedLocked(ls *liveSession) {
 		s.closing = map[ulid.ULID]chan struct{}{}
 	}
 	s.closing[id] = closingCh
+	if ls.runtime != nil && ls.runtime.thread != nil {
+		delete(s.runtimeThreads, runtimeThreadKey{runtime: ls.runtime.name, threadID: ls.runtime.thread.ThreadID})
+	}
 	delete(s.live, id)
 	s.mu.Unlock()
 
