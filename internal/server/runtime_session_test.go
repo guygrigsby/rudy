@@ -193,6 +193,41 @@ func TestRuntimeResumeRefreshesCanonicalProjection(t *testing.T) {
 	}
 }
 
+func TestRuntimeResumeCannotResurrectCompletedTurnFromStaleRead(t *testing.T) {
+	runtime := &sessionRuntime{readStarted: make(chan struct{}, 1), readRelease: make(chan struct{})}
+	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
+	runtime.links = h.store.RuntimeLinks()
+	owner := h.dial(t, true)
+	info := openRuntimeSession(t, owner, h.ws, nil)
+	var submitted protocol.SessionSubmitResult
+	if err := owner.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("hello")},
+	}, &submitted); err != nil {
+		t.Fatal(err)
+	}
+	runtime.setThread(agentruntime.Thread{Runtime: "codex", ThreadID: "thread-1", Turns: []agentruntime.Turn{{
+		TurnID: submitted.TurnID, Status: agentruntime.TurnRunning,
+	}}})
+	viewer := h.dial(t, true)
+	resumeDone := make(chan error, 1)
+	go func() {
+		var resumed protocol.SessionInfo
+		resumeDone <- viewer.Call(context.Background(), protocol.MethodSessionResume, protocol.SessionResumeParams{SessionID: info.SessionID}, &resumed)
+	}()
+	<-runtime.readStarted
+	runtime.emit(agentruntime.Event{Type: agentruntime.EventTurnCompleted, ThreadID: "thread-1", TurnID: submitted.TurnID, Status: string(agentruntime.TurnCompleted)})
+	close(runtime.readRelease)
+	if err := <-resumeDone; err != nil {
+		t.Fatal(err)
+	}
+	var next protocol.SessionSubmitResult
+	if err := owner.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("again")},
+	}, &next); err != nil {
+		t.Fatalf("submit after stale refresh: %v", err)
+	}
+}
+
 func TestRuntimeInterruptUsesRuntimeAndWaitsForTerminalEvent(t *testing.T) {
 	runtime := &sessionRuntime{}
 	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
@@ -285,7 +320,13 @@ func TestRuntimeForkBindsDistinctThreadAtLatestProjection(t *testing.T) {
 		Type: agentruntime.EventItemCompleted, ThreadID: "thread-1", TurnID: submitted.TurnID,
 		Item: agentruntime.Item{ItemID: "item-1", Type: agentruntime.ItemAgentMessage, Content: []session.Block{session.TextBlock("answer")}},
 	})
+	waitNotification(t, client, protocol.NotifyRuntimeEntry)
 	runtime.emit(agentruntime.Event{Type: agentruntime.EventTurnCompleted, ThreadID: "thread-1", TurnID: submitted.TurnID, Status: string(agentruntime.TurnCompleted)})
+	waitNotification(t, client, protocol.NotifyTurnState)
+	runtime.setThread(agentruntime.Thread{Runtime: "codex", ThreadID: "thread-fork", Turns: []agentruntime.Turn{{
+		TurnID: submitted.TurnID, Status: agentruntime.TurnCompleted,
+		Items: []agentruntime.Item{{ItemID: "item-1", Type: agentruntime.ItemAgentMessage, Content: []session.Block{session.TextBlock("answer")}}},
+	}}})
 	var forked protocol.SessionInfo
 	if err := client.Call(context.Background(), protocol.MethodSessionFork, protocol.SessionForkParams{SessionID: info.SessionID}, &forked); err != nil {
 		t.Fatal(err)
@@ -300,6 +341,14 @@ func TestRuntimeForkBindsDistinctThreadAtLatestProjection(t *testing.T) {
 	}
 	if link != (session.RuntimeLink{Runtime: "codex", ThreadID: "thread-fork"}) || !forked.ThreadLinked {
 		t.Fatalf("fork binding = %+v, info = %+v", link, forked)
+	}
+	note := waitNotification(t, client, protocol.NotifyRuntimeEntry)
+	var projected protocol.RuntimeEntryParams
+	if err := json.Unmarshal(note.Params, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if projected.SessionID != forked.SessionID || projected.Entry.ItemID != "item-1" {
+		t.Fatalf("fork projection = %+v", projected)
 	}
 }
 
@@ -637,6 +686,8 @@ type sessionRuntime struct {
 	thread                      agentruntime.Thread
 	startTurnErr                error
 	completeBeforeStartResponse bool
+	readStarted                 chan struct{}
+	readRelease                 chan struct{}
 }
 
 func (*sessionRuntime) Name() string { return "codex" }
@@ -669,11 +720,19 @@ func (*sessionRuntime) ForkThread(_ context.Context, ref agentruntime.ThreadRef)
 func (r *sessionRuntime) ReadThread(_ context.Context, ref agentruntime.ThreadRef) (agentruntime.Thread, error) {
 	r.record("thread/read")
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.thread.ThreadID == "" {
+	thread := r.thread
+	started, release := r.readStarted, r.readRelease
+	r.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
+	if thread.ThreadID == "" {
 		return agentruntime.Thread{Runtime: ref.Runtime, ThreadID: ref.ThreadID}, nil
 	}
-	return r.thread, nil
+	return thread, nil
 }
 func (r *sessionRuntime) StartTurn(_ context.Context, request agentruntime.StartTurnRequest) (agentruntime.TurnRef, error) {
 	if r.links == nil {

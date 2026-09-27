@@ -32,6 +32,7 @@ type runtimeSessionState struct {
 	mutating  bool
 	ambiguous bool
 	sequence  uint64
+	revision  uint64
 	items     map[string]agentruntime.ItemType
 	usage     session.Usage
 }
@@ -82,6 +83,7 @@ func (s *Server) refreshRuntimeSession(ctx context.Context, ls *liveSession) *pr
 		return nil
 	}
 	ref := *rs.thread
+	revision := rs.revision
 	rs.mutating = true
 	rs.mu.Unlock()
 
@@ -105,23 +107,52 @@ func (s *Server) refreshRuntimeSession(ctx context.Context, ls *liveSession) *pr
 		return runtimeOperationError(rs.name, err)
 	}
 	rs.mu.Lock()
+	changed := rs.revision != revision
 	rs.mutating = false
 	rs.ambiguous = false
-	rs.active = active
-	rs.terminal = ""
-	clear(rs.items)
+	if !changed {
+		rs.active = active
+		rs.terminal = ""
+		clear(rs.items)
+	}
 	rs.mu.Unlock()
 	ls.obsMu.Lock()
-	ls.runtimeEntries = entries
-	if active == nil {
-		ls.state = turn.Completed
-		ls.turnID = ""
+	if changed {
+		ls.runtimeEntries = mergeRuntimeEntries(entries, ls.runtimeEntries)
 	} else {
-		ls.state = turn.Streaming
-		ls.turnID = active.TurnID
+		ls.runtimeEntries = entries
+		if active == nil {
+			ls.state = turn.Completed
+			ls.turnID = ""
+		} else {
+			ls.state = turn.Streaming
+			ls.turnID = active.TurnID
+		}
 	}
 	ls.obsMu.Unlock()
 	return nil
+}
+
+func mergeRuntimeEntries(snapshot, live []agentruntime.ProjectedEntry) []agentruntime.ProjectedEntry {
+	liveByID := make(map[ulid.ULID]agentruntime.ProjectedEntry, len(live))
+	for _, entry := range live {
+		liveByID[entry.ID] = entry
+	}
+	merged := make([]agentruntime.ProjectedEntry, 0, len(snapshot)+len(live))
+	seen := make(map[ulid.ULID]bool, len(snapshot)+len(live))
+	for _, entry := range snapshot {
+		if newer, ok := liveByID[entry.ID]; ok {
+			entry = newer
+		}
+		merged = append(merged, entry)
+		seen[entry.ID] = true
+	}
+	for _, entry := range live {
+		if !seen[entry.ID] {
+			merged = append(merged, entry)
+		}
+	}
+	return merged
 }
 
 func projectRuntimeThread(thread agentruntime.Thread, ref agentruntime.ThreadRef) ([]agentruntime.ProjectedEntry, *agentruntime.TurnRef, error) {
@@ -253,6 +284,20 @@ func (s *Server) forkRuntimeAt(ctx context.Context, cn *conn, parent *liveSessio
 		return protocol.SessionInfo{}, protocol.ErrorFrom(forkErr)
 	}
 	childRef.SessionID = child.ID()
+	thread, err := rs.runtime.ReadThread(ctx, childRef)
+	if err != nil {
+		_ = child.Close()
+		return protocol.SessionInfo{}, runtimeOperationError(rs.name, err)
+	}
+	if thread.Runtime != rs.name || thread.ThreadID != childRef.ThreadID {
+		_ = child.Close()
+		return protocol.SessionInfo{}, runtimeOperationError(rs.name, errors.New("runtime returned a mismatched fork thread"))
+	}
+	entries, active, err := projectRuntimeThread(thread, childRef)
+	if err != nil {
+		_ = child.Close()
+		return protocol.SessionInfo{}, runtimeOperationError(rs.name, err)
+	}
 	if err := s.d.Store.RuntimeLinks().Write(child.ID(), session.RuntimeLink{Runtime: rs.name, ThreadID: childRef.ThreadID}); err != nil {
 		_ = child.Close()
 		return protocol.SessionInfo{}, protocol.ErrorFrom(err)
@@ -260,6 +305,12 @@ func (s *Server) forkRuntimeAt(ctx context.Context, cn *conn, parent *liveSessio
 	childLive := newLive(child, parent.model)
 	childLive.runtime = newRuntimeSession(rs.runtime)
 	childLive.runtime.thread = &childRef
+	childLive.runtime.active = active
+	childLive.runtimeEntries = entries
+	if active != nil {
+		childLive.state = turn.Streaming
+		childLive.turnID = active.TurnID
+	}
 	childLive.runtimeLinked = true
 	return s.installAndAttach(cn, childLive)
 }
@@ -420,6 +471,7 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 	if event.Sequence != 0 {
 		rs.sequence = event.Sequence
 	}
+	rs.revision++
 	activeID := ""
 	if rs.active != nil {
 		activeID = rs.active.TurnID
