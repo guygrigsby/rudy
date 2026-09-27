@@ -46,9 +46,6 @@ type fakeServer struct {
 	writeMu sync.Mutex
 	stateMu sync.Mutex
 	state   fakeState
-	// pendingLogin completes on the next thread start. That is the first later fake action
-	// and keeps the normal device challenge observable without a clock race.
-	pendingLogin string
 
 	approvalMu sync.Mutex
 	approval   chan json.RawMessage
@@ -151,8 +148,10 @@ func (s *fakeServer) handle(message envelope) {
 	case "thread/start":
 		thread := fakeThread{ID: "thread-1"}
 		s.storeThread(thread)
+		if invalidMutation(message.Method) {
+			thread.ID = ""
+		}
 		s.write(message.ID, map[string]any{"thread": thread})
-		s.completePendingLogin()
 	case "thread/resume":
 		thread := s.threadFrom(message.Params)
 		s.write(message.ID, map[string]any{"thread": thread})
@@ -163,16 +162,31 @@ func (s *fakeServer) handle(message envelope) {
 		}
 		s.write(message.ID, map[string]any{"thread": thread})
 	case "turn/start":
+		if invalidMutation(message.Method) {
+			s.write(message.ID, map[string]any{"turn": map[string]any{}})
+			return
+		}
 		s.startTurn(message)
 	case "turn/interrupt":
 		s.write(message.ID, map[string]any{})
 	case "turn/steer":
-		s.write(message.ID, map[string]any{"turnId": "turn-1"})
+		turnID := "turn-1"
+		if invalidMutation(message.Method) {
+			turnID = "other-turn"
+		}
+		s.write(message.ID, map[string]any{"turnId": turnID})
 	case "thread/fork":
 		thread := fakeThread{ID: "thread-fork"}
 		s.storeThread(thread)
+		if invalidMutation(message.Method) {
+			thread.ID = ""
+		}
 		s.write(message.ID, map[string]any{"thread": thread})
 	}
+}
+
+func invalidMutation(method string) bool {
+	return os.Getenv("FAKE_CODEX_INVALID_MUTATION") == method
 }
 
 func (s *fakeServer) startLogin(message envelope) {
@@ -193,7 +207,7 @@ func (s *fakeServer) startLogin(message envelope) {
 		}
 	}
 	early := os.Getenv("FAKE_CODEX_LOGIN_EARLY") != ""
-	if early || params.Type == "chatgptDeviceCode" {
+	if early {
 		s.stateMu.Lock()
 		s.state.Authenticated = true
 		s.persistLocked()
@@ -209,8 +223,10 @@ func (s *fakeServer) startLogin(message envelope) {
 		})
 		if !early {
 			s.stateMu.Lock()
-			s.pendingLogin = loginID
+			s.state.Authenticated = true
+			s.persistLocked()
 			s.stateMu.Unlock()
+			s.notify("account/login/completed", map[string]any{"loginId": loginID, "success": true})
 		}
 		return
 	}
@@ -218,16 +234,6 @@ func (s *fakeServer) startLogin(message envelope) {
 		"type": "chatgpt", "loginId": loginID,
 		"authUrl": "https://auth.openai.com/oauth?code=fake",
 	})
-}
-
-func (s *fakeServer) completePendingLogin() {
-	s.stateMu.Lock()
-	loginID := s.pendingLogin
-	s.pendingLogin = ""
-	s.stateMu.Unlock()
-	if loginID != "" {
-		s.notify("account/login/completed", map[string]any{"loginId": loginID, "success": true})
-	}
 }
 
 func (s *fakeServer) startTurn(message envelope) {
@@ -242,6 +248,10 @@ func (s *fakeServer) startTurn(message envelope) {
 		panic(err)
 	}
 	turn := fakeTurn{ID: "turn-1", Status: "inProgress"}
+	s.notify("turn/started", map[string]any{
+		"threadId": params.ThreadID,
+		"turn":     map[string]any{"id": turn.ID, "status": "inProgress", "items": []any{}},
+	})
 	s.write(message.ID, map[string]any{"turn": turn})
 
 	approval := make(chan json.RawMessage, 1)
@@ -249,12 +259,6 @@ func (s *fakeServer) startTurn(message envelope) {
 	s.approval = approval
 	s.approvalMu.Unlock()
 	go func() {
-		// Yield so the caller installs the returned turn binding before live events arrive.
-		time.Sleep(10 * time.Millisecond)
-		s.notify("turn/started", map[string]any{
-			"threadId": params.ThreadID,
-			"turn":     map[string]any{"id": turn.ID, "status": "inProgress", "items": []any{}},
-		})
 		command := map[string]any{
 			"id": "command-1", "type": "commandExecution", "command": "printf fake",
 			"cwd": "/repo", "status": "inProgress",

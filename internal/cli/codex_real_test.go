@@ -106,10 +106,14 @@ func TestRealCodexHeadlessLoginUsesDeviceCode(t *testing.T) {
 	bin := builtRudy(t)
 	fake := builtFakeCodex(t)
 	scratchConfig(t, root, []byte(codexTestConfig))
-	env, _ := fakeCodexProcessEnv(t, root, fake, false)
+	env, methods := fakeCodexProcessEnv(t, root, fake, false)
 	out := runClient(t, bin, root, env, "-p", "/login")
 	if !strings.Contains(out, "https://auth.openai.com/device") || !strings.Contains(out, "OPENAI-CODE") {
 		t.Fatalf("headless login output = %q", out)
+	}
+	got := readCodexMethods(t, methods)
+	if methodCount(got, "account/login/start") != 1 || methodCount(got, "account/read") < 2 || methodCount(got, "account/login/cancel") != 0 {
+		t.Fatalf("headless login did not complete cleanly: methods = %v", got)
 	}
 }
 

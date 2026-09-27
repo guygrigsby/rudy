@@ -93,6 +93,9 @@ cancels that login id before starting `type: "chatgptDeviceCode"`. It publishes
 a device challenge containing `login_id`, `verification_url` and `user_code`.
 Remote and headless clients start device login directly because the browser
 callback is hosted by the kernel-side App Server, not the client machine.
+The headless client prints the device challenge and keeps its connection open
+until the matching login completes or the operator interrupts it. Its exit
+status reports completion, not merely challenge delivery.
 
 `account/updated` updates displayed account state but never completes a login
 attempt because it carries no login id. A completion that races the start
@@ -100,6 +103,9 @@ response is buffered and matched once the response supplies its login id.
 Challenges and completion are private to the invoking connection. Disconnect
 cancels its attempt. The client sends hidden `browser` or `device` args based
 on its own transport because an SSH bridge is indistinguishable at the kernel.
+A new challenge for the same runtime supersedes the prior login id in that
+client. A late browser-opener result for the superseded id cannot start a
+second device attempt or cancel the device code already shown.
 
 Rudy stores no access token, refresh token, cookie, authorization code or
 client secret. Codex owns token persistence and refresh. Auth URLs and device
@@ -112,6 +118,9 @@ maps model id, display name, supported effort and input modalities. App Server
 does not promise pricing, context windows or output limits, so those fields are
 unknown rather than fabricated. Login completion, session open, picker open
 and model-not-found refresh the Codex model set. There is no timer.
+The current Rudy runtime submit path sends text only, so an advertised image
+input modality does not set Rudy's `vision` capability until image submission
+is supported end to end.
 
 `strict`, `permissive` and `off` map to App Server approval policies
 `onRequest`, `unlessTrusted` and `never`. Rudy leaves App Server sandbox policy
@@ -147,7 +156,8 @@ between those steps may leave an orphan Codex thread, but cannot cross-link or
 duplicate a turn because `turn/start` happens only after the link is durable.
 Resume calls
 `thread/resume` and `thread/read` with `includeTurns: true`. A fork calls
-`thread/fork` and binds the returned new thread id to the new Rudy session. A
+`thread/fork`, reads and validates the returned child thread and projects its
+canonical history before binding the new thread id to the new Rudy session. A
 fork never inherits or reuses its parent's mutable link.
 
 The link is `$XDG_DATA_HOME/rudy/sessions/<session-ulid>/runtime.toml`, written
@@ -180,6 +190,9 @@ facts. Closing detaches the client but does not delete the Codex thread.
 thread, turn and item notifications. `item/completed` replaces any accumulated
 deltas for that item. `turn/completed` is the terminal truth. Aggregated diff
 and plan updates replace their prior live values rather than append.
+If live events arrive while `thread/read` is in flight, a session revision
+fences the snapshot: live entries win on identical deterministic ids, new live
+entries remain and the snapshot cannot roll back the active turn state.
 
 Projected entry ids are deterministic hashes of the runtime name, thread id,
 turn id, item id and projected kind. The same item therefore has the same Rudy

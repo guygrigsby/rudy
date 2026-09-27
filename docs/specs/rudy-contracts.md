@@ -31,7 +31,7 @@ native sessions. Written before code.
 |---|---|---|---|
 | `session.open` | resolves the selected model's registry owner and writes `SessionExecution{runtime}`. A configured runtime model may open before login or discovery. It creates no thread. Runtime execution accepts only a root Session under the default agent with absent `tools` narrowing | `unavailable` only when the named runtime is not registered; absence of an HTTP Provider is not an error; `refused_by_invariant` for `parent`, a non-default agent or explicit `tools`, since runtime-owned tools cannot honor Rudy delegation constraints | `session_opened` schema 3 |
 | `session.resume` | loads local control records, resumes a linked runtime thread, reads authoritative history and sends `runtime.entry` projections before the response. An unlinked pre-login session has no runtime history | `runtime_error` when the link exists but cannot be resumed or read | no conversation write |
-| `session.fork` | requires a linked rested thread and `at_entry_id` empty or equal to the newest projected id; calls runtime fork and binds the returned distinct thread id to the child | `refused_by_invariant` for an older projection, active turn or reused thread id; `ambiguous` on lost fork response | child `session_opened`, `fork_point` and `runtime.toml` |
+| `session.fork` | requires a linked rested thread and `at_entry_id` empty or equal to the newest projected id; calls runtime fork, reads and validates the distinct child thread and projects its canonical history before binding it | `refused_by_invariant` for an older projection, active turn or reused thread id; `ambiguous` on lost fork response; `runtime_error` if the child cannot be read faithfully | child `session_opened`, `fork_point`, `runtime.toml` and replayed child projection |
 | `session.submit` | on the first submit, starts and durably binds a thread before starting a turn; later typed input starts a turn and steer input steers the verified active runtime turn | `runtime_error` unauthenticated or runtime failure; `ambiguous` on lost non-idempotent response, which is never retried | no user or assistant conversation entry |
 | `session.interrupt` | requests runtime turn interruption. The response is acknowledgment; terminal state waits for `turn_completed`. `how:steer` enters client steering and the next submit calls runtime steer only while that same runtime turn remains active; `how:cancel` does not accept later steer | `conflict` when expected runtime turn changed | no conversation write |
 | `session.answer` | native questions only. A runtime question answered here is `not_found` | none | `permission_decision` only |
@@ -97,6 +97,10 @@ completion never broadcast, enter transcript projection or reach logs. Client
 disconnect cancels its live LoginAttempt. A local TUI requests browser mode; a
 headless or SSH client requests device mode because the server cannot infer SSH
 after `rudy bridge` terminates it.
+The headless client keeps the connection open after printing the device code
+until its matching completion or interruption, so disconnect does not cancel
+an unredeemed challenge. A later challenge for the same runtime supersedes the
+prior id in the TUI; a late browser-opener result for that id is ignored.
 
 The visible command is `/login`; the client sends hidden args `browser` or
 `device` from its own transport. A user-supplied arg outside those values is
@@ -115,6 +119,13 @@ code. JSON output keeps the ordinary no-turn result and adds optional
 `auth_challenge:AuthChallenge`. Stream JSON writes one
 `{"method":"runtime.login.challenge","params":AuthChallenge}` object. These
 outputs contain the live challenge but never persist it.
+The headless command exits successfully only on matching successful completion.
+
+Rudy fences each in-flight runtime `thread/read` with a local session revision.
+Live events received during the read win on matching projected ids and remain if
+absent from the snapshot; the older snapshot cannot roll back active turn state.
+Codex model image-input metadata does not set Rudy's `vision` capability while
+the runtime submit path accepts text only.
 
 ### Codex App Server ACL
 
