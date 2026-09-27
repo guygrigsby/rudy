@@ -52,6 +52,14 @@ first account, model or thread operation starts it. Rudy resolves `codex` from
 `PATH`, requires version 0.155.1 or newer, starts it with argv rather than a
 shell and speaks newline-delimited JSON on stdio.
 
+The operational environment allowlist is `CODEX_HOME`, `HOME`, `PATH`, `SHELL`,
+`TMPDIR`, `TMP`, `TEMP`, `LANG`, `LC_ALL`, `LC_CTYPE`, `SSL_CERT_FILE` and
+`SSL_CERT_DIR`. The version probe and App Server process receive only those
+variables when they exist. Explicit process overrides replace or add individual
+variables. No other variable from the Rudy process crosses into Codex, so
+provider keys and service credentials cannot become ambient input to Codex
+tools (ADR 0047).
+
 The App Server connection has its own codec and bidirectional peer. App Server
 omits the JSON-RPC `jsonrpc` member. Rudy sends exactly one `initialize`, then
 `initialized`, before any other method. The existing plugin protocol codec and
@@ -257,7 +265,7 @@ without credentials. Tests cover initialization order, both login modes,
 completion races, cancellation before fallback, pagination, thread start,
 resume, fork, turn start, steer, interrupt, item projection, deterministic ids,
 approval binding, durable allow ordering, fail-closed paths, redaction, process
-restart and ambiguous non-retry.
+restart, ambiguous non-retry and process environment isolation.
 
 The real path gate runs a fake App Server binary through the actual subprocess
 transport, then drives `/login`, session creation, a turn, approval and resume

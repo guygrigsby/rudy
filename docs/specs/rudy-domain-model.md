@@ -766,6 +766,9 @@ the `codex` AgentRuntime implementation and anti-corruption layer.
 - At most one App Server process exists per Rudy kernel.
 - No request except `initialize` is sent before `initialized`.
 - All event routing uses a previously verified link and active turn binding.
+- The version probe and App Server inherit only the documented operational
+  environment allowlist plus explicit process overrides. Rudy credentials are
+  never ambient Codex process input.
 - Raw stderr, credentials and vendor error payloads never cross the ACL.
 
 ### States

@@ -4,6 +4,7 @@ package codexapp_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -109,6 +110,53 @@ func TestStartRejectsCodexBelowMinimumVersion(t *testing.T) {
 	}
 	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("app server started despite old version: %v", err)
+	}
+}
+
+func TestProcessEnvironmentExcludesAmbientVariables(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), "environment.json")
+	command := fakeCommand(t,
+		"FAKE_CODEX_ENV_LOG="+envPath,
+		"FAKE_CODEX_FORBID_ENV=RUDY_AMBIENT_SECRET",
+		"RUDY_EXPLICIT_SETTING=enabled",
+		"SHELL=/explicit/shell",
+	)
+	t.Setenv("HOME", "/ambient/home")
+	t.Setenv("SHELL", "/ambient/shell")
+	t.Setenv("RUDY_AMBIENT_SECRET", "must-not-cross-process-boundary")
+
+	client := codexapp.NewClient(command)
+	t.Cleanup(func() { _ = client.Close() })
+	if err := client.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []string
+	if err := json.Unmarshal(payload, &entries); err != nil {
+		t.Fatal(err)
+	}
+	environment := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			environment[name] = value
+		}
+	}
+	if _, ok := environment["RUDY_AMBIENT_SECRET"]; ok {
+		t.Fatal("ambient secret reached Codex process")
+	}
+	if got, want := environment["HOME"], "/ambient/home"; got != want {
+		t.Fatalf("HOME = %q, want %q", got, want)
+	}
+	if got, want := environment["SHELL"], "/explicit/shell"; got != want {
+		t.Fatalf("SHELL = %q, want explicit override %q", got, want)
+	}
+	if got, want := environment["RUDY_EXPLICIT_SETTING"], "enabled"; got != want {
+		t.Fatalf("RUDY_EXPLICIT_SETTING = %q, want %q", got, want)
 	}
 }
 

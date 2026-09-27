@@ -52,6 +52,10 @@ type fakeServer struct {
 }
 
 func main() {
+	if forbidden := os.Getenv("FAKE_CODEX_FORBID_ENV"); forbidden != "" && os.Getenv(forbidden) != "" {
+		fmt.Fprintf(os.Stderr, "forbidden environment variable %s\n", forbidden)
+		os.Exit(97)
+	}
 	if len(os.Args) == 2 && os.Args[1] == "--version" {
 		version := os.Getenv("FAKE_CODEX_VERSION")
 		if version == "" {
@@ -63,6 +67,15 @@ func main() {
 	if len(os.Args) != 3 || os.Args[1] != "app-server" || os.Args[2] != "--stdio" {
 		fmt.Fprintln(os.Stderr, "unexpected argv")
 		os.Exit(2)
+	}
+	if envPath := os.Getenv("FAKE_CODEX_ENV_LOG"); envPath != "" {
+		payload, err := json.Marshal(os.Environ())
+		if err != nil {
+			panic(err)
+		}
+		if err := os.WriteFile(envPath, payload, 0o600); err != nil {
+			panic(err)
+		}
 	}
 	server, err := newFakeServer()
 	if err != nil {

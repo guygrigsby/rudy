@@ -941,7 +941,7 @@ Every transition traced through protocol, event and record, else a recorded reas
 | PluginRegistry.Register* | `plugin.register_*`, `plugin.set_status` | `CapabilityRegistered`, `CapabilityRejected` | none; capabilities are runtime |
 | Registry.Refresh | `registry.refresh`, implicit on open | `RegistryRefreshed` | `registry.json` |
 | Runtime login | `/login` through `command.run`, runtime login methods and caller-private notifications | `LoginStarted`, `LoginChallenged`, `LoginCompleted` | none; Codex owns credentials and challenges are ephemeral |
-| Runtime process fail and lazy restart | active turns emit `runtime_failed` and linked Sessions reject submit or fork as `ambiguous` until `session.resume` reads canonical history; the next account, model or thread operation starts a replacement process | `RuntimeFailed`, `RuntimeStarted` | existing `runtime.toml` read on resume; lost non-idempotent calls never replayed |
+| Runtime process start, fail and lazy restart | the version probe and App Server receive only the documented operational environment allowlist plus explicit process overrides; active turns emit `runtime_failed` and linked Sessions reject submit or fork as `ambiguous` until `session.resume` reads canonical history; the next account, model or thread operation starts a replacement process | `RuntimeFailed`, `RuntimeStarted` | existing `runtime.toml` read on resume; lost non-idempotent calls never replayed |
 | session close | `session.close` | `session_closed` hook | none; closing is a connection fact, not a conversation fact |
 
 Invariants and where they are enforced:

@@ -23,6 +23,21 @@ const (
 
 var versionPattern = regexp.MustCompile(`^codex-cli (\d+)\.(\d+)\.(\d+)`)
 
+var codexEnvironmentKeys = [...]string{
+	"CODEX_HOME",
+	"HOME",
+	"PATH",
+	"SHELL",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+	"LANG",
+	"LC_ALL",
+	"LC_CTYPE",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+}
+
 type Command struct {
 	Path string
 	Env  []string
@@ -44,12 +59,13 @@ func startProcess(ctx context.Context, command Command, onRequest inboundHandler
 	if err != nil {
 		return nil, fmt.Errorf("find codex: %w", err)
 	}
-	if err := checkVersion(ctx, resolved, command.Env); err != nil {
+	env := processEnvironment(command.Env)
+	if err := checkVersion(ctx, resolved, env); err != nil {
 		return nil, err
 	}
 
 	cmd := exec.Command(resolved, "app-server", "--stdio")
-	cmd.Env = append(os.Environ(), command.Env...)
+	cmd.Env = env
 	inR, inW, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("codex app server stdin: %w", err)
@@ -91,7 +107,7 @@ func startProcess(ctx context.Context, command Command, onRequest inboundHandler
 
 func checkVersion(ctx context.Context, path string, env []string) error {
 	cmd := exec.CommandContext(ctx, path, "--version")
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("read codex version: %w", err)
@@ -112,6 +128,31 @@ func checkVersion(ctx context.Context, path string, env []string) error {
 		return fmt.Errorf("rudy requires codex-cli >= 0.155.1, found %d.%d.%d", version[0], version[1], version[2])
 	}
 	return nil
+}
+
+func processEnvironment(overrides []string) []string {
+	env := make([]string, 0, len(codexEnvironmentKeys)+len(overrides))
+	positions := make(map[string]int, len(codexEnvironmentKeys)+len(overrides))
+	for _, name := range codexEnvironmentKeys {
+		if value, ok := os.LookupEnv(name); ok {
+			positions[name] = len(env)
+			env = append(env, name+"="+value)
+		}
+	}
+	for _, entry := range overrides {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || name == "" {
+			env = append(env, entry)
+			continue
+		}
+		if position, ok := positions[name]; ok {
+			env[position] = entry
+			continue
+		}
+		positions[name] = len(env)
+		env = append(env, entry)
+	}
+	return env
 }
 
 func lessVersion(got, minimum [3]int) bool {
