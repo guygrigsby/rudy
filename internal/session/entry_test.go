@@ -345,3 +345,27 @@ func TestSessionOpenedParentFields(t *testing.T) {
 		t.Errorf("marshal must carry the empty parent fields: %s", out)
 	}
 }
+
+func TestVersionTwoSessionInfersNativeExecution(t *testing.T) {
+	line := `{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00Z","kind":"session_opened","schema_version":2,"rudy_version":"0.2.0","workspace":{"root":"/w","git_root":"","project_id":""},"model":{"provider":"aperture","model":"m"},"thinking":"high","mode":"strict","agent":"default","parent_session_id":"","parent_tool_use_id":"","tools":null}`
+	var e Entry
+	if err := e.UnmarshalJSON([]byte(line)); err != nil {
+		t.Fatal(err)
+	}
+	opened := e.Payload.(SessionOpened)
+	if opened.Execution.Kind != ExecutionNative || opened.Execution.Provider != "aperture" || opened.Execution.Runtime != "" {
+		t.Fatalf("execution = %+v", opened.Execution)
+	}
+}
+
+func TestSchemaThreeRequiresValidExecution(t *testing.T) {
+	opened := testOpened()
+	opened.SchemaVersion = 3
+	if err := Validate(opened); err == nil {
+		t.Fatal("schema 3 session accepted no execution")
+	}
+	opened.Execution = Execution{Kind: ExecutionRuntime, Runtime: "codex"}
+	if err := Validate(opened); err != nil {
+		t.Fatalf("runtime execution rejected: %v", err)
+	}
+}

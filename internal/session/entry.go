@@ -21,26 +21,27 @@ import (
 type Kind string
 
 const (
-	KindSessionOpened      Kind = "session_opened"
-	KindForkPoint          Kind = "fork_point"
-	KindUserMessage        Kind = "user_message"
-	KindAssistantMessage   Kind = "assistant_message"
-	KindPermissionDecision Kind = "permission_decision"
-	KindToolResult         Kind = "tool_result"
-	KindModelChange        Kind = "model_change"
-	KindModeChange         Kind = "mode_change"
-	KindThinkingChange     Kind = "thinking_change"
-	KindTitleChange        Kind = "title_change"
-	KindCompaction         Kind = "compaction"
-	KindTurnInterrupted    Kind = "turn_interrupted"
-	KindTurnFailed         Kind = "turn_failed"
-	KindNote               Kind = "note"
+	KindSessionOpened             Kind = "session_opened"
+	KindForkPoint                 Kind = "fork_point"
+	KindUserMessage               Kind = "user_message"
+	KindAssistantMessage          Kind = "assistant_message"
+	KindPermissionDecision        Kind = "permission_decision"
+	KindRuntimePermissionDecision Kind = "runtime_permission_decision"
+	KindToolResult                Kind = "tool_result"
+	KindModelChange               Kind = "model_change"
+	KindModeChange                Kind = "mode_change"
+	KindThinkingChange            Kind = "thinking_change"
+	KindTitleChange               Kind = "title_change"
+	KindCompaction                Kind = "compaction"
+	KindTurnInterrupted           Kind = "turn_interrupted"
+	KindTurnFailed                Kind = "turn_failed"
+	KindNote                      Kind = "note"
 )
 
 func (k Kind) Valid() bool {
 	switch k {
 	case KindSessionOpened, KindForkPoint, KindUserMessage, KindAssistantMessage,
-		KindPermissionDecision, KindToolResult, KindModelChange, KindModeChange,
+		KindPermissionDecision, KindRuntimePermissionDecision, KindToolResult, KindModelChange, KindModeChange,
 		KindThinkingChange, KindTitleChange, KindCompaction, KindTurnInterrupted,
 		KindTurnFailed, KindNote:
 		return true
@@ -334,6 +335,29 @@ type Matcher struct {
 // Payload is one entry kind's data.
 type Payload interface{ Kind() Kind }
 
+type ExecutionKind string
+
+const (
+	ExecutionNative  ExecutionKind = "native"
+	ExecutionRuntime ExecutionKind = "runtime"
+)
+
+type Execution struct {
+	Kind     ExecutionKind `json:"kind"`
+	Provider string        `json:"provider,omitempty"`
+	Runtime  string        `json:"runtime,omitempty"`
+}
+
+func (e Execution) Valid() bool {
+	switch e.Kind {
+	case ExecutionNative:
+		return e.Provider != "" && e.Runtime == ""
+	case ExecutionRuntime:
+		return e.Runtime != "" && e.Provider == ""
+	}
+	return false
+}
+
 type SessionOpened struct {
 	SchemaVersion int           `json:"schema_version"`
 	RudyVersion   string        `json:"rudy_version"`
@@ -356,6 +380,8 @@ type SessionOpened struct {
 	// written before this field existed decodes it as nil, the pre-existing behaviour for
 	// those sessions.
 	Tools []string `json:"tools"`
+	// Execution is required from schema 3. Older records infer native execution from Model.
+	Execution Execution `json:"execution"`
 }
 
 type ForkPoint struct {
@@ -390,6 +416,52 @@ type PermissionDecision struct {
 	// and is absent otherwise. Without it the log would show a decision, and then a tool
 	// result, for an input nothing in the session ever recorded.
 	Input json.RawMessage `json:"input,omitempty"`
+}
+
+type RuntimeApprovalKind string
+
+const (
+	RuntimeApprovalCommand     RuntimeApprovalKind = "command"
+	RuntimeApprovalFileChange  RuntimeApprovalKind = "file_change"
+	RuntimeApprovalPermissions RuntimeApprovalKind = "permissions"
+)
+
+func (k RuntimeApprovalKind) Valid() bool {
+	return k == RuntimeApprovalCommand || k == RuntimeApprovalFileChange || k == RuntimeApprovalPermissions
+}
+
+type RuntimeDecidedBy string
+
+const (
+	RuntimeByAsker          RuntimeDecidedBy = "asker"
+	RuntimeByNoAsker        RuntimeDecidedBy = "no_asker"
+	RuntimeByDisconnect     RuntimeDecidedBy = "disconnect"
+	RuntimeByTimeout        RuntimeDecidedBy = "timeout"
+	RuntimeByStale          RuntimeDecidedBy = "stale"
+	RuntimeByRuntimeFailure RuntimeDecidedBy = "runtime_failure"
+	RuntimeByShutdown       RuntimeDecidedBy = "shutdown"
+)
+
+func (d RuntimeDecidedBy) Valid() bool {
+	switch d {
+	case RuntimeByAsker, RuntimeByNoAsker, RuntimeByDisconnect, RuntimeByTimeout,
+		RuntimeByStale, RuntimeByRuntimeFailure, RuntimeByShutdown:
+		return true
+	}
+	return false
+}
+
+type RuntimePermissionDecision struct {
+	Runtime      string              `json:"runtime"`
+	ThreadID     string              `json:"thread_id"`
+	TurnID       string              `json:"turn_id"`
+	ItemID       string              `json:"item_id"`
+	RequestID    string              `json:"request_id"`
+	ApprovalKind RuntimeApprovalKind `json:"approval_kind"`
+	Decision     Decision            `json:"decision"`
+	DecidedBy    RuntimeDecidedBy    `json:"decided_by"`
+	Scope        Scope               `json:"scope"`
+	Reason       string              `json:"reason"`
 }
 
 type ToolResult struct {
@@ -445,20 +517,21 @@ type Note struct {
 	Role   NoteRole `json:"role"`
 }
 
-func (SessionOpened) Kind() Kind      { return KindSessionOpened }
-func (ForkPoint) Kind() Kind          { return KindForkPoint }
-func (UserMessage) Kind() Kind        { return KindUserMessage }
-func (AssistantMessage) Kind() Kind   { return KindAssistantMessage }
-func (PermissionDecision) Kind() Kind { return KindPermissionDecision }
-func (ToolResult) Kind() Kind         { return KindToolResult }
-func (ModelChange) Kind() Kind        { return KindModelChange }
-func (ModeChange) Kind() Kind         { return KindModeChange }
-func (ThinkingChange) Kind() Kind     { return KindThinkingChange }
-func (TitleChange) Kind() Kind        { return KindTitleChange }
-func (Compaction) Kind() Kind         { return KindCompaction }
-func (TurnInterrupted) Kind() Kind    { return KindTurnInterrupted }
-func (TurnFailed) Kind() Kind         { return KindTurnFailed }
-func (Note) Kind() Kind               { return KindNote }
+func (SessionOpened) Kind() Kind             { return KindSessionOpened }
+func (ForkPoint) Kind() Kind                 { return KindForkPoint }
+func (UserMessage) Kind() Kind               { return KindUserMessage }
+func (AssistantMessage) Kind() Kind          { return KindAssistantMessage }
+func (PermissionDecision) Kind() Kind        { return KindPermissionDecision }
+func (RuntimePermissionDecision) Kind() Kind { return KindRuntimePermissionDecision }
+func (ToolResult) Kind() Kind                { return KindToolResult }
+func (ModelChange) Kind() Kind               { return KindModelChange }
+func (ModeChange) Kind() Kind                { return KindModeChange }
+func (ThinkingChange) Kind() Kind            { return KindThinkingChange }
+func (TitleChange) Kind() Kind               { return KindTitleChange }
+func (Compaction) Kind() Kind                { return KindCompaction }
+func (TurnInterrupted) Kind() Kind           { return KindTurnInterrupted }
+func (TurnFailed) Kind() Kind                { return KindTurnFailed }
+func (Note) Kind() Kind                      { return KindNote }
 
 // Validate checks a payload's enums and blocks. Cross-entry rules live in
 // Session.Append; this is what can be checked on the payload alone.
@@ -493,6 +566,12 @@ func Validate(p Payload) error {
 				return fmt.Errorf("session_opened: parent_session_id: %w", err)
 			}
 		}
+		if v.SchemaVersion >= 3 && !v.Execution.Valid() {
+			return errors.New("session_opened: schema 3 requires valid execution")
+		}
+		if v.SchemaVersion < 3 && v.Execution.Kind != "" && !v.Execution.Valid() {
+			return errors.New("session_opened: invalid execution")
+		}
 	case ForkPoint:
 		if v.ParentSessionID.IsZero() || v.ParentEntryID.IsZero() {
 			return errors.New("fork_point: parent ids required")
@@ -516,6 +595,17 @@ func Validate(p Payload) error {
 		}
 		if len(v.Input) > 0 && !json.Valid(v.Input) {
 			return errors.New("permission_decision: input is not valid JSON")
+		}
+	case RuntimePermissionDecision:
+		if v.Runtime == "" || v.ThreadID == "" || v.TurnID == "" || v.ItemID == "" || v.RequestID == "" ||
+			!v.ApprovalKind.Valid() || !v.Decision.Valid() || !v.DecidedBy.Valid() || !v.Scope.Valid() || v.Reason == "" {
+			return errors.New("runtime_permission_decision: incomplete")
+		}
+		if v.Decision == Deny && v.Scope != ScopeOnce {
+			return errors.New("runtime_permission_decision: deny scope must be once")
+		}
+		if v.Scope == ScopeSession && (v.Decision != Allow || v.DecidedBy != RuntimeByAsker) {
+			return errors.New("runtime_permission_decision: session scope requires asker allow")
 		}
 	case ToolResult:
 		if v.ToolUseID == "" || !v.Outcome.Valid() {

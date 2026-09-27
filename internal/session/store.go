@@ -29,6 +29,8 @@ func OpenStore(root string) (*Store, error) {
 // Root is the store directory.
 func (st *Store) Root() string { return st.root }
 
+func (st *Store) RuntimeLinks() *RuntimeLinkStore { return NewRuntimeLinkStore(st.root) }
+
 // Dir is the directory of one session.
 func (st *Store) Dir(id ulid.ULID) string { return filepath.Join(st.root, id.String()) }
 
