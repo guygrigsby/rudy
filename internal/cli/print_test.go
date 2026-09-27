@@ -198,6 +198,25 @@ func TestHeadlessLoginOverridesExplicitBrowserMode(t *testing.T) {
 	}
 }
 
+func TestHeadlessLoginWaitsForMatchingCompletion(t *testing.T) {
+	clientEnd, serverEnd := protocol.Pipe()
+	client := protocol.NewClient(clientEnd)
+	defer func() { _ = client.Close(); _ = serverEnd.Close() }()
+	challenge := agentruntime.AuthChallenge{Type: agentruntime.ChallengeDevice, Runtime: "codex", LoginID: "login-1", VerificationURL: "https://auth.openai.com/device", UserCode: "ABCD"}
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		completion := agentruntime.LoginCompletion{Runtime: "codex", LoginID: "login-1", Success: true}
+		note, _ := protocol.NewNotification(protocol.NotifyRuntimeLoginCompleted, completion)
+		_ = serverEnd.Send(context.Background(), note)
+		close(done)
+	}()
+	if code, err := waitLoginCompletion(context.Background(), printOptions{Output: "text"}, client, challenge, io.Discard, io.Discard); err != nil || code != 0 {
+		t.Fatalf("wait completion: code=%d err=%v", code, err)
+	}
+	<-done
+}
+
 func TestNoOpJSONDeviceChallengeIsStructured(t *testing.T) {
 	challenge := &agentruntime.AuthChallenge{Type: agentruntime.ChallengeDevice, Runtime: "codex", LoginID: "login-1", VerificationURL: "https://auth.openai.com/device", UserCode: "ABCD"}
 	var out bytes.Buffer

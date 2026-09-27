@@ -213,7 +213,11 @@ func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt str
 		// above, or plugin.NoAction): there is nothing for the loop below to wait on. A
 		// turn.state for this turn id will never arrive, so waiting here would block
 		// until SIGINT. Report a completed no-op immediately instead.
-		return noOpResult(o, info, challenge, stdout)
+		code, err := noOpResult(o, info, challenge, stdout)
+		if err != nil || code != 0 || challenge == nil {
+			return code, err
+		}
+		return waitLoginCompletion(ctx, o, d.Client, *challenge, stdout, stderr)
 	}
 
 	out := &turnOutput{turnID: turnID, runtime: info.Execution.Kind == session.ExecutionRuntime, seenRuntime: map[string]bool{}}
@@ -276,6 +280,40 @@ func noOpResult(o printOptions, info protocol.SessionInfo, challenge *agentrunti
 		}
 	}
 	return 0, nil
+}
+
+func waitLoginCompletion(ctx context.Context, o printOptions, client *protocol.Client, challenge agentruntime.AuthChallenge, stdout, stderr io.Writer) (int, error) {
+	enc := json.NewEncoder(stdout)
+	for {
+		select {
+		case <-ctx.Done():
+			return 130, nil
+		case n, ok := <-client.Notifications():
+			if !ok {
+				return 1, errors.New("server closed the connection")
+			}
+			if o.Output == "stream-json" {
+				if err := enc.Encode(map[string]any{"method": n.Method, "params": json.RawMessage(n.Params)}); err != nil {
+					return 1, err
+				}
+			}
+			if n.Method != protocol.NotifyRuntimeLoginCompleted {
+				continue
+			}
+			var completion agentruntime.LoginCompletion
+			if err := json.Unmarshal(n.Params, &completion); err != nil {
+				return 1, fmt.Errorf("runtime.login.completed: %w", err)
+			}
+			if completion.Runtime != challenge.Runtime || completion.LoginID != challenge.LoginID {
+				continue
+			}
+			if completion.Success {
+				return 0, nil
+			}
+			_, _ = fmt.Fprintln(stderr, completion.Error)
+			return 1, nil
+		}
+	}
 }
 
 // submit sends the prompt, routing a leading slash word to command.run. It returns the turn id,

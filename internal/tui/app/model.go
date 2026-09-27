@@ -240,6 +240,7 @@ type Model struct {
 	runtimePromptOrder []string
 	runtimeAnswered    map[string]bool
 	finishedLogins     map[string]bool
+	activeLogins       map[string]string
 	// awaitLog is set from a switch until the head of the new session's log arrives, so
 	// the transcript is never built from the middle of a replay (see entry).
 	awaitLog bool
@@ -299,6 +300,7 @@ func New(o Options) *Model {
 		runtimePrompts:  make(map[string]protocol.RuntimePermissionRequested),
 		runtimeAnswered: make(map[string]bool),
 		finishedLogins:  make(map[string]bool),
+		activeLogins:    make(map[string]string),
 		showThinking:    cfg.UI.Transcript.Thinking == thinkingShown,
 		// The client's own are there from the first keystroke; command.list's answer is
 		// prepended to them when it lands.
@@ -614,6 +616,9 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 		var p agentruntime.LoginCompletion
 		if m.decode(n, &p) {
 			m.finishedLogins[p.Runtime+"/"+p.LoginID] = true
+			if m.activeLogins[p.Runtime] == p.LoginID {
+				delete(m.activeLogins, p.Runtime)
+			}
 			if p.Success {
 				m.note(levelInfo, p.Runtime+" login complete")
 			} else {
@@ -890,6 +895,10 @@ func (m *Model) authChallenge(challenge agentruntime.AuthChallenge) tea.Cmd {
 	if m.finishedLogins[challenge.Runtime+"/"+challenge.LoginID] {
 		return nil
 	}
+	if prior := m.activeLogins[challenge.Runtime]; prior != "" && prior != challenge.LoginID {
+		m.finishedLogins[challenge.Runtime+"/"+prior] = true
+	}
+	m.activeLogins[challenge.Runtime] = challenge.LoginID
 	switch challenge.Type {
 	case agentruntime.ChallengeDevice:
 		m.note(levelInfo, "Open "+challenge.VerificationURL+" and enter code "+challenge.UserCode)

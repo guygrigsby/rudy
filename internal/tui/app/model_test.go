@@ -224,6 +224,24 @@ func TestBrowserChallengeFailureRequestsDeviceFallback(t *testing.T) {
 	}
 }
 
+func TestServerDeviceFallbackSupersedesPendingBrowserOpener(t *testing.T) {
+	h := newHarnessWith(t, nil, func(o *Options) {
+		o.OpenAuthURL = func(context.Context, string) error { return fmt.Errorf("opener failed") }
+	})
+	browser := agentruntime.AuthChallenge{Type: agentruntime.ChallengeBrowser, Runtime: "codex", LoginID: "browser-1", URL: "https://auth.openai.com/x"}
+	browserCmd := h.m.authChallenge(browser)
+	if browserCmd == nil {
+		t.Fatal("browser challenge did not produce an opener command")
+	}
+	h.notify(protocol.NotifyRuntimeLoginChallenge, agentruntime.AuthChallenge{
+		Type: agentruntime.ChallengeDevice, Runtime: "codex", LoginID: "device-1",
+		VerificationURL: "https://auth.openai.com/device", UserCode: "ABCD",
+	})
+	if fallback := h.update(browserCmd()); fallback != nil {
+		t.Fatal("late browser failure replaced the server's device fallback")
+	}
+}
+
 func TestCompletedLoginDoesNotOpenLateBrowserChallenge(t *testing.T) {
 	opened := 0
 	h := newHarnessWith(t, nil, func(o *Options) {
