@@ -5,14 +5,257 @@
 package integration_test
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/guygrigsby/rudy/internal/agentruntime"
+	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/plugins/codex"
+	"github.com/guygrigsby/rudy/internal/provider/codexapp"
+	"github.com/guygrigsby/rudy/internal/session"
 )
+
+// These drift checks run in make test despite the rest of this package's
+// integration tag. The contracts, adapter and shipped wire catalogue must move
+// together when the Codex minimum version or runtime port changes.
+func TestRuntimeDriftMethods(t *testing.T) {
+	contract := runtimeContractRows(t, "### Runtime plugin requests", "| method |")
+	want := map[string]string{
+		"Account": "runtime.account.read", "StartLogin": "runtime.login.start",
+		"CancelLogin": "runtime.login.cancel", "ListModels": "runtime.model.list",
+		"StartThread": "runtime.thread.start", "ResumeThread": "runtime.thread.resume",
+		"ForkThread": "runtime.thread.fork", "ReadThread": "runtime.thread.read",
+		"StartTurn": "runtime.turn.start", "SteerTurn": "runtime.turn.steer",
+		"InterruptTurn": "runtime.turn.interrupt",
+	}
+	iface := reflect.TypeOf((*agentruntime.Runtime)(nil)).Elem()
+	for i := range iface.NumMethod() {
+		name := iface.Method(i).Name
+		if name == "Name" || name == "SetSink" {
+			continue
+		}
+		if _, ok := want[name]; !ok {
+			t.Errorf("agentruntime.Runtime.%s has no spawned method contract; update docs/specs/rudy-contracts.md and this mapping", name)
+		}
+	}
+	var expected []string
+	for name, method := range want {
+		if _, ok := iface.MethodByName(name); !ok {
+			t.Errorf("spawned method %s has no agentruntime.Runtime.%s operation", method, name)
+		}
+		expected = append(expected, method)
+	}
+	slices.Sort(expected)
+	if !slices.Equal(contract, expected) {
+		t.Errorf("runtime method contract %v, want Runtime port %v; update docs/specs/rudy-contracts.md", contract, expected)
+	}
+	f, err := parser.ParseFile(token.NewFileSet(), filepath.Join("..", "protocol", "methods.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var protocolMethods []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		v, ok := n.(*ast.ValueSpec)
+		if !ok || len(v.Names) != 1 || !strings.HasPrefix(v.Names[0].Name, "MethodRuntime") || len(v.Values) != 1 {
+			return true
+		}
+		lit, ok := v.Values[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		value, err := strconv.Unquote(lit.Value)
+		if err == nil && strings.HasPrefix(value, "runtime.") && !strings.HasPrefix(value, "runtime.approval.") {
+			protocolMethods = append(protocolMethods, value)
+		}
+		return true
+	})
+	slices.Sort(protocolMethods)
+	if !slices.Equal(contract, protocolMethods) {
+		t.Errorf("runtime contract %v, protocol constants %v; update internal/protocol/methods.go and docs/specs/rudy-contracts.md together", contract, protocolMethods)
+	}
+}
+
+func TestRuntimeDriftCodexRegistration(t *testing.T) {
+	client := codexapp.NewClient(codexapp.Command{Path: "/does-not-start"})
+	r := plugin.NewRegistry(nil, nil)
+	r.Load(context.Background(), codex.New(client))
+	t.Cleanup(func() { _ = r.Close(context.Background()) })
+	if got, ok := r.Runtime("codex"); !ok || got != client {
+		t.Fatal("Codex plugin must register its AgentRuntime through plugin.Host")
+	}
+	if len(r.Providers()) != 0 {
+		t.Fatal("Codex App Server must register as a runtime, not a native provider")
+	}
+	command, ok := r.Command("login")
+	if !ok || command.Owner != "codex" || command.Description == "" || command.Run == nil {
+		t.Fatalf("/login command metadata = %+v, registered = %v; update Codex plugin registration", command, ok)
+	}
+	for _, mode := range []agentruntime.LoginMode{"browser", "device"} {
+		action, err := command.Run(context.Background(), plugin.CommandCall{Args: string(mode)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		challenge, ok := action.(plugin.AuthChallenge)
+		if !ok || challenge.Runtime != "codex" || challenge.Mode != mode {
+			t.Errorf("/login %s = %#v; want Codex AuthChallenge", mode, action)
+		}
+	}
+}
+
+func TestRuntimeDriftCodexMethodCatalogue(t *testing.T) {
+	catalogue, err := os.ReadFile(filepath.Join("..", "provider", "codexapp", "testdata", "methods-0.155.1.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Changing the upstream method set needs a reviewed minimum-version update.
+	const reviewedSHA256 = "c97ac1d0202c51b1b4ca85deb0d62c276b02480492ab28f19af6b1cb18b7bc21"
+	if got := fmt.Sprintf("%x", sha256.Sum256(catalogue)); got != reviewedSHA256 {
+		t.Errorf("Codex 0.155.1 method catalogue changed: SHA256 %s; review upstream schema and update this hash", got)
+	}
+	spec, err := os.ReadFile(filepath.Join("..", "..", "docs", "specs", "codex-app-server-runtime.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(spec), "0.155.1") {
+		t.Error("Codex minimum version in docs/specs/codex-app-server-runtime.md must match method catalogue 0.155.1")
+	}
+	methods := strings.Fields(string(catalogue))
+	if !slices.IsSorted(methods) || len(methods) == 0 {
+		t.Fatal("Codex method catalogue must be nonempty and sorted")
+	}
+	known := make(map[string]bool, len(methods))
+	for _, method := range methods {
+		if known[method] {
+			t.Errorf("duplicate Codex catalogue method %q", method)
+		}
+		known[method] = true
+	}
+	root := filepath.Join("..")
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path == filepath.Join("..", "provider", "codexapp") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			return err
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(lit.Value)
+			if err == nil && strings.Contains(value, "/") && known[value] {
+				t.Errorf("Codex App Server method %q leaked into %s; keep wire tokens in internal/provider/codexapp", value, path)
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeDriftLinkKeys(t *testing.T) {
+	contract := runtimeContractRows(t, "### runtime.toml", "| key |")
+	if session.RuntimeLinkFile != "runtime.toml" {
+		t.Fatalf("RuntimeLinkFile = %q; update runtime.toml contract", session.RuntimeLinkFile)
+	}
+	typ := reflect.TypeOf(session.RuntimeLink{})
+	var tags []string
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.Type.Kind() != reflect.String {
+			t.Errorf("runtime link %s is not a string; update runtime.toml contract", field.Name)
+		}
+		tags = append(tags, field.Tag.Get("toml"))
+	}
+	slices.Sort(tags)
+	if !slices.Equal(contract, tags) {
+		t.Errorf("runtime.toml contract keys %v, RuntimeLink tags %v; update docs/specs/rudy-contracts.md", contract, tags)
+	}
+	store := session.NewRuntimeLinkStore(t.TempDir())
+	id := session.NewID()
+	if err := store.Write(id, session.RuntimeLink{Runtime: "codex", ThreadID: "thr_1"}); err != nil {
+		t.Fatal(err)
+	}
+	path := store.Path(id)
+	if filepath.Base(path) != session.RuntimeLinkFile {
+		t.Errorf("runtime link path = %s, want %s", path, session.RuntimeLinkFile)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actual []string
+	for _, line := range strings.Split(string(body), "\n") {
+		if key, _, ok := strings.Cut(line, " = "); ok {
+			actual = append(actual, key)
+		}
+	}
+	slices.Sort(actual)
+	if !slices.Equal(contract, actual) {
+		t.Errorf("runtime.toml contract keys %v, persisted keys %v; update session.RuntimeLinkStore", contract, actual)
+	}
+}
+
+func runtimeContractRows(t *testing.T, heading, header string) []string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join("..", "..", "docs", "specs", "rudy-contracts.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := strings.SplitN(string(body), heading, 2)
+	if len(section) != 2 {
+		t.Fatalf("missing %s in docs/specs/rudy-contracts.md", heading)
+	}
+	table := strings.SplitN(section[1], header, 2)
+	if len(table) != 2 {
+		t.Fatalf("missing %s table in %s", header, heading)
+	}
+	var rows []string
+	for _, line := range strings.Split(table[1], "\n") {
+		if !strings.HasPrefix(line, "| ") {
+			if len(rows) > 0 {
+				break
+			}
+			continue
+		}
+		cell := strings.TrimSpace(strings.SplitN(line, "|", 3)[1])
+		if strings.HasPrefix(cell, "`") && strings.HasSuffix(cell, "`") {
+			rows = append(rows, strings.Trim(cell, "`"))
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatalf("empty %s table in docs/specs/rudy-contracts.md", heading)
+	}
+	slices.Sort(rows)
+	return rows
+}
 
 // toolCall makes the fake endpoint answer with one call of tool carrying args, then stop.
 func toolCall(tool string, args map[string]any) func(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,12 @@
 Newest first. The startup header reads the top release from this file, so a
 bullet here is what a person sees when they open the client on that build.
 
+## 0.2.0
+
+- Runs Codex App Server sessions with browser or device login through `/login`
+- Resumes Codex threads across client and server restarts
+- Routes Codex command, file and permission approvals through Rudy
+
 ## 0.1.0
 
 - Opens full screen, and every row stays expandable

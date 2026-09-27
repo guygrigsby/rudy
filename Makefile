@@ -11,6 +11,7 @@ build:
 test:
 	CGO_ENABLED=1 go test -race ./...
 	CGO_ENABLED=1 RUDY_TEST_TRANSPORT=socket go test -race -count=1 ./internal/server/
+	CGO_ENABLED=1 go test -race -tags=integration -run '^TestRuntimeDrift' -count=1 ./internal/integration/
 
 lint:
 	golangci-lint run ./...
