@@ -84,7 +84,7 @@ events are de-duplicated by their binding and projection id.
 | notification | to | payload | delivery |
 |---|---|---|---|
 | `runtime.entry` | clients attached to the bound session and the parent's eligible watchers | `{session_id, entry:ProjectedEntry}` | authoritative history before `session.resume` response, then completed live items; reconnect de-duplicates by deterministic id |
-| `runtime.delta` | clients attached to the bound session and the parent's eligible watchers | `{session_id, turn_id, item_id, kind, text}` | live only; superseded by `runtime.entry` for the completed item |
+| `runtime.delta` | clients attached to the bound session and the parent's eligible watchers | `{session_id, turn_id, item_id, kind, text, replace}` | live only; `replace: false` appends a fragment, `replace: true` replaces the item's live text and `runtime.entry` supersedes either form for the completed item |
 | `runtime.permission.requested` | attached asker clients | `{session_id, turn_id, request_id, item_id, kind, summary, command, cwd, reason, changes, network, permissions, allowed_scopes}` | every current asker and an asker attaching while pending; first `runtime.approval.answer` wins; no asker denies immediately |
 | `runtime.account.updated` | every client | `AccountState` | latest wins; sent on connect and after verified `account/read` |
 | `runtime.login.challenge` | invoking connection only | `AuthChallenge` | live only; used when browser fallback creates a device attempt |
