@@ -34,6 +34,32 @@ func (st *Store) RuntimeLinks() *RuntimeLinkStore { return NewRuntimeLinkStore(s
 // Dir is the directory of one session.
 func (st *Store) Dir(id ulid.ULID) string { return filepath.Join(st.root, id.String()) }
 
+// RollbackFork closes and removes a newly created fork before it is published.
+// It refuses root sessions, forks from another store and forks changed after creation.
+func (st *Store) RollbackFork(child *Session) error {
+	if child == nil {
+		return errors.New("session: roll back nil fork")
+	}
+	child.mu.Lock()
+	id := child.id
+	if filepath.Clean(child.dir) != filepath.Clean(st.Dir(id)) {
+		child.mu.Unlock()
+		return errors.New("session: roll back fork from another store")
+	}
+	if len(child.own) != 1 {
+		child.mu.Unlock()
+		return errors.New("session: roll back fork changed after creation")
+	}
+	if _, ok := child.own[0].Payload.(ForkPoint); !ok {
+		child.mu.Unlock()
+		return errors.New("session: roll back root session")
+	}
+	closeErr := child.closeLocked()
+	child.mu.Unlock()
+	removeErr := os.RemoveAll(st.Dir(id))
+	return errors.Join(closeErr, removeErr)
+}
+
 // Summary is what List reports without replaying a log. Json tags match the contract's
 // SessionSummary shape (rudy-contracts.md); session.list wire-encodes this struct directly.
 type Summary struct {

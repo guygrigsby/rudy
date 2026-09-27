@@ -526,6 +526,10 @@ func (s *Session) decisionForLocked(toolUseID string) (PermissionDecision, bool)
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.closeLocked()
+}
+
+func (s *Session) closeLocked() error {
 	err := s.log.Close()
 	if s.unlock != nil {
 		s.unlock()

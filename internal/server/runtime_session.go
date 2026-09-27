@@ -286,21 +286,18 @@ func (s *Server) forkRuntimeAt(ctx context.Context, cn *conn, parent *liveSessio
 	childRef.SessionID = child.ID()
 	thread, err := rs.runtime.ReadThread(ctx, childRef)
 	if err != nil {
-		_ = child.Close()
-		return protocol.SessionInfo{}, runtimeOperationError(rs.name, err)
+		return protocol.SessionInfo{}, runtimeOperationError(rs.name, rollbackRuntimeFork(s.d.Store, child, err))
 	}
 	if thread.Runtime != rs.name || thread.ThreadID != childRef.ThreadID {
-		_ = child.Close()
-		return protocol.SessionInfo{}, runtimeOperationError(rs.name, errors.New("runtime returned a mismatched fork thread"))
+		err = errors.New("runtime returned a mismatched fork thread")
+		return protocol.SessionInfo{}, runtimeOperationError(rs.name, rollbackRuntimeFork(s.d.Store, child, err))
 	}
 	entries, active, err := projectRuntimeThread(thread, childRef)
 	if err != nil {
-		_ = child.Close()
-		return protocol.SessionInfo{}, runtimeOperationError(rs.name, err)
+		return protocol.SessionInfo{}, runtimeOperationError(rs.name, rollbackRuntimeFork(s.d.Store, child, err))
 	}
 	if err := s.d.Store.RuntimeLinks().Write(child.ID(), session.RuntimeLink{Runtime: rs.name, ThreadID: childRef.ThreadID}); err != nil {
-		_ = child.Close()
-		return protocol.SessionInfo{}, protocol.ErrorFrom(err)
+		return protocol.SessionInfo{}, protocol.ErrorFrom(rollbackRuntimeFork(s.d.Store, child, err))
 	}
 	childLive := newLive(child, parent.model)
 	childLive.runtime = newRuntimeSession(rs.runtime)
@@ -313,6 +310,13 @@ func (s *Server) forkRuntimeAt(ctx context.Context, cn *conn, parent *liveSessio
 	}
 	childLive.runtimeLinked = true
 	return s.installAndAttach(cn, childLive)
+}
+
+func rollbackRuntimeFork(store *session.Store, child *session.Session, cause error) error {
+	if err := store.RollbackFork(child); err != nil {
+		return errors.Join(cause, fmt.Errorf("roll back runtime fork: %w", err))
+	}
+	return cause
 }
 
 func (s *Server) startRuntimeTurn(ctx context.Context, ls *liveSession, msg session.UserMessage) (string, *protocol.Error) {

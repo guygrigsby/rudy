@@ -352,6 +352,84 @@ func TestRuntimeForkBindsDistinctThreadAtLatestProjection(t *testing.T) {
 	}
 }
 
+func TestRuntimeForkFailureRemovesCreatedChild(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, *sessionRuntime, *session.Store)
+	}{
+		{
+			name: "read thread",
+			prepare: func(_ *testing.T, runtime *sessionRuntime, _ *session.Store) {
+				runtime.readErr = errors.New("read failed")
+			},
+		},
+		{
+			name: "write runtime link",
+			prepare: func(t *testing.T, _ *sessionRuntime, store *session.Store) {
+				t.Helper()
+				if err := store.RuntimeLinks().Write(session.NewID(), session.RuntimeLink{
+					Runtime: "codex", ThreadID: "thread-fork",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := &sessionRuntime{}
+			h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
+			runtime.links = h.store.RuntimeLinks()
+			client := h.dial(t, true)
+			info := openRuntimeSession(t, client, h.ws, nil)
+			var submitted protocol.SessionSubmitResult
+			if err := client.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+				SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("hello")},
+			}, &submitted); err != nil {
+				t.Fatal(err)
+			}
+			runtime.emit(agentruntime.Event{
+				Type: agentruntime.EventItemCompleted, ThreadID: "thread-1", TurnID: submitted.TurnID,
+				Item: agentruntime.Item{ItemID: "item-1", Type: agentruntime.ItemAgentMessage, Content: []session.Block{session.TextBlock("answer")}},
+			})
+			waitNotification(t, client, protocol.NotifyRuntimeEntry)
+			runtime.emit(agentruntime.Event{
+				Type: agentruntime.EventTurnCompleted, ThreadID: "thread-1", TurnID: submitted.TurnID,
+				Status: string(agentruntime.TurnCompleted),
+			})
+			waitNotification(t, client, protocol.NotifyTurnState)
+			runtime.setThread(agentruntime.Thread{Runtime: "codex", ThreadID: "thread-fork"})
+			test.prepare(t, runtime, h.store)
+
+			var forked protocol.SessionInfo
+			err := client.Call(context.Background(), protocol.MethodSessionFork, protocol.SessionForkParams{
+				SessionID: info.SessionID,
+			}, &forked)
+			if err == nil {
+				t.Fatal("fork succeeded, want error")
+			}
+			childID := runtime.lastReadSession()
+			if childID.Compare(ulid.ULID{}) == 0 {
+				t.Fatal("runtime did not receive the created child id")
+			}
+			listed, listErr := h.store.List()
+			if listErr != nil {
+				t.Fatal(listErr)
+			}
+			if len(listed) != 1 || listed[0].ID.String() != info.SessionID {
+				t.Fatalf("sessions after failed fork = %+v, want only parent %s", listed, info.SessionID)
+			}
+			if _, statErr := os.Stat(h.store.Dir(childID)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("created child directory remains after failed fork: %v", statErr)
+			}
+			if child, loadErr := session.Load(h.store, childID); loadErr == nil {
+				_ = child.Close()
+				t.Fatal("created child remains resumable after failed fork")
+			}
+		})
+	}
+}
+
 func TestRuntimeAmbiguousTurnRequiresReadReconciliation(t *testing.T) {
 	runtime := &sessionRuntime{startTurnErr: agentruntime.ErrAmbiguous}
 	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
@@ -716,6 +794,8 @@ type sessionRuntime struct {
 	ops                         []string
 	links                       *session.RuntimeLinkStore
 	thread                      agentruntime.Thread
+	readErr                     error
+	lastReadSessionID           ulid.ULID
 	startTurnErr                error
 	completeBeforeStartResponse bool
 	readStarted                 chan struct{}
@@ -753,6 +833,8 @@ func (r *sessionRuntime) ReadThread(_ context.Context, ref agentruntime.ThreadRe
 	r.record("thread/read")
 	r.mu.Lock()
 	thread := r.thread
+	err := r.readErr
+	r.lastReadSessionID = ref.SessionID
 	started, release := r.readStarted, r.readRelease
 	r.mu.Unlock()
 	if started != nil {
@@ -761,10 +843,19 @@ func (r *sessionRuntime) ReadThread(_ context.Context, ref agentruntime.ThreadRe
 	if release != nil {
 		<-release
 	}
+	if err != nil {
+		return agentruntime.Thread{}, err
+	}
 	if thread.ThreadID == "" {
 		return agentruntime.Thread{Runtime: ref.Runtime, ThreadID: ref.ThreadID}, nil
 	}
 	return thread, nil
+}
+
+func (r *sessionRuntime) lastReadSession() ulid.ULID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastReadSessionID
 }
 func (r *sessionRuntime) StartTurn(_ context.Context, request agentruntime.StartTurnRequest) (agentruntime.TurnRef, error) {
 	if r.links == nil {

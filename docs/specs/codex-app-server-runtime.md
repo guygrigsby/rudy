@@ -224,8 +224,10 @@ session-scoped answer.
 No asker, asker disconnect, timeout, stale turn, unknown request, malformed
 request, subprocess failure and shutdown all fail closed. Command and file
 requests receive `decline`; permission requests receive an empty grant; user
-input and MCP elicitation receive cancellation. Unsupported inbound methods
-receive an immediate method error so a turn cannot hang.
+input requests receive `{answers:{}}` and dynamic tool calls receive
+`{contentItems:[],success:false}`. Neither reaches the approval asker.
+Unsupported inbound methods, including MCP elicitation, receive an immediate
+method error so a turn cannot hang.
 
 Pending approval UI clears only after `serverRequest/resolved` or terminal
 turn completion. Repeated or late answers are refused. Network approval text
