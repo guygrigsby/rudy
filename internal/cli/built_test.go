@@ -21,10 +21,14 @@ import (
 const builtVersion = "v0.0.0-1-gtest001"
 
 var (
-	builtOnce sync.Once
-	builtDir  string
-	builtPath string
-	builtErr  error
+	builtOnce     sync.Once
+	builtDir      string
+	builtPath     string
+	builtErr      error
+	fakeCodexOnce sync.Once
+	fakeCodexDir  string
+	fakeCodexPath string
+	fakeCodexErr  error
 )
 
 // pinVersion makes this process report the version builtRudy compiled. The test binary is
@@ -38,13 +42,15 @@ func pinVersion(t *testing.T, v string) {
 	t.Cleanup(func() { version = old })
 }
 
-// TestMain removes the binary builtRudy compiled. t.TempDir is per test and the binary is
-// per package run, so the directory is this package's to clean and nothing else's: without
-// this every `go test ./internal/cli/` leaves 41MB under the OS temp dir, for good.
+// TestMain removes the binaries built for real-path tests. t.TempDir is per test and these
+// binaries are per package run, so their directories are this package's to clean.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	if builtDir != "" {
 		_ = os.RemoveAll(builtDir)
+	}
+	if fakeCodexDir != "" {
+		_ = os.RemoveAll(fakeCodexDir)
 	}
 	os.Exit(code)
 }
@@ -78,6 +84,33 @@ func builtRudy(t *testing.T) string {
 		t.Fatal(builtErr)
 	}
 	return builtPath
+}
+
+// builtFakeCodex builds the stateful App Server fixture once per package run. It is named
+// codex so the production exec.LookPath branch finds it without a test-only production seam.
+func builtFakeCodex(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not on PATH")
+	}
+	fakeCodexOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "rudy-fake-codex-")
+		if err != nil {
+			fakeCodexErr = err
+			return
+		}
+		fakeCodexDir = dir
+		fakeCodexPath = filepath.Join(dir, "codex")
+		cmd := exec.Command("go", "build", "-o", fakeCodexPath, "../provider/codexapp/testdata/fakecodex")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fakeCodexErr = fmt.Errorf("go build fake codex: %v\n%s", err, out)
+		}
+	})
+	if fakeCodexErr != nil {
+		t.Fatal(fakeCodexErr)
+	}
+	return fakeCodexPath
 }
 
 // boxHome is a fresh home for a pretend box: XDG dirs under it, rudy linked into
