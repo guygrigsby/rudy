@@ -85,6 +85,7 @@ events are de-duplicated by their binding and projection id.
 |---|---|---|---|
 | `runtime.entry` | clients attached to the bound session and the parent's eligible watchers | `{session_id, entry:ProjectedEntry}` | authoritative history before `session.resume` response, then completed live items; reconnect de-duplicates by deterministic id |
 | `runtime.delta` | clients attached to the bound session and the parent's eligible watchers | `{session_id, turn_id, item_id, kind, text, replace}` | live only; `replace: false` appends a fragment, `replace: true` replaces the item's live text and `runtime.entry` supersedes either form for the completed item |
+| `runtime.usage.updated` | clients attached to the bound session | `{session_id, turn_id, usage:Usage}` | latest cumulative usage for the runtime turn; live only and replaces the prior value for that turn |
 | `runtime.permission.requested` | attached asker clients | `{session_id, turn_id, request_id, item_id, kind, summary, command, cwd, reason, changes, network, permissions, allowed_scopes}` | every current asker and an asker attaching while pending; first `runtime.approval.answer` wins; no asker denies immediately |
 | `runtime.permission.resolved` | clients attached to the bound session | `{session_id, request_id}` | sent after `serverRequest/resolved` or terminal turn completion; clears the pending approval UI |
 | `runtime.account.updated` | every client | `AccountState` | latest wins; sent on connect and after verified `account/read` |
@@ -99,13 +100,21 @@ after `rudy bridge` terminates it.
 
 The visible command is `/login`; the client sends hidden args `browser` or
 `device` from its own transport. A user-supplied arg outside those values is
-`invalid_argument`. Starting a new mode cancels the invoking connection's prior
+`invalid_argument`. Headless and remote clients replace even an explicit
+`browser` arg with `device` and never invoke a local opener for a browser
+challenge. Starting a new mode cancels the invoking connection's prior
 attempt first. Browser completion failure starts device mode and emits
 `runtime.login.challenge`. A platform opener accepts only an `https` URL whose
 lowercased host is `openai.com`, `chatgpt.com` or a dot-delimited subdomain of
 one of those suffixes, passes the URL as one argv element and never invokes a
 shell. An opener failure immediately runs `/login device`, which cancels the
 browser attempt before returning the new challenge.
+
+For `rudy --print /login`, text output writes the device verification URL and
+code. JSON output keeps the ordinary no-turn result and adds optional
+`auth_challenge:AuthChallenge`. Stream JSON writes one
+`{"method":"runtime.login.challenge","params":AuthChallenge}` object. These
+outputs contain the live challenge but never persist it.
 
 ### Codex App Server ACL
 
@@ -129,7 +138,8 @@ Unknown inbound requests receive an immediate method error. User input and MCP
 elicitation requests are cancelled because this contract exposes neither.
 Command and file requests deny on failure. Permission requests grant an empty
 set on failure. Pending approval UI clears only on request-resolved or terminal
-turn completion.
+turn completion. The prompt renders every opaque requested permission member
+before an allow key can grant it.
 
 Pass 9, 2026-09-14: daemon shutdown completion gains explicit terminal proof (ADR 0031). After successful cleanup the retained control connection receives `server.stopped {instance_id, state: "stopped"}` before EOF. Bare EOF means crash, transport loss or failed cleanup and never authorizes replacement. A tentative shutdown claim fences work without moving public Server state. Recorded with the security hardening before final verification.
 
@@ -359,6 +369,7 @@ Delivery inside the process is synchronous and ordered per session. Published ev
 | `ThreadLinked` | Session | unlinked to linked | `{session_id, runtime, thread_id}` | runtime router, Session resume | after `runtime.toml` fsync | internal | Session |
 | `RuntimeTurnStarted` | AgentRuntime | idle to active | `{session_id, thread_id, turn_id}` | clients, runtime router | sync | internal | AgentRuntime |
 | `RuntimeItemProjected` | AgentRuntime | item completed or cold read | `{session_id, entry:ProjectedEntry}` | clients | ordered per thread | internal | RuntimeProjector |
+| `RuntimeUsageUpdated` | AgentRuntime | usage notification or terminal turn usage | `{session_id, turn_id, usage}` | attached clients | latest wins per turn | internal | AgentRuntime |
 | `RuntimeTurnCompleted` | AgentRuntime | active to terminal | `{session_id, thread_id, turn_id, status, usage}` | Session, clients, `turn_completed` hook | sync | published only as existing hook | AgentRuntime |
 | `RuntimeApprovalRequested` | RuntimeApproval | new to pending | `RuntimeApprovalQuestion` plus resolved `session_id` | asker connections | sync | internal | AgentRuntime |
 | `RuntimePermissionDecided` | Session | append runtime decision | the `runtime_permission_decision` entry | RuntimeApproval, audit clients through normal entry replay | sync; fsync before allow response | internal | Session |

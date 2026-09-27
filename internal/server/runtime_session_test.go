@@ -109,6 +109,31 @@ func TestRuntimeLiveCompletionPublishesProjectedEntry(t *testing.T) {
 	}
 }
 
+func TestRuntimeUsageUpdateReachesAttachedClients(t *testing.T) {
+	runtime := &sessionRuntime{}
+	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
+	runtime.links = h.store.RuntimeLinks()
+	client := h.dial(t, true)
+	info := openRuntimeSession(t, client, h.ws, nil)
+	discardNotifications(client)
+	var submitted protocol.SessionSubmitResult
+	if err := client.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("hello")},
+	}, &submitted); err != nil {
+		t.Fatal(err)
+	}
+	want := session.Usage{Input: 10, Output: 2, CacheRead: 3}
+	runtime.emit(agentruntime.Event{Type: agentruntime.EventUsageUpdated, ThreadID: "thread-1", TurnID: submitted.TurnID, Usage: want})
+	note := waitNotification(t, client, protocol.NotifyRuntimeUsageUpdated)
+	var got protocol.RuntimeUsageUpdated
+	if err := json.Unmarshal(note.Params, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.SessionID != info.SessionID || got.TurnID != submitted.TurnID || got.Usage != want {
+		t.Fatalf("runtime usage = %+v", got)
+	}
+}
+
 func TestRuntimeEventRejectsUnboundThreadAndTurn(t *testing.T) {
 	runtime := &sessionRuntime{}
 	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
@@ -194,6 +219,30 @@ func TestRuntimeInterruptUsesRuntimeAndWaitsForTerminalEvent(t *testing.T) {
 	}
 	if operations := fmt.Sprint(runtime.operations()); !strings.Contains(operations, "turn/interrupt") {
 		t.Fatalf("operations = %s", operations)
+	}
+}
+
+func TestInterruptedRuntimeTurnReturnsToIdle(t *testing.T) {
+	runtime := &sessionRuntime{}
+	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
+	runtime.links = h.store.RuntimeLinks()
+	client := h.dial(t, true)
+	info := openRuntimeSession(t, client, h.ws, nil)
+	var submitted protocol.SessionSubmitResult
+	if err := client.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("hello")},
+	}, &submitted); err != nil {
+		t.Fatal(err)
+	}
+	waitNotification(t, client, protocol.NotifyTurnState)
+	runtime.emit(agentruntime.Event{Type: agentruntime.EventTurnCompleted, ThreadID: "thread-1", TurnID: submitted.TurnID, Status: string(agentruntime.TurnInterrupted)})
+	note := waitNotification(t, client, protocol.NotifyTurnState)
+	var got protocol.TurnStateChanged
+	if err := json.Unmarshal(note.Params, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(turn.Idle) {
+		t.Fatalf("interrupted runtime state = %q, want idle", got.State)
 	}
 }
 

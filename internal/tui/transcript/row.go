@@ -11,6 +11,7 @@
 package transcript
 
 import (
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/icons"
@@ -23,11 +24,13 @@ const (
 	RowUser RowKind = "user"
 	// RowShell is a shell command the operator ran with `!`, with its output. It is not a
 	// user row: the operator did not say it, they ran it (ADR 0023).
-	RowShell     RowKind = "shell"
-	RowAssistant RowKind = "assistant"
-	RowTool      RowKind = "tool"
-	RowPrompt    RowKind = "prompt"
-	RowMarker    RowKind = "marker"
+	RowShell         RowKind = "shell"
+	RowAssistant     RowKind = "assistant"
+	RowTool          RowKind = "tool"
+	RowPrompt        RowKind = "prompt"
+	RowMarker        RowKind = "marker"
+	RowRuntime       RowKind = "runtime"
+	RowRuntimePrompt RowKind = "runtime_prompt"
 )
 
 // Row is one thing on screen.
@@ -85,7 +88,9 @@ type Row struct {
 	// what a client attaching mid-turn is handed for every call already in flight, where the
 	// question it is parked on may have been asked long before this client arrived. Without it
 	// a row parked on the operator reads as one merely working.
-	ToolState string
+	ToolState     string
+	Runtime       *agentruntime.ProjectedEntry
+	RuntimePrompt *protocol.RuntimePermissionRequested
 }
 
 // Options are the [ui.transcript] and [ui.diff] render choices, one field per config key

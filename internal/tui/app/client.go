@@ -20,6 +20,13 @@ type NotificationMsg protocol.Notification
 // simply ended carries none.
 type DisconnectedMsg struct{ Err error }
 
+type browserOpenedMsg struct {
+	SessionID string
+	Runtime   string
+	LoginID   string
+	Err       error
+}
+
 // CallResultMsg is one server call's answer, delivered to Update rather than acted on in
 // the goroutine that made the call: the model is owned by the update loop and nothing
 // else may touch it. Result is the raw result, which the case for the method decodes.

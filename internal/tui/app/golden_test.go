@@ -5,6 +5,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/charmbracelet/colorprofile"
 	teatest "github.com/charmbracelet/x/exp/teatest/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/keys"
@@ -26,6 +28,30 @@ const (
 	goldenWidth  = 100
 	goldenHeight = 30
 )
+
+func TestGoldenRuntimeItems(t *testing.T) {
+	h := newHarness(t, map[string]any{"ui.render": renderAltscreen})
+	h.m.session.Execution = session.Execution{Kind: session.ExecutionRuntime, Runtime: "codex"}
+	items := []struct {
+		kind agentruntime.ItemType
+		text string
+	}{
+		{agentruntime.ItemUserMessage, "Fix the build"},
+		{agentruntime.ItemAgentMessage, "I found the failure."},
+		{agentruntime.ItemCommand, "make test\nPASS"},
+		{agentruntime.ItemFileChange, "updated internal/app.go"},
+		{agentruntime.ItemPlan, "1. Reproduce\n2. Fix"},
+		{agentruntime.ItemDiff, "-old\n+new"},
+		{agentruntime.ItemWarning, "One check was skipped"},
+		{agentruntime.ItemError, "A tool failed"},
+	}
+	for i, item := range items {
+		h.notify(protocol.NotifyRuntimeEntry, protocol.RuntimeEntryParams{SessionID: h.m.session.SessionID, Entry: agentruntime.ProjectedEntry{
+			ID: session.NewID(), Kind: item.kind, TurnID: "turn-1", ItemID: fmt.Sprintf("item-%d", i), Content: []session.Block{session.TextBlock(item.text)},
+		}})
+	}
+	golden(t, "runtime_items", h.m.View().Content)
+}
 
 // The design's screen, entry by entry (docs/specs/2026-09-07-rudy-design.md, "Client").
 // The same conversation internal/tui/transcript's screen_default golden renders, so the

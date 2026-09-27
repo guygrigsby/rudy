@@ -435,6 +435,7 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		resolvedRequest string
 		resolvedTurn    string
 		completedItem   string
+		usage           *protocol.RuntimeUsageUpdated
 	)
 	switch event.Type {
 	case agentruntime.EventTurnStarted:
@@ -493,6 +494,7 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		}
 	case agentruntime.EventUsageUpdated:
 		rs.usage = event.Usage
+		usage = &protocol.RuntimeUsageUpdated{SessionID: ls.sess.ID().String(), TurnID: event.TurnID, Usage: rs.usage}
 	case agentruntime.EventTurnCompleted:
 		if event.TurnID == "" || activeID != event.TurnID {
 			rs.mu.Unlock()
@@ -500,10 +502,14 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		}
 		if event.Usage != (session.Usage{}) {
 			rs.usage = event.Usage
+			usage = &protocol.RuntimeUsageUpdated{SessionID: ls.sess.ID().String(), TurnID: event.TurnID, Usage: rs.usage}
 		}
 		terminal := turn.Completed
-		if agentruntime.TurnStatus(event.Status) == agentruntime.TurnFailed {
+		switch agentruntime.TurnStatus(event.Status) {
+		case agentruntime.TurnFailed:
 			terminal = turn.Failed
+		case agentruntime.TurnInterrupted:
+			terminal = turn.Idle
 		}
 		rs.active = nil
 		rs.terminal = event.TurnID
@@ -552,6 +558,11 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		ls.broadcastObsLocked(protocol.NotifyRuntimeDelta, *delta)
 		ls.obsMu.Unlock()
 		ls.notifyWatchers(protocol.NotifyRuntimeDelta, *delta)
+	}
+	if usage != nil {
+		ls.obsMu.Lock()
+		ls.broadcastObsLocked(protocol.NotifyRuntimeUsageUpdated, *usage)
+		ls.obsMu.Unlock()
 	}
 	if state != nil {
 		ls.obsMu.Lock()

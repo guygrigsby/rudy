@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -16,9 +17,10 @@ import (
 // entry that commits it arrives. Tool ids come from a provider and prompt keys from a
 // tool id, so neither can collide with these.
 const (
-	livePrefix     = "live/"
-	thinkingSuffix = "/thinking"
-	promptPrefix   = "prompt/"
+	livePrefix        = "live/"
+	runtimeLivePrefix = "runtime/live/"
+	thinkingSuffix    = "/thinking"
+	promptPrefix      = "prompt/"
 )
 
 func liveKey(turnID string) string      { return livePrefix + turnID }
@@ -57,7 +59,8 @@ type Transcript struct {
 	// call's own row has gone to scrollback, which is what lets a subagent's straggler
 	// entry, arriving after the parent's turn already committed, still carry the right
 	// TurnID for CommitLate to find rather than stranding it in the live region forever.
-	toolTurn map[string]string
+	toolTurn     map[string]string
+	runtimeFinal map[string]bool
 }
 
 // origin is where a row came from when it is not the session this transcript renders: a
@@ -87,12 +90,92 @@ func (o origin) stamp(r *Row) *Row {
 
 // New opens an empty transcript.
 func New(o Options, th theme.Theme) *Transcript {
-	return &Transcript{opts: o, th: th, byKey: make(map[string]*Row), committed: make(map[string]bool)}
+	return &Transcript{opts: o, th: th, byKey: make(map[string]*Row), committed: make(map[string]bool), runtimeFinal: make(map[string]bool)}
 }
 
 // Rows are the transcript's rows, in order. The Row pointers are the transcript's own:
 // a caller may read them and set Expanded, and must not reorder the slice.
 func (t *Transcript) Rows() []*Row { return slices.Clone(t.rows) }
+
+// RuntimeDelta keeps one provisional row per upstream item. A completed projection
+// replaces that row with its stable ID, so replay cannot duplicate it.
+func (t *Transcript) RuntimeDelta(p protocol.RuntimeDeltaParams) []string {
+	key := runtimeLivePrefix + p.TurnID + "/" + p.ItemID
+	if t.runtimeFinal[key] {
+		return nil
+	}
+	if row := t.byKey[key]; row != nil {
+		if p.Kind == agentruntime.ItemReasoning && !t.opts.ShowThinking {
+			return nil
+		}
+		if p.Replace {
+			row.Text = p.Text
+		} else {
+			row.Text += p.Text
+		}
+		return []string{key}
+	}
+	text := p.Text
+	if p.Kind == agentruntime.ItemReasoning && !t.opts.ShowThinking {
+		text = ""
+	}
+	kind := runtimeRowKind(p.Kind)
+	return t.addOnce(&Row{Key: key, Kind: kind, TurnID: p.TurnID, Live: true, Thinking: p.Kind == agentruntime.ItemReasoning, Text: text})
+}
+
+func (t *Transcript) RuntimeEntry(e agentruntime.ProjectedEntry) []string {
+	key := e.ID.String()
+	if t.byKey[key] != nil {
+		return nil
+	}
+	t.turn = e.TurnID
+	provisional := runtimeLivePrefix + e.TurnID + "/" + e.ItemID
+	t.runtimeFinal[provisional] = true
+	text := session.TextOf(e.Content)
+	if e.Kind == agentruntime.ItemReasoning && !t.opts.ShowThinking {
+		text = ""
+	}
+	entry := e
+	row := &Row{Key: key, Kind: runtimeRowKind(e.Kind), TurnID: e.TurnID, Text: text, Thinking: e.Kind == agentruntime.ItemReasoning, Runtime: &entry}
+	if old := t.byKey[provisional]; old != nil {
+		for i, current := range t.rows {
+			if current == old {
+				t.rows[i] = row
+				break
+			}
+		}
+		delete(t.byKey, provisional)
+		t.byKey[key] = row
+		return []string{key}
+	}
+	return t.addOnce(row)
+}
+
+func runtimeRowKind(kind agentruntime.ItemType) RowKind {
+	switch kind {
+	case agentruntime.ItemUserMessage:
+		return RowUser
+	case agentruntime.ItemAgentMessage, agentruntime.ItemReasoning:
+		return RowAssistant
+	default:
+		return RowRuntime
+	}
+}
+
+func (t *Transcript) RuntimePrompt(p protocol.RuntimePermissionRequested) {
+	key := "runtime/prompt/" + p.RequestID
+	if t.byKey[key] != nil {
+		return
+	}
+	q := p
+	t.add(&Row{Key: key, Kind: RowRuntimePrompt, TurnID: p.TurnID, RuntimePrompt: &q})
+}
+
+func (t *Transcript) RuntimeResolved(requestID string) {
+	if i := t.indexOf("runtime/prompt/" + requestID); i >= 0 {
+		t.removeAt(i)
+	}
+}
 
 // RecordAgentCall remembers that sessionID is the subagent toolUseID's agent call opened, so
 // a later notification tagged with sessionID can be routed to that call's own rows

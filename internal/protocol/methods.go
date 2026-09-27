@@ -104,6 +104,7 @@ const (
 	NotifyRuntimeLoginChallenge      = "runtime.login.challenge"
 	NotifyRuntimeEntry               = "runtime.entry"
 	NotifyRuntimeDelta               = "runtime.delta"
+	NotifyRuntimeUsageUpdated        = "runtime.usage.updated"
 )
 
 // Span is one run of text with a theme role, the only thing a plugin may put in a status
@@ -248,6 +249,12 @@ type RuntimeDeltaParams struct {
 	Kind      agentruntime.ItemType `json:"kind"`
 	Text      string                `json:"text"`
 	Replace   bool                  `json:"replace"`
+}
+
+type RuntimeUsageUpdated struct {
+	SessionID string        `json:"session_id"`
+	TurnID    string        `json:"turn_id"`
+	Usage     session.Usage `json:"usage"`
 }
 
 type SessionResumeParams struct {

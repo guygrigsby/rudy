@@ -29,6 +29,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -125,6 +126,12 @@ type Options struct {
 	// Cwd, which is what a run does; a test sets it so drawing a status line never
 	// depends on the directory the test happens to run in.
 	Workspace string
+	// Remote means the kernel is on another host. Browser callbacks would land there,
+	// so this client requests a device challenge instead.
+	Remote bool
+	// OpenAuthURL opens a validated browser challenge. Nil leaves browser opening to
+	// the caller's default, which is supplied by the CLI launcher.
+	OpenAuthURL func(context.Context, string) error
 }
 
 // notice is one thing the client has to say that the log never will: a server notice, a
@@ -138,11 +145,13 @@ type notice struct {
 
 // Model is the client. Zero value is not usable; call New.
 type Model struct {
-	cfg  *config.Config
-	th   theme.Theme
-	ic   icons.Set
-	keys *keys.Table
-	cl   *protocol.Client
+	cfg         *config.Config
+	th          theme.Theme
+	ic          icons.Set
+	keys        *keys.Table
+	cl          *protocol.Client
+	remote      bool
+	openAuthURL func(context.Context, string) error
 	// cwd is the caller's directory, kept for the calls that need it: a session this
 	// client opens later is opened on the same one.
 	cwd string
@@ -225,7 +234,12 @@ type Model struct {
 	replaying bool
 	// seen are the entries already folded into this session, so a log the server replays
 	// twice leaves one row and one usage total. Emptied by a switch, with the transcript.
-	seen map[string]bool
+	seen               map[string]bool
+	runtimeUsage       map[string]session.Usage
+	runtimePrompts     map[string]protocol.RuntimePermissionRequested
+	runtimePromptOrder []string
+	runtimeAnswered    map[string]bool
+	finishedLogins     map[string]bool
 	// awaitLog is set from a switch until the head of the new session's log arrives, so
 	// the transcript is never built from the middle of a replay (see entry).
 	awaitLog bool
@@ -268,18 +282,24 @@ func New(o Options) *Model {
 	}
 	cfg := o.Config
 	m := &Model{
-		cfg:          cfg,
-		th:           o.Theme,
-		ic:           o.Icons,
-		keys:         table,
-		cl:           o.Client,
-		cwd:          o.Cwd,
-		home:         o.Home,
-		session:      o.Session,
-		models:       o.Models,
-		status:       make(map[string]protocol.StatusItem),
-		seen:         make(map[string]bool),
-		showThinking: cfg.UI.Transcript.Thinking == thinkingShown,
+		cfg:             cfg,
+		th:              o.Theme,
+		ic:              o.Icons,
+		keys:            table,
+		cl:              o.Client,
+		remote:          o.Remote,
+		openAuthURL:     o.OpenAuthURL,
+		cwd:             o.Cwd,
+		home:            o.Home,
+		session:         o.Session,
+		models:          o.Models,
+		status:          make(map[string]protocol.StatusItem),
+		seen:            make(map[string]bool),
+		runtimeUsage:    make(map[string]session.Usage),
+		runtimePrompts:  make(map[string]protocol.RuntimePermissionRequested),
+		runtimeAnswered: make(map[string]bool),
+		finishedLogins:  make(map[string]bool),
+		showThinking:    cfg.UI.Transcript.Thinking == thinkingShown,
 		// The client's own are there from the first keystroke; command.list's answer is
 		// prepended to them when it lands.
 		commands:  clientCommands,
@@ -404,6 +424,17 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case CallResultMsg:
 		return m, m.callResult(msg)
+	case browserOpenedMsg:
+		if msg.SessionID != m.session.SessionID || m.finishedLogins[msg.Runtime+"/"+msg.LoginID] {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.note(levelWarn, "browser login unavailable; switching to device code")
+			return m, m.callNamed(protocol.MethodCommandRun, "login", protocol.CommandRunParams{
+				SessionID: m.session.SessionID, Name: "login", Args: "device",
+			})
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.resize(msg.Width, msg.Height)
 		// The header needs a width before it can be drawn at all, so the first size is
@@ -495,6 +526,61 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 			}
 			m.tr.Delta(p.TurnID, p.Part)
 		}
+	case protocol.NotifyRuntimeEntry:
+		var p protocol.RuntimeEntryParams
+		if m.decode(n, &p) {
+			m.awaitLog = false
+			id := p.Entry.ID.String()
+			if m.seen[id] {
+				return nil
+			}
+			m.seen[id] = true
+			added := m.tr.RuntimeEntry(p.Entry)
+			if p.Entry.Usage != (session.Usage{}) {
+				m.runtimeUsage[p.Entry.TurnID] = p.Entry.Usage
+				m.usage = session.Usage{}
+				for _, usage := range m.runtimeUsage {
+					m.usage = m.usage.Add(usage)
+				}
+				m.lastPrompt = p.Entry.Usage.Input + p.Entry.Usage.CacheRead + p.Entry.Usage.CacheWrite
+			}
+			return m.lateRows(added)
+		}
+	case protocol.NotifyRuntimeDelta:
+		var p protocol.RuntimeDeltaParams
+		if m.decode(n, &p) {
+			if p.Kind == agentruntime.ItemAgentMessage {
+				m.turn.streamed = true
+			}
+			m.tr.RuntimeDelta(p)
+		}
+	case protocol.NotifyRuntimeUsageUpdated:
+		var p protocol.RuntimeUsageUpdated
+		if m.decode(n, &p) {
+			m.runtimeUsage[p.TurnID] = p.Usage
+			m.usage = session.Usage{}
+			for _, usage := range m.runtimeUsage {
+				m.usage = m.usage.Add(usage)
+			}
+			m.lastPrompt = p.Usage.Input + p.Usage.CacheRead + p.Usage.CacheWrite
+		}
+	case protocol.NotifyRuntimePermissionRequested:
+		var p protocol.RuntimePermissionRequested
+		if m.decode(n, &p) {
+			if _, exists := m.runtimePrompts[p.RequestID]; !exists {
+				m.runtimePromptOrder = append(m.runtimePromptOrder, p.RequestID)
+			}
+			m.runtimePrompts[p.RequestID] = p
+			m.tr.RuntimePrompt(p)
+		}
+	case protocol.NotifyRuntimePermissionResolved:
+		var p protocol.RuntimePermissionResolved
+		if m.decode(n, &p) {
+			delete(m.runtimePrompts, p.RequestID)
+			delete(m.runtimeAnswered, p.RequestID)
+			m.runtimePromptOrder = slices.DeleteFunc(m.runtimePromptOrder, func(id string) bool { return id == p.RequestID })
+			m.tr.RuntimeResolved(p.RequestID)
+		}
 	case protocol.NotifyTurnState:
 		var p protocol.TurnStateChanged
 		if m.decode(n, &p) {
@@ -518,6 +604,21 @@ func (m *Model) notification(n protocol.Notification) tea.Cmd {
 		var p protocol.NoticeParams
 		if m.decode(n, &p) {
 			m.note(p.Level, p.Text)
+		}
+	case protocol.NotifyRuntimeLoginChallenge:
+		var p agentruntime.AuthChallenge
+		if m.decode(n, &p) {
+			return m.authChallenge(p)
+		}
+	case protocol.NotifyRuntimeLoginCompleted:
+		var p agentruntime.LoginCompletion
+		if m.decode(n, &p) {
+			m.finishedLogins[p.Runtime+"/"+p.LoginID] = true
+			if p.Success {
+				m.note(levelInfo, p.Runtime+" login complete")
+			} else {
+				m.note(levelError, p.Runtime+" login failed: "+p.Error)
+			}
 		}
 	case protocol.NotifyStatusUpdated:
 		var p protocol.StatusUpdated
@@ -693,6 +794,8 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		// The server has this one's decision; nothing is left to put back for it. Named by
 		// r.Name (rudy-9nc), not blanket-cleared: another question can still be in flight.
 		m.turn.clearAsked(parsePromptName(r.Name))
+	case protocol.MethodRuntimeApprovalAnswer:
+		// Keep the question visible until the runtime resolves it.
 	case protocol.MethodRegistryList, protocol.MethodRegistryRefresh:
 		var res protocol.RegistryListResult
 		if !m.result(r, &res) {
@@ -729,7 +832,7 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 			return nil
 		}
 		var echo tea.Cmd
-		if r.Submitted != nil && r.Submitted.Source == session.SourceTyped {
+		if r.Submitted != nil && r.Submitted.Source == session.SourceTyped && m.session.Execution.Kind != session.ExecutionRuntime {
 			id, err := ulid.ParseStrict(res.TurnID)
 			if err != nil {
 				m.note(levelError, protocol.MethodSessionSubmit+": invalid turn id: "+err.Error())
@@ -756,6 +859,9 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 		if !m.result(r, &res) {
 			return nil
 		}
+		if res.AuthChallenge != nil {
+			return m.authChallenge(*res.AuthChallenge)
+		}
 		// The notice the answer carries is read, not drawn: the server sends the same text
 		// to every attached client as a notice notification, which is what put it on
 		// screen, and a second copy from the answer would draw every command's notice
@@ -780,6 +886,33 @@ func (m *Model) callResult(r CallResultMsg) tea.Cmd {
 	return nil
 }
 
+func (m *Model) authChallenge(challenge agentruntime.AuthChallenge) tea.Cmd {
+	if m.finishedLogins[challenge.Runtime+"/"+challenge.LoginID] {
+		return nil
+	}
+	switch challenge.Type {
+	case agentruntime.ChallengeDevice:
+		m.note(levelInfo, "Open "+challenge.VerificationURL+" and enter code "+challenge.UserCode)
+	case agentruntime.ChallengeBrowser:
+		open := m.openAuthURL
+		sid := m.session.SessionID
+		if m.remote {
+			return func() tea.Msg {
+				return browserOpenedMsg{SessionID: sid, Runtime: challenge.Runtime, LoginID: challenge.LoginID, Err: errors.New("browser login is unavailable for a remote runtime")}
+			}
+		}
+		if open == nil {
+			return func() tea.Msg {
+				return browserOpenedMsg{SessionID: sid, Runtime: challenge.Runtime, LoginID: challenge.LoginID, Err: errors.New("browser opener unavailable")}
+			}
+		}
+		return func() tea.Msg {
+			return browserOpenedMsg{SessionID: sid, Runtime: challenge.Runtime, LoginID: challenge.LoginID, Err: open(context.Background(), challenge.URL)}
+		}
+	}
+	return nil
+}
+
 // callFailed is one call that came back an error. Every failure is a notice, and the two
 // that leave the client holding something have to put it back: an answer that never
 // reached the server, and a session switch whose new session never opened.
@@ -793,6 +926,8 @@ func (m *Model) callFailed(r CallResultMsg) tea.Cmd {
 		// back, whichever others are still standing or in flight.
 		sid, toolUseID := parsePromptName(r.Name)
 		m.reaskOne(sid, toolUseID)
+	case r.Method == protocol.MethodRuntimeApprovalAnswer:
+		delete(m.runtimeAnswered, r.Name)
 	case switchMethod(r.Method):
 		// The session that was being left is still here and still attached: nothing was
 		// closed, and what arrived while the switch was in flight was its own.
@@ -857,7 +992,10 @@ func switchMethod(method string) bool {
 func sessionScoped(method string) bool {
 	switch method {
 	case protocol.NotifyEntryAppended, protocol.NotifyStreamDelta,
-		protocol.NotifyTurnState, protocol.NotifyPermissionRequested, protocol.NotifyToolState:
+		protocol.NotifyTurnState, protocol.NotifyPermissionRequested, protocol.NotifyToolState,
+		protocol.NotifyRuntimeEntry, protocol.NotifyRuntimeDelta,
+		protocol.NotifyRuntimeUsageUpdated,
+		protocol.NotifyRuntimePermissionRequested, protocol.NotifyRuntimePermissionResolved:
 		return true
 	}
 	return false
@@ -954,6 +1092,10 @@ func (m *Model) switched(info protocol.SessionInfo) tea.Cmd {
 	m.spinning = false
 	m.usage, m.lastPrompt = session.Usage{}, 0
 	m.seen = make(map[string]bool)
+	m.runtimeUsage = make(map[string]session.Usage)
+	m.runtimePrompts = make(map[string]protocol.RuntimePermissionRequested)
+	m.runtimeAnswered = make(map[string]bool)
+	m.runtimePromptOrder = nil
 	m.awaitLog = true
 	m.ed.Restore()
 	m.model = pickModel(m.models, info.Model)
