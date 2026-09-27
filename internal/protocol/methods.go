@@ -17,26 +17,27 @@ const ProtocolVersion = 1
 
 // Methods, client to server.
 const (
-	MethodClientHello        = "client.hello"
-	MethodServerShutdown     = "server.shutdown"
-	MethodSessionOpen        = "session.open"
-	MethodSessionResume      = "session.resume"
-	MethodSessionFork        = "session.fork"
-	MethodSessionList        = "session.list"
-	MethodSessionClose       = "session.close"
-	MethodSessionSubmit      = "session.submit"
-	MethodSessionShell       = "session.shell"
-	MethodSessionInterrupt   = "session.interrupt"
-	MethodSessionAnswer      = "session.answer"
-	MethodSessionSetModel    = "session.set_model"
-	MethodSessionSetMode     = "session.set_mode"
-	MethodSessionSetThinking = "session.set_thinking"
-	MethodSessionSetTitle    = "session.set_title"
-	MethodSessionCompact     = "session.compact"
-	MethodRegistryList       = "registry.list"
-	MethodRegistryRefresh    = "registry.refresh"
-	MethodCommandRun         = "command.run"
-	MethodCommandList        = "command.list"
+	MethodClientHello           = "client.hello"
+	MethodServerShutdown        = "server.shutdown"
+	MethodSessionOpen           = "session.open"
+	MethodSessionResume         = "session.resume"
+	MethodSessionFork           = "session.fork"
+	MethodSessionList           = "session.list"
+	MethodSessionClose          = "session.close"
+	MethodSessionSubmit         = "session.submit"
+	MethodSessionShell          = "session.shell"
+	MethodSessionInterrupt      = "session.interrupt"
+	MethodSessionAnswer         = "session.answer"
+	MethodRuntimeApprovalAnswer = "runtime.approval.answer"
+	MethodSessionSetModel       = "session.set_model"
+	MethodSessionSetMode        = "session.set_mode"
+	MethodSessionSetThinking    = "session.set_thinking"
+	MethodSessionSetTitle       = "session.set_title"
+	MethodSessionCompact        = "session.compact"
+	MethodRegistryList          = "registry.list"
+	MethodRegistryRefresh       = "registry.refresh"
+	MethodCommandRun            = "command.run"
+	MethodCommandList           = "command.list"
 )
 
 // Methods, plugin to server. A connection may send these only when its caller class is
@@ -88,19 +89,21 @@ const (
 
 // Notifications, server to client.
 const (
-	NotifyEntryAppended         = "entry.appended"
-	NotifyStreamDelta           = "stream.delta"
-	NotifyTurnState             = "turn.state"
-	NotifyToolState             = "tool.state"
-	NotifyPermissionRequested   = "permission.requested"
-	NotifyNotice                = "notice"
-	NotifyStatusUpdated         = "status.updated"
-	NotifyWidgetUpdated         = "widget.updated"
-	NotifyPluginState           = "plugin.state"
-	NotifyServerStopped         = "server.stopped"
-	NotifyRuntimeLoginChallenge = "runtime.login.challenge"
-	NotifyRuntimeEntry          = "runtime.entry"
-	NotifyRuntimeDelta          = "runtime.delta"
+	NotifyEntryAppended              = "entry.appended"
+	NotifyStreamDelta                = "stream.delta"
+	NotifyTurnState                  = "turn.state"
+	NotifyToolState                  = "tool.state"
+	NotifyPermissionRequested        = "permission.requested"
+	NotifyRuntimePermissionRequested = "runtime.permission.requested"
+	NotifyRuntimePermissionResolved  = "runtime.permission.resolved"
+	NotifyNotice                     = "notice"
+	NotifyStatusUpdated              = "status.updated"
+	NotifyWidgetUpdated              = "widget.updated"
+	NotifyPluginState                = "plugin.state"
+	NotifyServerStopped              = "server.stopped"
+	NotifyRuntimeLoginChallenge      = "runtime.login.challenge"
+	NotifyRuntimeEntry               = "runtime.entry"
+	NotifyRuntimeDelta               = "runtime.delta"
 )
 
 // Span is one run of text with a theme role, the only thing a plugin may put in a status
@@ -414,6 +417,37 @@ type PermissionRequested struct {
 	Tool      string          `json:"tool"`
 	Input     json.RawMessage `json:"input"`
 	Matcher   session.Matcher `json:"matcher"`
+}
+
+type RuntimePermissionRequested struct {
+	SessionID     string                           `json:"session_id"`
+	TurnID        string                           `json:"turn_id"`
+	RequestID     string                           `json:"request_id"`
+	ItemID        string                           `json:"item_id"`
+	Kind          agentruntime.ApprovalKind        `json:"kind"`
+	Summary       string                           `json:"summary"`
+	Command       string                           `json:"command"`
+	CWD           string                           `json:"cwd"`
+	Reason        string                           `json:"reason"`
+	Changes       []agentruntime.FileChange        `json:"changes"`
+	Network       []agentruntime.NetworkPermission `json:"network"`
+	Permissions   []string                         `json:"permissions"`
+	AllowedScopes []agentruntime.ApprovalScope     `json:"allowed_scopes"`
+}
+
+type RuntimePermissionResolved struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+}
+
+type RuntimeApprovalAnswerParams struct {
+	SessionID string                        `json:"session_id"`
+	TurnID    string                        `json:"turn_id"`
+	RequestID string                        `json:"request_id"`
+	Decision  agentruntime.ApprovalDecision `json:"decision"`
+	Scope     agentruntime.ApprovalScope    `json:"scope"`
+	Reason    string                        `json:"reason"`
+	Granted   []string                      `json:"granted"`
 }
 
 type NoticeParams struct {

@@ -203,12 +203,6 @@ func (s *Server) finishLogin(completion agentruntime.LoginCompletion) {
 	attempt.owner.notify(protocol.NotifyRuntimeLoginCompleted, completion)
 }
 
-func (s *Server) RequestApproval(context.Context, agentruntime.ApprovalQuestion) (agentruntime.ApprovalAnswer, error) {
-	return agentruntime.ApprovalAnswer{
-		Decision: agentruntime.DecisionDeny, Scope: agentruntime.ScopeOnce, Reason: "runtime approval routing is unavailable",
-	}, nil
-}
-
 func (s *Server) cancelOwnedLogins(ctx context.Context, owner *conn, runtimeName string) error {
 	type cancellation struct {
 		runtime string

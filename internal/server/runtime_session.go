@@ -261,7 +261,7 @@ func (s *Server) forkRuntimeAt(ctx context.Context, cn *conn, parent *liveSessio
 	childLive.runtime = newRuntimeSession(rs.runtime)
 	childLive.runtime.thread = &childRef
 	childLive.runtimeLinked = true
-	return s.installAndAttach(cn, childLive), nil
+	return s.installAndAttach(cn, childLive)
 }
 
 func (s *Server) startRuntimeTurn(ctx context.Context, ls *liveSession, msg session.UserMessage) (string, *protocol.Error) {
@@ -326,7 +326,17 @@ func (s *Server) startRuntimeTurn(ctx context.Context, ls *liveSession, msg sess
 		}
 		if err := s.d.Store.RuntimeLinks().Write(ls.sess.ID(), session.RuntimeLink{Runtime: rs.name, ThreadID: created.ThreadID}); err != nil {
 			rs.finishRuntimeMutation(err)
+			if errors.Is(err, session.ErrRuntimeLinkConflict) {
+				return "", perr(protocol.CodeConflict, err.Error())
+			}
 			return "", protocol.ErrorFrom(err)
+		}
+		s.mu.Lock()
+		bindErr := s.bindRuntimeThreadRefLocked(ls, rs.name, created.ThreadID)
+		s.mu.Unlock()
+		if bindErr != nil {
+			rs.finishRuntimeMutation(nil)
+			return "", bindErr
 		}
 		thread = &created
 		rs.mu.Lock()
@@ -335,9 +345,6 @@ func (s *Server) startRuntimeTurn(ctx context.Context, ls *liveSession, msg sess
 		ls.obsMu.Lock()
 		ls.runtimeLinked = true
 		ls.obsMu.Unlock()
-		s.mu.Lock()
-		s.runtimeThreads[runtimeThreadKey{runtime: rs.name, threadID: created.ThreadID}] = ls
-		s.mu.Unlock()
 	}
 	view := deriveInfo(ls.sess.ID(), ls.snapshotEntries())
 	ref, err := rs.runtime.StartTurn(ctx, agentruntime.StartTurnRequest{
@@ -422,9 +429,12 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		return
 	}
 	var (
-		entry *agentruntime.ProjectedEntry
-		delta *protocol.RuntimeDeltaParams
-		state *protocol.TurnStateChanged
+		entry           *agentruntime.ProjectedEntry
+		delta           *protocol.RuntimeDeltaParams
+		state           *protocol.TurnStateChanged
+		resolvedRequest string
+		resolvedTurn    string
+		completedItem   string
 	)
 	switch event.Type {
 	case agentruntime.EventTurnStarted:
@@ -467,6 +477,7 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 			agentruntime.Turn{TurnID: event.TurnID, Status: agentruntime.TurnRunning, Usage: rs.usage}, event.Item,
 		)
 		entry = &projected
+		completedItem = event.Item.ItemID
 		delete(rs.items, event.Item.ItemID)
 	case agentruntime.EventDiffUpdated, agentruntime.EventPlanUpdated:
 		kind := agentruntime.ItemDiff
@@ -499,6 +510,13 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		rs.steering = false
 		clear(rs.items)
 		state = &protocol.TurnStateChanged{SessionID: ls.sess.ID().String(), TurnID: event.TurnID, State: string(terminal)}
+		resolvedTurn = event.TurnID
+	case agentruntime.EventRequestResolved:
+		if event.RequestID == "" {
+			rs.mu.Unlock()
+			return
+		}
+		resolvedRequest = event.RequestID
 	case agentruntime.EventWarning, agentruntime.EventError:
 		if event.ItemID == "" || event.TurnID == "" || activeID != event.TurnID {
 			rs.mu.Unlock()
@@ -516,6 +534,15 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		entry = &projected
 	}
 	rs.mu.Unlock()
+	if resolvedRequest != "" {
+		s.resolveRuntimeApprovals(ls, resolvedRequest, "")
+	}
+	if resolvedTurn != "" {
+		s.resolveRuntimeApprovals(ls, "", resolvedTurn)
+	}
+	if completedItem != "" {
+		s.failRuntimeApprovalsForItem(ls, event.TurnID, completedItem)
+	}
 
 	if entry != nil {
 		s.publishRuntimeEntry(ls, *entry)

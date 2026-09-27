@@ -104,13 +104,15 @@ type liveSession struct {
 	// while the session is live, from whichever connection is opening the child.
 	children map[string]bool
 
-	obsMu          sync.Mutex
-	entries        []session.Entry
-	conns          []*conn
-	state          turn.State
-	turnID         string
-	runtimeLinked  bool
-	runtimeEntries []agentruntime.ProjectedEntry
+	obsMu            sync.Mutex
+	entries          []session.Entry
+	conns            []*conn
+	state            turn.State
+	turnID           string
+	runtimeLinked    bool
+	runtimeEntries   []agentruntime.ProjectedEntry
+	runtimeApprovals map[string]*runtimeApproval
+	runtimeAnswered  map[string]bool
 
 	// standing is the permission questions the askers have been asked and none has
 	// answered yet, by tool_use id: what an asker attaching while one stands is owed, and
@@ -147,16 +149,18 @@ type standingQuestion struct {
 // mirror, and that read is only safe while this caller is still the sole owner.
 func newLive(sess *session.Session, m provider.Model) *liveSession {
 	return &liveSession{
-		sess:      sess,
-		model:     m,
-		entries:   append([]session.Entry(nil), sess.Entries()...),
-		pending:   map[string]pendingAsk{},
-		asking:    map[askKey]*standingAsk{},
-		overrides: map[string][]session.Block{},
-		children:  map[string]bool{},
-		standing:  map[string]standingQuestion{},
-		answered:  map[string]bool{},
-		inFlight:  map[string]protocol.ToolStateChanged{},
+		sess:             sess,
+		model:            m,
+		entries:          append([]session.Entry(nil), sess.Entries()...),
+		pending:          map[string]pendingAsk{},
+		asking:           map[askKey]*standingAsk{},
+		overrides:        map[string][]session.Block{},
+		children:         map[string]bool{},
+		standing:         map[string]standingQuestion{},
+		answered:         map[string]bool{},
+		inFlight:         map[string]protocol.ToolStateChanged{},
+		runtimeApprovals: map[string]*runtimeApproval{},
+		runtimeAnswered:  map[string]bool{},
 	}
 }
 
@@ -372,10 +376,17 @@ func (ls *liveSession) abandonStanding() {
 		return
 	}
 	ls.obsMu.Lock()
-	abandoned := make([]chan struct{}, 0, len(ls.standing))
+	abandoned := make([]chan struct{}, 0, len(ls.standing)+len(ls.runtimeApprovals))
 	for id, q := range ls.standing {
 		abandoned = append(abandoned, q.abandon)
 		delete(ls.standing, id)
+	}
+	for _, approval := range ls.runtimeApprovals {
+		if approval.answered || approval.abandoned {
+			continue
+		}
+		approval.abandoned = true
+		abandoned = append(abandoned, approval.abandon)
 	}
 	ls.obsMu.Unlock()
 	for _, ch := range abandoned {
@@ -420,13 +431,14 @@ func (ls *liveSession) broadcastObsLocked(method string, params any) {
 // permission.requested when the newcomer is an asker, then what each live child of this session
 // is owed, and last the response carrying info.
 type attachment struct {
-	entries        []session.Entry
-	runtimeEntries []agentruntime.ProjectedEntry
-	state          *protocol.TurnStateChanged
-	toolStates     []protocol.ToolStateChanged
-	standing       []protocol.PermissionRequested
-	children       []childAttachment
-	info           protocol.SessionInfo
+	entries         []session.Entry
+	runtimeEntries  []agentruntime.ProjectedEntry
+	state           *protocol.TurnStateChanged
+	toolStates      []protocol.ToolStateChanged
+	standing        []protocol.PermissionRequested
+	runtimeStanding []protocol.RuntimePermissionRequested
+	children        []childAttachment
+	info            protocol.SessionInfo
 }
 
 // childAttachment is what a connection attaching to a parent is owed about one child of it that
@@ -487,6 +499,14 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 			at.standing = append(at.standing, q.req)
 		}
 		sortStanding(at.standing)
+		for _, approval := range ls.runtimeApprovals {
+			if !approval.answered && !approval.abandoned && approval.ctx.Err() == nil {
+				at.runtimeStanding = append(at.runtimeStanding, runtimePermissionRequest(sid.String(), approval.question))
+			}
+		}
+		slices.SortFunc(at.runtimeStanding, func(a, b protocol.RuntimePermissionRequested) int {
+			return strings.Compare(a.RequestID, b.RequestID)
+		})
 	}
 	ls.obsMu.Unlock()
 

@@ -519,6 +519,8 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 		return s.handleInterrupt(cn, req.Params)
 	case protocol.MethodSessionAnswer:
 		return s.handleAnswer(cn, req.Params)
+	case protocol.MethodRuntimeApprovalAnswer:
+		return s.handleRuntimeApprovalAnswer(cn, req.Params)
 	case protocol.MethodSessionSetModel:
 		return s.handleSetModel(req.Params)
 	case protocol.MethodSessionSetMode:
@@ -674,11 +676,11 @@ func (s *Server) handleRuntimeApprovalRequest(cn *conn, raw json.RawMessage) (an
 	if _, ok := s.d.Plugins.Runtime(question.Runtime); !ok {
 		return nil, perr(protocol.CodeUnauthorized, "plugin did not register this runtime")
 	}
-	return protocol.RuntimeApprovalResult{
-		Decision: agentruntime.DecisionDeny,
-		Scope:    agentruntime.ScopeOnce,
-		Reason:   "no verified session binding",
-	}, nil
+	answer, err := s.RequestApproval(cn.lifetime, question)
+	if err != nil {
+		return nil, protocol.ErrorFrom(err)
+	}
+	return protocol.RuntimeApprovalResult(answer), nil
 }
 
 // registerErr maps a registration failure: a name another plugin already owns is a conflict,
@@ -1542,7 +1544,7 @@ func (s *Server) open(cn *conn, p protocol.SessionOpenParams) (any, *protocol.Er
 		s.applyAgent(ls, def, allow)
 		s.fireSessionOpened(s.ctx, ls, false)
 	}
-	return s.installAndAttach(cn, ls), nil
+	return s.installAndAttach(cn, ls)
 }
 
 // firstNonEmpty is the first non-empty of vs, or "" when there is none: the resolution order
@@ -1882,7 +1884,7 @@ func (s *Server) forkAt(cn *conn, parent *liveSession, at string) (protocol.Sess
 	// no step limit.
 	ls := newLive(child, m)
 	s.applyAgentFromLog(cn, ls)
-	return s.installAndAttach(cn, ls), nil
+	return s.installAndAttach(cn, ls)
 }
 
 // loadCold returns the live session for sid, loading it from disk first if it is not already
@@ -1980,10 +1982,12 @@ func (s *Server) coldLoadOne(cn *conn, sid ulid.ULID) (*liveSession, *protocol.E
 		s.fireSessionOpened(s.ctx, ls, true)
 	}
 	s.mu.Lock()
-	s.live[sid] = ls
-	if ls.runtime != nil && ls.runtime.thread != nil {
-		s.runtimeThreads[runtimeThreadKey{runtime: ls.runtime.name, threadID: ls.runtime.thread.ThreadID}] = ls
+	if bindErr := s.bindRuntimeThreadLocked(ls); bindErr != nil {
+		s.mu.Unlock()
+		_ = sess.Close()
+		return nil, bindErr
 	}
+	s.live[sid] = ls
 	s.mu.Unlock()
 	return ls, nil
 }
@@ -2053,18 +2057,36 @@ func (s *Server) fireSessionClosed(ctx context.Context, ls *liveSession) {
 // subscribes cn to it in one critical section. Used by open, fork's child and resume's cold
 // load. Safe unconditionally: the session is not yet visible to any other goroutine before this
 // call, so there is no id to race.
-func (s *Server) installAndAttach(cn *conn, ls *liveSession) protocol.SessionInfo {
+func (s *Server) installAndAttach(cn *conn, ls *liveSession) (protocol.SessionInfo, *protocol.Error) {
 	s.mu.Lock()
-	s.live[ls.sess.ID()] = ls
-	if ls.runtime != nil && ls.runtime.thread != nil {
-		s.runtimeThreads[runtimeThreadKey{runtime: ls.runtime.name, threadID: ls.runtime.thread.ThreadID}] = ls
+	if bindErr := s.bindRuntimeThreadLocked(ls); bindErr != nil {
+		s.mu.Unlock()
+		_ = ls.sess.Close()
+		return protocol.SessionInfo{}, bindErr
 	}
+	s.live[ls.sess.ID()] = ls
 	at := ls.subscribeLocked(cn)
 	at.children = s.childAttachmentsLocked(cn, ls)
 	s.mu.Unlock()
 	deliverAttach(cn, ls.sess.ID(), at)
 	slog.Info("session: open", "session", ls.sess.ID(), "agent", ls.sess.Agent(), "conn", cn.id)
-	return at.info
+	return at.info, nil
+}
+
+func (s *Server) bindRuntimeThreadLocked(ls *liveSession) *protocol.Error {
+	if ls.runtime == nil || ls.runtime.thread == nil {
+		return nil
+	}
+	return s.bindRuntimeThreadRefLocked(ls, ls.runtime.name, ls.runtime.thread.ThreadID)
+}
+
+func (s *Server) bindRuntimeThreadRefLocked(ls *liveSession, runtimeName, threadID string) *protocol.Error {
+	key := runtimeThreadKey{runtime: runtimeName, threadID: threadID}
+	if owner := s.runtimeThreads[key]; owner != nil && owner != ls {
+		return perr(protocol.CodeConflict, "runtime thread is already bound to another live session")
+	}
+	s.runtimeThreads[key] = ls
+	return nil
 }
 
 // childAttachmentsLocked is what cn is owed about the children of ls that are live right now
@@ -2149,6 +2171,9 @@ func deliverAttach(cn *conn, sid ulid.ULID, at attachment) {
 	for _, q := range at.standing {
 		cn.notify(protocol.NotifyPermissionRequested, q)
 	}
+	for _, q := range at.runtimeStanding {
+		cn.notify(protocol.NotifyRuntimePermissionRequested, q)
+	}
 	for _, c := range at.children {
 		cn.notify(protocol.NotifyEntryAppended, protocol.EntryAppended{SessionID: c.sid, Entry: c.opened})
 		for _, q := range c.standing {
@@ -2184,6 +2209,9 @@ func (s *Server) detach(cn *conn, ls *liveSession) {
 	empty := len(ls.conns) == 0
 	steering := ls.state == turn.Steering
 	standing := len(ls.standing) > 0
+	for _, approval := range ls.runtimeApprovals {
+		standing = standing || !approval.answered
+	}
 	ls.obsMu.Unlock()
 
 	s.closeIfUnusedLocked(ls)
@@ -2248,7 +2276,10 @@ func (s *Server) closeIfUnusedLocked(ls *liveSession) {
 	}
 	s.closing[id] = closingCh
 	if ls.runtime != nil && ls.runtime.thread != nil {
-		delete(s.runtimeThreads, runtimeThreadKey{runtime: ls.runtime.name, threadID: ls.runtime.thread.ThreadID})
+		key := runtimeThreadKey{runtime: ls.runtime.name, threadID: ls.runtime.thread.ThreadID}
+		if s.runtimeThreads[key] == ls {
+			delete(s.runtimeThreads, key)
+		}
 	}
 	delete(s.live, id)
 	s.mu.Unlock()
