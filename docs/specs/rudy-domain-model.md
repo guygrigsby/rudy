@@ -769,6 +769,8 @@ the `codex` AgentRuntime implementation and anti-corruption layer.
 - The version probe and App Server inherit only the documented operational
   environment allowlist plus explicit process overrides. Rudy credentials are
   never ambient Codex process input.
+- Strict permission mode fixes the Codex sandbox to read-only without network
+  and uses `untrusted` approval, so effects require Rudy's durable decision.
 - Raw stderr, credentials and vendor error payloads never cross the ACL.
 
 ### States

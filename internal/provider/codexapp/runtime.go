@@ -31,9 +31,13 @@ func (c *Client) StartThread(ctx context.Context, request agentruntime.StartThre
 	var response struct {
 		Thread wireThread `json:"thread"`
 	}
-	err := c.callMutation(ctx, methodThreadStart, map[string]any{
+	params := map[string]any{
 		"cwd": request.Workspace.Root, "model": request.Model.Model, "approvalPolicy": approvalPolicy(request.Mode),
-	}, &response)
+	}
+	if sandbox := threadSandbox(request.Mode); sandbox != "" {
+		params["sandbox"] = sandbox
+	}
+	err := c.callMutation(ctx, methodThreadStart, params, &response)
 	if err != nil {
 		return agentruntime.ThreadRef{}, err
 	}
@@ -133,12 +137,31 @@ func (c *Client) InterruptTurn(ctx context.Context, ref agentruntime.TurnRef) er
 func approvalPolicy(mode session.Mode) string {
 	switch mode {
 	case session.ModePermissive:
-		return "unlessTrusted"
+		return "on-request"
 	case session.ModeOff:
 		return "never"
 	default:
-		return "onRequest"
+		return "untrusted"
 	}
+}
+
+type sandboxPolicy struct {
+	Type          string `json:"type"`
+	NetworkAccess bool   `json:"networkAccess"`
+}
+
+func threadSandbox(mode session.Mode) string {
+	if mode == session.ModeStrict {
+		return "read-only"
+	}
+	return ""
+}
+
+func turnSandboxPolicy(mode session.Mode) *sandboxPolicy {
+	if mode == session.ModeStrict {
+		return &sandboxPolicy{Type: "readOnly", NetworkAccess: false}
+	}
+	return nil
 }
 
 func translateThread(raw wireThread) (agentruntime.Thread, error) {

@@ -129,14 +129,16 @@ func (c *Client) StartTurn(ctx context.Context, request agentruntime.StartTurnRe
 		return agentruntime.TurnRef{}, err
 	}
 	params := struct {
-		ThreadID       string      `json:"threadId"`
-		Input          []userInput `json:"input"`
-		Model          string      `json:"model,omitempty"`
-		Effort         string      `json:"effort,omitempty"`
-		ApprovalPolicy string      `json:"approvalPolicy,omitempty"`
+		ThreadID       string         `json:"threadId"`
+		Input          []userInput    `json:"input"`
+		Model          string         `json:"model,omitempty"`
+		Effort         string         `json:"effort,omitempty"`
+		ApprovalPolicy string         `json:"approvalPolicy,omitempty"`
+		SandboxPolicy  *sandboxPolicy `json:"sandboxPolicy,omitempty"`
 	}{
 		ThreadID: request.Thread.ThreadID, Input: input, Model: request.Model.Model,
 		Effort: c.reasoningEffort(request.Model, request.Thinking), ApprovalPolicy: approvalPolicy(request.Mode),
+		SandboxPolicy: turnSandboxPolicy(request.Mode),
 	}
 	var response struct {
 		Turn struct {

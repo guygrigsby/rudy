@@ -133,7 +133,10 @@ input modality does not set Rudy's `vision` capability until image submission
 is supported end to end.
 
 `strict`, `permissive` and `off` map to App Server approval policies
-`onRequest`, `unlessTrusted` and `never`. Rudy leaves App Server sandbox policy
+`untrusted`, `on-request` and `never`. Strict mode also forces `read-only` at
+`thread/start` and `{type:"readOnly",networkAccess:false}` at `turn/start`, so
+workspace writes, network access and unsandboxed commands cross Rudy's durable
+approval boundary. Permissive and off modes leave the App Server sandbox policy
 to the operator's Codex configuration. Thinking targets `minimal`, `low`,
 `medium` and `high`; an unsupported target falls to the nearest advertised
 lower effort or the lowest advertised effort. Rudy does not promote `high` to

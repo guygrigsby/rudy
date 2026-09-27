@@ -136,9 +136,11 @@ Server. It sends `initialize` then `initialized`, pages `model/list`, uses
 `thread/resume`, `thread/fork`, `thread/read`, `turn/start`, `turn/steer` and
 `turn/interrupt`, then translates documented events and inbound requests.
 
-Rudy sends App Server approval policy `onRequest`, `unlessTrusted` and `never`
-for permission mode `strict`, `permissive` and `off`. It does not override App
-Server sandbox policy, which remains the operator's Codex configuration.
+Rudy sends App Server approval policy `untrusted`, `on-request` and `never` for
+permission mode `strict`, `permissive` and `off`. Strict sends sandbox mode
+`read-only` on `thread/start` and sandbox policy
+`{type:"readOnly",networkAccess:false}` on every `turn/start`. Permissive and
+off do not override the operator's App Server sandbox configuration.
 Thinking levels target `minimal`, `low`, `medium` and `high` in that order;
 `off` targets `minimal`. If the target is absent, choose the nearest advertised
 lower effort, or the lowest advertised effort when none is lower. Rudy never
