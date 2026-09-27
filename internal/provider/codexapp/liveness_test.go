@@ -85,3 +85,28 @@ func TestOldProcessCompletionCannotFinishReplacementLogin(t *testing.T) {
 		t.Fatalf("replacement completion = %+v", sink.completions)
 	}
 }
+
+func TestOldProcessNotificationCannotResolveReplacementRequest(t *testing.T) {
+	client := NewClient(Command{})
+	t.Cleanup(func() { client.process = nil; _ = client.Close() })
+	sink := &collectingRuntimeSink{}
+	client.SetSink(sink)
+	oldProcess, replacement := &appProcess{}, &appProcess{}
+	client.process = replacement
+
+	client.handleNotification(wireNotification{
+		process: oldProcess, method: methodServerRequestResolved,
+		params: json.RawMessage(`{"threadId":"thread-1","requestId":1}`),
+	})
+	if len(sink.events) != 0 {
+		t.Fatalf("old process resolved replacement request: %+v", sink.events)
+	}
+
+	client.handleNotification(wireNotification{
+		process: replacement, method: methodServerRequestResolved,
+		params: json.RawMessage(`{"threadId":"thread-1","requestId":1}`),
+	})
+	if len(sink.events) != 1 || sink.events[0].Type != agentruntime.EventRequestResolved {
+		t.Fatalf("replacement resolution = %+v", sink.events)
+	}
+}

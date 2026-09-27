@@ -296,11 +296,11 @@ func (c *Client) dispatchNotifications() {
 }
 
 func (c *Client) handleNotification(notification wireNotification) {
+	if notification.process != nil && notification.process != c.currentProcess() {
+		return
+	}
 	switch notification.method {
 	case methodAccountLoginCompleted:
-		if notification.process != nil && notification.process != c.currentProcess() {
-			return
-		}
 		var completion wireLoginCompletion
 		if json.Unmarshal(notification.params, &completion) == nil {
 			completion.process = notification.process

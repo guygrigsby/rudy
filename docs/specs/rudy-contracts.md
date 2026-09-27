@@ -148,6 +148,9 @@ selects `xhigh` for a `high` setting.
 
 It keys login completion by `loginId`, pending approvals by the App Server
 JSON-RPC request id and turn routing by verified `threadId` plus `turnId`.
+An approval request id is single-use within its active turn; terminal completion
+or runtime failure clears the fence for a replacement connection. Notifications
+from a replaced App Server process are discarded before event translation.
 Unknown inbound requests receive an immediate method error. The supported
 `item/tool/requestUserInput` request receives `{answers:{}}`; the supported
 `item/tool/call` request receives `{contentItems:[],success:false}`. These

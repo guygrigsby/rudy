@@ -245,6 +245,12 @@ turn completion. Repeated or late answers are refused. Network approval text
 is rendered as data and never executed or treated as a trustworthy command
 preview.
 
+Approval request ids are single-use within an active turn. Terminal completion
+or runtime failure clears that turn's id fence so a replacement App Server
+connection may reuse its connection-scoped ids. Notifications tagged with a
+replaced process are discarded before translation, so a delayed resolution
+cannot resolve a replacement process's request.
+
 ## Failures
 
 - Missing or old `codex` marks only the Codex runtime unavailable. Native
