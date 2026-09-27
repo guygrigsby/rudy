@@ -79,6 +79,10 @@ keep their names but some operations are runtime-specific refusals. Model
 records need an execution owner because their string prefix alone no longer
 means HTTP Provider.
 
+Runtime sessions cannot yet be child sessions or use a non-default Rudy agent
+definition or explicit tool narrowing. Accepting those inputs would claim a
+delegation ceiling Rudy cannot enforce over App Server's own tools.
+
 The plugin protocol gains runtime registration, runtime calls, runtime events
 and bound approval requests. The existing one-way protocol client cannot serve
 the App Server connection.

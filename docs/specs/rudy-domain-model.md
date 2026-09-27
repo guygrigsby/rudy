@@ -203,6 +203,10 @@ constructs `runtime{runtimeName:"codex"}`. A configured runtime model may open
 before authentication or successful discovery so `/login` has a Session from
 which to run.
 
+Runtime execution is invariantly a root Session under the default agent with
+no explicit Rudy tool narrowing until AgentRuntime has a contract that can
+enforce the same prompt, tool and turn ceilings as AgentDefinition.
+
 ## Entry
 
 Entity, immutable after append. One item in a Session log. Identity persists; content never changes. The `kind` selects exactly one payload shape from the closed set below.

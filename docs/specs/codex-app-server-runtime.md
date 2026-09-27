@@ -134,6 +134,12 @@ The two execution kinds are:
 - `native` runs Rudy's loop against a Provider.
 - `runtime` delegates to a named AgentRuntime. The first runtime is `codex`.
 
+Runtime execution currently accepts only a root Session under the default
+agent with no explicit Rudy tool narrowing. Child sessions, non-default agent
+definitions and explicit `tools` are refused because App Server owns its tool
+surface and loop, so accepting constraints Rudy cannot enforce would widen
+delegated authority. Native subagents remain unchanged.
+
 For an unlinked Codex session, the first `session.submit` after authentication
 calls `thread/start`, writes and fsyncs the link, then starts the turn. Rudy
 writes a `CodexThreadLink` only after the response returns a thread id. A crash

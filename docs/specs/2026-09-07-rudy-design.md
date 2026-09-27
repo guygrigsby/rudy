@@ -122,6 +122,8 @@ the Rudy session to the runtime's canonical thread. `entries.jsonl` keeps local
 control facts and fsynced approval decisions, not copied runtime messages. The
 client transcript is a deterministic projection of the runtime thread. See
 [Codex App Server runtime](codex-app-server-runtime.md) and ADR 0045.
+Runtime execution is root-only under the default Rudy agent until the runtime
+port can enforce the same prompt, tool and turn ceilings as a child definition.
 
 ## Permissions
 
