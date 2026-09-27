@@ -4,6 +4,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -83,10 +84,10 @@ func (r *remoteRuntime) StartThread(ctx context.Context, req agentruntime.StartT
 		Model: req.Model, Thinking: req.Thinking, Mode: req.Mode,
 	}, &out)
 	if err != nil {
-		return agentruntime.ThreadRef{}, err
+		return agentruntime.ThreadRef{}, remoteMutationError(err)
 	}
 	if out.ThreadID == "" {
-		return agentruntime.ThreadRef{}, fmt.Errorf("runtime %s: thread start returned an empty id", r.name)
+		return agentruntime.ThreadRef{}, remoteMutationResultError(r.name, "thread start returned an empty id")
 	}
 	return agentruntime.ThreadRef{Runtime: r.name, SessionID: req.SessionID, ThreadID: out.ThreadID}, nil
 }
@@ -98,10 +99,10 @@ func (r *remoteRuntime) ResumeThread(ctx context.Context, ref agentruntime.Threa
 func (r *remoteRuntime) ForkThread(ctx context.Context, ref agentruntime.ThreadRef) (agentruntime.ThreadRef, error) {
 	var out protocol.RuntimeThreadResult
 	if err := r.sp.peer.Client().Call(ctx, protocol.MethodRuntimeThreadFork, threadParams(r.name, ref), &out); err != nil {
-		return agentruntime.ThreadRef{}, err
+		return agentruntime.ThreadRef{}, remoteMutationError(err)
 	}
 	if out.ThreadID == "" || out.ThreadID == ref.ThreadID {
-		return agentruntime.ThreadRef{}, fmt.Errorf("runtime %s: thread fork did not return a distinct id", r.name)
+		return agentruntime.ThreadRef{}, remoteMutationResultError(r.name, "thread fork did not return a distinct id")
 	}
 	return agentruntime.ThreadRef{Runtime: r.name, SessionID: ref.SessionID, ThreadID: out.ThreadID}, nil
 }
@@ -129,10 +130,10 @@ func (r *remoteRuntime) StartTurn(ctx context.Context, req agentruntime.StartTur
 		Content: req.Content, Model: req.Model, Thinking: req.Thinking, Mode: req.Mode,
 	}, &out)
 	if err != nil {
-		return agentruntime.TurnRef{}, err
+		return agentruntime.TurnRef{}, remoteMutationError(err)
 	}
 	if out.TurnID == "" {
-		return agentruntime.TurnRef{}, fmt.Errorf("runtime %s: turn start returned an empty id", r.name)
+		return agentruntime.TurnRef{}, remoteMutationResultError(r.name, "turn start returned an empty id")
 	}
 	return agentruntime.TurnRef{ThreadRef: req.Thread, TurnID: out.TurnID}, nil
 }
@@ -144,12 +145,24 @@ func (r *remoteRuntime) SteerTurn(ctx context.Context, req agentruntime.SteerTur
 		TurnID: req.Turn.TurnID, Content: req.Content,
 	}, &out)
 	if err != nil {
-		return agentruntime.TurnRef{}, err
+		return agentruntime.TurnRef{}, remoteMutationError(err)
 	}
 	if out.TurnID != req.Turn.TurnID {
-		return agentruntime.TurnRef{}, fmt.Errorf("runtime %s: steer changed turn id", r.name)
+		return agentruntime.TurnRef{}, remoteMutationResultError(r.name, "steer changed turn id")
 	}
 	return req.Turn, nil
+}
+
+func remoteMutationError(err error) error {
+	var applicationError *protocol.Error
+	if errors.As(err, &applicationError) {
+		return err
+	}
+	return errors.Join(agentruntime.ErrAmbiguous, err)
+}
+
+func remoteMutationResultError(runtime, message string) error {
+	return errors.Join(agentruntime.ErrAmbiguous, fmt.Errorf("runtime %s: %s", runtime, message))
 }
 
 func (r *remoteRuntime) InterruptTurn(ctx context.Context, ref agentruntime.TurnRef) error {

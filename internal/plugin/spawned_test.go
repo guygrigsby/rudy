@@ -34,6 +34,7 @@ type fakeChild struct {
 	slowTool     bool           // never answer tool.invoke, so the caller's context is what ends it
 	slowCommand  bool           // never answer command.invoke
 	failComplete bool           // answer provider.complete with an error
+	dropRuntime  string         // close the peer without answering this runtime mutation
 	extraRegs    []registerCall // additional plugin.register_* calls, sent last
 
 	mu        sync.Mutex
@@ -183,6 +184,30 @@ func (c *fakeChild) handle(ctx context.Context, req protocol.Request) (any, *pro
 		return protocol.RuntimeModelListResult{Models: []provider.Model{{
 			Ref: session.ModelRef{Provider: "hello", Model: "gpt"}, OwnerKind: provider.OwnerRuntime,
 		}}}, nil, false
+	case protocol.MethodRuntimeThreadStart:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeThreadResult{ThreadID: "thread-new"}, nil, false
+	case protocol.MethodRuntimeThreadFork:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeThreadResult{ThreadID: "thread-fork"}, nil, false
+	case protocol.MethodRuntimeTurnStart:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeTurnResult{TurnID: "turn-new"}, nil, false
+	case protocol.MethodRuntimeTurnSteer:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeTurnResult{TurnID: "turn-old"}, nil, false
 	}
 	return nil, protocol.NewError(protocol.CodeMethodNotFound, "no method "+req.Method, nil), false
 }
@@ -596,6 +621,46 @@ func TestSpawnedRuntimeRegistersAndListsModels(t *testing.T) {
 	}
 	if len(models) != 1 || models[0].Ref != (session.ModelRef{Provider: "hello", Model: "gpt"}) || models[0].OwnerKind != provider.OwnerRuntime {
 		t.Fatalf("models = %+v", models)
+	}
+}
+
+func TestSpawnedRuntimeLostMutationResponseIsAmbiguous(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		call   func(agentruntime.Runtime) error
+	}{
+		{name: "start thread", method: protocol.MethodRuntimeThreadStart, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.StartThread(context.Background(), agentruntime.StartThreadRequest{SessionID: session.NewID()})
+			return err
+		}},
+		{name: "fork thread", method: protocol.MethodRuntimeThreadFork, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.ForkThread(context.Background(), agentruntime.ThreadRef{SessionID: session.NewID(), ThreadID: "thread-old"})
+			return err
+		}},
+		{name: "start turn", method: protocol.MethodRuntimeTurnStart, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.StartTurn(context.Background(), agentruntime.StartTurnRequest{Thread: agentruntime.ThreadRef{SessionID: session.NewID(), ThreadID: "thread-old"}})
+			return err
+		}},
+		{name: "steer turn", method: protocol.MethodRuntimeTurnSteer, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.SteerTurn(context.Background(), agentruntime.SteerTurnRequest{Turn: agentruntime.TurnRef{ThreadRef: agentruntime.ThreadRef{SessionID: session.NewID(), ThreadID: "thread-old"}, TurnID: "turn-old"}})
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := loadSpawned(t, nil, func(c *fakeChild) {
+				c.runtime = true
+				c.dropRuntime = test.method
+			})
+			runtime, ok := h.reg.Runtime("hello")
+			if !ok {
+				t.Fatal("runtime not registered")
+			}
+			if err := test.call(runtime); !errors.Is(err, agentruntime.ErrAmbiguous) {
+				t.Fatalf("err = %v, want ambiguous result", err)
+			}
+		})
 	}
 }
 
