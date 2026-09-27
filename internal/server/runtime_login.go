@@ -217,7 +217,7 @@ func (s *Server) cancelOwnedLogins(ctx context.Context, owner *conn, runtimeName
 		delete(s.loginAttempts, key)
 		delete(s.pendingLogins, key)
 		s.rememberFinishedLoginLocked(key)
-		cancellations = append(cancellations, cancellation{runtime: key.runtime, loginID: key.loginID})
+		cancellations = append(cancellations, cancellation(key))
 	}
 	s.mu.Unlock()
 	var errs []error

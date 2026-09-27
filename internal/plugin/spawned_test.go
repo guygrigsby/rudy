@@ -597,7 +597,6 @@ func TestSpawnedRuntimeRegistersAndListsModels(t *testing.T) {
 	if len(models) != 1 || models[0].Ref != (session.ModelRef{Provider: "hello", Model: "gpt"}) || models[0].OwnerKind != provider.OwnerRuntime {
 		t.Fatalf("models = %+v", models)
 	}
-	var _ agentruntime.Runtime = runtime
 }
 
 type runtimeSink struct {

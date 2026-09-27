@@ -124,7 +124,7 @@ func lessVersion(got, minimum [3]int) bool {
 }
 
 func captureDiagnostics(reader io.ReadCloser, tail *diagnosticTail) {
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64<<10), maxWireBytes)
 	for scanner.Scan() {

@@ -289,7 +289,7 @@ func (p *peer) fail(err error) {
 	if err == nil {
 		err = io.EOF
 	}
-	p.closeTransport()
+	_ = p.closeTransport()
 	p.writeMu.Lock()
 	p.mu.Lock()
 	if p.err != nil {
