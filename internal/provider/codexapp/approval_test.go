@@ -141,6 +141,32 @@ func TestUnsupportedInboundRequestReturnsMethodError(t *testing.T) {
 	}
 }
 
+// Codex 0.155.1's generated ToolRequestUserInputResponse and
+// DynamicToolCallResponse schemas require these fields even on cancellation.
+func TestUnsupportedToolRequestsReturnSchemaValidCancellation(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		params string
+		want   string
+	}{
+		{"user input", methodItemToolRequestUserInput, `{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","isBlocking":true,"questions":[{"header":"Choose","id":"q1","question":"Continue?"}]}`, `{"answers":{}}`},
+		{"dynamic tool", methodItemToolCall, `{"threadId":"thread-1","turnId":"turn-1","callId":"call-1","tool":"outside","arguments":{}}`, `{"contentItems":[],"success":false}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sink := &approvalSink{answer: agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionAllow, Scope: agentruntime.ScopeOnce}}
+			response := sendInboundApproval(t, sink, `{"id":1,"method":"`+test.method+`","params":`+test.params+`}`)
+			if got := string(response["result"]); got != test.want {
+				t.Fatalf("cancellation response = %s, want %s; full response = %v", got, test.want, response)
+			}
+			if sink.calls != 0 {
+				t.Fatalf("unsupported tool request reached approval sink %d times", sink.calls)
+			}
+		})
+	}
+}
+
 type orderedApprovalSink struct {
 	itemStarted chan struct{}
 	releaseItem chan struct{}

@@ -36,6 +36,12 @@ type permissionResponse struct {
 }
 
 func (c *Client) handleRequest(ctx context.Context, requestID, method string, raw json.RawMessage) (any, error) {
+	switch method {
+	case methodItemToolRequestUserInput:
+		return map[string]any{"answers": map[string]any{}}, nil
+	case methodItemToolCall:
+		return map[string]any{"contentItems": []any{}, "success": false}, nil
+	}
 	if !oneOf(method, methodItemCommandExecutionApproval, methodItemFileChangeApproval, methodItemPermissionsApproval) {
 		return nil, &wireError{Code: -32601, Message: "unsupported App Server request"}
 	}

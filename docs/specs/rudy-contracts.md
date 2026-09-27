@@ -146,8 +146,11 @@ selects `xhigh` for a `high` setting.
 
 It keys login completion by `loginId`, pending approvals by the App Server
 JSON-RPC request id and turn routing by verified `threadId` plus `turnId`.
-Unknown inbound requests receive an immediate method error. User input and MCP
-elicitation requests are cancelled because this contract exposes neither.
+Unknown inbound requests receive an immediate method error. The supported
+`item/tool/requestUserInput` request receives `{answers:{}}`; the supported
+`item/tool/call` request receives `{contentItems:[],success:false}`. These
+schema-valid cancellations expose neither user input nor dynamic tool execution
+and do not call Rudy's approval asker. MCP elicitation is unsupported.
 Command and file requests deny on failure. Permission requests grant an empty
 set on failure. Pending approval UI clears only on request-resolved or terminal
 turn completion. The prompt renders every opaque requested permission member
