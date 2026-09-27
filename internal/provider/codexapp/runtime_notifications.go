@@ -5,7 +5,6 @@ package codexapp
 import (
 	"encoding/json"
 	"errors"
-	"strconv"
 	"strings"
 
 	"github.com/guygrigsby/rudy/internal/agentruntime"
@@ -145,12 +144,10 @@ func translateRuntimeNotification(notification wireNotification) (*agentruntime.
 		event.Text = Redact(wire.Error.Message)
 	case methodServerRequestResolved:
 		event.Type = agentruntime.EventRequestResolved
-		if err := json.Unmarshal(wire.RequestID, &event.RequestID); err != nil {
-			var numericID int64
-			if err := json.Unmarshal(wire.RequestID, &numericID); err != nil {
-				return nil, errors.New("codex resolved request has invalid id")
-			}
-			event.RequestID = strconv.FormatInt(numericID, 10)
+		var err error
+		event.RequestID, err = canonicalRequestID(wire.RequestID)
+		if err != nil {
+			return nil, err
 		}
 	default:
 		return nil, nil

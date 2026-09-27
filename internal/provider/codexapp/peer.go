@@ -25,27 +25,40 @@ type callNotSentError struct{ err error }
 func (e *callNotSentError) Error() string { return e.err.Error() }
 func (e *callNotSentError) Unwrap() error { return e.err }
 
+type inboundRequest struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	threadID string
+}
+
 type peer struct {
 	reader io.Reader
 	writer io.Writer
 	closer io.Closer
 
-	writeMu sync.Mutex
-	mu      sync.Mutex
-	nextID  uint64
-	pending map[string]chan callResult
-	done    chan struct{}
-	err     error
+	writeMu        sync.Mutex
+	mu             sync.Mutex
+	nextID         uint64
+	pending        map[string]chan callResult
+	inbound        map[string]inboundRequest
+	done           chan struct{}
+	err            error
+	requestCtx     context.Context
+	cancelRequests context.CancelFunc
+	closeOnce      sync.Once
+	closeErr       error
 
 	onRequest      inboundHandler
 	onNotification notificationHandler
 }
 
 func newPeer(reader io.Reader, writer io.Writer, closer io.Closer, onRequest inboundHandler, onNotification notificationHandler) *peer {
+	requestCtx, cancelRequests := context.WithCancel(context.Background())
 	p := &peer{
 		reader: reader, writer: writer, closer: closer,
-		pending: make(map[string]chan callResult), done: make(chan struct{}),
+		pending: make(map[string]chan callResult), inbound: make(map[string]inboundRequest), done: make(chan struct{}),
 		onRequest: onRequest, onNotification: onNotification,
+		requestCtx: requestCtx, cancelRequests: cancelRequests,
 	}
 	go p.readLoop()
 	return p
@@ -116,6 +129,12 @@ func (p *peer) write(message envelope) error {
 	b = append(b, '\n')
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	p.mu.Lock()
+	peerErr := p.err
+	p.mu.Unlock()
+	if peerErr != nil {
+		return peerErr
+	}
 	if _, err := p.writer.Write(b); err != nil {
 		return fmt.Errorf("codex app server write: %w", err)
 	}
@@ -133,12 +152,35 @@ func (p *peer) readLoop() {
 		}
 		if message.Method != "" {
 			if len(message.ID) == 0 {
+				if message.Method == methodServerRequestResolved {
+					p.cancelResolvedRequest(message.Params)
+				}
 				if p.onNotification != nil {
 					p.onNotification(message.Method, message.Params)
 				}
 				continue
 			}
-			go p.handleRequest(message)
+			requestID, err := canonicalRequestID(message.ID)
+			if err != nil {
+				p.fail(err)
+				return
+			}
+			p.mu.Lock()
+			_, duplicate := p.inbound[requestID]
+			if !duplicate {
+				requestCtx, cancel := context.WithCancel(p.requestCtx)
+				var params struct {
+					ThreadID string `json:"threadId"`
+				}
+				_ = json.Unmarshal(message.Params, &params)
+				p.inbound[requestID] = inboundRequest{ctx: requestCtx, cancel: cancel, threadID: params.ThreadID}
+			}
+			p.mu.Unlock()
+			if duplicate {
+				p.fail(errors.New("codex app server reused an active request id"))
+				return
+			}
+			go p.handleRequest(requestID, message)
 			continue
 		}
 		if len(message.ID) == 0 {
@@ -154,7 +196,22 @@ func (p *peer) readLoop() {
 	p.fail(io.EOF)
 }
 
-func (p *peer) handleRequest(message envelope) {
+func (p *peer) handleRequest(requestID string, message envelope) {
+	p.mu.Lock()
+	request, found := p.inbound[requestID]
+	p.mu.Unlock()
+	requestCtx := p.requestCtx
+	if found {
+		requestCtx = request.ctx
+	}
+	defer func() {
+		p.mu.Lock()
+		if found {
+			request.cancel()
+		}
+		delete(p.inbound, requestID)
+		p.mu.Unlock()
+	}()
 	var (
 		result any
 		err    error
@@ -162,7 +219,7 @@ func (p *peer) handleRequest(message envelope) {
 	if p.onRequest == nil {
 		err = &wireError{Code: -32601, Message: "method not supported"}
 	} else {
-		result, err = p.onRequest(message.Method, message.Params)
+		result, err = p.onRequest(requestCtx, requestID, message.Method, message.Params)
 	}
 	response := envelope{ID: message.ID}
 	if err != nil {
@@ -178,8 +235,31 @@ func (p *peer) handleRequest(message envelope) {
 			response.Error = &wireError{Code: -32603, Message: "could not encode response"}
 		}
 	}
+	if requestCtx.Err() != nil {
+		return
+	}
 	if err := p.write(response); err != nil {
 		p.fail(err)
+	}
+}
+
+func (p *peer) cancelResolvedRequest(raw json.RawMessage) {
+	var params struct {
+		ThreadID  string          `json:"threadId"`
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if json.Unmarshal(raw, &params) != nil {
+		return
+	}
+	id, err := canonicalRequestID(params.RequestID)
+	if err != nil {
+		return
+	}
+	p.mu.Lock()
+	request, found := p.inbound[id]
+	p.mu.Unlock()
+	if found && request.threadID != "" && request.threadID == params.ThreadID {
+		request.cancel()
 	}
 }
 
@@ -209,25 +289,35 @@ func (p *peer) fail(err error) {
 	if err == nil {
 		err = io.EOF
 	}
+	p.closeTransport()
+	p.writeMu.Lock()
 	p.mu.Lock()
 	if p.err != nil {
 		p.mu.Unlock()
+		p.writeMu.Unlock()
 		return
 	}
 	p.err = err
+	p.cancelRequests()
 	waits := p.pending
 	p.pending = make(map[string]chan callResult)
 	close(p.done)
 	p.mu.Unlock()
+	p.writeMu.Unlock()
 	for _, wait := range waits {
 		wait <- callResult{err: err}
 	}
 }
 
 func (p *peer) Close() error {
-	err := p.closer.Close()
+	err := p.closeTransport()
 	p.fail(errors.New("codex app server closed"))
 	return err
+}
+
+func (p *peer) closeTransport() error {
+	p.closeOnce.Do(func() { p.closeErr = p.closer.Close() })
+	return p.closeErr
 }
 
 func (p *peer) alive() bool {

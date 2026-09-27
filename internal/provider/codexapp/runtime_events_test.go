@@ -53,7 +53,7 @@ func TestRuntimeNotificationsTranslateEveryProjectionVariant(t *testing.T) {
 		{"thread/tokenUsage/updated", `{"threadId":"thread-1","turnId":"turn-1","tokenUsage":{"last":{"inputTokens":12,"cachedInputTokens":3,"outputTokens":5,"reasoningOutputTokens":2,"totalTokens":17,"cacheWriteInputTokens":1},"total":{"inputTokens":99,"cachedInputTokens":9,"outputTokens":80,"reasoningOutputTokens":20,"totalTokens":179}}}`, agentruntime.Event{Type: agentruntime.EventUsageUpdated, ThreadID: "thread-1", TurnID: "turn-1", Usage: session.Usage{Input: 12, Output: 5, CacheRead: 3, CacheWrite: 1}}},
 		{methodTurnCompleted, `{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[]}}`, agentruntime.Event{Type: agentruntime.EventTurnCompleted, ThreadID: "thread-1", TurnID: "turn-1", Status: "completed"}},
 		{methodError, `{"threadId":"thread-1","turnId":"turn-1","error":{"message":"retry unavailable"},"willRetry":false}`, agentruntime.Event{Type: agentruntime.EventError, ThreadID: "thread-1", TurnID: "turn-1", Text: "retry unavailable"}},
-		{methodServerRequestResolved, `{"threadId":"thread-1","requestId":"request-1"}`, agentruntime.Event{Type: agentruntime.EventRequestResolved, ThreadID: "thread-1", RequestID: "request-1"}},
+		{methodServerRequestResolved, `{"threadId":"thread-1","requestId":"request-1"}`, agentruntime.Event{Type: agentruntime.EventRequestResolved, ThreadID: "thread-1", RequestID: `"request-1"`}},
 	}
 	for index, test := range tests {
 		client.handleNotification(wireNotification{method: test.method, params: json.RawMessage(test.params)})

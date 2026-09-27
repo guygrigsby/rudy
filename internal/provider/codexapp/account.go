@@ -18,8 +18,9 @@ import (
 const maxEarlyLoginCompletions = 64
 
 type wireNotification struct {
-	method string
-	params json.RawMessage
+	method  string
+	params  json.RawMessage
+	barrier chan struct{}
 }
 
 type wireLoginCompletion struct {
@@ -261,6 +262,10 @@ func (c *Client) dispatchNotifications() {
 	for {
 		select {
 		case notification := <-c.notifications:
+			if notification.barrier != nil {
+				close(notification.barrier)
+				continue
+			}
 			c.handleNotification(notification)
 		case <-c.dispatchStop:
 			return

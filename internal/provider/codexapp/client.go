@@ -5,7 +5,6 @@ package codexapp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -171,10 +170,6 @@ func (c *Client) callMutation(ctx context.Context, method string, params, result
 		return err
 	}
 	return errors.Join(agentruntime.ErrAmbiguous, err)
-}
-
-func (c *Client) handleRequest(method string, _ json.RawMessage) (any, error) {
-	return nil, &wireError{Code: -32601, Message: "unsupported App Server request: " + method}
 }
 
 func (c *Client) Close() error {
