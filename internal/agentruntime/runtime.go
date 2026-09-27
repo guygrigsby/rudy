@@ -18,6 +18,15 @@ import (
 
 var ErrAmbiguous = errors.New("agent runtime: operation outcome is ambiguous")
 
+type Error struct {
+	Runtime string
+	Message string
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("agent runtime %s: %s", e.Runtime, e.Message)
+}
+
 type LoginMode string
 
 const (

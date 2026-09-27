@@ -5,6 +5,7 @@ package protocol
 import (
 	"encoding/json"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -47,6 +48,8 @@ const (
 	MethodPluginRegisterHook     = "plugin.register_hook"
 	MethodPluginRegisterWidget   = "plugin.register_widget"
 	MethodPluginRegisterProvider = "plugin.register_provider"
+	MethodPluginRegisterRuntime  = "plugin.register_runtime"
+	MethodRuntimeApprovalRequest = "runtime.approval.request"
 	MethodPluginRegisterAgent    = "plugin.register_agent"
 	MethodPluginSetStatus        = "plugin.set_status"
 )
@@ -54,19 +57,33 @@ const (
 // Methods, server to plugin. Only a spawned plugin is ever called: a linked plugin is the
 // same Go interface on the other side of a function call.
 const (
-	MethodPluginInit         = "plugin.init"
-	MethodToolInvoke         = "tool.invoke"
-	MethodToolCancel         = "tool.cancel"
-	MethodHookFire           = "hook.fire"
-	MethodCommandInvoke      = "command.invoke"
-	MethodProviderComplete   = "provider.complete"
-	MethodProviderListModels = "provider.list_models"
+	MethodPluginInit           = "plugin.init"
+	MethodToolInvoke           = "tool.invoke"
+	MethodToolCancel           = "tool.cancel"
+	MethodHookFire             = "hook.fire"
+	MethodCommandInvoke        = "command.invoke"
+	MethodProviderComplete     = "provider.complete"
+	MethodProviderListModels   = "provider.list_models"
+	MethodRuntimeAccountRead   = "runtime.account.read"
+	MethodRuntimeLoginStart    = "runtime.login.start"
+	MethodRuntimeLoginCancel   = "runtime.login.cancel"
+	MethodRuntimeModelList     = "runtime.model.list"
+	MethodRuntimeThreadStart   = "runtime.thread.start"
+	MethodRuntimeThreadResume  = "runtime.thread.resume"
+	MethodRuntimeThreadFork    = "runtime.thread.fork"
+	MethodRuntimeThreadRead    = "runtime.thread.read"
+	MethodRuntimeTurnStart     = "runtime.turn.start"
+	MethodRuntimeTurnSteer     = "runtime.turn.steer"
+	MethodRuntimeTurnInterrupt = "runtime.turn.interrupt"
 )
 
 // Notifications, plugin to server.
 const (
-	NotifyToolProgress  = "tool.progress"
-	NotifyProviderDelta = "provider.delta"
+	NotifyToolProgress          = "tool.progress"
+	NotifyProviderDelta         = "provider.delta"
+	NotifyRuntimeEvent          = "runtime.event"
+	NotifyRuntimeAccountUpdated = "runtime.account.updated"
+	NotifyRuntimeLoginCompleted = "runtime.login.completed"
 )
 
 // Notifications, server to client.
@@ -425,6 +442,10 @@ type PluginRegisterProviderParams struct {
 	Wire string `json:"wire"`
 }
 
+type PluginRegisterRuntimeParams struct {
+	Name string `json:"name"`
+}
+
 // PluginRegisterAgentParams carries the same fields agents/<name>.md does. Tools is a pointer
 // so an absent key (every tool) stays distinguishable from an explicit empty list (no tool),
 // exactly as the file's frontmatter does; a plain []string cannot make that distinction once
@@ -521,12 +542,14 @@ type CommandInvokeResult struct {
 
 type ProviderCompleteParams struct {
 	RequestID string                `json:"request_id"`
+	SessionID string                `json:"session_id"`
 	Model     session.ModelRef      `json:"model"`
 	System    string                `json:"system"`
 	Messages  []provider.Message    `json:"messages"`
 	Tools     []provider.ToolDef    `json:"tools"`
 	Thinking  session.ThinkingLevel `json:"thinking"`
 	MaxTokens int                   `json:"max_tokens"`
+	Headers   map[string]string     `json:"headers"`
 }
 
 type ProviderCompleteResult struct {
@@ -545,3 +568,85 @@ type ProviderDelta struct {
 type ProviderListModelsResult struct {
 	Models []provider.Model `json:"models"`
 }
+
+type RuntimeAccountReadParams struct {
+	Runtime string `json:"runtime"`
+}
+
+type RuntimeLoginStartParams struct {
+	Runtime string                 `json:"runtime"`
+	Mode    agentruntime.LoginMode `json:"mode"`
+}
+
+type RuntimeLoginCancelParams struct {
+	Runtime string `json:"runtime"`
+	LoginID string `json:"login_id"`
+}
+
+type RuntimeModelListParams struct {
+	Runtime string `json:"runtime"`
+	Cursor  string `json:"cursor"`
+}
+
+type RuntimeModelListResult struct {
+	Models     []provider.Model `json:"models"`
+	NextCursor string           `json:"next_cursor"`
+}
+
+type RuntimeThreadStartParams struct {
+	Runtime   string                `json:"runtime"`
+	SessionID string                `json:"session_id"`
+	CWD       string                `json:"cwd"`
+	Model     session.ModelRef      `json:"model"`
+	Thinking  session.ThinkingLevel `json:"thinking"`
+	Mode      session.Mode          `json:"mode"`
+}
+
+type RuntimeThreadRefParams struct {
+	Runtime   string `json:"runtime"`
+	SessionID string `json:"session_id"`
+	ThreadID  string `json:"thread_id"`
+}
+
+type RuntimeThreadResult struct {
+	ThreadID string `json:"thread_id"`
+}
+
+type RuntimeTurnStartParams struct {
+	Runtime   string                `json:"runtime"`
+	SessionID string                `json:"session_id"`
+	ThreadID  string                `json:"thread_id"`
+	Content   []session.Block       `json:"content"`
+	Model     session.ModelRef      `json:"model"`
+	Thinking  session.ThinkingLevel `json:"thinking"`
+	Mode      session.Mode          `json:"mode"`
+}
+
+type RuntimeTurnSteerParams struct {
+	Runtime   string          `json:"runtime"`
+	SessionID string          `json:"session_id"`
+	ThreadID  string          `json:"thread_id"`
+	TurnID    string          `json:"turn_id"`
+	Content   []session.Block `json:"content"`
+}
+
+type RuntimeTurnRefParams struct {
+	Runtime   string `json:"runtime"`
+	SessionID string `json:"session_id"`
+	ThreadID  string `json:"thread_id"`
+	TurnID    string `json:"turn_id"`
+}
+
+type RuntimeTurnResult struct {
+	TurnID string `json:"turn_id"`
+}
+
+type RuntimeEventParams struct {
+	Runtime string             `json:"runtime"`
+	Event   agentruntime.Event `json:"event"`
+}
+
+type RuntimeAccountUpdatedParams = agentruntime.AccountState
+type RuntimeLoginCompletedParams = agentruntime.LoginCompletion
+type RuntimeApprovalRequestParams = agentruntime.ApprovalQuestion
+type RuntimeApprovalResult = agentruntime.ApprovalAnswer

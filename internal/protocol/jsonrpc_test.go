@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
@@ -27,6 +28,8 @@ func TestErrorFrom(t *testing.T) {
 		{"locked", session.ErrLocked, CodeUnavailable},
 		{"canceled", context.Canceled, CodeInterrupted},
 		{"invalid argument", fmt.Errorf("cwd: %w", ErrInvalidArgument), CodeInvalidArgument},
+		{"runtime", &agentruntime.Error{Runtime: "codex", Message: "not logged in"}, CodeRuntimeError},
+		{"ambiguous runtime mutation", agentruntime.ErrAmbiguous, CodeAmbiguous},
 		{"other", errors.New("disk on fire"), CodeInternal},
 	}
 	for _, c := range cases {

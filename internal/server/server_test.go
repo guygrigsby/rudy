@@ -27,6 +27,7 @@ import (
 	yaml "go.yaml.in/yaml/v3"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -2311,8 +2312,10 @@ func TestEveryProtocolMethodIsDecidedForPlugins(t *testing.T) {
 		protocol.MethodPluginRegisterHook:     true,
 		protocol.MethodPluginRegisterWidget:   true,
 		protocol.MethodPluginRegisterProvider: true,
+		protocol.MethodPluginRegisterRuntime:  true,
 		protocol.MethodPluginRegisterAgent:    true,
 		protocol.MethodPluginSetStatus:        true,
+		protocol.MethodRuntimeApprovalRequest: true,
 	}
 	methods := protocolMethods(t)
 	if len(methods) < len(allowed) {
@@ -2330,6 +2333,18 @@ func TestEveryProtocolMethodIsDecidedForPlugins(t *testing.T) {
 		if got := code(t, err); got != protocol.CodeUnauthorized {
 			t.Errorf("plugin %s: code %d (%v), want unauthorized or a place in the allowlist", m, got, err)
 		}
+	}
+}
+
+func TestClientCannotSubmitRuntimeApprovalRequest(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	cl := dialAs(t, h.srv, true)
+	err := cl.Call(context.Background(), protocol.MethodRuntimeApprovalRequest, protocol.RuntimeApprovalRequestParams{
+		Runtime: "codex", RequestID: "1", ThreadID: "thr", TurnID: "turn", ItemID: "item",
+		Kind: agentruntime.ApprovalCommand,
+	}, &protocol.RuntimeApprovalResult{})
+	if got := code(t, err); got != protocol.CodeUnauthorized {
+		t.Fatalf("runtime approval request code = %d (%v), want unauthorized", got, err)
 	}
 }
 

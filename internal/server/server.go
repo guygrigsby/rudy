@@ -23,6 +23,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -515,9 +516,11 @@ func (s *Server) dispatch(ctx context.Context, cn *conn, req protocol.Request) (
 		return s.handleAppendNote(cn, req.Params)
 	case protocol.MethodPluginRegisterTool, protocol.MethodPluginRegisterCommand,
 		protocol.MethodPluginRegisterHook, protocol.MethodPluginRegisterProvider,
-		protocol.MethodPluginRegisterAgent, protocol.MethodPluginRegisterWidget,
+		protocol.MethodPluginRegisterRuntime, protocol.MethodPluginRegisterAgent, protocol.MethodPluginRegisterWidget,
 		protocol.MethodPluginSetStatus:
 		return s.handleRegister(cn, req)
+	case protocol.MethodRuntimeApprovalRequest:
+		return s.handleRuntimeApprovalRequest(cn, req.Params)
 	default:
 		return nil, perr(protocol.CodeNotFound, "unknown method "+req.Method)
 	}
@@ -546,8 +549,10 @@ var pluginMethods = map[string]bool{
 	protocol.MethodPluginRegisterHook:     true,
 	protocol.MethodPluginRegisterWidget:   true,
 	protocol.MethodPluginRegisterProvider: true,
+	protocol.MethodPluginRegisterRuntime:  true,
 	protocol.MethodPluginRegisterAgent:    true,
 	protocol.MethodPluginSetStatus:        true,
+	protocol.MethodRuntimeApprovalRequest: true,
 }
 
 // pluginOwnSession is the subset of pluginMethods a plugin may only aim at a session it
@@ -613,6 +618,37 @@ func (s *Server) handleRegister(cn *conn, req protocol.Request) (any, *protocol.
 		return nil, registerErr(err)
 	}
 	return res, nil
+}
+
+// handleRuntimeApprovalRequest establishes the spawned-runtime authority boundary. No
+// caller-provided session id is accepted because a verified thread link chooses the Session.
+// Without a verified coordinator binding, the request fails closed.
+func (s *Server) handleRuntimeApprovalRequest(cn *conn, raw json.RawMessage) (any, *protocol.Error) {
+	if cn.plugin == "" || cn.reg == nil {
+		return nil, perr(protocol.CodeUnauthorized, "runtime.approval.request is for spawned runtimes")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, perr(protocol.CodeInvalidArgument, "invalid runtime approval request")
+	}
+	if _, ok := fields["session_id"]; ok {
+		return nil, perr(protocol.CodeInvalidArgument, "runtime approval request must not contain session_id")
+	}
+	var question protocol.RuntimeApprovalRequestParams
+	if e := decode(raw, &question); e != nil {
+		return nil, e
+	}
+	if question.Runtime != cn.plugin {
+		return nil, perr(protocol.CodeUnauthorized, "runtime approval owner does not match plugin")
+	}
+	if _, ok := s.d.Plugins.Runtime(question.Runtime); !ok {
+		return nil, perr(protocol.CodeUnauthorized, "plugin did not register this runtime")
+	}
+	return protocol.RuntimeApprovalResult{
+		Decision: agentruntime.DecisionDeny,
+		Scope:    agentruntime.ScopeOnce,
+		Reason:   "no verified session binding",
+	}, nil
 }
 
 // registerErr maps a registration failure: a name another plugin already owns is a conflict,
