@@ -642,6 +642,101 @@ func TestRuntimeApprovalWithoutAskerFailsClosedAndRecordsReason(t *testing.T) {
 	assertNoNotification(t, client, protocol.NotifyRuntimePermissionRequested)
 }
 
+func TestRuntimeApprovalRequestIDFenceEndsWithTurn(t *testing.T) {
+	for _, terminal := range []agentruntime.EventType{agentruntime.EventTurnCompleted, agentruntime.EventRuntimeFailed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			runtime := &sessionRuntime{}
+			h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
+			runtime.links = h.store.RuntimeLinks()
+			client := h.dial(t, false)
+			info := openRuntimeSession(t, client, h.ws, nil)
+			var submitted protocol.SessionSubmitResult
+			if err := client.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+				SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("hello")},
+			}, &submitted); err != nil {
+				t.Fatal(err)
+			}
+			runtime.emit(agentruntime.Event{Type: agentruntime.EventItemStarted, ThreadID: "thread-1", TurnID: submitted.TurnID,
+				ItemID: "item-1", Item: agentruntime.Item{ItemID: "item-1", Type: agentruntime.ItemCommand}})
+			question := agentruntime.ApprovalQuestion{Runtime: "codex", RequestID: "1", ThreadID: "thread-1",
+				TurnID: submitted.TurnID, ItemID: "item-1", Kind: agentruntime.ApprovalCommand,
+				AllowedScopes: []agentruntime.ApprovalScope{agentruntime.ScopeOnce}}
+			runtime.mu.Lock()
+			sink := runtime.sink
+			runtime.mu.Unlock()
+			answer, err := sink.RequestApproval(context.Background(), question)
+			if err != nil || answer.Decision != agentruntime.DecisionDeny {
+				t.Fatalf("initial approval = %+v, %v", answer, err)
+			}
+			if _, err := sink.RequestApproval(context.Background(), question); err == nil {
+				t.Fatal("same-turn request ID reuse was accepted")
+			}
+			runtime.emit(agentruntime.Event{Type: terminal, ThreadID: "thread-1", TurnID: submitted.TurnID,
+				Status: string(agentruntime.TurnCompleted)})
+			if terminal == agentruntime.EventRuntimeFailed {
+				var resumed protocol.SessionInfo
+				if err := client.Call(context.Background(), protocol.MethodSessionResume,
+					protocol.SessionResumeParams{SessionID: info.SessionID}, &resumed); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runtime.emit(agentruntime.Event{Type: agentruntime.EventTurnStarted, ThreadID: "thread-1", TurnID: "turn-2"})
+			runtime.emit(agentruntime.Event{Type: agentruntime.EventItemStarted, ThreadID: "thread-1", TurnID: "turn-2",
+				ItemID: "item-2", Item: agentruntime.Item{ItemID: "item-2", Type: agentruntime.ItemCommand}})
+			question.TurnID, question.ItemID = "turn-2", "item-2"
+			answer, err = sink.RequestApproval(context.Background(), question)
+			if err != nil || answer.Decision != agentruntime.DecisionDeny {
+				t.Fatalf("next-turn request ID reuse = %+v, %v", answer, err)
+			}
+		})
+	}
+}
+
+func TestRuntimeApprovalPendingRequestResolvesBeforeIDReuse(t *testing.T) {
+	runtime := &sessionRuntime{}
+	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))
+	runtime.links = h.store.RuntimeLinks()
+	client := h.dial(t, true)
+	info := openRuntimeSession(t, client, h.ws, nil)
+	var submitted protocol.SessionSubmitResult
+	if err := client.Call(context.Background(), protocol.MethodSessionSubmit, protocol.SessionSubmitParams{
+		SessionID: info.SessionID, Source: session.SourceTyped, Content: []session.Block{session.TextBlock("hello")},
+	}, &submitted); err != nil {
+		t.Fatal(err)
+	}
+	runtime.emit(agentruntime.Event{Type: agentruntime.EventItemStarted, ThreadID: "thread-1", TurnID: submitted.TurnID,
+		ItemID: "item-1", Item: agentruntime.Item{ItemID: "item-1", Type: agentruntime.ItemCommand}})
+	discardNotifications(client)
+	question := agentruntime.ApprovalQuestion{Runtime: "codex", RequestID: "1", ThreadID: "thread-1",
+		TurnID: submitted.TurnID, ItemID: "item-1", Kind: agentruntime.ApprovalCommand,
+		AllowedScopes: []agentruntime.ApprovalScope{agentruntime.ScopeOnce}}
+	answers := make(chan agentruntime.ApprovalAnswer, 2)
+	go func() { answers <- runtime.ask(context.Background(), question) }()
+	waitNotification(t, client, protocol.NotifyRuntimePermissionRequested)
+	runtime.emit(agentruntime.Event{Type: agentruntime.EventTurnCompleted, ThreadID: "thread-1", TurnID: submitted.TurnID,
+		Status: string(agentruntime.TurnCompleted)})
+	if answer := <-answers; answer.Decision != agentruntime.DecisionDeny {
+		t.Fatalf("stale approval = %+v", answer)
+	}
+	waitNotification(t, client, protocol.NotifyRuntimePermissionResolved)
+	runtime.emit(agentruntime.Event{Type: agentruntime.EventTurnStarted, ThreadID: "thread-1", TurnID: "turn-2"})
+	runtime.emit(agentruntime.Event{Type: agentruntime.EventItemStarted, ThreadID: "thread-1", TurnID: "turn-2",
+		ItemID: "item-2", Item: agentruntime.Item{ItemID: "item-2", Type: agentruntime.ItemCommand}})
+	question.TurnID, question.ItemID = "turn-2", "item-2"
+	go func() { answers <- runtime.ask(context.Background(), question) }()
+	waitNotification(t, client, protocol.NotifyRuntimePermissionRequested)
+	var result struct{}
+	if err := client.Call(context.Background(), protocol.MethodRuntimeApprovalAnswer, protocol.RuntimeApprovalAnswerParams{
+		SessionID: info.SessionID, TurnID: "turn-2", RequestID: "1",
+		Decision: agentruntime.DecisionDeny, Scope: agentruntime.ScopeOnce, Reason: "denied",
+	}, &result); err != nil {
+		t.Fatal(err)
+	}
+	if answer := <-answers; answer.Decision != agentruntime.DecisionDeny || answer.Reason != "denied" {
+		t.Fatalf("next-turn approval = %+v", answer)
+	}
+}
+
 func TestRuntimeApprovalDeniesWhenLastAskerDisconnects(t *testing.T) {
 	runtime := &sessionRuntime{}
 	h := newHarnessWith(t, &scriptProvider{}, codexplugin.New(runtime))

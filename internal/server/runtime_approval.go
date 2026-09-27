@@ -71,23 +71,22 @@ func (s *Server) RequestApproval(ctx context.Context, question agentruntime.Appr
 		return deny, errors.New("runtime approval request id was already used")
 	}
 	targets := ls.askersObsLocked()
-	ls.runtimeAnswered[question.RequestID] = false
+	ls.runtimeAnswered[question.RequestID] = len(targets) == 0
 	if len(targets) > 0 {
 		ls.runtimeApprovals[question.RequestID] = pending
 	}
 	ls.obsMu.Unlock()
-	rs.mu.Unlock()
 
 	if len(targets) == 0 {
 		deny = runtimeDeny("no asker is attached")
-		ls.obsMu.Lock()
-		ls.runtimeAnswered[question.RequestID] = true
-		ls.obsMu.Unlock()
-		if err := s.recordRuntimeDecision(ls, question, deny, session.RuntimeByNoAsker); err != nil {
+		err := s.recordRuntimeDecision(ls, question, deny, session.RuntimeByNoAsker)
+		rs.mu.Unlock()
+		if err != nil {
 			return deny, err
 		}
 		return deny, nil
 	}
+	rs.mu.Unlock()
 	request := runtimePermissionRequest(ls.sess.ID().String(), question)
 	for _, target := range targets {
 		target.notify(protocol.NotifyRuntimePermissionRequested, request)

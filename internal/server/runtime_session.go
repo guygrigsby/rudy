@@ -607,12 +607,17 @@ func (s *Server) runtimeEvent(runtimeName string, event agentruntime.Event) {
 		)
 		entry = &projected
 	}
+	if resolvedTurn != "" {
+		// Complete the old turn's approvals before another turn can claim the same
+		// upstream request id. Codex may restart its JSON-RPC id sequence.
+		s.resolveRuntimeApprovals(ls, "", resolvedTurn)
+		ls.obsMu.Lock()
+		clear(ls.runtimeAnswered)
+		ls.obsMu.Unlock()
+	}
 	rs.mu.Unlock()
 	if resolvedRequest != "" {
 		s.resolveRuntimeApprovals(ls, resolvedRequest, "")
-	}
-	if resolvedTurn != "" {
-		s.resolveRuntimeApprovals(ls, "", resolvedTurn)
 	}
 	if completedItem != "" {
 		s.failRuntimeApprovalsForItem(ls, event.TurnID, completedItem)
