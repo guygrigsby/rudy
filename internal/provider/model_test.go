@@ -3,11 +3,41 @@
 package provider_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
+
+func TestOldSnapshotDefaultsModelOwnerToProvider(t *testing.T) {
+	var m provider.Model
+	if err := json.Unmarshal([]byte(`{"ref":{"provider":"aperture","model":"m"}}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.OwnerKind != provider.OwnerProvider {
+		t.Fatalf("owner kind = %q, want %q", m.OwnerKind, provider.OwnerProvider)
+	}
+}
+
+func TestModelOwnerKindRoundTrips(t *testing.T) {
+	want := provider.Model{
+		Ref:              session.ModelRef{Provider: "codex", Model: "gpt-5"},
+		OwnerKind:        provider.OwnerRuntime,
+		ReasoningEfforts: []string{"minimal", "low", "medium", "high"},
+	}
+	b, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got provider.Model
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.OwnerKind != want.OwnerKind || len(got.ReasoningEfforts) != len(want.ReasoningEfforts) {
+		t.Fatalf("round trip = %+v, want %+v", got, want)
+	}
+}
 
 func TestPricingCost(t *testing.T) {
 	aperture := provider.Pricing{Input: "0.00000014", Output: "0.00000028", CacheRead: "0.00000000"}

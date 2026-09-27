@@ -12,6 +12,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -36,6 +37,108 @@ func (p fakeProvider) Complete(context.Context, provider.Request, func(provider.
 	return nil
 }
 func (p fakeProvider) ListModels(context.Context) ([]provider.Model, error) { return nil, nil }
+
+type fakeRuntime struct{ name string }
+
+func (r fakeRuntime) Name() string                                       { return r.name }
+func (fakeRuntime) ListModels(context.Context) ([]provider.Model, error) { return nil, nil }
+func (fakeRuntime) Account(context.Context) (agentruntime.AccountState, error) {
+	return agentruntime.AccountState{}, nil
+}
+func (fakeRuntime) StartLogin(context.Context, agentruntime.LoginMode) (agentruntime.AuthChallenge, error) {
+	return agentruntime.AuthChallenge{}, nil
+}
+func (fakeRuntime) CancelLogin(context.Context, string) error { return nil }
+func (fakeRuntime) StartThread(context.Context, agentruntime.StartThreadRequest) (agentruntime.ThreadRef, error) {
+	return agentruntime.ThreadRef{}, nil
+}
+func (fakeRuntime) ResumeThread(context.Context, agentruntime.ThreadRef) error { return nil }
+func (fakeRuntime) ForkThread(context.Context, agentruntime.ThreadRef) (agentruntime.ThreadRef, error) {
+	return agentruntime.ThreadRef{}, nil
+}
+func (fakeRuntime) ReadThread(context.Context, agentruntime.ThreadRef) (agentruntime.Thread, error) {
+	return agentruntime.Thread{}, nil
+}
+func (fakeRuntime) StartTurn(context.Context, agentruntime.StartTurnRequest) (agentruntime.TurnRef, error) {
+	return agentruntime.TurnRef{}, nil
+}
+func (fakeRuntime) SteerTurn(context.Context, agentruntime.SteerTurnRequest) (agentruntime.TurnRef, error) {
+	return agentruntime.TurnRef{}, nil
+}
+func (fakeRuntime) InterruptTurn(context.Context, agentruntime.TurnRef) error { return nil }
+func (fakeRuntime) SetSink(agentruntime.Sink)                                 {}
+
+func TestRuntimeAndProviderNamespacesConflict(t *testing.T) {
+	r, notices := newTestRegistry(nil)
+	var runtimeErr, providerErr error
+	r.Load(context.Background(),
+		fakePlugin{"runtime", func(_ context.Context, h Host) error {
+			runtimeErr = h.RegisterRuntime(fakeRuntime{name: "codex"})
+			return nil
+		}},
+		fakePlugin{"provider", func(_ context.Context, h Host) error {
+			providerErr = h.RegisterProvider(fakeProvider{name: "codex"})
+			return nil
+		}},
+	)
+	if runtimeErr != nil {
+		t.Fatalf("runtime registration: %v", runtimeErr)
+	}
+	if !errors.Is(providerErr, ErrDuplicate) {
+		t.Fatalf("provider registration = %v, want duplicate", providerErr)
+	}
+	if _, ok := r.Runtime("codex"); !ok {
+		t.Fatal("runtime missing")
+	}
+	if len(r.Providers()) != 0 {
+		t.Fatalf("providers = %+v, want none", r.Providers())
+	}
+	if len(*notices) != 1 || !strings.Contains((*notices)[0], "runtime") {
+		t.Fatalf("notices = %v", *notices)
+	}
+}
+
+func TestRuntimeAndProviderNamespacesConflictInsideOnePlugin(t *testing.T) {
+	r, _ := newTestRegistry(nil)
+	var providerErr error
+	r.Load(context.Background(), fakePlugin{"both", func(_ context.Context, h Host) error {
+		if err := h.RegisterRuntime(fakeRuntime{name: "codex"}); err != nil {
+			return err
+		}
+		providerErr = h.RegisterProvider(fakeProvider{name: "codex"})
+		return nil
+	}})
+	if !errors.Is(providerErr, ErrDuplicate) {
+		t.Fatalf("provider registration = %v, want duplicate", providerErr)
+	}
+	if _, ok := r.Runtime("codex"); !ok || len(r.Providers()) != 0 {
+		t.Fatalf("runtime=%v providers=%+v", ok, r.Providers())
+	}
+}
+
+func TestRuntimeRegistrationRollsBackAndWithdraws(t *testing.T) {
+	r, _ := newTestRegistry(nil)
+	r.Load(context.Background(), fakePlugin{"broken", func(_ context.Context, h Host) error {
+		if err := h.RegisterRuntime(fakeRuntime{name: "broken-runtime"}); err != nil {
+			return err
+		}
+		return errors.New("broken")
+	}})
+	if len(r.Runtimes()) != 0 {
+		t.Fatalf("failed plugin runtimes = %+v", r.Runtimes())
+	}
+
+	r.Load(context.Background(), fakePlugin{"healthy", func(_ context.Context, h Host) error {
+		return h.RegisterRuntime(fakeRuntime{name: "codex"})
+	}})
+	if _, ok := r.Runtime("codex"); !ok {
+		t.Fatal("committed runtime missing")
+	}
+	r.Fail("healthy", "process exited")
+	if _, ok := r.Runtime("codex"); ok || len(r.Runtimes()) != 0 {
+		t.Fatalf("failed plugin runtime survived: %+v", r.Runtimes())
+	}
+}
 
 func newTestRegistry(config map[string]map[string]any) (*Registry, *[]string) {
 	var notices []string

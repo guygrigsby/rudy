@@ -12,6 +12,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -27,6 +28,7 @@ type Host struct {
 	RegisteredTools    []tool.Tool
 	RegisteredCommands []plugin.Command
 	Providers          []provider.Provider
+	Runtimes           []agentruntime.Runtime
 	Agents             []agentdef.Definition
 	Hooks              []plugin.HookHandler
 	Notices            []string
@@ -54,6 +56,11 @@ func (h *Host) RegisterCommand(c plugin.Command) error {
 
 func (h *Host) RegisterProvider(p provider.Provider) error {
 	h.Providers = append(h.Providers, p)
+	return nil
+}
+
+func (h *Host) RegisterRuntime(r agentruntime.Runtime) error {
+	h.Runtimes = append(h.Runtimes, r)
 	return nil
 }
 

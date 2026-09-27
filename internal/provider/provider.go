@@ -104,14 +104,20 @@ type Part struct {
 	StopReasonRaw string             `json:"stop_reason_raw,omitempty"`
 }
 
+// ModelSource is one owner that can discover models. Providers and AgentRuntimes both
+// implement it while only Providers can complete one request for Rudy's native loop.
+type ModelSource interface {
+	Name() string
+	ListModels(ctx context.Context) ([]Model, error)
+}
+
 // Provider is one configured endpoint.
 //
 // Complete streams parts by calling emit in order until the stream ends. A non-nil error
 // from emit stops the stream and is returned. Context cancellation returns ctx.Err().
 type Provider interface {
-	Name() string
+	ModelSource
 	Complete(ctx context.Context, req Request, emit func(Part) error) error
-	ListModels(ctx context.Context) ([]Model, error)
 }
 
 // Error is a provider failure after retries. The turn loop records it as turn_failed with

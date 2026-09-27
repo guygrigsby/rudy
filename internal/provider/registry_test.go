@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -17,6 +18,16 @@ type fakeProvider struct {
 	name   string
 	models []provider.Model
 	err    error
+}
+
+type fakeModelSource struct {
+	name   string
+	models []provider.Model
+}
+
+func (f *fakeModelSource) Name() string { return f.name }
+func (f *fakeModelSource) ListModels(context.Context) ([]provider.Model, error) {
+	return f.models, nil
 }
 
 func (f *fakeProvider) Name() string { return f.name }
@@ -53,6 +64,24 @@ func TestRegistryRefreshKeepsOldModelsWhenAProviderFails(t *testing.T) {
 	}
 }
 
+func TestRegistryRefreshesNonProviderModelSource(t *testing.T) {
+	source := &fakeModelSource{name: "codex", models: []provider.Model{{
+		Ref:       session.ModelRef{Provider: "codex", Model: "gpt-5"},
+		OwnerKind: provider.OwnerRuntime,
+	}}}
+	r := provider.NewRegistrySources(filepath.Join(t.TempDir(), "registry.json"), source)
+	if err := r.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := r.Models()
+	if len(got) != 1 || got[0].OwnerKind != provider.OwnerRuntime {
+		t.Fatalf("models = %+v", got)
+	}
+	if _, ok := r.Provider("codex"); ok {
+		t.Fatal("model source must not become a completion provider")
+	}
+}
+
 func TestRegistrySnapshotRoundTrip(t *testing.T) {
 	a := &fakeProvider{name: "aperture", models: []provider.Model{{
 		Ref:           session.ModelRef{Provider: "aperture", Model: "cline-pass/deepseek-v4-flash"},
@@ -75,7 +104,7 @@ func TestRegistrySnapshotRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := r2.Models()
-	if len(got) != 1 || got[0] != a.models[0] {
+	if len(got) != 1 || !reflect.DeepEqual(got[0], a.models[0]) {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 	r3 := provider.NewRegistry(filepath.Join(t.TempDir(), "missing.json"), a)

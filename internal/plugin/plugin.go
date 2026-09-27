@@ -12,6 +12,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -50,6 +51,7 @@ type Services struct {
 	// set that survives. The provider registry keeps its own copy of the provider set, so
 	// withdrawing one here is invisible to a turn until that copy is replaced.
 	ProvidersChanged func(ps []provider.Provider)
+	RuntimesChanged  func(rs []agentruntime.Runtime)
 	// Models is the provider registry's current set, for a plugin that reports on it: the
 	// /model command with no argument lists what a session could switch to. Nil means the
 	// registry is not wired, which is a plugin loaded outside a server.
@@ -128,6 +130,7 @@ type Host interface {
 	RegisterTool(t tool.Tool) error
 	RegisterCommand(c Command) error
 	RegisterProvider(p provider.Provider) error
+	RegisterRuntime(r agentruntime.Runtime) error
 	RegisterHook(h HookHandler) error // invalid point or nil Handle refused
 	// RegisterAgent contributes an agent definition, the same thing an agents/<name>.md file
 	// carries. A definition is static data, so it needs no callback. An operator's file of the

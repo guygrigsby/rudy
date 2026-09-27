@@ -28,6 +28,7 @@ type Registry struct {
 	mu        sync.Mutex
 	snapshot  string
 	order     []string
+	sources   map[string]ModelSource
 	providers map[string]Provider
 	models    map[string][]Model // by provider name
 }
@@ -38,11 +39,18 @@ type snapshotFile struct {
 }
 
 func NewRegistry(snapshotPath string, providers ...Provider) *Registry {
-	r := &Registry{snapshot: snapshotPath, providers: map[string]Provider{}, models: map[string][]Model{}}
+	sources := make([]ModelSource, 0, len(providers))
 	for _, p := range providers {
-		r.order = append(r.order, p.Name())
-		r.providers[p.Name()] = p
+		sources = append(sources, p)
 	}
+	return NewRegistrySources(snapshotPath, sources...)
+}
+
+// NewRegistrySources constructs a registry from both completion providers and other model
+// owners such as AgentRuntimes.
+func NewRegistrySources(snapshotPath string, sources ...ModelSource) *Registry {
+	r := &Registry{snapshot: snapshotPath, sources: map[string]ModelSource{}, providers: map[string]Provider{}, models: map[string][]Model{}}
+	r.setSources(sources)
 	return r
 }
 
@@ -51,13 +59,30 @@ func NewRegistry(snapshotPath string, providers ...Provider) *Registry {
 // first Refresh. Call it before the first Refresh, which is where wire.go calls it, once
 // plugin.Load has committed the provider plugins.
 func (r *Registry) SetProviders(ps ...Provider) {
+	sources := make([]ModelSource, 0, len(ps))
+	for _, p := range ps {
+		sources = append(sources, p)
+	}
+	r.SetSources(sources...)
+}
+
+// SetSources replaces every model owner while retaining the last known model listing.
+func (r *Registry) SetSources(sources ...ModelSource) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.setSources(sources)
+}
+
+func (r *Registry) setSources(sources []ModelSource) {
 	r.order = r.order[:0]
+	r.sources = map[string]ModelSource{}
 	r.providers = map[string]Provider{}
-	for _, p := range ps {
-		r.order = append(r.order, p.Name())
-		r.providers[p.Name()] = p
+	for _, source := range sources {
+		r.order = append(r.order, source.Name())
+		r.sources[source.Name()] = source
+		if p, ok := source.(Provider); ok {
+			r.providers[p.Name()] = p
+		}
 	}
 }
 
@@ -69,7 +94,7 @@ func (r *Registry) Refresh(ctx context.Context) error {
 	var mu sync.Mutex
 	var errs []error
 	results := map[string][]Model{}
-	for _, p := range r.snapshotProviders() {
+	for _, p := range r.snapshotSources() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -244,14 +269,14 @@ func (r *Registry) Provider(name string) (Provider, bool) {
 	return p, ok
 }
 
-// snapshotProviders is the provider set in order, for a caller that then works without the
+// snapshotSources is the model owner set in order, for a caller that then works without the
 // lock (Refresh, which waits on the network).
-func (r *Registry) snapshotProviders() []Provider {
+func (r *Registry) snapshotSources() []ModelSource {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]Provider, 0, len(r.order))
+	out := make([]ModelSource, 0, len(r.order))
 	for _, name := range r.order {
-		out = append(out, r.providers[name])
+		out = append(out, r.sources[name])
 	}
 	return out
 }
