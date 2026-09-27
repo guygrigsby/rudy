@@ -85,6 +85,9 @@ func (c *Client) ReadThread(ctx context.Context, ref agentruntime.ThreadRef) (ag
 	if err := c.call(ctx, methodThreadRead, map[string]any{"threadId": ref.ThreadID, "includeTurns": true}, &response); err != nil {
 		return agentruntime.Thread{}, err
 	}
+	if response.Thread.ID != ref.ThreadID {
+		return agentruntime.Thread{}, errors.New("codex app server read a different thread")
+	}
 	return translateThread(response.Thread)
 }
 
@@ -131,13 +134,27 @@ func translateThread(raw wireThread) (agentruntime.Thread, error) {
 		return agentruntime.Thread{}, errors.New("codex app server thread has no id")
 	}
 	thread := agentruntime.Thread{Runtime: "codex", ThreadID: raw.ID, Turns: make([]agentruntime.Turn, 0, len(raw.Turns))}
+	seenTurns := make(map[string]bool, len(raw.Turns))
 	for _, rawTurn := range raw.Turns {
-		turn := agentruntime.Turn{TurnID: rawTurn.ID, Status: translateTurnStatus(rawTurn.Status)}
+		if rawTurn.ID == "" || seenTurns[rawTurn.ID] {
+			return agentruntime.Thread{}, errors.New("codex thread has empty or duplicate turn id")
+		}
+		seenTurns[rawTurn.ID] = true
+		status, err := translateTurnStatus(rawTurn.Status)
+		if err != nil {
+			return agentruntime.Thread{}, err
+		}
+		turn := agentruntime.Turn{TurnID: rawTurn.ID, Status: status}
+		seenItems := make(map[string]bool, len(rawTurn.Items))
 		for _, rawItem := range rawTurn.Items {
 			item, err := translateItem(rawItem)
 			if err != nil {
 				return agentruntime.Thread{}, err
 			}
+			if seenItems[item.ItemID] {
+				return agentruntime.Thread{}, errors.New("codex turn has duplicate item id")
+			}
+			seenItems[item.ItemID] = true
 			turn.Items = append(turn.Items, item)
 		}
 		thread.Turns = append(thread.Turns, turn)
@@ -145,43 +162,62 @@ func translateThread(raw wireThread) (agentruntime.Thread, error) {
 	return thread, nil
 }
 
-func translateTurnStatus(status string) agentruntime.TurnStatus {
+func translateTurnStatus(status string) (agentruntime.TurnStatus, error) {
 	switch status {
 	case "completed":
-		return agentruntime.TurnCompleted
+		return agentruntime.TurnCompleted, nil
 	case "interrupted":
-		return agentruntime.TurnInterrupted
+		return agentruntime.TurnInterrupted, nil
 	case "failed":
-		return agentruntime.TurnFailed
-	default:
-		return agentruntime.TurnRunning
+		return agentruntime.TurnFailed, nil
+	case "inProgress":
+		return agentruntime.TurnRunning, nil
 	}
+	return "", errors.New("codex turn has unknown status")
 }
 
 func translateItem(raw json.RawMessage) (agentruntime.Item, error) {
 	var item struct {
-		ID               string                    `json:"id"`
-		Type             string                    `json:"type"`
-		Status           string                    `json:"status"`
-		Text             string                    `json:"text"`
-		Content          []json.RawMessage         `json:"content"`
-		Summary          []string                  `json:"summary"`
-		Command          string                    `json:"command"`
-		CWD              string                    `json:"cwd"`
-		AggregatedOutput *string                   `json:"aggregatedOutput"`
-		Changes          []agentruntime.FileChange `json:"changes"`
+		ID               string          `json:"id"`
+		Type             string          `json:"type"`
+		Status           string          `json:"status"`
+		Text             string          `json:"text"`
+		Content          json.RawMessage `json:"content"`
+		Summary          []string        `json:"summary"`
+		Command          string          `json:"command"`
+		CWD              string          `json:"cwd"`
+		AggregatedOutput *string         `json:"aggregatedOutput"`
+		Changes          []struct {
+			Path string `json:"path"`
+			Kind struct {
+				Type string `json:"type"`
+			} `json:"kind"`
+		} `json:"changes"`
 	}
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return agentruntime.Item{}, fmt.Errorf("codex thread item: %w", err)
 	}
-	out := agentruntime.Item{ItemID: item.ID, Status: item.Status, Command: item.Command, CWD: item.CWD, Changes: item.Changes}
+	if item.ID == "" {
+		return agentruntime.Item{}, errors.New("codex thread item has no id")
+	}
+	out := agentruntime.Item{ItemID: item.ID, Status: item.Status, Command: item.Command, CWD: item.CWD}
+	for _, change := range item.Changes {
+		if change.Path == "" || !oneOf(change.Kind.Type, "add", "delete", "update") {
+			return agentruntime.Item{}, errors.New("codex file change has invalid path or kind")
+		}
+		out.Changes = append(out.Changes, agentruntime.FileChange{Path: change.Path, Kind: change.Kind.Type})
+	}
 	if item.AggregatedOutput != nil {
 		out.Output = *item.AggregatedOutput
 	}
 	switch item.Type {
 	case "userMessage":
 		out.Type = agentruntime.ItemUserMessage
-		for _, content := range item.Content {
+		var contents []json.RawMessage
+		if err := json.Unmarshal(item.Content, &contents); err != nil {
+			return agentruntime.Item{}, errors.New("codex user message has invalid content")
+		}
+		for _, content := range contents {
 			var input struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -195,16 +231,54 @@ func translateItem(raw json.RawMessage) (agentruntime.Item, error) {
 		out.Content = []session.Block{session.TextBlock(item.Text)}
 	case "reasoning":
 		out.Type = agentruntime.ItemReasoning
-		out.Content = []session.Block{{Type: session.BlockThinking, Text: strings.Join(append(item.Summary, item.Text), "\n")}}
+		var reasoningContent []string
+		if len(item.Content) > 0 {
+			if err := json.Unmarshal(item.Content, &reasoningContent); err != nil {
+				return agentruntime.Item{}, errors.New("codex reasoning item has invalid content")
+			}
+		}
+		out.Content = []session.Block{{Type: session.BlockThinking, Text: strings.Join(append(item.Summary, reasoningContent...), "\n")}}
 	case "commandExecution":
 		out.Type = agentruntime.ItemCommand
+		if !oneOf(item.Status, "inProgress", "completed", "failed", "declined") {
+			return agentruntime.Item{}, errors.New("codex command item has unknown status")
+		}
 	case "fileChange":
 		out.Type = agentruntime.ItemFileChange
+		if !oneOf(item.Status, "inProgress", "completed", "failed", "declined") {
+			return agentruntime.Item{}, errors.New("codex file change item has unknown status")
+		}
 	case "plan":
 		out.Type = agentruntime.ItemPlan
 		out.Content = []session.Block{session.TextBlock(item.Text)}
-	default:
+	case "mcpToolCall", "dynamicToolCall":
 		out.Type = agentruntime.ItemTool
+		if !oneOf(item.Status, "inProgress", "completed", "failed") {
+			return agentruntime.Item{}, errors.New("codex tool item has unknown status")
+		}
+	case "collabAgentToolCall":
+		out.Type = agentruntime.ItemTool
+		if !oneOf(item.Status, "inProgress", "completed", "failed", "interrupted") {
+			return agentruntime.Item{}, errors.New("codex collaboration item has unknown status")
+		}
+	case "imageGeneration":
+		out.Type = agentruntime.ItemTool
+		if item.Status == "" {
+			return agentruntime.Item{}, errors.New("codex image generation item has no status")
+		}
+	case "hookPrompt", "functionCallOutput", "subAgentActivity", "webSearch", "imageView", "sleep", "enteredReviewMode", "exitedReviewMode", "contextCompaction":
+		out.Type = agentruntime.ItemTool
+	default:
+		return agentruntime.Item{}, errors.New("codex thread item has unknown type")
 	}
 	return out, nil
+}
+
+func oneOf(value string, choices ...string) bool {
+	for _, choice := range choices {
+		if value == choice {
+			return true
+		}
+	}
+	return false
 }

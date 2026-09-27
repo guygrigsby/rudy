@@ -30,6 +30,7 @@ thread/resume
 thread/start
 thread/started
 thread/status/changed
+thread/tokenUsage/updated
 turn/completed
 turn/diff/updated
 turn/interrupt

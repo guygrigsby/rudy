@@ -60,6 +60,14 @@ func main() {
 			write(encoder, message.ID, map[string]any{
 				"turn": map[string]any{"id": "turn-1", "status": "inProgress", "items": []any{}},
 			})
+		case "thread/read":
+			threadID := "thread-1"
+			if os.Getenv("FAKE_CODEX_READ_WRONG") != "" {
+				threadID = "other-thread"
+			}
+			write(encoder, message.ID, map[string]any{
+				"thread": map[string]any{"id": threadID, "turns": []any{}},
+			})
 		case "account/read":
 			write(encoder, message.ID, map[string]any{"account": nil, "requiresOpenaiAuth": true})
 		case "account/login/start":

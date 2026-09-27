@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -33,6 +34,7 @@ type Client struct {
 	finishedLogins map[string]struct{}
 	modelsMu       sync.Mutex
 	models         []provider.Model
+	eventSequence  atomic.Uint64
 
 	notifications chan wireNotification
 	dispatchStop  chan struct{}

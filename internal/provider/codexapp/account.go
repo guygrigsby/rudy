@@ -293,6 +293,15 @@ func (c *Client) handleNotification(notification wireNotification) {
 		if sink := c.currentSink(); sink != nil {
 			sink.AccountUpdated(state)
 		}
+	default:
+		event, err := translateRuntimeNotification(notification)
+		if err != nil || event == nil {
+			return
+		}
+		event.Sequence = c.eventSequence.Add(1)
+		if sink := c.currentSink(); sink != nil {
+			sink.RuntimeEvent(*event)
+		}
 	}
 }
 

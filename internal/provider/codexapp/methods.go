@@ -17,6 +17,7 @@ const (
 	methodThreadRead                      = "thread/read"
 	methodThreadStarted                   = "thread/started"
 	methodThreadStatusChanged             = "thread/status/changed"
+	methodThreadTokenUsageUpdated         = "thread/tokenUsage/updated"
 	methodTurnStart                       = "turn/start"
 	methodTurnSteer                       = "turn/steer"
 	methodTurnInterrupt                   = "turn/interrupt"
@@ -77,6 +78,7 @@ var usedMethods = []string{
 	methodThreadStart,
 	methodThreadStarted,
 	methodThreadStatusChanged,
+	methodThreadTokenUsageUpdated,
 	methodTurnCompleted,
 	methodTurnDiffUpdated,
 	methodTurnInterrupt,

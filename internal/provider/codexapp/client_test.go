@@ -307,6 +307,15 @@ func TestLostTurnStartIsAmbiguousAndNotRetried(t *testing.T) {
 	}
 }
 
+func TestReadThreadRejectsDifferentReturnedThread(t *testing.T) {
+	client := codexapp.NewClient(fakeCommand(t, "FAKE_CODEX_LOG="+filepath.Join(t.TempDir(), "methods"), "FAKE_CODEX_READ_WRONG=1"))
+	t.Cleanup(func() { _ = client.Close() })
+	_, err := client.ReadThread(context.Background(), agentruntime.ThreadRef{Runtime: "codex", SessionID: ulid.Make(), ThreadID: "thread-1"})
+	if err == nil || !strings.Contains(err.Error(), "different thread") {
+		t.Fatalf("ReadThread error = %v, want identity mismatch", err)
+	}
+}
+
 func TestStderrRedactionRemovesSecretsAndQueryValues(t *testing.T) {
 	in := "Authorization: Bearer secret https://auth.openai.com/x?code=abc&state=visible Cookie: sid=cookie-secret"
 	got := codexapp.Redact(in)
