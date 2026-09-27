@@ -127,7 +127,7 @@ func (c *Client) StartTurn(ctx context.Context, request agentruntime.StartTurnRe
 		return agentruntime.TurnRef{}, err
 	}
 	if response.Turn.ID == "" {
-		return agentruntime.TurnRef{}, errors.New("codex app server turn/start returned no turn id")
+		return agentruntime.TurnRef{}, errors.Join(agentruntime.ErrAmbiguous, errors.New("codex app server turn/start returned no turn id"))
 	}
 	return agentruntime.TurnRef{ThreadRef: request.Thread, TurnID: response.Turn.ID}, nil
 }

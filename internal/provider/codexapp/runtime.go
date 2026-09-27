@@ -38,7 +38,7 @@ func (c *Client) StartThread(ctx context.Context, request agentruntime.StartThre
 		return agentruntime.ThreadRef{}, err
 	}
 	if response.Thread.ID == "" {
-		return agentruntime.ThreadRef{}, errors.New("codex app server thread/start returned no thread id")
+		return agentruntime.ThreadRef{}, errors.Join(agentruntime.ErrAmbiguous, errors.New("codex app server thread/start returned no thread id"))
 	}
 	return agentruntime.ThreadRef{Runtime: c.Name(), SessionID: request.SessionID, ThreadID: response.Thread.ID}, nil
 }
@@ -70,7 +70,7 @@ func (c *Client) ForkThread(ctx context.Context, ref agentruntime.ThreadRef) (ag
 		return agentruntime.ThreadRef{}, err
 	}
 	if response.Thread.ID == "" {
-		return agentruntime.ThreadRef{}, errors.New("codex app server thread/fork returned no thread id")
+		return agentruntime.ThreadRef{}, errors.Join(agentruntime.ErrAmbiguous, errors.New("codex app server thread/fork returned no thread id"))
 	}
 	return agentruntime.ThreadRef{Runtime: c.Name(), SessionID: ref.SessionID, ThreadID: response.Thread.ID}, nil
 }
@@ -107,6 +107,9 @@ func (c *Client) SteerTurn(ctx context.Context, request agentruntime.SteerTurnRe
 	}, &response)
 	if err != nil {
 		return agentruntime.TurnRef{}, err
+	}
+	if response.TurnID != request.Turn.TurnID {
+		return agentruntime.TurnRef{}, errors.Join(agentruntime.ErrAmbiguous, fmt.Errorf("codex app server turn/steer returned turn %q, want %q", response.TurnID, request.Turn.TurnID))
 	}
 	return agentruntime.TurnRef{ThreadRef: request.Turn.ThreadRef, TurnID: response.TurnID}, nil
 }

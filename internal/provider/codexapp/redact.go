@@ -13,6 +13,7 @@ var (
 	cookiePattern        = regexp.MustCompile(`(?i)(cookie\s*:\s*)[^\r\n]+`)
 	urlPattern           = regexp.MustCompile(`https?://[^\s]+`)
 	secretValuePattern   = regexp.MustCompile(`(?i)\b(code|token|access_token|refresh_token|client_secret)=([^&\s]+)`)
+	jsonSecretPattern    = regexp.MustCompile(`(?i)("(?:authorization|cookie|code|token|access_token|refresh_token|client_secret)"\s*:\s*)"(?:\\.|[^"\\])*"`)
 )
 
 // Redact strips credentials and URL query values from App Server diagnostics.
@@ -25,7 +26,8 @@ func Redact(value string) string {
 		}
 		return raw
 	})
-	return secretValuePattern.ReplaceAllString(value, `${1}=[REDACTED]`)
+	value = secretValuePattern.ReplaceAllString(value, `${1}=[REDACTED]`)
+	return jsonSecretPattern.ReplaceAllString(value, `${1}"[REDACTED]"`)
 }
 
 type diagnosticTail struct {

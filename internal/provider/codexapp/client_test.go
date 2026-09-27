@@ -307,6 +307,63 @@ func TestLostTurnStartIsAmbiguousAndNotRetried(t *testing.T) {
 	}
 }
 
+func TestInvalidMutationResultIsAmbiguous(t *testing.T) {
+	tests := []struct {
+		method string
+		call   func(*codexapp.Client) error
+	}{
+		{
+			method: "thread/start",
+			call: func(client *codexapp.Client) error {
+				_, err := client.StartThread(context.Background(), agentruntime.StartThreadRequest{SessionID: ulid.Make()})
+				return err
+			},
+		},
+		{
+			method: "thread/fork",
+			call: func(client *codexapp.Client) error {
+				_, err := client.ForkThread(context.Background(), agentruntime.ThreadRef{Runtime: "codex", SessionID: ulid.Make(), ThreadID: "thread-1"})
+				return err
+			},
+		},
+		{
+			method: "turn/start",
+			call: func(client *codexapp.Client) error {
+				_, err := client.StartTurn(context.Background(), agentruntime.StartTurnRequest{
+					Thread:  agentruntime.ThreadRef{Runtime: "codex", SessionID: ulid.Make(), ThreadID: "thread-1"},
+					Content: []session.Block{session.TextBlock("hello")},
+				})
+				return err
+			},
+		},
+		{
+			method: "turn/steer",
+			call: func(client *codexapp.Client) error {
+				_, err := client.SteerTurn(context.Background(), agentruntime.SteerTurnRequest{
+					Turn: agentruntime.TurnRef{
+						ThreadRef: agentruntime.ThreadRef{Runtime: "codex", SessionID: ulid.Make(), ThreadID: "thread-1"},
+						TurnID:    "turn-1",
+					},
+					Content: []session.Block{session.TextBlock("steer")},
+				})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.method, func(t *testing.T) {
+			client := codexapp.NewClient(fakeCommand(t,
+				"FAKE_CODEX_LOG="+filepath.Join(t.TempDir(), "methods"),
+				"FAKE_CODEX_INVALID_MUTATION="+test.method,
+			))
+			t.Cleanup(func() { _ = client.Close() })
+			if err := test.call(client); !errors.Is(err, agentruntime.ErrAmbiguous) {
+				t.Fatalf("%s error = %v, want ErrAmbiguous", test.method, err)
+			}
+		})
+	}
+}
+
 func TestReadThreadRejectsDifferentReturnedThread(t *testing.T) {
 	client := codexapp.NewClient(fakeCommand(t, "FAKE_CODEX_LOG="+filepath.Join(t.TempDir(), "methods"), "FAKE_CODEX_READ_WRONG=1"))
 	t.Cleanup(func() { _ = client.Close() })
@@ -320,6 +377,16 @@ func TestStderrRedactionRemovesSecretsAndQueryValues(t *testing.T) {
 	in := "Authorization: Bearer secret https://auth.openai.com/x?code=abc&state=visible Cookie: sid=cookie-secret"
 	got := codexapp.Redact(in)
 	for _, secret := range []string{"secret", "abc", "visible", "cookie-secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("Redact(%q) leaked %q in %q", in, secret, got)
+		}
+	}
+}
+
+func TestRedactRemovesJSONSecretValues(t *testing.T) {
+	in := `{"authorization":"Bearer json-authorization","cookie":"sid=json-cookie","code":"json-code","token":"json-token","access_token":"json-access","refresh_token":"json-refresh","client_secret":"json-client"}`
+	got := codexapp.Redact(in)
+	for _, secret := range []string{"json-authorization", "json-cookie", "json-code", "json-token", "json-access", "json-refresh", "json-client"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("Redact(%q) leaked %q in %q", in, secret, got)
 		}
