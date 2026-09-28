@@ -149,6 +149,34 @@ func (b *Block) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// MarshalJSON keeps schema 1 and 2 records byte-stable after their in-memory execution is
+// inferred. Schema 3 writes the explicit execution variant.
+func (s SessionOpened) MarshalJSON() ([]byte, error) {
+	type wire struct {
+		SchemaVersion   int           `json:"schema_version"`
+		RudyVersion     string        `json:"rudy_version"`
+		Workspace       Workspace     `json:"workspace"`
+		Model           ModelRef      `json:"model"`
+		Thinking        ThinkingLevel `json:"thinking"`
+		Mode            Mode          `json:"mode"`
+		Agent           string        `json:"agent"`
+		ParentSessionID string        `json:"parent_session_id"`
+		ParentToolUseID string        `json:"parent_tool_use_id"`
+		Tools           []string      `json:"tools"`
+		Execution       *Execution    `json:"execution,omitempty"`
+	}
+	var execution *Execution
+	if s.SchemaVersion >= 3 {
+		execution = &s.Execution
+	}
+	return encodeNoEscape(wire{
+		SchemaVersion: s.SchemaVersion, RudyVersion: s.RudyVersion, Workspace: s.Workspace,
+		Model: s.Model, Thinking: s.Thinking, Mode: s.Mode, Agent: s.Agent,
+		ParentSessionID: s.ParentSessionID, ParentToolUseID: s.ParentToolUseID,
+		Tools: s.Tools, Execution: execution,
+	})
+}
+
 // splitPayload separates the fields the log line writes by hand from a
 // scalar-only view of everything else. Two fields are written by hand: a
 // content block array (see appendBlocks), and a permission_decision's
@@ -283,6 +311,8 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 		p, err = decodePayload[AssistantMessage](data)
 	case KindPermissionDecision:
 		p, err = decodePayload[PermissionDecision](data)
+	case KindRuntimePermissionDecision:
+		p, err = decodePayload[RuntimePermissionDecision](data)
 	case KindToolResult:
 		p, err = decodePayload[ToolResult](data)
 	case KindModelChange:
@@ -306,6 +336,10 @@ func (e *Entry) UnmarshalJSON(data []byte) error {
 	}
 	if err != nil {
 		return fmt.Errorf("entry %s: %w", env.Kind, err)
+	}
+	if opened, ok := p.(SessionOpened); ok && opened.SchemaVersion < 3 && opened.Execution.Kind == "" {
+		opened.Execution = Execution{Kind: ExecutionNative, Provider: opened.Model.Provider}
+		p = opened
 	}
 	if err := Validate(p); err != nil {
 		return fmt.Errorf("entry %s: %w", env.Kind, err)

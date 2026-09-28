@@ -199,6 +199,14 @@ func (s *Session) Append(p Payload) (Entry, error) {
 		if _, ok := s.decisionForLocked(v.ToolUseID); ok {
 			return Entry{}, invariant("second permission_decision for tool_use %q", v.ToolUseID)
 		}
+	case RuntimePermissionDecision:
+		for _, e := range s.entriesLocked() {
+			prior, ok := e.Payload.(RuntimePermissionDecision)
+			if ok && prior.Runtime == v.Runtime && prior.ThreadID == v.ThreadID && prior.TurnID == v.TurnID &&
+				prior.ItemID == v.ItemID && prior.RequestID == v.RequestID {
+				return Entry{}, invariant("second runtime_permission_decision for request %q", v.RequestID)
+			}
+		}
 	case ToolResult:
 		if !s.isPendingLocked(v.ToolUseID) {
 			return Entry{}, invariant("tool_result for tool_use %q that is not pending", v.ToolUseID)
@@ -219,13 +227,23 @@ func (s *Session) Append(p Payload) (Entry, error) {
 	if err := s.log.Append(e); err != nil {
 		return Entry{}, err
 	}
-	if pd, ok := p.(PermissionDecision); ok && pd.Decision == Allow {
+	if durableAllow(p) {
 		if err := s.log.Sync(); err != nil {
 			return Entry{}, err
 		}
 	}
 	s.own = append(s.own, e)
 	return e, nil
+}
+
+func durableAllow(p Payload) bool {
+	switch decision := p.(type) {
+	case PermissionDecision:
+		return decision.Decision == Allow
+	case RuntimePermissionDecision:
+		return decision.Decision == Allow
+	}
+	return false
 }
 
 // Sync flushes the log's write buffer and fsyncs it. Append leaves most entries in that
@@ -317,6 +335,16 @@ func (s *Session) SchemaVersion() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.openedLocked().SchemaVersion
+}
+
+func (s *Session) Execution() Execution {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	opened := s.openedLocked()
+	if opened.Execution.Kind == "" {
+		return Execution{Kind: ExecutionNative, Provider: opened.Model.Provider}
+	}
+	return opened.Execution
 }
 
 func (s *Session) Model() ModelRef {
@@ -498,6 +526,10 @@ func (s *Session) decisionForLocked(toolUseID string) (PermissionDecision, bool)
 func (s *Session) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.closeLocked()
+}
+
+func (s *Session) closeLocked() error {
 	err := s.log.Close()
 	if s.unlock != nil {
 		s.unlock()

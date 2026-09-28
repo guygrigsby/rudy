@@ -16,11 +16,13 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
 	anthropicplugin "github.com/guygrigsby/rudy/internal/plugins/anthropic"
 	"github.com/guygrigsby/rudy/internal/plugins/clinepass"
+	codexplugin "github.com/guygrigsby/rudy/internal/plugins/codex"
 	"github.com/guygrigsby/rudy/internal/plugins/commands"
 	"github.com/guygrigsby/rudy/internal/plugins/compactcmd"
 	"github.com/guygrigsby/rudy/internal/plugins/initcmd"
@@ -38,6 +40,7 @@ import (
 	webplugin "github.com/guygrigsby/rudy/internal/plugins/web"
 	"github.com/guygrigsby/rudy/internal/pluginstore"
 	"github.com/guygrigsby/rudy/internal/provider"
+	"github.com/guygrigsby/rudy/internal/provider/codexapp"
 	"github.com/guygrigsby/rudy/internal/provider/httpx"
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -226,11 +229,22 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	services := srv.PluginServices()
 	// Withdrawing a provider has to reach the provider registry's own copy, not just the
 	// plugin registry; SetProviders below installs the initial set the same way.
-	services.ProvidersChanged = func(ps []provider.Provider) { registry.SetProviders(ps...) }
+	syncSources := func() { registry.SetSources(modelSources(plugins)...) }
+	services.ProvidersChanged = func([]provider.Provider) { syncSources() }
+	services.RuntimesChanged = func(runtimes []agentruntime.Runtime) {
+		for _, runtime := range runtimes {
+			runtime.SetSink(srv.RuntimeSink(runtime.Name()))
+		}
+		syncSources()
+	}
 	plugins.SetServices(services)
 	plugins.Load(ctx, set...)
 	providers := plugins.Providers()
-	registry.SetProviders(providers...)
+	runtimes := plugins.Runtimes()
+	for _, runtime := range runtimes {
+		runtime.SetSink(srv.RuntimeSink(runtime.Name()))
+	}
+	registry.SetSources(modelSources(plugins)...)
 	if err := registry.LoadSnapshot(); err != nil {
 		return nil, err
 	}
@@ -239,10 +253,11 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		refreshTimeout = defaultRefreshTimeout
 	}
 	hadSnapshot := len(registry.Models()) > 0
+	_, hasDefaultRuntime := plugins.Runtime(cfg.Default.Provider)
 	// No provider and no snapshot is a fresh install, not an endpoint that went away:
 	// nothing is dialed below, so a timeout would be a lie. Name the file a provider goes
 	// in and the command that writes it, which is all a first run needs to hear.
-	if len(providers) == 0 && !hadSnapshot {
+	if len(providers) == 0 && !hasDefaultRuntime && !hadSnapshot {
 		return nil, fmt.Errorf("no model provider is configured: %s has no [providers.*] table and no plugin registered one; rudy config sync writes that file with every key and what each is for", paths.ConfigFile())
 	}
 	if !hadSnapshot {
@@ -250,11 +265,20 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		for i, p := range providers {
 			names[i] = p.Name()
 		}
-		_, _ = fmt.Fprintln(stderr, "refreshing model registry from "+strings.Join(names, ", "))
+		if len(names) > 0 {
+			_, _ = fmt.Fprintln(stderr, "refreshing model registry from "+strings.Join(names, ", "))
+		}
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, refreshTimeout)
-	refreshErr := registry.Refresh(refreshCtx)
+	refreshErr := registry.RefreshProviders(refreshCtx)
 	cancel()
+	if runtime, ok := plugins.Runtime(cfg.Default.Provider); ok && runtime.Name() == cfg.Default.Provider {
+		registry.EnsureModel(provider.Model{
+			Ref:       session.ModelRef{Provider: cfg.Default.Provider, Model: cfg.Default.Model},
+			OwnerKind: provider.OwnerRuntime, DisplayName: cfg.Default.Model,
+			Capabilities: provider.Capabilities{Tools: true},
+		})
+	}
 	// Refresh returns nil when there is nothing to refresh (no provider plugin loaded), so an
 	// empty registry after a nil-error refresh is just as fatal as one after a failed refresh:
 	// either way there is no model to open a session with and no snapshot to fall back on.
@@ -387,19 +411,32 @@ func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []erro
 	}), errs
 }
 
-// BuiltinPlugins is the linked-in set: the six tools, the agent tool, /init, /compact,
+// BuiltinPlugins is the linked-in set: the six tools, the agent tool, Codex, /init, /compact,
 // /skills, /memory, the kernel's own slash commands (/model, /help, /fork, /plugins), the
 // MCP servers from mcp.toml, the openai_chat and anthropic_messages providers, and the
 // clinepass dialect over openai_chat.
 func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cfg.Secrets.File) }
 	return append(BuiltinTools(), webplugin.New(cfg.Web, version, resolve),
-		subagents.New(paths.Config), initcmd.New(), compactcmd.New(), commands.New(),
+		subagents.New(paths.Config), codexplugin.New(codexapp.NewClient(codexapp.Command{CodexHome: filepath.Join(paths.Data, "codex")})), initcmd.New(), compactcmd.New(), commands.New(),
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
 		newMCPPlugin(cfg, paths, resolve, version),
 		openaichatplugin.New(cfg.Providers, httpc, resolve),
 		anthropicplugin.New(cfg.Providers, httpc, resolve),
 		clinepass.New(cfg.Providers, httpc, resolve))
+}
+
+func modelSources(plugins *plugin.Registry) []provider.ModelSource {
+	providers := plugins.Providers()
+	runtimes := plugins.Runtimes()
+	sources := make([]provider.ModelSource, 0, len(providers)+len(runtimes))
+	for _, source := range providers {
+		sources = append(sources, source)
+	}
+	for _, source := range runtimes {
+		sources = append(sources, source)
+	}
+	return sources
 }
 
 // newMCPPlugin is the mcp plugin over the user and project mcp.toml files. Plugins load once

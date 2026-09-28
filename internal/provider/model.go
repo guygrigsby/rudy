@@ -3,10 +3,42 @@
 package provider
 
 import (
+	"encoding/json"
 	"math/big"
 
 	"github.com/guygrigsby/rudy/internal/session"
 )
+
+type OwnerKind string
+
+const (
+	// OwnerProvider is the zero value so old in-memory model sources remain provider-owned.
+	OwnerProvider OwnerKind = ""
+	OwnerRuntime  OwnerKind = "runtime"
+)
+
+func (o OwnerKind) MarshalJSON() ([]byte, error) {
+	if o == OwnerProvider {
+		return json.Marshal("provider")
+	}
+	return json.Marshal(string(o))
+}
+
+func (o *OwnerKind) UnmarshalJSON(data []byte) error {
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	switch raw {
+	case "", "provider":
+		*o = OwnerProvider
+	case "runtime":
+		*o = OwnerRuntime
+	default:
+		*o = OwnerKind(raw)
+	}
+	return nil
+}
 
 // Pricing is USD per token as decimal strings, verbatim from the provider. "" is unknown.
 type Pricing struct {
@@ -53,12 +85,14 @@ const fallbackOutputTokens = 8192
 
 // Model is one id a provider serves.
 type Model struct {
-	Ref           session.ModelRef `json:"ref"`
-	DisplayName   string           `json:"display_name"`
-	ContextWindow int64            `json:"context_window"` // 0 unknown
-	MaxOutput     int64            `json:"max_output"`     // 0 unknown
-	Pricing       Pricing          `json:"pricing"`
-	Capabilities  Capabilities     `json:"capabilities"`
+	Ref              session.ModelRef `json:"ref"`
+	OwnerKind        OwnerKind        `json:"owner_kind"`
+	DisplayName      string           `json:"display_name"`
+	ContextWindow    int64            `json:"context_window"` // 0 unknown
+	MaxOutput        int64            `json:"max_output"`     // 0 unknown
+	Pricing          Pricing          `json:"pricing"`
+	Capabilities     Capabilities     `json:"capabilities"`
+	ReasoningEfforts []string         `json:"reasoning_efforts,omitempty"`
 	// Upstream is who actually serves this model when the endpoint is a proxy, in the
 	// endpoint's own words: an aperture that fronts OpenRouter, ClinePass and OpenAI says
 	// so per model, and without it every model reads as the proxy's own. Empty when the

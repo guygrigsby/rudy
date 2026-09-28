@@ -14,6 +14,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -35,27 +36,29 @@ type ownerKey struct {
 }
 
 type Registry struct {
-	mu          sync.RWMutex
-	config      map[string]map[string]any
-	notice      func(string)
-	services    Services
-	disabled    map[string]bool
-	failed      map[string]bool // Fail has withdrawn this plugin; later writes are ignored
-	tools       map[string]owned[tool.Tool]
-	toolOrder   []string
-	commands    map[string]owned[Command]
-	cmdOrder    []string
-	providers   map[string]owned[provider.Provider]
-	provOrder   []string
-	agents      map[string]owned[agentdef.Definition]
-	agentOrder  []string
-	hooks       []OwnedHook // load order; Hooks sorts a point's handlers by priority
-	loaded      []Plugin    // every plugin whose Init returned nil, in load order, for Close
-	statuses    []Status
-	status      map[ownerKey]StatusItem
-	statusOrder []ownerKey // first-set order
-	widgets     map[ownerKey]Widget
-	widgetOrder []ownerKey // first-set order
+	mu           sync.RWMutex
+	config       map[string]map[string]any
+	notice       func(string)
+	services     Services
+	disabled     map[string]bool
+	failed       map[string]bool // Fail has withdrawn this plugin; later writes are ignored
+	tools        map[string]owned[tool.Tool]
+	toolOrder    []string
+	commands     map[string]owned[Command]
+	cmdOrder     []string
+	providers    map[string]owned[provider.Provider]
+	provOrder    []string
+	runtimes     map[string]owned[agentruntime.Runtime]
+	runtimeOrder []string
+	agents       map[string]owned[agentdef.Definition]
+	agentOrder   []string
+	hooks        []OwnedHook // load order; Hooks sorts a point's handlers by priority
+	loaded       []Plugin    // every plugin whose Init returned nil, in load order, for Close
+	statuses     []Status
+	status       map[ownerKey]StatusItem
+	statusOrder  []ownerKey // first-set order
+	widgets      map[ownerKey]Widget
+	widgetOrder  []ownerKey // first-set order
 }
 
 func NewRegistry(config map[string]map[string]any, notice func(string)) *Registry {
@@ -68,6 +71,7 @@ func NewRegistry(config map[string]map[string]any, notice func(string)) *Registr
 		tools:     map[string]owned[tool.Tool]{},
 		commands:  map[string]owned[Command]{},
 		providers: map[string]owned[provider.Provider]{},
+		runtimes:  map[string]owned[agentruntime.Runtime]{},
 		agents:    map[string]owned[agentdef.Definition]{},
 		disabled:  map[string]bool{},
 		failed:    map[string]bool{},
@@ -268,6 +272,10 @@ func (r *Registry) commit(h *host) {
 		r.providers[n] = owned[provider.Provider]{owner: h.name, value: h.providers[n]}
 		r.provOrder = append(r.provOrder, n)
 	}
+	for _, n := range h.runtimeOrder {
+		r.runtimes[n] = owned[agentruntime.Runtime]{owner: h.name, value: h.runtimes[n]}
+		r.runtimeOrder = append(r.runtimeOrder, n)
+	}
 	for _, n := range h.agentOrder {
 		r.agents[n] = owned[agentdef.Definition]{owner: h.name, value: h.agents[n]}
 		r.agentOrder = append(r.agentOrder, n)
@@ -385,6 +393,7 @@ func (r *Registry) Fail(name, reason string) {
 	r.toolOrder = withdraw(r.tools, r.toolOrder, name)
 	r.cmdOrder = withdraw(r.commands, r.cmdOrder, name)
 	r.provOrder = withdraw(r.providers, r.provOrder, name)
+	r.runtimeOrder = withdraw(r.runtimes, r.runtimeOrder, name)
 	r.agentOrder = withdraw(r.agents, r.agentOrder, name)
 	r.hooks = slices.DeleteFunc(r.hooks, func(h OwnedHook) bool { return h.Owner == name })
 	hadStatus := false
@@ -410,8 +419,10 @@ func (r *Registry) Fail(name, reason string) {
 	}
 	statusChanged := r.services.StatusChanged
 	providersChanged := r.services.ProvidersChanged
+	runtimesChanged := r.services.RuntimesChanged
 	onStatus := r.services.OnStatus
 	remaining := r.providersLocked()
+	remainingRuntimes := r.runtimesLocked()
 	r.mu.Unlock()
 	if hadStatus && statusChanged != nil {
 		statusChanged()
@@ -425,6 +436,9 @@ func (r *Registry) Fail(name, reason string) {
 	// without this the withdrawn plugin's provider still answers the next turn.
 	if providersChanged != nil {
 		providersChanged(remaining)
+	}
+	if runtimesChanged != nil {
+		runtimesChanged(remainingRuntimes)
 	}
 }
 
@@ -532,6 +546,27 @@ func (r *Registry) Providers() []provider.Provider {
 	return r.providersLocked()
 }
 
+func (r *Registry) Runtimes() []agentruntime.Runtime {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.runtimesLocked()
+}
+
+func (r *Registry) runtimesLocked() []agentruntime.Runtime {
+	out := make([]agentruntime.Runtime, 0, len(r.runtimeOrder))
+	for _, n := range r.runtimeOrder {
+		out = append(out, r.runtimes[n].value)
+	}
+	return out
+}
+
+func (r *Registry) Runtime(name string) (agentruntime.Runtime, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	o, ok := r.runtimes[name]
+	return o.value, ok
+}
+
 // providersLocked is Providers for a caller that already holds mu. Caller holds mu.
 func (r *Registry) providersLocked() []provider.Provider {
 	out := make([]provider.Provider, 0, len(r.provOrder))
@@ -567,21 +602,23 @@ type host struct {
 	r    *Registry
 	name string
 
-	mu          sync.Mutex
-	live        bool // commit has run; status and widget writes go straight to the registry
-	tools       map[string]tool.Tool
-	toolOrder   []string
-	commands    map[string]Command
-	cmdOrder    []string
-	providers   map[string]provider.Provider
-	provOrder   []string
-	agents      map[string]agentdef.Definition
-	agentOrder  []string
-	hooks       []HookHandler
-	status      map[string]StatusItem
-	statusOrder []string
-	widgets     map[string]Widget
-	widgetOrder []string
+	mu           sync.Mutex
+	live         bool // commit has run; status and widget writes go straight to the registry
+	tools        map[string]tool.Tool
+	toolOrder    []string
+	commands     map[string]Command
+	cmdOrder     []string
+	providers    map[string]provider.Provider
+	provOrder    []string
+	runtimes     map[string]agentruntime.Runtime
+	runtimeOrder []string
+	agents       map[string]agentdef.Definition
+	agentOrder   []string
+	hooks        []HookHandler
+	status       map[string]StatusItem
+	statusOrder  []string
+	widgets      map[string]Widget
+	widgetOrder  []string
 }
 
 func newHost(r *Registry, name string) *host {
@@ -591,6 +628,7 @@ func newHost(r *Registry, name string) *host {
 		tools:     map[string]tool.Tool{},
 		commands:  map[string]Command{},
 		providers: map[string]provider.Provider{},
+		runtimes:  map[string]agentruntime.Runtime{},
 		agents:    map[string]agentdef.Definition{},
 		status:    map[string]StatusItem{},
 		widgets:   map[string]Widget{},
@@ -602,6 +640,7 @@ func (h *host) RegisterTool(t tool.Tool) error {
 }
 
 func (h *host) RegisterCommand(c Command) error {
+	c.Owner = h.name
 	return stageRegister(h, "command", c.Name, c, h.r.commands, h.commands, &h.cmdOrder)
 }
 
@@ -609,7 +648,56 @@ func (h *host) RegisterProvider(p provider.Provider) error {
 	if p == nil {
 		return errors.New("plugin: nil provider")
 	}
+	if err := h.checkRuntimeNamespace(p.Name(), "provider"); err != nil {
+		return err
+	}
 	return stageRegister(h, "provider", p.Name(), p, h.r.providers, h.providers, &h.provOrder)
+}
+
+func (h *host) RegisterRuntime(runtime agentruntime.Runtime) error {
+	if runtime == nil {
+		return errors.New("plugin: nil agent runtime")
+	}
+	if err := h.checkProviderNamespace(runtime.Name(), "runtime"); err != nil {
+		return err
+	}
+	return stageRegister(h, "runtime", runtime.Name(), runtime, h.r.runtimes, h.runtimes, &h.runtimeOrder)
+}
+
+func (h *host) checkRuntimeNamespace(name, kind string) error {
+	h.mu.Lock()
+	_, staged := h.runtimes[name]
+	h.mu.Unlock()
+	h.r.mu.RLock()
+	existing, committed := h.r.runtimes[name]
+	h.r.mu.RUnlock()
+	if !staged && !committed {
+		return nil
+	}
+	owner := h.name
+	if committed {
+		owner = existing.owner
+	}
+	h.r.notice(fmt.Sprintf("plugin %s: %s %s already registered by runtime %s", h.name, kind, name, owner))
+	return fmt.Errorf("%w: %s %q owned by runtime %s", ErrDuplicate, kind, name, owner)
+}
+
+func (h *host) checkProviderNamespace(name, kind string) error {
+	h.mu.Lock()
+	_, staged := h.providers[name]
+	h.mu.Unlock()
+	h.r.mu.RLock()
+	existing, committed := h.r.providers[name]
+	h.r.mu.RUnlock()
+	if !staged && !committed {
+		return nil
+	}
+	owner := h.name
+	if committed {
+		owner = existing.owner
+	}
+	h.r.notice(fmt.Sprintf("plugin %s: %s %s already registered by provider %s", h.name, kind, name, owner))
+	return fmt.Errorf("%w: %s %q owned by provider %s", ErrDuplicate, kind, name, owner)
 }
 
 func (h *host) RegisterAgent(d agentdef.Definition) error {

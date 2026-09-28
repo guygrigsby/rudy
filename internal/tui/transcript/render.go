@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
@@ -87,8 +88,72 @@ func (t *Transcript) Render(r *Row) []string {
 		return t.prompt(r, indent)
 	case RowMarker:
 		return t.marker(r, indent)
+	case RowRuntime:
+		return t.runtimeRow(r, indent)
+	case RowRuntimePrompt:
+		return t.runtimePrompt(r, indent)
 	}
 	return nil
+}
+
+func (t *Transcript) runtimePrompt(r *Row, indent int) []string {
+	p := r.RuntimePrompt
+	if p == nil {
+		return nil
+	}
+	text := p.Summary
+	if p.Command != "" {
+		text += "\n" + p.Command
+	}
+	if p.CWD != "" {
+		text += "\n" + p.CWD
+	}
+	if p.Reason != "" {
+		text += "\n" + p.Reason
+	}
+	for _, change := range p.Changes {
+		text += "\n" + change.Kind + " " + change.Path
+	}
+	for _, network := range p.Network {
+		text += "\n" + network.Host + " " + network.Protocol
+	}
+	for _, permission := range p.Permissions {
+		text += "\n" + permission
+	}
+	var choices []string
+	if slices.Contains(p.AllowedScopes, "once") {
+		choices = append(choices, "allow once [y]")
+	}
+	if slices.Contains(p.AllowedScopes, "session") {
+		choices = append(choices, "allow for session [a]")
+	}
+	choices = append(choices, "deny [n]")
+	out := t.wrap(theme.RoleWarning, indent, text)
+	return append(out, t.wrap(theme.RoleMuted, indent, strings.Join(choices, "  "))...)
+}
+
+func (t *Transcript) runtimeRow(r *Row, indent int) []string {
+	if r.Runtime == nil {
+		return t.wrap(theme.RoleMuted, indent, r.Text)
+	}
+	e := r.Runtime
+	text := r.Text
+	role := theme.RoleMuted
+	switch e.Kind {
+	case "command":
+		text = "$ " + text
+	case "file_change":
+		text = "file: " + text
+	case "plan":
+		text = "plan: " + text
+	case "diff":
+		text = "diff:\n" + text
+	case "warning":
+		role = theme.RoleWarning
+	case "error":
+		role = theme.RoleError
+	}
+	return t.wrap(role, indent, strings.TrimRight(text, "\n"))
 }
 
 // rowIndent is how far under its own left margin a row draws: previewIndent, the same a

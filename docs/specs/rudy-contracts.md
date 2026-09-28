@@ -1,5 +1,173 @@
 # rudy contracts
 
+Pass 10, 2026-09-26: Codex App Server joins as an AgentRuntime (ADR 0045,
+revised by ADR 0046 for process recovery).
+Runtime sessions keep canonical conversation history outside Rudy, project it
+for clients and retain only local control and approval evidence. The Pass 10
+rows below replace same-method native assumptions only when
+`SessionExecution.kind` is `runtime`; unchanged rows remain normative for
+native sessions. Written before code.
+
+## Pass 10: AgentRuntime contract
+
+### Runtime protocol types
+
+| type | shape |
+|---|---|
+| `SessionExecution` | one of `{kind:"native", provider:string}` or `{kind:"runtime", runtime:string}`; the selected model owner fixes it at session open |
+| `SessionInfo` | `{session_id, workspace:Workspace, model:ModelRef, mode:PermissionMode, thinking:ThinkingLevel, title:string, execution:SessionExecution, thread_linked:bool}`; `thread_linked` is false for native and for a runtime session before its first successful thread start |
+| `AccountState` | `{runtime, authenticated:bool, auth_mode:string, plan_type:string}`; the two strings are empty when unauthenticated and no credential field exists |
+| `AuthChallenge` | one of `{type:"browser", runtime, login_id, url}` or `{type:"device", runtime, login_id, verification_url, user_code}`; caller-private and never logged |
+| `RuntimeThread` | `{runtime, thread_id, turns:[RuntimeTurn]}`; returned history is authoritative and contains no Rudy session id |
+| `RuntimeTurn` | `{turn_id, status, items:[RuntimeItem], usage:Usage}`; `status` is `running`, `completed`, `interrupted` or `failed` |
+| `RuntimeItem` | `{item_id, type, status, content, command, cwd, output, changes, error}`; every field is present, unused strings and lists are empty, `content` is `[ContentBlock]`, `changes` is `[{path, kind}]`; supported types are `user_message`, `agent_message`, `reasoning`, `command`, `file_change`, `tool`, `plan`, `diff`, `warning`, `error` |
+| `ProjectedEntry` | `{id, at, kind, runtime, thread_id, turn_id, item_id, content, status, usage}`; `id` is a deterministic ULID-shaped digest, `at` is the runtime time or the projection time when absent, unused content is empty; derived and never an `entries.jsonl` record |
+| `RuntimeEvent` | one of `thread_started`, `thread_status`, `turn_started`, `turn_completed`, `runtime_failed`, `item_started`, `item_delta`, `item_completed`, `diff_updated`, `plan_updated`, `usage_updated`, `warning`, `error`, `request_resolved`; each carries `thread_id`, an empty or non-empty `turn_id`, an empty or non-empty `item_id`, `request_id` empty except `request_resolved`, adapter-assigned receive `sequence`, `item:RuntimeItem`, `text`, `status`, `usage`; `runtime_failed` names the active thread and turn with `status:"failed"`; fields not used by the variant are the stated empty value |
+| `RuntimeApprovalQuestion` | `{runtime, request_id, thread_id, turn_id, item_id, kind, summary, command, cwd, reason, changes:[{path,kind}], network:[{host,protocol,port}], permissions:[string], allowed_scopes:[Scope]}`; `kind` is `command`, `file_change` or `permissions`; display fields may be empty and confer no authority |
+| `RuntimeApprovalAnswer` | `{decision, scope, reason, granted:[string]}`; `decision` is `allow` or `deny`; allow scope must be in `allowed_scopes`, deny always uses `once`; `granted` is used only for a permissions allow and is a subset of the requested permissions |
+
+### Runtime session behavior
+
+| method | runtime behavior | additional errors | record |
+|---|---|---|---|
+| `session.open` | resolves the selected model's registry owner and writes `SessionExecution{runtime}`. A configured runtime model may open before login or discovery. It creates no thread. Runtime execution accepts only a root Session under the default agent with absent `tools` narrowing | `unavailable` only when the named runtime is not registered; absence of an HTTP Provider is not an error; `refused_by_invariant` for `parent`, a non-default agent or explicit `tools`, since runtime-owned tools cannot honor Rudy delegation constraints | `session_opened` schema 3 |
+| `session.resume` | loads local control records, resumes a linked runtime thread, reads authoritative history and sends `runtime.entry` projections before the response. An unlinked pre-login session has no runtime history | `runtime_error` when the link exists but cannot be resumed or read | no conversation write |
+| `session.fork` | requires a linked rested thread and `at_entry_id` empty or equal to the newest projected id; calls runtime fork, reads and validates the distinct child thread and projects its canonical history before binding it | `refused_by_invariant` for an older projection, active turn or reused thread id; `ambiguous` on lost fork response; `runtime_error` if the child cannot be read faithfully | child `session_opened`, `fork_point`, `runtime.toml` and replayed child projection |
+| `session.submit` | on the first submit, starts and durably binds a thread before starting a turn; later typed input starts a turn and steer input steers the verified active runtime turn; a process-failed session must resume and read its canonical thread first | `runtime_error` unauthenticated or runtime failure; `ambiguous` on lost non-idempotent response or while canonical reconciliation is required, with no automatic retry | no user or assistant conversation entry |
+| `session.interrupt` | requests runtime turn interruption. The response is acknowledgment; terminal state waits for `turn_completed`. `how:steer` enters client steering and the next submit calls runtime steer only while that same runtime turn remains active; `how:cancel` does not accept later steer | `conflict` when expected runtime turn changed | no conversation write |
+| `session.answer` | native questions only. A runtime question answered here is `not_found` | none | `permission_decision` only |
+| `runtime.approval.answer` | verifies asker, session, active turn and pending request binding, appends the runtime decision, fsyncs an allow, then answers the owning runtime | `unauthorized`, `not_found` or `conflict` on the same rules as `session.answer`, plus `conflict` for any binding mismatch | `runtime_permission_decision` |
+| `session.set_model` | permits only another model owned by the same AgentRuntime and applies it to the next turn. Changing execution kind is refused | `refused_by_invariant` for a different owner or owner kind | `model_change` |
+| `session.set_mode`, `session.set_thinking`, `session.set_title` | append local control facts and apply mode and effort to the next runtime turn | unchanged | corresponding existing entry |
+| `session.compact` | refused because runtime history is canonical and App Server exposes no matching operation | `refused_by_invariant` | none |
+| `session.shell` | refused because a local shell result cannot be inserted into canonical runtime history without starting a model turn | `refused_by_invariant` | none |
+| `session.close` | detaches and closes live projection resources; does not delete or mutate the runtime thread | runtime process cleanup errors become notices | none |
+
+Native-only hook points `session_opened`, `before_turn`, `before_request`,
+`after_response`, `before_tool`, `after_tool` and `before_compaction` do not fire
+for runtime-owned execution because their returns cannot be applied faithfully
+to canonical runtime history. `turn_completed` and `session_closed` still fire
+with domain payloads. Runtime approval translation is not a Tool hook.
+
+### Runtime plugin requests
+
+The linked Go interface has the same operations and domain shapes. For a
+spawned runtime the parent calls these methods on the plugin connection. Every
+row's callee is the plugin that registered `request.runtime`, authentication is
+the parent-child stdio connection, authorization requires that exact registered
+name and the domain operation is the same-named AgentRuntime behavior. A name
+owned by another plugin is `unauthorized` before the call.
+
+| method | request | response | errors | idempotency |
+|---|---|---|---|---|
+| `runtime.account.read` | `{runtime}` | `AccountState` | `runtime_error`, `unavailable` | idempotent |
+| `runtime.login.start` | `{runtime, mode}` where mode is `browser` or `device` | `AuthChallenge` | `runtime_error`, `unavailable` | not idempotent; completion may race the response and is matched by `login_id` |
+| `runtime.login.cancel` | `{runtime, login_id}` | `{}` | `not_found`, `runtime_error` | idempotent |
+| `runtime.model.list` | `{runtime, cursor}`; empty cursor starts | `{models:[Model], next_cursor}`; empty next cursor ends | `runtime_error`, `unavailable` | idempotent per cursor |
+| `runtime.thread.start` | `{runtime, session_id, cwd, model, thinking, mode}` | `{thread_id}` | `runtime_error`, `unavailable`, `ambiguous` | not idempotent and never retried after ambiguity |
+| `runtime.thread.resume` | `{runtime, session_id, thread_id}` | `{}` | `not_found`, `runtime_error` | idempotent |
+| `runtime.thread.fork` | `{runtime, session_id, thread_id}` | `{thread_id}` for a distinct child | `not_found`, `runtime_error`, `ambiguous` | not idempotent and never retried after ambiguity |
+| `runtime.thread.read` | `{runtime, session_id, thread_id}` | `RuntimeThread` | `not_found`, `runtime_error` | idempotent |
+| `runtime.turn.start` | `{runtime, session_id, thread_id, content:[ContentBlock], model, thinking, mode}` | `{turn_id}` | `runtime_error`, `ambiguous` | not idempotent and never retried after ambiguity |
+| `runtime.turn.steer` | `{runtime, session_id, thread_id, turn_id, content:[ContentBlock]}` | `{turn_id}` equal to the expected turn | `conflict`, `runtime_error`, `ambiguous` | not idempotent and never retried after ambiguity |
+| `runtime.turn.interrupt` | `{runtime, session_id, thread_id, turn_id}` | `{}` acknowledgment only | `not_found`, `runtime_error` | idempotent request; terminal proof is a turn event |
+
+The runtime plugin calls the fully specified `plugin.register_runtime` and
+`runtime.approval.request` server methods in the client-to-server table below.
+
+The runtime plugin sends `runtime.event` with `{runtime, event:RuntimeEvent}`.
+The server rejects an event whose thread, turn or item binding does not match
+its verified state. Delivery is ordered per runtime connection. Repeated final
+events are de-duplicated by their binding and projection id.
+
+### Runtime client notifications
+
+| notification | to | payload | delivery |
+|---|---|---|---|
+| `runtime.entry` | clients attached to the bound session and the parent's eligible watchers | `{session_id, entry:ProjectedEntry}` | authoritative history before `session.resume` response, then completed live items; reconnect de-duplicates by deterministic id |
+| `runtime.delta` | clients attached to the bound session and the parent's eligible watchers | `{session_id, turn_id, item_id, kind, text, replace}` | live only; `replace: false` appends a fragment, `replace: true` replaces the item's live text and `runtime.entry` supersedes either form for the completed item |
+| `runtime.usage.updated` | clients attached to the bound session | `{session_id, turn_id, usage:Usage}` | latest cumulative usage for the runtime turn; live only and replaces the prior value for that turn |
+| `runtime.permission.requested` | attached asker clients | `{session_id, turn_id, request_id, item_id, kind, summary, command, cwd, reason, changes, network, permissions, allowed_scopes}` | every current asker and an asker attaching while pending; first `runtime.approval.answer` wins; no asker denies immediately |
+| `runtime.permission.resolved` | clients attached to the bound session | `{session_id, request_id}` | sent after `serverRequest/resolved` or terminal turn completion; clears the pending approval UI |
+| `runtime.account.updated` | every client | `AccountState` | latest wins; sent on connect and after verified `account/read` |
+| `runtime.login.challenge` | invoking connection only | `AuthChallenge` | live only; used when browser fallback creates a device attempt |
+| `runtime.login.completed` | invoking connection only | `{runtime, login_id, success, error}` | exactly once for the attempt; `error` is redacted and empty on success |
+
+Initial `/login` returns its AuthChallenge in `command.run`. Challenge and
+completion never broadcast, enter transcript projection or reach logs. Client
+disconnect cancels its live LoginAttempt. A local TUI requests browser mode; a
+headless or SSH client requests device mode because the server cannot infer SSH
+after `rudy bridge` terminates it.
+The headless client keeps the connection open after printing the device code
+until its matching completion or interruption, so disconnect does not cancel
+an unredeemed challenge. A later challenge for the same runtime supersedes the
+prior id in the TUI; a late browser-opener result for that id is ignored.
+
+The visible command is `/login`; the client sends hidden args `browser` or
+`device` from its own transport. A user-supplied arg outside those values is
+`invalid_argument`. Headless and remote clients replace even an explicit
+`browser` arg with `device` and never invoke a local opener for a browser
+challenge. Starting a new mode cancels the invoking connection's prior
+attempt first. Browser completion failure starts device mode and emits
+`runtime.login.challenge`. A platform opener accepts only an `https` URL whose
+lowercased host is `openai.com`, `chatgpt.com` or a dot-delimited subdomain of
+one of those suffixes, passes the URL as one argv element and never invokes a
+shell. An opener failure immediately runs `/login device`, which cancels the
+browser attempt before returning the new challenge.
+
+For `rudy --print /login`, text output writes the device verification URL and
+code. JSON output keeps the ordinary no-turn result and adds optional
+`auth_challenge:AuthChallenge`. Stream JSON writes one
+`{"method":"runtime.login.challenge","params":AuthChallenge}` object. These
+outputs contain the live challenge but never persist it.
+The headless command exits successfully only on matching successful completion.
+
+Rudy fences each in-flight runtime `thread/read` with a local session revision.
+Live events received during the read win on matching projected ids and remain if
+absent from the snapshot; the older snapshot cannot roll back active turn state.
+Codex model image-input metadata does not set Rudy's `vision` capability while
+the runtime submit path accepts text only.
+
+### Codex App Server ACL
+
+The built-in `codex` runtime translates the generic operations above to App
+Server. It sends `initialize` then `initialized`, pages `model/list`, uses
+`account/read`, `account/login/start`, `account/login/cancel`, `thread/start`,
+`thread/resume`, `thread/fork`, `thread/read`, `turn/start`, `turn/steer` and
+`turn/interrupt`, then translates documented events and inbound requests.
+
+Rudy accepts only strict permission mode for Codex. It selects the immutable
+`rudy_strict` profile and `on-request` approval policy at thread start, resume,
+fork and every turn, routes review to `user`, enables
+`features.exec_permission_approvals` and `features.request_permissions_tool`
+and disables `features.apps`, `features.plugins` and
+`features.remote_plugin`. The profile reads only minimal system paths and
+project roots, denies dedicated and ambient Codex account homes and disables
+network. Rudy rejects `permissive` and `off` before
+starting a process or mutating a thread. Every operation requires Rudy's exact
+`config.toml` and rejects any `rules` path. Filesystem grants at or below either
+account home fail closed. Opaque file-change approvals always decline.
+Thinking levels target `minimal`, `low`, `medium` and `high` in that order;
+`off` targets `minimal`. If the target is absent, choose the nearest advertised
+lower effort, or the lowest advertised effort when none is lower. Rudy never
+selects `xhigh` for a `high` setting.
+
+It keys login completion by `loginId`, pending approvals by the App Server
+JSON-RPC request id and turn routing by verified `threadId` plus `turnId`.
+An approval request id is single-use within its active turn; terminal completion
+or runtime failure clears the fence for a replacement connection. Notifications
+from a replaced App Server process are discarded before event translation.
+Unknown inbound requests receive an immediate method error. The supported
+`item/tool/requestUserInput` request receives `{answers:{}}`; the supported
+`item/tool/call` request receives `{contentItems:[],success:false}`. These
+schema-valid cancellations expose neither user input nor dynamic tool execution
+and do not call Rudy's approval asker. MCP elicitation is unsupported.
+Command requests deny on failure. Permission requests grant an empty set on
+failure. File-change requests always decline because 0.155.1 omits their target
+paths. Pending approval UI clears only on request-resolved or terminal turn
+completion. The prompt renders every opaque requested permission member before
+an allow key can grant it.
+
 Pass 9, 2026-09-14: daemon shutdown completion gains explicit terminal proof (ADR 0031). After successful cleanup the retained control connection receives `server.stopped {instance_id, state: "stopped"}` before EOF. Bare EOF means crash, transport loss or failed cleanup and never authorizes replacement. A tentative shutdown claim fences work without moving public Server state. Recorded with the security hardening before final verification.
 
 Pass 8, 2026-09-14: protocol-owned Server shutdown replaces pid signaling for daemon upgrades (ADR 0030). `server.shutdown` is confined to greeted non-plugin connections whose same-user identity the unix listener proved. Its response is flushed before cleanup begins, its connection closes only after cleanup completes, and `client.hello.instance_id` proves replacement without a process id. `rudy bridge --stop` exposes the same path. No pid file remains. Written before the code.
@@ -22,6 +190,8 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `provider_error` | -32007 | the provider answered with an error after retries; `data.status`, `data.body` |
 | `plugin_error` | -32008 | a plugin returned an error or timed out; `data.plugin` |
 | `interrupted` | -32009 | the operation was cancelled by an interrupt before it completed |
+| `runtime_error` | -32010 | an AgentRuntime returned a redacted error; `data.runtime` |
+| `ambiguous` | -32011 | a non-idempotent runtime request lost its response and may have committed; it was not replayed |
 
 ## Common types
 
@@ -33,8 +203,8 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `Span` | `{text: string, role: string}`; `role` is a theme role name |
 | `Usage` | `{input: int, output: int, cache_read: int, cache_write: int}`; the input buckets are disjoint: `input` is uncached prompt tokens, so `input + cache_read + cache_write` is the full prompt |
 | `Entry` | `{id: ulid, at: rfc3339nano, kind: EntryKind, ...payload}`; payloads in the record layer |
-| `Model` | `{provider, id, display_name, upstream, context_window: int, max_output: int, pricing}`; `upstream` is who actually serves the model when the endpoint is a proxy: the route it takes, named as the endpoint names that route, comma separated when it serves the id over more than one and absent when it names none; `context_window` and `max_output` zero mean unknown; `pricing` is `{input, output, cache_read, cache_write}` as decimal strings in USD per token and is absent when no source supplied it |
-| `SessionSummary` | `{id, opened_at, workspace, model, forked, parent_session_id, last_entry_at, title, entry_count}`; `parent_session_id` empty means root, `forked` is true when the session began as a fork; `last_entry_at`, `title` and `entry_count` are pass 3: not yet reported, the store does not compute them and `session.list` omits them |
+| `Model` | `{provider, owner_kind, id, display_name, upstream, context_window: int, max_output: int, reasoning_efforts:[string], pricing}`; `provider` is the stable model namespace and may name a Provider or AgentRuntime, `owner_kind` says which; `upstream` is absent when none; numeric zero means unknown; `reasoning_efforts` is empty when unreported; `pricing` is absent when no source supplied it |
+| `SessionSummary` | `{id, opened_at, workspace, model, execution, thread_linked, forked, parent_session_id, last_entry_at, title, entry_count}`; `parent_session_id` empty means root, `forked` is true when the session began as a fork; runtime projections do not contribute to `entry_count`; `last_entry_at`, `title` and `entry_count` are pass 3: not yet reported |
 | `PermissionMode` | `strict`, `permissive`, `off` |
 | `ThinkingLevel` | `off`, `low`, `medium`, `high` |
 | `TurnState` | `idle`, `streaming`, `running_tool`, `awaiting_permission`, `steering`, `completed`, `failed` |
@@ -44,7 +214,9 @@ One closed set. Every request row picks from it. JSON-RPC `error.code` is the nu
 | `ParentRef` | `{session_id: ulid, tool_use_id: string}`; the session and the `tool_use` that spawned a child session |
 | `Safety` | `safe`, `unsafe` |
 
-`turn_id` everywhere is the entry id of the `user_message` that started the turn. Turns are not stored; that id is enough to find one in the log.
+For native execution, `turn_id` is the entry id of the `user_message` that
+started the turn. For runtime execution it is the AgentRuntime turn id and is
+never presented as a stored Entry id.
 
 ## 1. Protocol
 
@@ -63,7 +235,7 @@ JSON-RPC 2.0. Requests carry `id`; notifications do not. Both peers may send req
 |---|---|---|---|---|
 | TUI client | in-memory, unix socket | in-memory: trusted by construction; socket: directory `0700`, socket `0600`, peer uid equals server uid via `LOCAL_PEERCRED` or `SO_PEERCRED` | user messages, permission answers, model, mode, thinking, title, attach and detach, slash commands | entries of any other kind, tool results, registrations, registry contents |
 | headless client | in-memory, unix socket | as TUI client | user messages, commands, attach without asker | permission answers; it declares `asker: false` in hello and the Gate treats it as absent |
-| spawned plugin | stdio | spawned by the server from a manifest the user placed in config; identity is the manifest name | registrations under its own name, results for its own tools, hook returns, notes, status and widgets under its own name, child sessions it opens and messages to those | user messages to sessions it did not open, permission answers, items under another plugin's name, entries directly |
+| spawned plugin | stdio | spawned by the server from a manifest the user placed in config; identity is the manifest name | registrations under its own name, results for its own tools, hook returns, notes, status and widgets under its own name, child sessions it opens, runtime events and approval requests for a runtime it registered | user messages to sessions it did not open, permission answers, runtime assertions for another plugin's name, entries directly |
 | linked plugin | in-memory Go interface | compiled in; trusted by build | as spawned plugin | as spawned plugin |
 | ACP adapter | unix socket | as TUI client | as TUI client | as TUI client; deferred, not in v1 |
 
@@ -91,7 +263,7 @@ Authn column names the caller class table. Domain column names the aggregate met
 | `client.hello` | TUI, headless, ACP, plugin | per class | first request on a connection; refused otherwise | `{client, version, asker: bool}` | `{server, version, home, instance_id}`; `home` is the server process's home directory, which a client over ssh uses to place the workspace (`<home>/<cwd relative to the local home>`) and a local client ignores; `instance_id` is the runtime-only Server ULID and lets a reconnect prove replacement; a client whose `version` differs from the server's carries on and shows a notice (ADR 0029, ADR 0030) | `invalid_argument` on protocol mismatch | idempotent per connection; a second hello is `refused_by_invariant` | registers the connection as an asker or not and identifies the Server. A plugin connection may send it (it needs no introduction, so it usually does not) and its `asker` is ignored: the plugin holding a child session is the one waiting on that child's tool call, so its own question must never route back to it |
 | `server.shutdown` | TUI, headless, ACP | unix socket or ssh under the TUI class rule | greeted non-plugin connection carrying the same-user marker minted by the accepting unix listener; the `client.hello.client` string grants nothing | `{}` | `{instance_id, state: "shutting_down"}`; the response is physically written before shutdown is requested | `unauthorized` for a plugin, in-memory connection or connection without the marker; `refused_by_invariant` before hello or after shutdown was reserved | not idempotent on one Server; the first accepted request reserves shutdown and fences later work while public state remains `running`. A failed response releases the reservation. `rudy bridge --stop` treats no answering Server as an idempotent success at the CLI boundary | `Server.RequestShutdown`; the request's connection and writer remain open for terminal proof |
 | `session.open` | TUI, headless, plugin | per class | any; `parent` only from a plugin, and only naming a `tool_use` pending in a live session whose tool that same plugin registered, in a session that is not itself a child, at most once per `tool_use`, and with `cwd` equal to that session's workspace root | `{cwd, model?: string, mode?: PermissionMode, thinking?: ThinkingLevel, agent?: string, tools?: [string], parent?: ParentRef}`; `model` is `provider:id` or a unique bare id; absent `model`, `mode`, `thinking` take the agent definition's values, then the parent's when `parent` is given, then config defaults; absent `agent` means the default agent. A session's tool set is the agent definition's list, intersected with `tools` when given, intersected with the parent's effective set when `parent` is given, minus `agent` for a child. Every term only removes: `tools` names what to keep and cannot name a tool the definition or the parent withheld, so delegation never widens what the caller holds (ADR 0028). Absent `tools` narrows nothing and an explicit empty list narrows to no tools at all, the same distinction the definition file carries. A name in `tools` that no plugin has registered is dropped before the set is persisted, so a session cannot acquire a tool later by having named one that did not exist when it opened | `SessionInfo`, same shape as `session.resume`; the `session_opened` entry is replayed first as `entry.appended`, this response returns once replay finishes | `invalid_argument` root not a directory, `parent` from a non-plugin, or `cwd` not the parent's workspace root; a name in `tools` that the definition or the parent did not hold is dropped rather than refused, since the set is an intersection and a caller asking for less than it is owed is not an error; `not_found` an explicitly named `model`, an unknown agent, parent session or parent tool_use; a model that came from config, an agent definition or the parent instead opens on the ModelRef as written and notices that it is not in the registry, since a provider retiring an id the operator configured must not stop the harness from starting; `unauthorized` the pending `tool_use` is not a tool of the calling plugin; `refused_by_invariant` the parent is itself a child session; `conflict` that `tool_use` has already opened a child; `unavailable` registry unreachable and no cached snapshot | not idempotent; every call opens a session | `Session.Open` factory; appends `session_opened` with `parent_session_id` and `parent_tool_use_id` |
-| `session.resume` | TUI, headless, ACP | per class | any session on this machine | `{session_id}` | `SessionInfo`: `{session_id, workspace: Workspace, model: ModelRef, mode: PermissionMode, thinking: ThinkingLevel, title: string}`; every entry is replayed first as `entry.appended` notifications, then, when a turn is active, the current `turn.state`, a `tool.state` per call in flight and any standing `permission.requested` to an asker connection, then, for each live child of the session, that child's `session_opened` as `entry.appended` and any question standing on it, then this response | `not_found`; `unavailable` locked by another process, `data.socket` | idempotent; re-attaches | `Session.Load` then attach; `Session.Load` runs recovery |
+| `session.resume` | TUI, headless, ACP | per class | any session on this machine | `{session_id}` | `SessionInfo`; native entries replay first as `entry.appended`, runtime history replays first as `runtime.entry`, then current turn and permission state, then the response | `not_found`; `unavailable` locked by another process, `data.socket`; `runtime_error` when canonical runtime history cannot be read | idempotent; re-attaches | `Session.Load` then attach; native Load runs Recovery, runtime Load resumes and reads canonical thread when linked |
 | `session.fork` | TUI, headless, ACP | per class | any session | `{session_id, at_entry_id}`; `at_entry_id` empty means the newest entry | `SessionInfo` for the new session, same shape as `session.resume`; its entries are replayed first as `entry.appended`, this response returns once replay finishes | `not_found` session or entry | not idempotent | `Session.Fork(at)`; appends `fork_point` |
 | `session.list` | TUI, headless, ACP | per class | any | `{}` no params | `{sessions: [SessionSummary]}` | none | idempotent | query over `session_opened` and last entries; no mutation |
 | `session.close` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id}` | `{}` | `not_found` | idempotent | detach; fires `session_closed` hook when the last client detaches; appends nothing, except that a last subscriber leaving a turn parked in `TurnSteering` cancels it, which appends `turn_interrupted` |
@@ -99,6 +271,7 @@ Authn column names the caller class table. Domain column names the aggregate met
 | `session.shell` | TUI, headless | per class | any attached | `{session_id, command}` | `{entry_id, is_error}` | `invalid_argument` empty command; `not_found` unknown session or no `bash` tool in this session's view; `conflict` a turn is active | not idempotent | invokes the registered `bash` tool with the command, ungated, and appends one `user_message` with `source: shell` carrying `$ <command>` and its output. Starts no turn: the model reads it with the next message. The Gate does not run, since the operator typed the command themselves (ADR 0023) |
 | `session.interrupt` | TUI, headless, ACP, plugin (own sessions) | per class | a plugin only a session it opened; a plain client is not checked for attachment at all, which is pre-existing and true of every session method but `submit` (`rudy-jkz`); a session whose log records a parent refuses any caller not subscribed to it, on the same rule and for the same reason as `session.submit`, because routing a child's notifications to its parent's client is what made a running child's id reachable | `{session_id, how: steer or cancel}` | `{turn_id, state: TurnState}` | `refused_by_invariant` no active turn; `unauthorized` a child session from a connection not subscribed to it | idempotent; repeating returns current state | `Turn.Steer` or `Turn.Cancel`; cancel appends `turn_interrupted` |
 | `session.answer` | TUI, ACP | per class | connection declared `asker: true` | `{session_id, turn_id, tool_use_id, decision: allow or deny, scope: once or session, reason: string}`; `turn_id` is the turn the question was asked in, as `permission.requested` carried it | `{}` | `unauthorized` not an asker; `invalid_argument` no `turn_id`; `not_found` no pending request; `conflict` when another asker answered first, or when `turn_id` is not the active turn | keyed by the turn and the `tool_use_id` together, so consent given in one turn cannot decide a question in another that reuses the id (rudy-rn7); a second answer is `conflict` | `Turn.Answer` via the Gate; appends `permission_decision` |
+| `runtime.approval.answer` | TUI, ACP | per class | connection declared `asker: true` | `{session_id, turn_id, request_id, decision: allow or deny, scope: once or session, reason: string, granted:[string]}` | `{}` after the runtime accepts the response | `unauthorized` not an asker; `not_found` no pending request; `conflict` another answer won, active binding changed, granted value was not requested or scope is session without explicit allow | keyed by session, turn and upstream request id; never replayed | AgentRuntime coordinator appends `runtime_permission_decision`, fsyncs allow, then answers RuntimeApproval |
 | `session.set_model` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id, model: ModelRef}` | `{entry_id}` | `conflict` a turn is active; `not_found` model not in registry | same value appends nothing and returns the latest `model_change` id | `Session.SetModel`; appends `model_change` |
 | `session.set_mode` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id, mode: PermissionMode}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetMode`; appends `mode_change` |
 | `session.set_thinking` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id, thinking: ThinkingLevel}` | `{entry_id}` | `conflict` a turn is active; `invalid_argument` | same value appends nothing | `Session.SetThinking`; appends `thinking_change` |
@@ -107,26 +280,28 @@ Authn column names the caller class table. Domain column names the aggregate met
 | `registry.list` | TUI, headless, plugin, ACP | per class | any | `{provider?: string}` | `{fetched_at, models: [Model]}` | none | idempotent | query over the Registry snapshot |
 | `registry.refresh` | TUI, headless, ACP | per class | any | `{provider?: string}` | `{fetched_at, models: [Model], failures: [{provider, error}]}` | none; a failing provider lands in `failures` and the rest succeed | idempotent | `Registry.Refresh` |
 | `command.list` | TUI, headless, ACP | per class | any | `{}` | `{commands: [{name, description}]}` in registration order | none | idempotent | query over `PluginRegistry.Commands`; the set is fixed once every plugin has answered `plugin.init`, so a client asks once on connect and there is no notification for it. A plugin is refused: it knows its own registrations and has no use for another's. `/exit`, `/quit` and `/scoped-models` are not in it, being the client's own (ADR 0015, ADR 0020) |
-| `command.run` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id, name, args: string}` | `{turn_id, notice, session_id}`; `turn_id` set for a command that submitted a prompt, `notice` for one that only reports, `session_id` set when the command opened another session, a fork or a `NewSession` | `not_found` unknown command or unknown session; `conflict` a turn is active and the command's action needs a resting session (`SubmitPrompt`, `Compact`, `NewSession`) | not idempotent; the command decides | called whatever the turn is doing: a command is not a message and does not wait behind one, and the refusals above are what stop the actions that cannot run mid-turn (ADR 0026). Runs the plugin.Command's `Run`, then maps its `Action` (`SubmitPrompt`, `Notice`, `Compact`, `SetModel`, `SetMode`, `SetTitle`, `Fork`, `NewSession`, `NoAction`) onto the matching domain call. `SetTitle` names the session through the same path `session.set_title` takes, refusing an empty title the same way (ADR 0019); `SetMode` sets the permission mode through the same path `session.set_mode` takes, refusing an invalid one the same way; `NewSession` opens a fresh session in the old one's workspace with its model, mode and thinking, attaches the caller and closes the old one, which is `/clear` |
+| `command.run` | TUI, headless, ACP, plugin (own sessions) | per class | any attached; a plugin only a session it opened | `{session_id, name, args: string}` | `{turn_id, notice, session_id, auth_challenge}`; `turn_id` set for a submitted prompt, `notice` for a report, `session_id` for a newly opened session and `auth_challenge` for caller-private login work; unused strings are empty and absent challenge means no challenge | `not_found` unknown command or unknown session; `conflict` a turn is active and the command's action needs a resting session (`SubmitPrompt`, `Compact`, `NewSession`) | not idempotent; the command decides | called whatever the turn is doing: a command is not a message and does not wait behind one. Runs the plugin Command, then maps its `Action` (`SubmitPrompt`, `Notice`, `Compact`, `SetModel`, `SetMode`, `SetTitle`, `Fork`, `NewSession`, `AuthChallenge`, `NoAction`) onto the matching domain call. `AuthChallenge` is returned only on this connection and never broadcast. Other action semantics remain as previously specified |
 | `plugin.register_tool` | plugin | per class | own name only | `{name, description, input_schema, safety: Safety}`; `input_schema` raw JSON | `{}` | `conflict` name taken; the plugin stays loaded and a `notice` is emitted | not idempotent; a second registration of a name already held is refused with `conflict` whatever it carries, since a plugin registering one name twice is a mistake rather than a retry, and the first registration is the one sessions were opened against | `PluginRegistry.RegisterTool` |
 | `plugin.register_command` | plugin | per class | own name only | `{name, description}`; not yet implemented, `args` and their completion sources: the slash menu completes a command name, never its arguments | `{}` | `conflict` | not idempotent; a second registration of a name already held is refused with `conflict` whatever it carries | `PluginRegistry.RegisterCommand` |
 | `plugin.register_hook` | plugin | per class | own name only | `{point: HookPoint, priority: int}` | `{}` | `invalid_argument` unknown point | idempotent | `PluginRegistry.RegisterHook` |
 | `plugin.register_widget` | plugin | per class | own name only | `{key, slot: header, above_editor or below_editor, content: [Span]}` | `{}` | `invalid_argument` unknown slot | idempotent; re-registering replaces content | `PluginRegistry.SetWidget` |
 | `plugin.set_status` | plugin | per class | own name only | `{key, content: [Span]}`; empty content clears | `{}` | none | idempotent | `PluginRegistry.SetStatus` |
 | `plugin.register_provider` | plugin | per class | own name only | `{name, wire: anthropic_messages, openai_chat or custom}`; `custom` means the server calls `provider.complete` on the plugin; a spawned plugin may register only `custom`, since a codec wire needs the endpoint and credential config a linked provider plugin reads | `{}` | `conflict` provider name taken; `invalid_argument` a codec wire from a spawned plugin, or an unknown wire | not idempotent; a second registration of a name already held is refused with `conflict` whatever it carries | `PluginRegistry.RegisterProvider` |
+| `plugin.register_runtime` | plugin | per class | own name only, during `plugin.init` | `{name}` | `{}` | `conflict` Provider or AgentRuntime namespace taken | not idempotent | `PluginRegistry.RegisterRuntime` |
 | `plugin.register_agent` | plugin | per class | own name only | `{name, description, prompt: string, tools?: [string], model: string, thinking: ThinkingLevel, max_turns: int}`; the same fields `agents/<name>.md` carries, since a definition is static data and needs no callback. Absent `tools` means every tool, an empty list means none, matching the file | `{}` | `conflict` a plugin already registered that name; `invalid_argument` empty description, or a `thinking` that is not off, low, medium or high | not idempotent; a second registration of a name already held is refused with `conflict` whatever it carries | `PluginRegistry.RegisterAgent`; read by `resolveAgent` after both disk roots, so a user or workspace definition of the same name wins and a plugin cannot take a name an operator is using (ADR 0028) |
 | `plugin.append_note` | plugin | per class | any live session; pass 3 has no ownership check here, see the open list | `{session_id, text, role: info, muted, warn or error}` | `{entry_id}` | `not_found` for a session nobody holds live, which is what a plugin's background work gets once the session it belongs to has closed (ADR 0041); the caller handles it rather than dropping it, and a note that reports a failure goes to the notice sink instead | not idempotent | `Session.Append(note)` |
+| `runtime.approval.request` | plugin | per class | ready plugin that registered `request.runtime`; no `session_id` is accepted | `RuntimeApprovalQuestion` | `RuntimeApprovalAnswer` | `unauthorized` wrong owner; `not_found` no verified thread link; `conflict` stale turn, duplicate request id or terminal item; `no_asker` returns a deny response and records the reason rather than leaving the request pending | keyed by runtime connection and request id; a repeat is `conflict` | AgentRuntime coordinator resolves Session from the verified thread link and creates RuntimeApproval |
 
 ### Requests, server to plugin
 
 | method | callee | authn | authz | request | response | errors | idempotency | domain |
 |---|---|---|---|---|---|---|---|---|
-| `plugin.init` | spawned plugin | parent-child | first request the server sends | `{name, version, protocol_version, config: table, workspace_roots: [string]}`; `config` is the plugin's `[plugins.<name>]` table verbatim | `{name, version, protocol_version}`; registrations the plugin sends before it answers are committed with the plugin, so a plugin declares its surface while the server waits for this response | `plugin_error` on mismatch or timeout; plugin marked failed; a `plugin.register_tool`, `plugin.register_command`, `plugin.register_hook`, `plugin.register_provider` or `plugin.register_agent` after the response is `refused_by_invariant`, since the tool set, command set, hook set, provider set and agent set a session was opened with never change under it. `plugin.set_status` and `plugin.register_widget` stay live for the life of the process: they are display, not surface | once per process | `Plugin.Ready` or `Plugin.Fail` |
+| `plugin.init` | spawned plugin | parent-child | first request the server sends | `{name, version, protocol_version, config: table, workspace_roots: [string]}`; `config` is the plugin's `[plugins.<name>]` table verbatim | `{name, version, protocol_version}`; registrations the plugin sends before it answers are committed with the plugin, so a plugin declares its surface while the server waits for this response | `plugin_error` on mismatch or timeout; plugin marked failed; a `plugin.register_tool`, `plugin.register_command`, `plugin.register_hook`, `plugin.register_provider`, `plugin.register_runtime` or `plugin.register_agent` after the response is `refused_by_invariant`, since the execution surface a session opens against never changes under it. Display registrations stay live | once per process | `Plugin.Ready` or `Plugin.Fail` |
 | `tool.invoke` | owning plugin | parent-child | the plugin that registered the tool | `{session_id, tool_use_id, name, input, workspace: Workspace, timeout_ms: int}` | `{content: [ContentBlock], is_error: bool}` | `plugin_error` timeout or crash; `interrupted` after `tool.cancel` | keyed by `tool_use_id`; a repeat after a lost connection is a new invocation and the old result is discarded | `Turn.RunTool`; the result is appended as `tool_result` |
 | `tool.cancel` | owning plugin | parent-child | as above | `{tool_use_id}` | `{}` | none | idempotent | `Turn.Steer` or `Turn.Cancel` reaching a running tool |
 | `hook.fire` | registered plugins in priority order | parent-child | registered for that point | `{point, session_id, turn_id, payload}`; payloads in the events contract; `turn_id` is empty for `session_opened`, `before_compaction` and `session_closed` | `{result}` per point; timeout `hook_timeout_ms` from config | `plugin_error` timeout; the hook is skipped and a `notice` emitted | not idempotent | the domain event's consumer list |
-| `command.invoke` | owning plugin | parent-child | the plugin that registered the command | `{session_id, name, args: string, mode, model, thinking}`; the session's own facts, so a command can report what it is about to change | `{prompt?: string, notice?: string}`; a non-empty `prompt` is submitted to the session as a user message and its `turn_id` comes back from `command.run`, a non-empty `notice` is shown to the client; both empty means the command did its work itself | `plugin_error` | not idempotent | plugin-defined |
-| `provider.complete` | provider plugin with `wire: custom` | parent-child | registered provider | `{request_id, model: ModelRef, system: string, messages: [{role, content?: [ContentBlock], results?: [{tool_use_id, content: [ContentBlock], is_error: bool}]}], tools: [{name, description, input_schema}], thinking: ThinkingLevel, max_tokens: int}`; a message carries `content` for every role but `tool_result`, and `results` for that one. The results of one assistant message arrive as a single message carrying every one of them, because the two shipped codecs need opposite renderings of that group and only the kernel knows it as a group rather than by inferring it from adjacency (ADR 0028). A plugin rendering them must emit whatever its own upstream requires | `{stop_reason, stop_reason_raw, usage: Usage}` after the stream ends | `provider_error`, `interrupted` | keyed by `request_id` | `Provider.Complete` port |
+| `command.invoke` | owning plugin | parent-child | the plugin that registered the command | `{session_id, name, args: string, mode, model, thinking}`; the session's own facts | `{prompt, notice, auth_challenge}`; unused strings are empty and absent challenge means none. A non-empty prompt is submitted, a notice is shown and a challenge is returned only to the invoking connection | `plugin_error` | not idempotent | plugin-defined |
+| `provider.complete` | provider plugin with `wire: custom` | parent-child | registered provider | `{request_id, session_id, model: ModelRef, system: string, messages: [{role, content?: [ContentBlock], results?: [{tool_use_id, content: [ContentBlock], is_error: bool}]}], tools: [{name, description, input_schema}], thinking: ThinkingLevel, max_tokens: int, headers:table}`; `session_id` and hook-produced headers remain bound to the request across the spawned-plugin seam. A message carries `content` for every role but `tool_result`, and `results` for that one. The results of one assistant message arrive as one grouped message | `{stop_reason, stop_reason_raw, usage: Usage}` after the stream ends | `provider_error`, `interrupted` | keyed by `request_id` | `Provider.Complete` port |
 | `provider.list_models` | provider plugin with `wire: custom` | parent-child | registered provider | `{}` | `{models: [Model]}` | `provider_error` | idempotent | `Registry.Refresh` for that provider |
 
 ### Notifications, server to clients
@@ -152,7 +327,7 @@ Two things this does not claim. Answering is deliberately not gated, because a c
 | `widget.updated` | every client | `{owner, key, slot, content: [Span]}` | latest wins per owner and key; all sent on connect |
 | `notice` | every client | `{level: info, warn or error, owner, text}` | best effort; not replayed |
 | `plugin.state` | every client | `{name, origin: linked or spawned, state: loading, ready, failed or stopped, reason: string}`; `reason` empty unless failed | latest wins; all sent on connect. It carries what the state now is, not that it changed, so a client renders it and keeps no history. A connection is in the broadcast set before its connect snapshot is sent, so it may be told the same state twice and must treat the repeat as the state it already holds. What it is never told is an older state after a newer one: the snapshot and the broadcasts are serialized against each other, so the last `plugin.state` a client receives for a plugin is that plugin's state (rudy-9jl) |
-| `registry.updated` | every client | `{fetched_at, providers: [{name, count: int, error: string}]}`; `error` empty on success | latest wins |
+| `registry.updated` | every client | `{fetched_at, owners: [{name, owner_kind, count: int, error: string}]}`; `owner_kind` is provider or runtime and `error` is empty on success | latest wins |
 | `server.stopped` | the one connection whose `server.shutdown` request was accepted | `{instance_id, state: stopped}` | sent only after successful runtime and listener cleanup, then followed by EOF. Cleanup failure, process death or transport loss produces no notification, so bare EOF is failure |
 
 ### Notifications, plugin to server
@@ -161,6 +336,7 @@ Two things this does not claim. Answering is deliberately not gated, because a c
 |---|---|---|
 | `tool.progress` | `{tool_use_id, text}` | pass 3: received by the spawned plugin's adapter and dropped there; forwarding to clients as `stream.delta` needs a stream part type the TUI plan defines |
 | `provider.delta` | `{request_id, part: StreamPart}` | ordered per request; the server assembles the `assistant_message` from them |
+| `runtime.event` | `{runtime, event:RuntimeEvent}` | owning ready runtime only; ordered per connection, rejected on any unverified thread or turn binding, repeated final events de-duplicated |
 
 ## 2. Domain events
 
@@ -208,6 +384,28 @@ Delivery inside the process is synchronous and ordered per session. Published ev
 | `ServerShutdownRequested` | Server | running to shutting_down | `{instance_id}` | process owner (`ShutdownCoordinator`) | sync, after the successful protocol response is sent | internal | `Server.RequestShutdown` |
 | `ServerStopped` | Server | shutting_down to stopped | `{instance_id}` | the held shutdown control connection, which is then closed | sync, after runtime cleanup completes | internal | `Server.CompleteShutdown` |
 
+### AgentRuntime events
+
+| name | aggregate | transition | payload | consumers | delivery | boundary | owner |
+|---|---|---|---|---|---|---|---|
+| `RuntimeStarted` | CodexRuntime | starting to ready | `{runtime, version}` | linked Sessions, clients as account state | sync | internal | AgentRuntime |
+| `RuntimeFailed` | CodexRuntime | ready to failed with an active turn | `{thread_id, turn_id, status:"failed"}`; runtime identity is bound by the registered sink | linked Session, which marks the turn terminal and fences new work as ambiguous | ordered after preceding notifications for that process | internal | AgentRuntime |
+| `LoginStarted` | LoginAttempt | new to starting | `{runtime, mode, client_id}` with no challenge secret | account coordinator | sync | internal | AgentRuntime |
+| `LoginChallenged` | LoginAttempt | starting to challenged | `AuthChallenge` | invoking connection only | sync | internal | AgentRuntime |
+| `LoginCompleted` | LoginAttempt | starting or challenged to terminal | `{runtime, login_id, success, error}` redacted | invoking connection, Registry refresh on success | sync | internal | AgentRuntime |
+| `ThreadLinked` | Session | unlinked to linked | `{session_id, runtime, thread_id}` | runtime router, Session resume | after `runtime.toml` fsync | internal | Session |
+| `RuntimeTurnStarted` | AgentRuntime | idle to active | `{session_id, thread_id, turn_id}` | clients, runtime router | sync | internal | AgentRuntime |
+| `RuntimeItemProjected` | AgentRuntime | item completed or cold read | `{session_id, entry:ProjectedEntry}` | clients | ordered per thread | internal | RuntimeProjector |
+| `RuntimeUsageUpdated` | AgentRuntime | usage notification or terminal turn usage | `{session_id, turn_id, usage}` | attached clients | latest wins per turn | internal | AgentRuntime |
+| `RuntimeTurnCompleted` | AgentRuntime | active to terminal | `{session_id, thread_id, turn_id, status, usage}` | Session, clients, `turn_completed` hook | sync | published only as existing hook | AgentRuntime |
+| `RuntimeApprovalRequested` | RuntimeApproval | new to pending | `RuntimeApprovalQuestion` plus resolved `session_id` | asker connections | sync | internal | AgentRuntime |
+| `RuntimePermissionDecided` | Session | append runtime decision | the `runtime_permission_decision` entry | RuntimeApproval, audit clients through normal entry replay | sync; fsync before allow response | internal | Session |
+| `RuntimeApprovalResolved` | RuntimeApproval | pending or answered to resolved | `{session_id, request_id}` | clients clear pending UI | sync | internal | AgentRuntime |
+
+AgentRuntime is the domain service owning cross-aggregate rules between Session,
+CodexRuntime, LoginAttempt, RuntimeApproval and Registry. An application handler
+only transports its decisions.
+
 ### Plugin and Registry events
 
 | name | aggregate | transition | payload | consumers | delivery | boundary | owner |
@@ -216,9 +414,9 @@ Delivery inside the process is synchronous and ordered per session. Published ev
 | `PluginReady` | Plugin | loading to ready | `{name}` | PluginRegistry (capabilities become visible), clients | sync | internal | `Plugin.Ready` |
 | `PluginFailed` | Plugin | loading or ready to failed | `{name, reason}` | PluginRegistry (capabilities withdrawn), clients (`notice`, `plugin.state`) | sync | internal | `Plugin.Fail` |
 | `PluginStopped` | Plugin | ready to stopped | `{name}` | PluginRegistry, clients | sync | internal | `Plugin.Stop` |
-| `CapabilityRegistered` | Plugin | ready, on any `register_*` | `{plugin, kind: tool, command, hook, widget, status, provider or agent, name}` | RequestAssembler (tools), `resolveAgent` (agents), clients (commands, widgets, status) | sync | internal | `PluginRegistry.Register*` |
+| `CapabilityRegistered` | Plugin | ready, on any `register_*` | `{plugin, kind: tool, command, hook, widget, status, provider, runtime or agent, name}` | RequestAssembler (tools), `resolveAgent` (agents), execution registry, clients | sync | internal | `PluginRegistry.Register*` |
 | `CapabilityRejected` | Plugin | ready, on a `conflict` | `{plugin, kind, name, held_by}` | clients (`notice`) | sync | internal | `PluginRegistry.Register*` |
-| `RegistryRefreshed` | Registry | `Refresh` | `{fetched_at, providers: [{name, count, error}]}` | clients (`registry.updated`), model picker, `session.open` validation | sync | internal | `Registry.Refresh` |
+| `RegistryRefreshed` | Registry | `Refresh` | `{fetched_at, owners: [{name, owner_kind, count, error}]}` | clients (`registry.updated`), model picker, `session.open` validation | sync | internal | `Registry.Refresh` |
 
 ### Published events, the hook points
 
@@ -246,6 +444,7 @@ Handlers run in priority order, then plugin load order. Each handler gets `hook_
 | Subagent runner | given an `agent` tool call, open a child session under the named agent definition with `parent` set and the call's `tools` narrowing, submit the prompt, wait for `turn.state` completed or failed, return the final assistant text or the failure as the tool result; a child session exposes no `agent` tool. Several `agent` calls in one assistant message run at once, so the runner holds no state shared between calls | Session (child), Plugin (tool), Registry (model) |
 | Tool scheduler | given the tool calls of one assistant message, run them all concurrently, each with its own cancellation, and append each result as it lands; an interrupt is observed by every call in flight rather than consumed by one, so no call records success after the turn was cut. Reentrancy is the tool's own obligation, not a property the scheduler infers from safety (ADR 0028) | Turn, Plugin (tool invoke), Session (append) |
 | ShutdownCoordinator | reserve admission for an authenticated `server.shutdown`, flush the success response, transition Server once, cancel other connection work, close sessions and plugins, and close the listener. On success, complete Server shutdown so the retained writer sends `server.stopped` before EOF. On failure, release it without terminal proof | Server, Session, Turn, Plugin, connection registry |
+| AgentRuntime coordinator | select execution from the model owner, own runtime process readiness, bind threads to Sessions, route verified events, project canonical history, correlate login attempts, translate approval requests, persist consent before an allow and fail closed when the binding or asker is absent | Session, Registry, Plugin, CodexRuntime, LoginAttempt, RuntimeApproval |
 | Recovery | on `Session.Load`, for every `permission_decision` allow without a `tool_result`, append `tool_result` with outcome `lost`; single aggregate, listed here because it runs outside a turn | Session |
 
 The dangerous set is checked before session allowances in every mode but off: a dangerous command always asks even when a prior session-scope allow matches, so widening a matcher prefix can never silence a dangerous command. See ADR 0011.
@@ -259,6 +458,7 @@ No database. Files under XDG roots, resolved as `$XDG_CONFIG_HOME` or `~/.config
 | path | owner | holds |
 |---|---|---|
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/entries.jsonl` | Session | the log; append-only |
+| `$XDG_DATA_HOME/rudy/sessions/<ulid>/runtime.toml` | AgentRuntime | runtime name and canonical thread id; absent before a runtime session's first successful thread start and from every native session |
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/blobs/<sha256>` | Session | image bytes referenced by `blob` |
 | `$XDG_DATA_HOME/rudy/sessions/<ulid>/lock` | Session | `flock` held by the process serving the session; a second process gets `unavailable` and is told the socket path |
 | `$XDG_CACHE_HOME/rudy/registry.json` | Registry | the last discovered snapshot; a snapshot is a cache |
@@ -298,8 +498,9 @@ Invariants, enforced by `Session.Append` and checked by `Session.Load`:
 - append-only; a line is never rewritten or removed
 - `id` is monotonic; `Load` refuses a file whose ids are not increasing
 - the first line is `session_opened` or `fork_point`; `fork_point` appears only as the first line; `session_opened` appears only as the first line of a root session
-- an `assistant_message` containing `tool_use` blocks is followed, for each `tool_use.id`, by exactly one `permission_decision` and then exactly one `tool_result` before the next `assistant_message`; `Load` appends `tool_result` outcome `lost` for any allow without a result
+- in native execution, an `assistant_message` containing `tool_use` blocks is followed, for each `tool_use.id`, by exactly one `permission_decision` and then exactly one `tool_result` before the next `assistant_message`; `Load` appends `tool_result` outcome `lost` for any allow without a result
 - for a tool whose safety is `unsafe`, the `permission_decision` line is fsynced before the tool runs
+- a runtime approval allow is a `runtime_permission_decision` line fsynced before its response is sent to the AgentRuntime
 - `user_message` with source `steer` appears only after an `assistant_message` with `stop_reason: interrupted` or a `tool_result` with outcome `killed`
 - `compaction.first_entry_id` and `last_entry_id` name entries in this file or, for a fork, in the parent chain
 - a session with children under `fork_point` is refused deletion
@@ -310,10 +511,11 @@ Kinds:
 
 | field | type | null | meaning |
 |---|---|---|---|
-| `schema_version` | int | no | 2. Version 1 lacks `tools` |
+| `schema_version` | int | no | 3. Version 1 lacks `tools`; versions 1 and 2 lack `execution` and infer native |
 | `rudy_version` | string | no | the binary that opened it |
 | `workspace` | Workspace | no | `git_root` empty means not a repo |
 | `model` | ModelRef | no | initial selection |
+| `execution` | SessionExecution | no from version 3 | fixed execution kind; absent in older logs means native |
 | `thinking` | ThinkingLevel | no | initial |
 | `mode` | PermissionMode | no | initial |
 | `agent` | string | no | agent definition name; `default` when none |
@@ -322,7 +524,7 @@ Kinds:
 | `tools` | [string] | yes | the tool set resolved at open, before the `agent` deny. `null` means every tool the registry offers, an empty list means none. The one nullable field in the log, because the distinction it carries is the difference between an unrestricted session and a restricted one |
 
 ```json
-{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":2,"rudy_version":"0.1.0","workspace":{"root":"/Users/guy/projects/rudy","git_root":"/Users/guy/projects/rudy","project_id":"local/rudy"},"model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"thinking":"high","mode":"strict","agent":"default","parent_session_id":"","parent_tool_use_id":"","tools":null}
+{"id":"01K4M0A7Q8ZJ3N6R9T2V5X8B1D","at":"2026-09-07T20:30:00.123456789-06:00","kind":"session_opened","schema_version":3,"rudy_version":"0.1.0","workspace":{"root":"/Users/guy/projects/rudy","git_root":"/Users/guy/projects/rudy","project_id":"local/rudy"},"model":{"provider":"aperture","model":"cline-pass/kimi-k3"},"execution":{"kind":"native","provider":"aperture"},"thinking":"high","mode":"strict","agent":"default","parent_session_id":"","parent_tool_use_id":"","tools":null}
 ```
 
 A pass 1 log lacks the two parent fields; `Load` reads their absence as empty.
@@ -330,6 +532,9 @@ A pass 1 log lacks the two parent fields; `Load` reads their absence as empty.
 `tools` is the session's tool set as resolved at open: the agent definition's list, intersected with the caller's `tools` and with the parent's effective set. It is recorded **before** the `agent` deny that caps subagent depth, because that deny is derived on every rebuild from `parent_session_id` rather than replayed, so recording it would store a rule rather than a fact. A child under a parent that holds `agent` therefore records `agent` here and is still refused it. `null` means every tool the registry offers and an empty list means none, the same distinction the definition file carries. It is written because a session is rebuilt on resume long after its parent is gone, and recomputing it from the definition alone would hand back exactly what the intersection removed (ADR 0028).
 
 This field is why `schema_version` is 2. A version 1 log has no `tools` key, and an absent key is indistinguishable from an explicit `null` once decoded into a slice, so reading one as `null` would hand every pre-existing session the whole registry on its next resume: for a child that is the escalation this field exists to close. `Load` takes the definition's list for a version 1 log and the recorded value from version 2 on.
+
+`execution` raises the schema to 3. Versions 1 and 2 are native by definition.
+No migration writes an old log.
 
 That leaves one residual, stated rather than left to be discovered: a version 1 child log resumes under its own definition's list, which for any definition wider than its parent's set is wider than the bound a session opened today would get. There is nothing recorded to bound it and its parent is long gone. It is not a new escalation, since a session written before the field ran unbounded while it was live too, but it is looser than anything opened from now on. Refusing to resume such a log was considered and rejected: it would break sessions that predate the field, to retroactively enforce a rule they never ran under.
 
@@ -391,6 +596,29 @@ A version 1 log that does carry `tools` is a different case and is not covered b
 ```json
 {"id":"01K4M0AA...","at":"...","kind":"permission_decision","tool_use_id":"toolu_01","tool":"bash","mode":"strict","matcher":{"tool":"bash","prefix":"go test"},"decision":"allow","decided_by":"asker","scope":"session","reason":"allow for session"}
 {"id":"01K4M0AB...","at":"...","kind":"permission_decision","tool_use_id":"toolu_02","tool":"bash","mode":"strict","matcher":{"tool":"bash","prefix":"go test"},"decision":"allow","decided_by":"hook","scope":"once","reason":"hook","input":{"command":"go test ./..."}}
+```
+
+**`runtime_permission_decision`**
+
+| field | type | null | meaning |
+|---|---|---|---|
+| `runtime` | string | no | registered runtime name |
+| `thread_id` | string | no | verified linked thread |
+| `turn_id` | string | no | verified active runtime turn |
+| `item_id` | string | no | requesting runtime item |
+| `request_id` | string | no | canonical upstream request id |
+| `approval_kind` | `command`, `file_change`, `permissions` | no | request family |
+| `decision` | `allow`, `deny` | no | |
+| `decided_by` | `asker`, `no_asker`, `disconnect`, `timeout`, `stale`, `runtime_failure`, `shutdown` | no | fail-closed source or asker |
+| `scope` | `once`, `session` | no | session only from an explicit asker allow |
+| `reason` | string | no | never empty |
+
+The five binding fields are unique within one Session. An allow line is fsynced
+before its response crosses to the AgentRuntime. It has no paired `tool_result`
+because runtime history is canonical outside this log.
+
+```json
+{"id":"01K4M0AC...","at":"...","kind":"runtime_permission_decision","runtime":"codex","thread_id":"thr_1","turn_id":"turn_1","item_id":"item_1","request_id":"42","approval_kind":"command","decision":"allow","decided_by":"asker","scope":"once","reason":"allow once"}
 ```
 
 **`tool_result`**
@@ -504,6 +732,26 @@ A version 1 log that does carry `tools` is a different case and is not covered b
 | `providers` | table of name to `{fetched_at, error, models: [Model]}` | no | `error` empty on success; `models` is the last good list even when `error` is set |
 
 Refreshed on `session.open`, on picker open and on a `not_found` model error from a provider. No timer.
+
+### runtime.toml
+
+Exactly two non-null string keys:
+
+| key | meaning |
+|---|---|
+| `runtime` | registered AgentRuntime name; `codex` in this integration |
+| `thread_id` | non-empty canonical thread id returned by that runtime |
+
+Write a temporary file in the Session directory with mode `0600`, fsync it,
+rename it to `runtime.toml` and fsync the directory before starting the first
+turn. Refuse unknown keys, a runtime that differs from `session_opened.execution`
+or a thread id already linked to another Session. A fork writes its own returned
+thread id. The file is never copied or inherited.
+
+```toml
+runtime = "codex"
+thread_id = "thr_1"
+```
 
 ### config.toml
 
@@ -674,8 +922,10 @@ Every transition traced through protocol, event and record, else a recorded reas
 |---|---|---|---|
 | Server.RequestShutdown, CompleteShutdown | `server.shutdown`; response precedes shutdown, then `server.stopped` precedes EOF only after successful cleanup | `ServerShutdownRequested`, `ServerStopped` | none; Server identity and lifecycle are process facts, not durable records |
 | Session.Open | `session.open` | `SessionOpened` | `session_opened` |
+| Runtime Session.Open | `session.open` resolved through model `owner_kind` | `SessionOpened` | schema 3 `session_opened.execution`; no thread yet |
 | Session.Open, child | `session.open` with `parent` from a plugin | `SessionOpened`; the subagent runner consumes `TurnCompleted` and `TurnFailed` of the child | `session_opened` with `parent_session_id` and `parent_tool_use_id` |
 | Session.Fork | `session.fork` | `ForkPointRecorded` | `fork_point` |
+| Runtime Session.Fork | `session.fork` to `runtime.thread.fork` | `ThreadLinked`, `ForkPointRecorded` | child `session_opened`, `fork_point`, distinct `runtime.toml` |
 | Session.Load and Recovery | `session.resume` | none; recovery appends through `Append` | `tool_result` outcome `lost` |
 | Session.SetModel | `session.set_model` | `ModelChanged` | `model_change` |
 | Session.SetThinking | `session.set_thinking` | `ThinkingChanged` | `thinking_change` |
@@ -684,8 +934,11 @@ Every transition traced through protocol, event and record, else a recorded reas
 | Session.Enqueue | pass 3: not yet implemented; `session.submit` refuses a queued source with `invalid_argument` and there is no queue behind it | none until dequeued; queued messages would be in memory only, returned to the client on cancel | none; a queued message becomes a `user_message` only when it starts a turn |
 | Session.Append(note) | `plugin.append_note` | `NoteAppended` | `note` |
 | Turn.Start | `session.submit` source typed | `UserMessageAppended`, `TurnStarted` | `user_message` |
+| Runtime thread start | first runtime `session.submit` to `runtime.thread.start` | `ThreadLinked` | `runtime.toml` durable before turn start; an orphan thread is possible only before the link rename |
+| Runtime turn start or steer | `session.submit` to `runtime.turn.start` or `runtime.turn.steer` | `RuntimeTurnStarted`, `RuntimeItemProjected`, `RuntimeTurnCompleted` | canonical runtime thread; no copied conversation record |
 | Turn.OnResponse | none; provider stream | `AssistantMessageAppended` | `assistant_message` |
 | Gate decide | `session.answer` when asked | `ToolRequested`, `PermissionRequested`, `PermissionDecided` | `permission_decision` |
+| Runtime approval decide | `runtime.approval.request`, `runtime.permission.requested`, `runtime.approval.answer` | `RuntimeApprovalRequested`, `RuntimePermissionDecided`, `RuntimeApprovalResolved` | `runtime_permission_decision`, allow fsynced before runtime response |
 | Turn.RunTool | `tool.invoke` to plugin, `tool.state` to clients | `ToolStarted` | none until finished; the decision row precedes the run. Every call of one assistant message runs at once, so the `tool_result` rows of a turn may be in a different order from its `tool_use` blocks; both codecs pair them by id, and the invariant below is per `tool_use`, not positional. The results of one assistant message are assembled into a single message carrying every block, not one message per result: Anthropic's parallel tool use requires that shape, and splitting them is accepted on the wire but teaches the model to stop calling tools in parallel, which is the behaviour this wave exists to enable |
 | Turn.OnToolResult | none | `ToolFinished`, `ToolResultAppended` | `tool_result` |
 | Turn.Steer | `session.interrupt` how steer | `TurnSteering` | partial `assistant_message` stop_reason `interrupted`, or `tool_result` outcome `killed` |
@@ -699,6 +952,8 @@ Every transition traced through protocol, event and record, else a recorded reas
 | Plugin.Load, Ready, Fail, Stop | `plugin.init`; state via `plugin.state` | `PluginLoading`, `PluginReady`, `PluginFailed`, `PluginStopped` | none; plugin state is runtime, rebuilt at boot from config |
 | PluginRegistry.Register* | `plugin.register_*`, `plugin.set_status` | `CapabilityRegistered`, `CapabilityRejected` | none; capabilities are runtime |
 | Registry.Refresh | `registry.refresh`, implicit on open | `RegistryRefreshed` | `registry.json` |
+| Runtime login | `/login` through `command.run`, runtime login methods and caller-private notifications | `LoginStarted`, `LoginChallenged`, `LoginCompleted` | none; Codex owns credentials and challenges are ephemeral |
+| Runtime process start, fail and lazy restart | the version probe and App Server receive only the documented operational environment allowlist plus explicit process overrides; the built-in forces `CODEX_HOME` to `$XDG_DATA_HOME/rudy/codex`; active turns emit `runtime_failed` and linked Sessions reject submit or fork as `ambiguous` until `session.resume` reads canonical history; the next account, model or thread operation starts a replacement process | `RuntimeFailed`, `RuntimeStarted` | existing `runtime.toml` read on resume; lost non-idempotent calls never replayed |
 | session close | `session.close` | `session_closed` hook | none; closing is a connection fact, not a conversation fact |
 
 Invariants and where they are enforced:
@@ -706,6 +961,10 @@ Invariants and where they are enforced:
 | invariant | aggregate | record layer |
 |---|---|---|
 | unsafe tool runs only after a durable allow | Gate then `Session.Append` with fsync | line order plus fsync; `Load` checks order |
+| runtime authority crosses only after durable consent | AgentRuntime coordinator binds the question, then Session appends and fsyncs an allow before answering | `runtime_permission_decision` binding plus fsync; no runtime `tool_result` is synthesized |
+| one runtime thread belongs to one Rudy session | AgentRuntime coordinator rejects duplicate or mismatched links and never trusts an upstream session id | atomic mode-0600 `runtime.toml`; load rejects duplicate live bindings |
+| runtime projection is stable but not canonical | RuntimeProjector derives ids from the full runtime binding and replaces completed items | no projected content is stored in `entries.jsonl` |
+| ambiguous runtime mutations are not replayed | CodexRuntime fails the operation and reconciles by read | no retry record or second link is written |
 | one `tool_result` per `tool_use` | `Turn.OnToolResult` | Recovery writes `lost` |
 | `fork_point` only first | `Session.Fork` | `Load` refuses otherwise |
 | ids monotonic | `Session.Append` | `Load` refuses otherwise |
@@ -728,6 +987,9 @@ Invariants and where they are enforced:
 - [ ] `before_request` exposes headers only; body mutation is deferred and marked open
 - [ ] the dangerous set is not enumerated
 - [x] pass 3: child sessions, `session.compact`, `before_compaction`, `mcp.toml`, `plugins.lock.toml` trace through all three
+- [x] pass 10: AgentRuntime registration, login, model discovery, thread link,
+  resume, fork, turn, projection, approval and restart trace through protocol,
+  domain events and records or state why no record exists
 
 ## Open
 

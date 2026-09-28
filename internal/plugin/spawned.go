@@ -22,6 +22,7 @@ import (
 	toml "github.com/pelletier/go-toml/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -176,6 +177,7 @@ type Registrar interface {
 	RegisterCommand(name, description string) error
 	RegisterHook(point HookPoint, priority int) error
 	RegisterProvider(name, wire string) error
+	RegisterRuntime(name string) error
 	// RegisterAgent contributes an agent definition. tools is a pointer so an absent field and
 	// an explicit empty list stay distinguishable, the same as agents/<name>.md's frontmatter.
 	RegisterAgent(name, description, prompt string, tools *[]string, model, thinking string, maxTurns int) error
@@ -215,6 +217,12 @@ func Register(reg Registrar, method string, params json.RawMessage) (any, error)
 			return nil, fmt.Errorf("%w: %s", protocol.ErrInvalidArgument, err)
 		}
 		return ok, reg.RegisterProvider(p.Name, p.Wire)
+	case protocol.MethodPluginRegisterRuntime:
+		var p protocol.PluginRegisterRuntimeParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("%w: %s", protocol.ErrInvalidArgument, err)
+		}
+		return ok, reg.RegisterRuntime(p.Name)
 	case protocol.MethodPluginRegisterAgent:
 		var p protocol.PluginRegisterAgentParams
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -293,8 +301,9 @@ type Spawned struct {
 	procMu sync.Mutex
 	proc   *os.Process
 
-	mu     sync.Mutex
-	deltas map[string]*deltaSub
+	mu       sync.Mutex
+	deltas   map[string]*deltaSub
+	runtimes map[string]*remoteRuntime
 }
 
 // deltaSub is one in-flight provider.complete: the parts its plugin is streaming.
@@ -327,6 +336,7 @@ func newSpawnedWith(m Manifest, s SpawnServices, start func(ctx context.Context)
 		commit:   make(chan struct{}),
 		exited:   make(chan struct{}),
 		deltas:   map[string]*deltaSub{},
+		runtimes: map[string]*remoteRuntime{},
 	}
 }
 
@@ -648,6 +658,23 @@ func (s *Spawned) RegisterProvider(name, wire string) error {
 	return fmt.Errorf("%w: unknown provider wire %q", protocol.ErrInvalidArgument, wire)
 }
 
+func (s *Spawned) RegisterRuntime(name string) error {
+	if err := s.refuseLate("runtime", name); err != nil {
+		return err
+	}
+	if name != s.m.Name {
+		return fmt.Errorf("%w: plugin %s may register only runtime %s", protocol.ErrInvalidArgument, s.m.Name, s.m.Name)
+	}
+	runtime := &remoteRuntime{name: name, sp: s}
+	if err := s.host.RegisterRuntime(runtime); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.runtimes[name] = runtime
+	s.mu.Unlock()
+	return nil
+}
+
 // RegisterAgent stages an agent definition, the same thing an agents/<name>.md file carries. A
 // definition is static data, so unlike RegisterTool and RegisterProvider it needs no callback.
 // A spawned plugin is outside the process, so its input is validated here the same way
@@ -705,7 +732,37 @@ func (s *Spawned) Deliver(method string, params json.RawMessage) {
 	case protocol.NotifyToolProgress:
 		// Nothing renders a running tool's progress in this plan. A plugin that sends it is
 		// not doing anything wrong, so it is dropped here rather than refused.
+	case protocol.NotifyRuntimeEvent:
+		var p protocol.RuntimeEventParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return
+		}
+		if runtime := s.runtime(p.Runtime); runtime != nil {
+			runtime.deliverEvent(p.Event)
+		}
+	case protocol.NotifyRuntimeAccountUpdated:
+		var p agentruntime.AccountState
+		if err := json.Unmarshal(params, &p); err != nil {
+			return
+		}
+		if runtime := s.runtime(p.Runtime); runtime != nil {
+			runtime.deliverAccount(p)
+		}
+	case protocol.NotifyRuntimeLoginCompleted:
+		var p agentruntime.LoginCompletion
+		if err := json.Unmarshal(params, &p); err != nil {
+			return
+		}
+		if runtime := s.runtime(p.Runtime); runtime != nil {
+			runtime.deliverLogin(p)
+		}
 	}
+}
+
+func (s *Spawned) runtime(name string) *remoteRuntime {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runtimes[name]
 }
 
 // invoke is the tool body for a tool the child registered: one tool.invoke call. A context
@@ -819,6 +876,8 @@ func (s *Spawned) runCommand(name string) func(ctx context.Context, call Command
 			return SubmitPrompt{Text: out.Prompt}, nil
 		case out.Notice != "":
 			return Notice{Text: out.Notice}, nil
+		case out.AuthChallenge != nil:
+			return AuthChallenge{Runtime: out.AuthChallenge.Runtime, Mode: out.AuthChallenge.Mode}, nil
 		}
 		return NoAction{}, nil
 	}

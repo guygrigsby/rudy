@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
@@ -57,6 +58,8 @@ const (
 	CodeProviderError      = -32007
 	CodePluginError        = -32008
 	CodeInterrupted        = -32009
+	CodeRuntimeError       = -32010
+	CodeAmbiguous          = -32011
 )
 
 // ErrInvalidArgument is wrapped by handlers that reject a request shape or value.
@@ -96,7 +99,13 @@ func ErrorFrom(err error) *Error {
 			"body":   string(provErr.Body),
 		})
 	}
+	var runtimeErr *agentruntime.Error
+	if errors.As(err, &runtimeErr) {
+		return NewError(CodeRuntimeError, runtimeErr.Message, map[string]any{"runtime": runtimeErr.Runtime})
+	}
 	switch {
+	case errors.Is(err, agentruntime.ErrAmbiguous):
+		return NewError(CodeAmbiguous, err.Error(), nil)
 	case errors.Is(err, session.ErrInvariant):
 		return NewError(CodeRefusedByInvariant, err.Error(), nil)
 	case errors.Is(err, provider.ErrUnknownModel):

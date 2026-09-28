@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -29,17 +30,20 @@ type fakeChild struct {
 	version      int            // what to answer plugin.init with
 	register     bool           // send registrations before answering plugin.init
 	provider     bool           // register a wire: custom provider too
+	runtime      bool           // register an agent runtime too
 	slowTool     bool           // never answer tool.invoke, so the caller's context is what ends it
 	slowCommand  bool           // never answer command.invoke
 	failComplete bool           // answer provider.complete with an error
+	dropRuntime  string         // close the peer without answering this runtime mutation
 	extraRegs    []registerCall // additional plugin.register_* calls, sent last
 
-	mu      sync.Mutex
-	init    protocol.PluginInitParams
-	invoked []protocol.ToolInvokeParams
-	hooks   []protocol.HookFireParams
-	cancels []string
-	regErrs []error
+	mu        sync.Mutex
+	init      protocol.PluginInitParams
+	invoked   []protocol.ToolInvokeParams
+	completes []protocol.ProviderCompleteParams
+	hooks     []protocol.HookFireParams
+	cancels   []string
+	regErrs   []error
 
 	cancelled chan string
 }
@@ -140,10 +144,18 @@ func (c *fakeChild) handle(ctx context.Context, req protocol.Request) (any, *pro
 		if p.Args == "prompt" {
 			return protocol.CommandInvokeResult{Prompt: "say hi"}, nil, false
 		}
+		if p.Args == "login" {
+			return protocol.CommandInvokeResult{AuthChallenge: &protocol.RuntimeLoginStartParams{
+				Runtime: "hello", Mode: agentruntime.LoginDevice,
+			}}, nil, false
+		}
 		return protocol.CommandInvokeResult{Notice: "hello from the plugin"}, nil, false
 	case protocol.MethodProviderComplete:
 		var p protocol.ProviderCompleteParams
 		_ = json.Unmarshal(req.Params, &p)
+		c.mu.Lock()
+		c.completes = append(c.completes, p)
+		c.mu.Unlock()
 		if c.failComplete {
 			return nil, protocol.NewError(protocol.CodePluginError, "the model said no", nil), false
 		}
@@ -168,6 +180,34 @@ func (c *fakeChild) handle(ctx context.Context, req protocol.Request) (any, *pro
 		return protocol.ProviderListModelsResult{Models: []provider.Model{{
 			Ref: session.ModelRef{Provider: "hello", Model: "m1"}, DisplayName: "Hello 1",
 		}}}, nil, false
+	case protocol.MethodRuntimeModelList:
+		return protocol.RuntimeModelListResult{Models: []provider.Model{{
+			Ref: session.ModelRef{Provider: "hello", Model: "gpt"}, OwnerKind: provider.OwnerRuntime,
+		}}}, nil, false
+	case protocol.MethodRuntimeThreadStart:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeThreadResult{ThreadID: "thread-new"}, nil, false
+	case protocol.MethodRuntimeThreadFork:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeThreadResult{ThreadID: "thread-fork"}, nil, false
+	case protocol.MethodRuntimeTurnStart:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeTurnResult{TurnID: "turn-new"}, nil, false
+	case protocol.MethodRuntimeTurnSteer:
+		if c.dropRuntime == req.Method {
+			_ = c.peer.Close()
+			return nil, nil, true
+		}
+		return protocol.RuntimeTurnResult{TurnID: "turn-old"}, nil, false
 	}
 	return nil, protocol.NewError(protocol.CodeMethodNotFound, "no method "+req.Method, nil), false
 }
@@ -194,6 +234,9 @@ func (c *fakeChild) registerAll(ctx context.Context) {
 	}
 	if c.provider {
 		calls = append(calls, registerCall{protocol.MethodPluginRegisterProvider, protocol.PluginRegisterProviderParams{Name: "hello", Wire: protocol.WireCustom}})
+	}
+	if c.runtime {
+		calls = append(calls, registerCall{protocol.MethodPluginRegisterRuntime, protocol.PluginRegisterRuntimeParams{Name: "hello"}})
 	}
 	calls = append(calls, c.extraRegs...)
 	for _, call := range calls {
@@ -494,6 +537,14 @@ func TestSpawnedCommandInvokeMapsActions(t *testing.T) {
 	if !ok || n.Text != "hello from the plugin" {
 		t.Fatalf("action = %#v", act)
 	}
+	act, err = cmd.Run(context.Background(), CommandCall{Args: "login"})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	auth, ok := act.(AuthChallenge)
+	if !ok || auth.Runtime != "hello" || auth.Mode != agentruntime.LoginDevice {
+		t.Fatalf("action = %#v", act)
+	}
 }
 
 func TestSpawnedCustomProviderStreamsThenStops(t *testing.T) {
@@ -534,6 +585,130 @@ func TestSpawnedCustomProviderStreamsThenStops(t *testing.T) {
 	}
 	if len(models) != 1 || models[0].Ref.Model != "m1" {
 		t.Fatalf("models = %+v", models)
+	}
+}
+
+func TestProviderCompleteKeepsSessionAndHeadersAcrossWire(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) { c.provider = true })
+	ps := h.reg.Providers()
+	if len(ps) != 1 {
+		t.Fatalf("providers = %+v", ps)
+	}
+	sid := session.NewID()
+	wantHeaders := map[string]string{"X-Rudy-Session": sid.String(), "X-Test": "kept"}
+	if err := ps[0].Complete(context.Background(), provider.Request{
+		Model: session.ModelRef{Provider: "hello", Model: "m1"}, SessionID: sid, Headers: wantHeaders,
+	}, func(provider.Part) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	h.child.mu.Lock()
+	got := append([]protocol.ProviderCompleteParams(nil), h.child.completes...)
+	h.child.mu.Unlock()
+	if len(got) != 1 || got[0].SessionID != sid.String() || !reflect.DeepEqual(got[0].Headers, wantHeaders) {
+		t.Fatalf("provider.complete = %+v", got)
+	}
+}
+
+func TestSpawnedRuntimeRegistersAndListsModels(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) { c.runtime = true })
+	runtime, ok := h.reg.Runtime("hello")
+	if !ok {
+		t.Fatal("runtime not registered")
+	}
+	models, err := runtime.ListModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].Ref != (session.ModelRef{Provider: "hello", Model: "gpt"}) || models[0].OwnerKind != provider.OwnerRuntime {
+		t.Fatalf("models = %+v", models)
+	}
+}
+
+func TestSpawnedRuntimeLostMutationResponseIsAmbiguous(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		call   func(agentruntime.Runtime) error
+	}{
+		{name: "start thread", method: protocol.MethodRuntimeThreadStart, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.StartThread(context.Background(), agentruntime.StartThreadRequest{SessionID: session.NewID()})
+			return err
+		}},
+		{name: "fork thread", method: protocol.MethodRuntimeThreadFork, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.ForkThread(context.Background(), agentruntime.ThreadRef{SessionID: session.NewID(), ThreadID: "thread-old"})
+			return err
+		}},
+		{name: "start turn", method: protocol.MethodRuntimeTurnStart, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.StartTurn(context.Background(), agentruntime.StartTurnRequest{Thread: agentruntime.ThreadRef{SessionID: session.NewID(), ThreadID: "thread-old"}})
+			return err
+		}},
+		{name: "steer turn", method: protocol.MethodRuntimeTurnSteer, call: func(runtime agentruntime.Runtime) error {
+			_, err := runtime.SteerTurn(context.Background(), agentruntime.SteerTurnRequest{Turn: agentruntime.TurnRef{ThreadRef: agentruntime.ThreadRef{SessionID: session.NewID(), ThreadID: "thread-old"}, TurnID: "turn-old"}})
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := loadSpawned(t, nil, func(c *fakeChild) {
+				c.runtime = true
+				c.dropRuntime = test.method
+			})
+			runtime, ok := h.reg.Runtime("hello")
+			if !ok {
+				t.Fatal("runtime not registered")
+			}
+			if err := test.call(runtime); !errors.Is(err, agentruntime.ErrAmbiguous) {
+				t.Fatalf("err = %v, want ambiguous result", err)
+			}
+		})
+	}
+}
+
+type runtimeSink struct {
+	events chan agentruntime.Event
+}
+
+func (s *runtimeSink) RuntimeEvent(event agentruntime.Event)     { s.events <- event }
+func (*runtimeSink) AccountUpdated(agentruntime.AccountState)    {}
+func (*runtimeSink) LoginCompleted(agentruntime.LoginCompletion) {}
+func (*runtimeSink) RequestApproval(context.Context, agentruntime.ApprovalQuestion) (agentruntime.ApprovalAnswer, error) {
+	return agentruntime.ApprovalAnswer{Decision: agentruntime.DecisionDeny, Scope: agentruntime.ScopeOnce}, nil
+}
+
+func TestSpawnedRuntimeRoutesOnlyItsRegisteredEvents(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) { c.runtime = true })
+	runtime, ok := h.reg.Runtime("hello")
+	if !ok {
+		t.Fatal("runtime not registered")
+	}
+	sink := &runtimeSink{events: make(chan agentruntime.Event, 1)}
+	runtime.SetSink(sink)
+
+	wrong, err := protocol.NewNotification(protocol.NotifyRuntimeEvent, protocol.RuntimeEventParams{
+		Runtime: "other", Event: agentruntime.Event{Type: agentruntime.EventTurnStarted, ThreadID: "wrong"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.child.peer.Incoming().Send(context.Background(), wrong); err != nil {
+		t.Fatal(err)
+	}
+	right, err := protocol.NewNotification(protocol.NotifyRuntimeEvent, protocol.RuntimeEventParams{
+		Runtime: "hello", Event: agentruntime.Event{Type: agentruntime.EventTurnStarted, ThreadID: "thr-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.child.peer.Incoming().Send(context.Background(), right); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-sink.events:
+		if event.ThreadID != "thr-1" {
+			t.Fatalf("event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("registered runtime event was not delivered")
 	}
 }
 

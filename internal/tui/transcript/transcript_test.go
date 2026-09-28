@@ -12,6 +12,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -45,6 +46,20 @@ func entry(t *testing.T, p session.Payload) session.Entry {
 func newTestTranscript(t *testing.T) *Transcript {
 	t.Helper()
 	return New(Options{Width: 80, ToolCollapsed: true, ToolPreviewLines: 2, BlockGap: 1}, theme.Default())
+}
+
+func TestRuntimeFinalItemReplacesDeltaAndDedupesReplay(t *testing.T) {
+	tr := newTestTranscript(t)
+	tr.RuntimeDelta(protocol.RuntimeDeltaParams{TurnID: "turn-1", ItemID: "item-1", Kind: agentruntime.ItemAgentMessage, Text: "hel"})
+	id := session.NewID()
+	entry := agentruntime.ProjectedEntry{ID: id, Kind: agentruntime.ItemAgentMessage, TurnID: "turn-1", ItemID: "item-1", Content: []session.Block{session.TextBlock("hello")}}
+	tr.RuntimeEntry(entry)
+	tr.RuntimeEntry(entry)
+	tr.RuntimeDelta(protocol.RuntimeDeltaParams{TurnID: "turn-1", ItemID: "item-1", Kind: agentruntime.ItemAgentMessage, Text: "stale"})
+	rows := tr.Rows()
+	if len(rows) != 1 || rows[0].Key != id.String() || rows[0].Text != "hello" || rows[0].Live {
+		t.Fatalf("runtime rows = %+v", rows)
+	}
 }
 
 // assistantEntry is one assistant_message entry carrying blocks, for a test that only cares

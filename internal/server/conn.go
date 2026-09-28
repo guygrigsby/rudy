@@ -17,8 +17,9 @@ import (
 // notifications and responses leave in the order they were produced, and a slow client never
 // blocks whoever is producing them (the turn.Runner's Observer callbacks, in particular).
 type conn struct {
-	id int
-	c  protocol.Conn
+	id       int
+	c        protocol.Conn
+	lifetime context.Context
 	// hello is whether this connection may dispatch anything but client.hello. A plugin
 	// connection starts true: the server handed it out itself, so there is nothing to
 	// introduce. greeted is whether a client.hello has actually been answered, which is
@@ -54,7 +55,10 @@ type outbound struct {
 }
 
 func newConn(id int, c protocol.Conn) *conn {
-	return &conn{id: id, c: c, wake: make(chan struct{}, 1), pumpDone: make(chan struct{}), subs: map[ulid.ULID]*liveSession{}}
+	return &conn{
+		id: id, c: c, lifetime: context.Background(), wake: make(chan struct{}, 1),
+		pumpDone: make(chan struct{}), subs: map[ulid.ULID]*liveSession{},
+	}
 }
 
 // send enqueues msg without blocking.

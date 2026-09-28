@@ -160,6 +160,8 @@ type Listener struct {
 // authentication.
 type sameUserConn struct{ Conn }
 
+func (c sameUserConn) Disconnected() <-chan struct{} { return Disconnected(c.Conn) }
+
 // IsSameUser reports whether c came from this package's successful listener-side peer check.
 func IsSameUser(c Conn) bool {
 	_, ok := c.(sameUserConn)

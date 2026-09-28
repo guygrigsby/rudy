@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tui/input"
@@ -258,6 +259,13 @@ func (m *Model) runCommand(name, args, draft string) tea.Cmd {
 	if localCommand(name) {
 		return m.runLocal(name, args)
 	}
+	if name == "login" {
+		if m.remote {
+			args = "device"
+		} else if args == "" {
+			args = "browser"
+		}
+	}
 	m.pendingCommand = draft
 	return m.callNamed(protocol.MethodCommandRun, name, protocol.CommandRunParams{
 		SessionID: m.session.SessionID,
@@ -367,6 +375,28 @@ func (m *Model) reaskOne(sid, toolUseID string) {
 // keyboard has no way to name one but the nearest until a picker gives it one, which is why
 // that row is also the only one that draws the keys.
 func (m *Model) answer(k tea.KeyPressMsg) (tea.Cmd, bool) {
+	if m.session.Execution.Kind == session.ExecutionRuntime && len(m.runtimePromptOrder) > 0 {
+		id := m.runtimePromptOrder[len(m.runtimePromptOrder)-1]
+		p, ok := m.runtimePrompts[id]
+		if ok {
+			decision, scope, matched := answerKey(tea.Key(k))
+			if !matched {
+				return nil, false
+			}
+			if m.runtimeAnswered[id] {
+				return nil, true
+			}
+			if decision == session.Allow && !slices.Contains(p.AllowedScopes, agentruntime.ApprovalScope(scope)) {
+				return nil, true
+			}
+			m.runtimeAnswered[id] = true
+			answer := protocol.RuntimeApprovalAnswerParams{SessionID: p.SessionID, TurnID: p.TurnID, RequestID: p.RequestID, Decision: agentruntime.ApprovalDecision(decision), Scope: agentruntime.ApprovalScope(scope), Reason: answerReason}
+			if decision == session.Allow && p.Kind == agentruntime.ApprovalPermissions {
+				answer.Granted = slices.Clone(p.Permissions)
+			}
+			return m.callNamed(protocol.MethodRuntimeApprovalAnswer, id, answer), true
+		}
+	}
 	p := m.focused()
 	if p == nil {
 		return nil, false

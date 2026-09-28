@@ -15,7 +15,9 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 )
@@ -73,6 +75,163 @@ func TestReadPrompt(t *testing.T) {
 				t.Fatalf("got %q want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestRuntimeTurnOutputAcceptsOpaqueTurnID(t *testing.T) {
+	out := &turnOutput{turnID: "codex-turn-1", runtime: true, seenRuntime: map[string]bool{}}
+	id := session.NewID()
+	e := agentruntime.ProjectedEntry{ID: id, Kind: agentruntime.ItemAgentMessage, TurnID: "codex-turn-1", ItemID: "item-1", Content: []session.Block{session.TextBlock("hello")}}
+	raw, err := json.Marshal(protocol.RuntimeEntryParams{SessionID: "session", Entry: e})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := protocol.Notification{Method: protocol.NotifyRuntimeEntry, Params: raw}
+	for range 2 {
+		if done, err := out.observe(n); err != nil || done {
+			t.Fatalf("observe: done=%v err=%v", done, err)
+		}
+	}
+	if out.text != "hello" {
+		t.Fatalf("result %q", out.text)
+	}
+}
+
+func TestRuntimeTurnOutputUsesTerminalUsageUpdate(t *testing.T) {
+	out := &turnOutput{turnID: "codex-turn-1", runtime: true, seenRuntime: map[string]bool{}}
+	want := session.Usage{Input: 10, Output: 2, CacheRead: 3}
+	raw, err := json.Marshal(protocol.RuntimeUsageUpdated{SessionID: "session", TurnID: "codex-turn-1", Usage: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done, err := out.observe(protocol.Notification{Method: protocol.NotifyRuntimeUsageUpdated, Params: raw}); err != nil || done {
+		t.Fatalf("observe: done=%v err=%v", done, err)
+	}
+	if out.usage != want {
+		t.Fatalf("usage = %+v, want %+v", out.usage, want)
+	}
+}
+
+func TestRuntimeIdleStateReportsInterruptedStop(t *testing.T) {
+	out := &turnOutput{turnID: "codex-turn-1", runtime: true, seenRuntime: map[string]bool{}}
+	raw, err := json.Marshal(protocol.TurnStateChanged{SessionID: "session", TurnID: "codex-turn-1", State: "idle"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := out.observe(protocol.Notification{Method: protocol.NotifyTurnState, Params: raw})
+	if err != nil || !done {
+		t.Fatalf("observe: done=%v err=%v", done, err)
+	}
+	if out.stopReason != session.StopInterrupted {
+		t.Fatalf("stop reason = %q, want interrupted", out.stopReason)
+	}
+}
+
+func TestHeadlessLoginRequestsDeviceAndPrintsChallenge(t *testing.T) {
+	clientEnd, serverEnd := protocol.Pipe()
+	client := protocol.NewClient(clientEnd)
+	defer func() { _ = client.Close(); _ = serverEnd.Close() }()
+	request := make(chan protocol.Request, 1)
+	go func() {
+		raw, err := serverEnd.Recv(context.Background())
+		if err != nil {
+			return
+		}
+		var req protocol.Request
+		if json.Unmarshal(raw, &req) != nil {
+			return
+		}
+		request <- req
+		challenge := agentruntime.AuthChallenge{Type: agentruntime.ChallengeDevice, Runtime: "codex", LoginID: "login-1", VerificationURL: "https://auth.openai.com/device", UserCode: "ABCD"}
+		response, _ := protocol.NewResponse(req.ID, protocol.CommandRunResult{AuthChallenge: &challenge})
+		_ = serverEnd.Send(context.Background(), response)
+	}()
+	var out bytes.Buffer
+	id, challenge, code, err := submit(context.Background(), client, "sid", "/login", &out, io.Discard)
+	if err != nil || code != 0 || id != "" {
+		t.Fatalf("submit: id=%q code=%d err=%v", id, code, err)
+	}
+	req := <-request
+	var params protocol.CommandRunParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if params.Name != "login" || params.Args != "device" {
+		t.Fatalf("command = %+v", params)
+	}
+	if _, err := noOpResult(printOptions{Output: "text"}, protocol.SessionInfo{SessionID: "sid"}, challenge, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "https://auth.openai.com/device") || !strings.Contains(out.String(), "ABCD") {
+		t.Fatalf("challenge output = %q", out.String())
+	}
+}
+
+func TestHeadlessLoginOverridesExplicitBrowserMode(t *testing.T) {
+	clientEnd, serverEnd := protocol.Pipe()
+	client := protocol.NewClient(clientEnd)
+	defer func() { _ = client.Close(); _ = serverEnd.Close() }()
+	request := make(chan protocol.Request, 1)
+	go func() {
+		raw, err := serverEnd.Recv(context.Background())
+		if err != nil {
+			return
+		}
+		var req protocol.Request
+		if json.Unmarshal(raw, &req) != nil {
+			return
+		}
+		request <- req
+		response, _ := protocol.NewResponse(req.ID, protocol.CommandRunResult{})
+		_ = serverEnd.Send(context.Background(), response)
+	}()
+	if _, _, code, err := submit(context.Background(), client, "sid", "/login browser", io.Discard, io.Discard); err != nil || code != 0 {
+		t.Fatalf("submit: code=%d err=%v", code, err)
+	}
+	req := <-request
+	var params protocol.CommandRunParams
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if params.Args != "device" {
+		t.Fatalf("login args = %q, want device", params.Args)
+	}
+}
+
+func TestHeadlessLoginWaitsForMatchingCompletion(t *testing.T) {
+	clientEnd, serverEnd := protocol.Pipe()
+	client := protocol.NewClient(clientEnd)
+	defer func() { _ = client.Close(); _ = serverEnd.Close() }()
+	challenge := agentruntime.AuthChallenge{Type: agentruntime.ChallengeDevice, Runtime: "codex", LoginID: "login-1", VerificationURL: "https://auth.openai.com/device", UserCode: "ABCD"}
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		completion := agentruntime.LoginCompletion{Runtime: "codex", LoginID: "login-1", Success: true}
+		note, _ := protocol.NewNotification(protocol.NotifyRuntimeLoginCompleted, completion)
+		_ = serverEnd.Send(context.Background(), note)
+		close(done)
+	}()
+	if code, err := waitLoginCompletion(context.Background(), printOptions{Output: "text"}, client, challenge, io.Discard, io.Discard); err != nil || code != 0 {
+		t.Fatalf("wait completion: code=%d err=%v", code, err)
+	}
+	<-done
+}
+
+func TestNoOpJSONDeviceChallengeIsStructured(t *testing.T) {
+	challenge := &agentruntime.AuthChallenge{Type: agentruntime.ChallengeDevice, Runtime: "codex", LoginID: "login-1", VerificationURL: "https://auth.openai.com/device", UserCode: "ABCD"}
+	var out bytes.Buffer
+	code, err := noOpResult(printOptions{Output: "json"}, protocol.SessionInfo{SessionID: "sid"}, challenge, &out)
+	if err != nil || code != 0 {
+		t.Fatalf("result: code=%d err=%v", code, err)
+	}
+	var payload struct {
+		AuthChallenge agentruntime.AuthChallenge `json:"auth_challenge"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.AuthChallenge.UserCode != "ABCD" {
+		t.Fatalf("payload = %+v", payload)
 	}
 }
 

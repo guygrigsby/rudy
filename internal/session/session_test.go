@@ -127,6 +127,35 @@ func TestAllowDecisionIsOnDiskBeforeAppendReturns(t *testing.T) {
 	}
 }
 
+func TestRuntimeAllowIsOnDiskBeforeAppendReturns(t *testing.T) {
+	_, s := newSession(t)
+	decision := RuntimePermissionDecision{
+		Runtime: "codex", ThreadID: "thr-1", TurnID: "turn-1", ItemID: "item-1", RequestID: "42",
+		ApprovalKind: RuntimeApprovalCommand, Decision: Allow, DecidedBy: RuntimeByAsker,
+		Scope: ScopeOnce, Reason: "allow once",
+	}
+	mustAppend(t, s, decision)
+	onDisk, err := ReadLog(s.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := onDisk[len(onDisk)-1]
+	if last.Kind != KindRuntimePermissionDecision || last.Payload != decision {
+		t.Fatalf("last entry on disk = %+v", last)
+	}
+	if _, err := s.Append(decision); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("duplicate runtime decision = %v, want ErrInvariant", err)
+	}
+}
+
+func TestExecutionInfersLegacyNativeOwner(t *testing.T) {
+	_, s := newSession(t)
+	got := s.Execution()
+	if got.Kind != ExecutionNative || got.Provider != "aperture" {
+		t.Fatalf("execution = %+v", got)
+	}
+}
+
 func TestDerivedGettersFollowChanges(t *testing.T) {
 	_, s := newSession(t)
 	mustAppend(t, s, ModelChange{Model: ModelRef{"aperture", "gpt-5.6-sol"}})

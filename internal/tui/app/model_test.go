@@ -20,6 +20,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -147,6 +148,155 @@ type recorded struct {
 func newHarness(t *testing.T, over map[string]any) *harness {
 	t.Helper()
 	return newHarnessPrompt(t, over, "")
+}
+
+func TestLoginUsesDeviceModeWhenClientIsRemote(t *testing.T) {
+	h := newHarnessWith(t, nil, func(o *Options) { o.Remote = true })
+	cmd := h.m.runCommand("login", "", "/login")
+	if cmd == nil {
+		t.Fatal("login did not call server")
+	}
+	_ = cmd()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.reqs) == 0 || h.reqs[len(h.reqs)-1].Method != protocol.MethodCommandRun || !strings.Contains(string(h.reqs[len(h.reqs)-1].Params), `"args":"device"`) {
+		t.Fatalf("requests = %+v", h.reqs)
+	}
+}
+
+func TestRemoteLoginOverridesExplicitBrowserMode(t *testing.T) {
+	h := newHarnessWith(t, nil, func(o *Options) { o.Remote = true })
+	cmd := h.m.runCommand("login", "browser", "/login browser")
+	if cmd == nil {
+		t.Fatal("login did not call server")
+	}
+	_ = cmd()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.reqs) == 0 || !strings.Contains(string(h.reqs[len(h.reqs)-1].Params), `"args":"device"`) {
+		t.Fatalf("requests = %+v", h.reqs)
+	}
+}
+
+func TestRemoteBrowserChallengeNeverRunsLocalOpener(t *testing.T) {
+	opened := 0
+	h := newHarnessWith(t, nil, func(o *Options) {
+		o.Remote = true
+		o.OpenAuthURL = func(context.Context, string) error { opened++; return nil }
+	})
+	cmd := h.m.authChallenge(agentruntime.AuthChallenge{Type: agentruntime.ChallengeBrowser, Runtime: "codex", LoginID: "login-1", URL: "https://auth.openai.com/x"})
+	if cmd == nil {
+		t.Fatal("remote browser challenge did not request fallback")
+	}
+	fallback := h.update(cmd())
+	if fallback == nil {
+		t.Fatal("remote browser challenge did not request device login")
+	}
+	_ = fallback()
+	if opened != 0 {
+		t.Fatalf("remote challenge opened browser %d times", opened)
+	}
+}
+
+func TestBrowserChallengeFailureRequestsDeviceFallback(t *testing.T) {
+	h := newHarnessWith(t, nil, func(o *Options) {
+		o.OpenAuthURL = func(context.Context, string) error { return fmt.Errorf("opener failed") }
+	})
+	challenge := agentruntime.AuthChallenge{Type: agentruntime.ChallengeBrowser, Runtime: "codex", LoginID: "login-1", URL: "https://auth.openai.com/x"}
+	raw, err := json.Marshal(protocol.CommandRunResult{AuthChallenge: &challenge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := h.update(CallResultMsg{Method: protocol.MethodCommandRun, Name: "login", Result: raw})
+	if cmd == nil {
+		t.Fatal("browser challenge did not produce an opener command")
+	}
+	msg := cmd()
+	fallback := h.update(msg)
+	if fallback == nil {
+		t.Fatal("failed browser did not request device login")
+	}
+	_ = fallback()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.reqs) == 0 || !strings.Contains(string(h.reqs[len(h.reqs)-1].Params), `"args":"device"`) {
+		t.Fatalf("fallback requests = %+v", h.reqs)
+	}
+}
+
+func TestServerDeviceFallbackSupersedesPendingBrowserOpener(t *testing.T) {
+	h := newHarnessWith(t, nil, func(o *Options) {
+		o.OpenAuthURL = func(context.Context, string) error { return fmt.Errorf("opener failed") }
+	})
+	browser := agentruntime.AuthChallenge{Type: agentruntime.ChallengeBrowser, Runtime: "codex", LoginID: "browser-1", URL: "https://auth.openai.com/x"}
+	browserCmd := h.m.authChallenge(browser)
+	if browserCmd == nil {
+		t.Fatal("browser challenge did not produce an opener command")
+	}
+	h.notify(protocol.NotifyRuntimeLoginChallenge, agentruntime.AuthChallenge{
+		Type: agentruntime.ChallengeDevice, Runtime: "codex", LoginID: "device-1",
+		VerificationURL: "https://auth.openai.com/device", UserCode: "ABCD",
+	})
+	if fallback := h.update(browserCmd()); fallback != nil {
+		t.Fatal("late browser failure replaced the server's device fallback")
+	}
+}
+
+func TestCompletedLoginDoesNotOpenLateBrowserChallenge(t *testing.T) {
+	opened := 0
+	h := newHarnessWith(t, nil, func(o *Options) {
+		o.OpenAuthURL = func(context.Context, string) error { opened++; return nil }
+	})
+	h.notify(protocol.NotifyRuntimeLoginCompleted, agentruntime.LoginCompletion{Runtime: "codex", LoginID: "login-1", Success: true})
+	challenge := agentruntime.AuthChallenge{Type: agentruntime.ChallengeBrowser, Runtime: "codex", LoginID: "login-1", URL: "https://auth.openai.com/x"}
+	raw, err := json.Marshal(protocol.CommandRunResult{AuthChallenge: &challenge})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd := h.update(CallResultMsg{Method: protocol.MethodCommandRun, Name: "login", Result: raw}); cmd != nil {
+		_ = cmd()
+	}
+	if opened != 0 {
+		t.Fatalf("opened completed challenge %d times", opened)
+	}
+}
+
+func TestRuntimeProjectionNotificationDedupesReplay(t *testing.T) {
+	h := newHarness(t, nil)
+	id := session.NewID()
+	e := agentruntime.ProjectedEntry{ID: id, Kind: agentruntime.ItemAgentMessage, TurnID: "turn-1", ItemID: "item-1", Content: []session.Block{session.TextBlock("hello")}}
+	h.notify(protocol.NotifyRuntimeDelta, protocol.RuntimeDeltaParams{SessionID: h.m.session.SessionID, TurnID: "turn-1", ItemID: "item-1", Kind: agentruntime.ItemAgentMessage, Text: "hel"})
+	h.notify(protocol.NotifyRuntimeEntry, protocol.RuntimeEntryParams{SessionID: h.m.session.SessionID, Entry: e})
+	h.notify(protocol.NotifyRuntimeEntry, protocol.RuntimeEntryParams{SessionID: h.m.session.SessionID, Entry: e})
+	rows := h.m.tr.Rows()
+	if len(rows) != 1 || rows[0].Text != "hello" {
+		t.Fatalf("runtime rows = %+v", rows)
+	}
+}
+
+func TestRuntimeProjectionCountsTurnUsageOnce(t *testing.T) {
+	h := newHarness(t, nil)
+	usage := session.Usage{Input: 10, Output: 2}
+	for i := range 2 {
+		e := agentruntime.ProjectedEntry{ID: session.NewID(), Kind: agentruntime.ItemAgentMessage, TurnID: "turn-1", ItemID: fmt.Sprintf("item-%d", i), Content: []session.Block{session.TextBlock("text")}, Usage: usage}
+		h.notify(protocol.NotifyRuntimeEntry, protocol.RuntimeEntryParams{SessionID: h.m.session.SessionID, Entry: e})
+	}
+	if h.m.usage != usage {
+		t.Fatalf("usage = %+v, want %+v", h.m.usage, usage)
+	}
+}
+
+func TestRuntimeUsageNotificationReplacesProjectedUsage(t *testing.T) {
+	h := newHarness(t, nil)
+	h.notify(protocol.NotifyRuntimeEntry, protocol.RuntimeEntryParams{SessionID: h.m.session.SessionID, Entry: agentruntime.ProjectedEntry{
+		ID: session.NewID(), Kind: agentruntime.ItemAgentMessage, TurnID: "turn-1", ItemID: "item-1",
+		Content: []session.Block{session.TextBlock("text")}, Usage: session.Usage{Input: 4, Output: 1},
+	}})
+	want := session.Usage{Input: 10, Output: 2, CacheRead: 3}
+	h.notify(protocol.NotifyRuntimeUsageUpdated, protocol.RuntimeUsageUpdated{SessionID: h.m.session.SessionID, TurnID: "turn-1", Usage: want})
+	if h.m.usage != want {
+		t.Fatalf("usage = %+v, want %+v", h.m.usage, want)
+	}
 }
 
 // newHarnessPrompt is newHarness with a draft already in the editor, the way a positional

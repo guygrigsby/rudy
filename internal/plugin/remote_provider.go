@@ -53,12 +53,14 @@ func (p *remoteProvider) Complete(ctx context.Context, req provider.Request, emi
 		var res protocol.ProviderCompleteResult
 		err := p.sp.peer.Client().Call(ctx, protocol.MethodProviderComplete, protocol.ProviderCompleteParams{
 			RequestID: id,
+			SessionID: req.SessionID.String(),
 			Model:     req.Model,
 			System:    req.System,
 			Messages:  req.Messages,
 			Tools:     req.Tools,
 			Thinking:  req.Thinking,
 			MaxTokens: req.MaxTokens,
+			Headers:   req.Headers,
 		}, &res)
 		done <- completion{res: res, err: err}
 	}()

@@ -5,6 +5,7 @@ package protocol
 import (
 	"encoding/json"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
 	"github.com/guygrigsby/rudy/internal/tool"
@@ -16,26 +17,27 @@ const ProtocolVersion = 1
 
 // Methods, client to server.
 const (
-	MethodClientHello        = "client.hello"
-	MethodServerShutdown     = "server.shutdown"
-	MethodSessionOpen        = "session.open"
-	MethodSessionResume      = "session.resume"
-	MethodSessionFork        = "session.fork"
-	MethodSessionList        = "session.list"
-	MethodSessionClose       = "session.close"
-	MethodSessionSubmit      = "session.submit"
-	MethodSessionShell       = "session.shell"
-	MethodSessionInterrupt   = "session.interrupt"
-	MethodSessionAnswer      = "session.answer"
-	MethodSessionSetModel    = "session.set_model"
-	MethodSessionSetMode     = "session.set_mode"
-	MethodSessionSetThinking = "session.set_thinking"
-	MethodSessionSetTitle    = "session.set_title"
-	MethodSessionCompact     = "session.compact"
-	MethodRegistryList       = "registry.list"
-	MethodRegistryRefresh    = "registry.refresh"
-	MethodCommandRun         = "command.run"
-	MethodCommandList        = "command.list"
+	MethodClientHello           = "client.hello"
+	MethodServerShutdown        = "server.shutdown"
+	MethodSessionOpen           = "session.open"
+	MethodSessionResume         = "session.resume"
+	MethodSessionFork           = "session.fork"
+	MethodSessionList           = "session.list"
+	MethodSessionClose          = "session.close"
+	MethodSessionSubmit         = "session.submit"
+	MethodSessionShell          = "session.shell"
+	MethodSessionInterrupt      = "session.interrupt"
+	MethodSessionAnswer         = "session.answer"
+	MethodRuntimeApprovalAnswer = "runtime.approval.answer"
+	MethodSessionSetModel       = "session.set_model"
+	MethodSessionSetMode        = "session.set_mode"
+	MethodSessionSetThinking    = "session.set_thinking"
+	MethodSessionSetTitle       = "session.set_title"
+	MethodSessionCompact        = "session.compact"
+	MethodRegistryList          = "registry.list"
+	MethodRegistryRefresh       = "registry.refresh"
+	MethodCommandRun            = "command.run"
+	MethodCommandList           = "command.list"
 )
 
 // Methods, plugin to server. A connection may send these only when its caller class is
@@ -47,6 +49,8 @@ const (
 	MethodPluginRegisterHook     = "plugin.register_hook"
 	MethodPluginRegisterWidget   = "plugin.register_widget"
 	MethodPluginRegisterProvider = "plugin.register_provider"
+	MethodPluginRegisterRuntime  = "plugin.register_runtime"
+	MethodRuntimeApprovalRequest = "runtime.approval.request"
 	MethodPluginRegisterAgent    = "plugin.register_agent"
 	MethodPluginSetStatus        = "plugin.set_status"
 )
@@ -54,33 +58,53 @@ const (
 // Methods, server to plugin. Only a spawned plugin is ever called: a linked plugin is the
 // same Go interface on the other side of a function call.
 const (
-	MethodPluginInit         = "plugin.init"
-	MethodToolInvoke         = "tool.invoke"
-	MethodToolCancel         = "tool.cancel"
-	MethodHookFire           = "hook.fire"
-	MethodCommandInvoke      = "command.invoke"
-	MethodProviderComplete   = "provider.complete"
-	MethodProviderListModels = "provider.list_models"
+	MethodPluginInit           = "plugin.init"
+	MethodToolInvoke           = "tool.invoke"
+	MethodToolCancel           = "tool.cancel"
+	MethodHookFire             = "hook.fire"
+	MethodCommandInvoke        = "command.invoke"
+	MethodProviderComplete     = "provider.complete"
+	MethodProviderListModels   = "provider.list_models"
+	MethodRuntimeAccountRead   = "runtime.account.read"
+	MethodRuntimeLoginStart    = "runtime.login.start"
+	MethodRuntimeLoginCancel   = "runtime.login.cancel"
+	MethodRuntimeModelList     = "runtime.model.list"
+	MethodRuntimeThreadStart   = "runtime.thread.start"
+	MethodRuntimeThreadResume  = "runtime.thread.resume"
+	MethodRuntimeThreadFork    = "runtime.thread.fork"
+	MethodRuntimeThreadRead    = "runtime.thread.read"
+	MethodRuntimeTurnStart     = "runtime.turn.start"
+	MethodRuntimeTurnSteer     = "runtime.turn.steer"
+	MethodRuntimeTurnInterrupt = "runtime.turn.interrupt"
 )
 
 // Notifications, plugin to server.
 const (
-	NotifyToolProgress  = "tool.progress"
-	NotifyProviderDelta = "provider.delta"
+	NotifyToolProgress          = "tool.progress"
+	NotifyProviderDelta         = "provider.delta"
+	NotifyRuntimeEvent          = "runtime.event"
+	NotifyRuntimeAccountUpdated = "runtime.account.updated"
+	NotifyRuntimeLoginCompleted = "runtime.login.completed"
 )
 
 // Notifications, server to client.
 const (
-	NotifyEntryAppended       = "entry.appended"
-	NotifyStreamDelta         = "stream.delta"
-	NotifyTurnState           = "turn.state"
-	NotifyToolState           = "tool.state"
-	NotifyPermissionRequested = "permission.requested"
-	NotifyNotice              = "notice"
-	NotifyStatusUpdated       = "status.updated"
-	NotifyWidgetUpdated       = "widget.updated"
-	NotifyPluginState         = "plugin.state"
-	NotifyServerStopped       = "server.stopped"
+	NotifyEntryAppended              = "entry.appended"
+	NotifyStreamDelta                = "stream.delta"
+	NotifyTurnState                  = "turn.state"
+	NotifyToolState                  = "tool.state"
+	NotifyPermissionRequested        = "permission.requested"
+	NotifyRuntimePermissionRequested = "runtime.permission.requested"
+	NotifyRuntimePermissionResolved  = "runtime.permission.resolved"
+	NotifyNotice                     = "notice"
+	NotifyStatusUpdated              = "status.updated"
+	NotifyWidgetUpdated              = "widget.updated"
+	NotifyPluginState                = "plugin.state"
+	NotifyServerStopped              = "server.stopped"
+	NotifyRuntimeLoginChallenge      = "runtime.login.challenge"
+	NotifyRuntimeEntry               = "runtime.entry"
+	NotifyRuntimeDelta               = "runtime.delta"
+	NotifyRuntimeUsageUpdated        = "runtime.usage.updated"
 )
 
 // Span is one run of text with a theme role, the only thing a plugin may put in a status
@@ -203,12 +227,34 @@ type ParentRef struct {
 }
 
 type SessionInfo struct {
+	SessionID    string                `json:"session_id"`
+	Workspace    session.Workspace     `json:"workspace"`
+	Model        session.ModelRef      `json:"model"`
+	Mode         session.Mode          `json:"mode"`
+	Thinking     session.ThinkingLevel `json:"thinking"`
+	Title        string                `json:"title"`
+	Execution    session.Execution     `json:"execution"`
+	ThreadLinked bool                  `json:"thread_linked"`
+}
+
+type RuntimeEntryParams struct {
+	SessionID string                      `json:"session_id"`
+	Entry     agentruntime.ProjectedEntry `json:"entry"`
+}
+
+type RuntimeDeltaParams struct {
 	SessionID string                `json:"session_id"`
-	Workspace session.Workspace     `json:"workspace"`
-	Model     session.ModelRef      `json:"model"`
-	Mode      session.Mode          `json:"mode"`
-	Thinking  session.ThinkingLevel `json:"thinking"`
-	Title     string                `json:"title"`
+	TurnID    string                `json:"turn_id"`
+	ItemID    string                `json:"item_id"`
+	Kind      agentruntime.ItemType `json:"kind"`
+	Text      string                `json:"text"`
+	Replace   bool                  `json:"replace"`
+}
+
+type RuntimeUsageUpdated struct {
+	SessionID string        `json:"session_id"`
+	TurnID    string        `json:"turn_id"`
+	Usage     session.Usage `json:"usage"`
 }
 
 type SessionResumeParams struct {
@@ -325,7 +371,8 @@ type CommandRunResult struct {
 	TurnID string `json:"turn_id,omitempty"`
 	Notice string `json:"notice,omitempty"`
 	// SessionID is set when the command opened another session, a fork.
-	SessionID string `json:"session_id,omitempty"`
+	SessionID     string                      `json:"session_id,omitempty"`
+	AuthChallenge *agentruntime.AuthChallenge `json:"auth_challenge,omitempty"`
 }
 
 type PluginAppendNoteParams struct {
@@ -379,6 +426,37 @@ type PermissionRequested struct {
 	Matcher   session.Matcher `json:"matcher"`
 }
 
+type RuntimePermissionRequested struct {
+	SessionID     string                           `json:"session_id"`
+	TurnID        string                           `json:"turn_id"`
+	RequestID     string                           `json:"request_id"`
+	ItemID        string                           `json:"item_id"`
+	Kind          agentruntime.ApprovalKind        `json:"kind"`
+	Summary       string                           `json:"summary"`
+	Command       string                           `json:"command"`
+	CWD           string                           `json:"cwd"`
+	Reason        string                           `json:"reason"`
+	Changes       []agentruntime.FileChange        `json:"changes"`
+	Network       []agentruntime.NetworkPermission `json:"network"`
+	Permissions   []string                         `json:"permissions"`
+	AllowedScopes []agentruntime.ApprovalScope     `json:"allowed_scopes"`
+}
+
+type RuntimePermissionResolved struct {
+	SessionID string `json:"session_id"`
+	RequestID string `json:"request_id"`
+}
+
+type RuntimeApprovalAnswerParams struct {
+	SessionID string                        `json:"session_id"`
+	TurnID    string                        `json:"turn_id"`
+	RequestID string                        `json:"request_id"`
+	Decision  agentruntime.ApprovalDecision `json:"decision"`
+	Scope     agentruntime.ApprovalScope    `json:"scope"`
+	Reason    string                        `json:"reason"`
+	Granted   []string                      `json:"granted"`
+}
+
 type NoticeParams struct {
 	Level string `json:"level"`
 	Text  string `json:"text"`
@@ -423,6 +501,10 @@ type PluginSetStatusParams struct {
 type PluginRegisterProviderParams struct {
 	Name string `json:"name"`
 	Wire string `json:"wire"`
+}
+
+type PluginRegisterRuntimeParams struct {
+	Name string `json:"name"`
 }
 
 // PluginRegisterAgentParams carries the same fields agents/<name>.md does. Tools is a pointer
@@ -515,18 +597,21 @@ type CommandInvokeParams struct {
 // CommandInvokeResult is what the command asks the server to do. A non-empty Prompt is
 // submitted as a user message; a non-empty Notice is shown to the client.
 type CommandInvokeResult struct {
-	Prompt string `json:"prompt,omitempty"`
-	Notice string `json:"notice,omitempty"`
+	Prompt        string                   `json:"prompt,omitempty"`
+	Notice        string                   `json:"notice,omitempty"`
+	AuthChallenge *RuntimeLoginStartParams `json:"auth_challenge,omitempty"`
 }
 
 type ProviderCompleteParams struct {
 	RequestID string                `json:"request_id"`
+	SessionID string                `json:"session_id"`
 	Model     session.ModelRef      `json:"model"`
 	System    string                `json:"system"`
 	Messages  []provider.Message    `json:"messages"`
 	Tools     []provider.ToolDef    `json:"tools"`
 	Thinking  session.ThinkingLevel `json:"thinking"`
 	MaxTokens int                   `json:"max_tokens"`
+	Headers   map[string]string     `json:"headers"`
 }
 
 type ProviderCompleteResult struct {
@@ -545,3 +630,85 @@ type ProviderDelta struct {
 type ProviderListModelsResult struct {
 	Models []provider.Model `json:"models"`
 }
+
+type RuntimeAccountReadParams struct {
+	Runtime string `json:"runtime"`
+}
+
+type RuntimeLoginStartParams struct {
+	Runtime string                 `json:"runtime"`
+	Mode    agentruntime.LoginMode `json:"mode"`
+}
+
+type RuntimeLoginCancelParams struct {
+	Runtime string `json:"runtime"`
+	LoginID string `json:"login_id"`
+}
+
+type RuntimeModelListParams struct {
+	Runtime string `json:"runtime"`
+	Cursor  string `json:"cursor"`
+}
+
+type RuntimeModelListResult struct {
+	Models     []provider.Model `json:"models"`
+	NextCursor string           `json:"next_cursor"`
+}
+
+type RuntimeThreadStartParams struct {
+	Runtime   string                `json:"runtime"`
+	SessionID string                `json:"session_id"`
+	CWD       string                `json:"cwd"`
+	Model     session.ModelRef      `json:"model"`
+	Thinking  session.ThinkingLevel `json:"thinking"`
+	Mode      session.Mode          `json:"mode"`
+}
+
+type RuntimeThreadRefParams struct {
+	Runtime   string `json:"runtime"`
+	SessionID string `json:"session_id"`
+	ThreadID  string `json:"thread_id"`
+}
+
+type RuntimeThreadResult struct {
+	ThreadID string `json:"thread_id"`
+}
+
+type RuntimeTurnStartParams struct {
+	Runtime   string                `json:"runtime"`
+	SessionID string                `json:"session_id"`
+	ThreadID  string                `json:"thread_id"`
+	Content   []session.Block       `json:"content"`
+	Model     session.ModelRef      `json:"model"`
+	Thinking  session.ThinkingLevel `json:"thinking"`
+	Mode      session.Mode          `json:"mode"`
+}
+
+type RuntimeTurnSteerParams struct {
+	Runtime   string          `json:"runtime"`
+	SessionID string          `json:"session_id"`
+	ThreadID  string          `json:"thread_id"`
+	TurnID    string          `json:"turn_id"`
+	Content   []session.Block `json:"content"`
+}
+
+type RuntimeTurnRefParams struct {
+	Runtime   string `json:"runtime"`
+	SessionID string `json:"session_id"`
+	ThreadID  string `json:"thread_id"`
+	TurnID    string `json:"turn_id"`
+}
+
+type RuntimeTurnResult struct {
+	TurnID string `json:"turn_id"`
+}
+
+type RuntimeEventParams struct {
+	Runtime string             `json:"runtime"`
+	Event   agentruntime.Event `json:"event"`
+}
+
+type RuntimeAccountUpdatedParams = agentruntime.AccountState
+type RuntimeLoginCompletedParams = agentruntime.LoginCompletion
+type RuntimeApprovalRequestParams = agentruntime.ApprovalQuestion
+type RuntimeApprovalResult = agentruntime.ApprovalAnswer

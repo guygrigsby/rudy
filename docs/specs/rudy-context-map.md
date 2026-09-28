@@ -4,7 +4,7 @@
 
 | Term | Means | Lives in |
 |------|-------|----------|
-| Session | A conversation over one workspace with an append-only log; everything about it is derived from the log | Session |
+| Session | A conversation over one workspace. Native history is its append-only log; runtime history is canonical in its AgentRuntime and locally projected | Session |
 | Entry | One immutable item appended to a session log; kinds are a closed set | Session |
 | Turn | One user message and everything the loop does until it yields; at most one active per session; not stored | Session |
 | Steering | The turn state after a single Esc: the prompt is live and the next message continues the turn | Session |
@@ -18,11 +18,19 @@
 | Provider | A named endpoint speaking one wire kind, with an auth reference | Provider |
 | Wire kind | `anthropic_messages` or `openai_chat`; a codec | Provider |
 | Dialect | A provider's deviations from a wire kind, applied by its plugin | Provider |
-| Model | An id a provider serves, with context window, capabilities and prices | Provider |
-| Registry | The models discovered from every configured provider, with a cached snapshot | Provider |
+| Model | An id a Provider or AgentRuntime serves, with any metadata that owner reports | Provider, Agent Runtime |
+| Registry | The models discovered from configured Providers and AgentRuntimes, with a cached snapshot | Provider, Agent Runtime |
 | Completion | One request to a model and its streamed parts, in domain types | Provider |
+| AgentRuntime | An execution backend that owns threads, turns, model-facing history and tools instead of returning one completion | Agent Runtime |
+| Execution kind | `native` for Rudy's loop through a Provider or `runtime` for a named AgentRuntime | Session |
+| Runtime thread | The AgentRuntime's canonical conversation | Agent Runtime |
+| Thread link | The durable one-to-one binding from a Rudy session to a runtime thread | Agent Runtime |
+| Projection | The deterministic client view derived from a runtime thread read and live events; never model input | Agent Runtime, derived |
+| Login attempt | One browser or device-code authentication attempt correlated by the runtime's login id | Agent Runtime |
+| Account state | The runtime-reported login mode and plan, with no credential material | Agent Runtime, derived |
+| Runtime approval | A blocking runtime request bound to one Rudy session, runtime thread, turn, item and upstream request id | Agent Runtime, Session |
 | Plugin | A unit that registers capabilities through one interface, linked in or spawned | Plugin |
-| Capability | A tool, slash command, hook handler, widget, status item or provider a plugin registers | Plugin |
+| Capability | A tool, slash command, hook handler, widget, status item, provider or agent runtime a plugin registers | Plugin |
 | Hook point | A named place in the session lifecycle a handler attaches to; a closed set | Plugin |
 | Slash command | A client-facing command a plugin registers | Plugin |
 | Skill | A `SKILL.md` discovered under a skills root | Plugin |
@@ -42,6 +50,7 @@
 |---------|-----------|-------|
 | Session | core | The process runtime and its lifecycle, the log, the turn loop, the gate, the workspace, subagents as child sessions |
 | Provider | supporting | Endpoints, models, the registry, completions in domain types |
+| Agent Runtime | supporting | Runtime process lifecycle, account login, model discovery, canonical thread links, event projection and approval translation |
 | Plugin | supporting | How every capability arrives, linked or spawned, plus the hook lifecycle |
 | Client | supporting, conformist | Rendering the protocol: the TUI and the headless printer |
 | Memory | generic, external | The OKF bundle, reached through the memory-go SDK |
@@ -62,8 +71,10 @@ Inside Session, groupings that share one language:
 |----------|-----------|---------|-------|
 | Session | Client | Open Host Service, Published Language | The protocol; clients conform and render from entries plus deltas |
 | Provider | Session | Customer/Supplier | Session asks for completions in domain types; never sees a wire shape |
+| Agent Runtime | Session | Customer/Supplier | Session delegates thread and turn execution; Session owns local policy and durable approval evidence |
+| Codex App Server | Agent Runtime | ACL | The Codex adapter alone speaks App Server methods, events and server requests |
 | Vendor SDK, aperture, local servers | Provider | ACL | The two codecs and the provider plugins are the only packages that speak a wire format |
-| Plugin | Session | Partnership | Plugins contribute tools, commands and hook handlers; Session fires hook points |
+| Plugin | Session | Partnership | Plugins contribute tools, commands, hook handlers and agent runtimes; Session fires hook points |
 | Session | Plugin | Open Host Service | Spawned plugins are protocol clients with registration rights |
 | MCP servers | Plugin | ACL | The `mcp` plugin adapts go-sdk tools into rudy tools; MCP types stay inside it; servers come from `mcp.toml` |
 | Session (child) | Plugin (subagents) | Open Host Service | The `agent` tool opens a child session over the protocol like any client and reads its outcome back |
@@ -71,7 +82,7 @@ Inside Session, groupings that share one language:
 | Hosts | Client | Customer/Supplier | The client asks Hosts for a connection and a placement; Hosts speaks ssh and git and hands back a `Conn` and a path. Session never sees a host |
 | Session | Hosts | Open Host Service, Published Language | Hosts requests `server.shutdown` over the same greeted connection it used to inspect the remote Server, then requires matching `server.stopped` proof and EOF before it starts a replacement. No Host type crosses into Session |
 | sand | Hosts | Separate Ways | Same box, same checkouts, same ssh alias; rudy takes sand's runtime behaviour (PATH over ssh, the doctor, push by URL, fetch back) and leaves the signing ring to sand |
-| Codex, Claude Code, pi | rudy | Separate Ways | Precedents only; no protocol or format shared |
+| Claude Code, pi | rudy | Separate Ways | Precedents only; no protocol or format shared |
 
 ## Ambiguous terms
 
@@ -82,11 +93,18 @@ Inside Session, groupings that share one language:
 | event | would have meant log item, notification and hook lifecycle | | Not a word here: `Entry`, `Notification`, `Hook point` |
 | command | | slash command versus shell command | Always qualified: `SlashCommand`, `ShellCommand` |
 | agent | | pi: the loop; ADK: a framework object; Claude Code: a subagent | No `Agent` object. A subagent is a child Session under an `AgentDefinition` |
+| thread | An AgentRuntime's canonical conversation | Go execution thread, discussion thread | Always `RuntimeThread` outside the Codex ACL |
+| runtime | One process-backed agent execution capability | Go runtime, server process | Always `AgentRuntime` or `CodexRuntime` in domain code |
 
 ## Stored and derived
 
-- Stored: entries; config; the registry snapshot with its fetch time; discovered skills and agent definitions as files; provider usage on each `assistant_message`, recorded verbatim as an external fact.
-- Derived, never stored: current model, mode, thinking level and title of a session; the request context; token totals; cost from usage times registry prices; turn state; the list of sessions; Server identity and state. No pid file is a record.
+Native Session content remains stored in `entries.jsonl`. A runtime Session
+stores its runtime name and thread id in `runtime.toml`; its conversation
+projection and account state are derived. `entries.jsonl` retains local control
+facts and fsynced runtime approval decisions, not copied runtime messages.
+
+- Stored: entries; runtime thread links; config; the registry snapshot with its fetch time; discovered skills and agent definitions as files; provider usage on each native `assistant_message`, recorded verbatim as an external fact.
+- Derived, never stored: runtime conversation projection and account state; current model, mode, thinking level and title of a session; the native request context; token totals; cost from usage times registry prices; turn state; the list of sessions; Server identity and state. No pid file is a record.
 
 ## Still open
 

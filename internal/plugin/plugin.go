@@ -12,6 +12,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentdef"
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -50,6 +51,7 @@ type Services struct {
 	// set that survives. The provider registry keeps its own copy of the provider set, so
 	// withdrawing one here is invisible to a turn until that copy is replaced.
 	ProvidersChanged func(ps []provider.Provider)
+	RuntimesChanged  func(rs []agentruntime.Runtime)
 	// Models is the provider registry's current set, for a plugin that reports on it: the
 	// /model command with no argument lists what a session could switch to. Nil means the
 	// registry is not wired, which is a plugin loaded outside a server.
@@ -95,17 +97,25 @@ type Fork struct{ AtEntryID string }
 // action: the conversation's log stays on disk and nothing carries over.
 type NewSession struct{}
 
+// AuthChallenge asks the server to start one runtime login attempt for the invoking
+// connection. The server returns the resulting challenge only to that connection.
+type AuthChallenge struct {
+	Runtime string
+	Mode    agentruntime.LoginMode
+}
+
 type NoAction struct{}
 
-func (SubmitPrompt) isAction() {}
-func (Notice) isAction()       {}
-func (Compact) isAction()      {}
-func (SetModel) isAction()     {}
-func (SetMode) isAction()      {}
-func (SetTitle) isAction()     {}
-func (Fork) isAction()         {}
-func (NewSession) isAction()   {}
-func (NoAction) isAction()     {}
+func (SubmitPrompt) isAction()  {}
+func (Notice) isAction()        {}
+func (Compact) isAction()       {}
+func (SetModel) isAction()      {}
+func (SetMode) isAction()       {}
+func (SetTitle) isAction()      {}
+func (Fork) isAction()          {}
+func (NewSession) isAction()    {}
+func (AuthChallenge) isAction() {}
+func (NoAction) isAction()      {}
 
 type CommandCall struct {
 	SessionID ulid.ULID
@@ -122,12 +132,16 @@ type Command struct {
 	Name        string // without the slash
 	Description string
 	Run         func(ctx context.Context, call CommandCall) (Action, error)
+	// Owner is assigned by the registering Host. A plugin cannot nominate another plugin's
+	// runtime for an auth action by forging this field.
+	Owner string
 }
 
 type Host interface {
 	RegisterTool(t tool.Tool) error
 	RegisterCommand(c Command) error
 	RegisterProvider(p provider.Provider) error
+	RegisterRuntime(r agentruntime.Runtime) error
 	RegisterHook(h HookHandler) error // invalid point or nil Handle refused
 	// RegisterAgent contributes an agent definition, the same thing an agents/<name>.md file
 	// carries. A definition is static data, so it needs no callback. An operator's file of the

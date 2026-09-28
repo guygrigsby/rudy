@@ -15,6 +15,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
@@ -49,6 +50,57 @@ func TestSubmitStreamsAndCommitsInline(t *testing.T) {
 	}
 	if h.editor().Text() != "" {
 		t.Errorf("editor cleared on submit, holds %q", h.editor().Text())
+	}
+}
+
+func TestRuntimeApprovalUsesBoundRequestAndStaysUntilResolved(t *testing.T) {
+	h := newHarness(t, nil)
+	h.m.session.Execution = session.Execution{Kind: session.ExecutionRuntime, Runtime: "codex"}
+	p := protocol.RuntimePermissionRequested{SessionID: h.m.session.SessionID, TurnID: "turn-1", RequestID: "request-1", ItemID: "item-1", Kind: "command", Summary: "Run build", Command: "make build", Permissions: []string{`fileSystem:{"read":["/"]}`}, AllowedScopes: []agentruntime.ApprovalScope{agentruntime.ScopeOnce}}
+	h.notify(protocol.NotifyRuntimePermissionRequested, p)
+	if view := ansi.Strip(h.view()); !strings.Contains(view, "Run build") || !strings.Contains(view, p.Permissions[0]) {
+		t.Fatal("runtime approval is not visible")
+	}
+	cmd, handled := h.m.answer(tea.KeyPressMsg{Code: 'y', Text: "y"})
+	if !handled || cmd == nil {
+		t.Fatal("approval key was not handled")
+	}
+	_ = cmd()
+	h.mu.Lock()
+	if len(h.reqs) == 0 || h.reqs[len(h.reqs)-1].Method != protocol.MethodRuntimeApprovalAnswer {
+		h.mu.Unlock()
+		t.Fatalf("requests = %+v", h.reqs)
+	}
+	var got protocol.RuntimeApprovalAnswerParams
+	err := json.Unmarshal(h.reqs[len(h.reqs)-1].Params, &got)
+	h.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SessionID != p.SessionID || got.TurnID != p.TurnID || got.RequestID != p.RequestID || got.Decision != "allow" {
+		t.Fatalf("answer = %+v", got)
+	}
+	if !strings.Contains(ansi.Strip(h.view()), "Run build") {
+		t.Fatal("approval cleared before resolution")
+	}
+	h.notify(protocol.NotifyRuntimePermissionResolved, protocol.RuntimePermissionResolved{SessionID: p.SessionID, RequestID: p.RequestID})
+	if strings.Contains(ansi.Strip(h.view()), "Run build") {
+		t.Fatal("resolved approval remains")
+	}
+}
+
+func TestRuntimeApprovalCannotGrantUnadvertisedScope(t *testing.T) {
+	h := newHarness(t, nil)
+	h.m.session.Execution = session.Execution{Kind: session.ExecutionRuntime, Runtime: "codex"}
+	p := protocol.RuntimePermissionRequested{SessionID: h.m.session.SessionID, TurnID: "turn-1", RequestID: "request-1", Kind: "command", Summary: "Run build", AllowedScopes: []agentruntime.ApprovalScope{agentruntime.ScopeSession}}
+	h.notify(protocol.NotifyRuntimePermissionRequested, p)
+	if cmd, handled := h.m.answer(tea.KeyPressMsg{Code: 'y', Text: "y"}); !handled || cmd != nil {
+		t.Fatalf("once allow: handled=%v cmd=%v", handled, cmd)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.reqs) != 0 {
+		t.Fatalf("unadvertised scope reached server: %+v", h.reqs)
 	}
 }
 

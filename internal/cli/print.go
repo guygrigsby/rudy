@@ -19,6 +19,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"github.com/spf13/cobra"
 
+	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/session"
 )
@@ -46,11 +47,12 @@ type printOptions struct {
 
 // printResult is the --output json shape.
 type printResult struct {
-	SessionID  string             `json:"session_id"`
-	Result     string             `json:"result"`
-	Usage      session.Usage      `json:"usage"`
-	Cost       string             `json:"cost"`
-	StopReason session.StopReason `json:"stop_reason"`
+	SessionID     string                      `json:"session_id"`
+	Result        string                      `json:"result"`
+	Usage         session.Usage               `json:"usage"`
+	Cost          string                      `json:"cost"`
+	StopReason    session.StopReason          `json:"stop_reason"`
+	AuthChallenge *agentruntime.AuthChallenge `json:"auth_challenge,omitempty"`
 }
 
 // stdinIsTerminal is a variable so tests can pretend.
@@ -202,7 +204,7 @@ func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt str
 		return code, nil
 	}
 
-	turnID, code, err := submit(bg, d.Client, info.SessionID, prompt, stdout, stderr)
+	turnID, challenge, code, err := submit(bg, d.Client, info.SessionID, prompt, stdout, stderr)
 	if err != nil || code != 0 {
 		return code, err
 	}
@@ -211,14 +213,21 @@ func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt str
 		// above, or plugin.NoAction): there is nothing for the loop below to wait on. A
 		// turn.state for this turn id will never arrive, so waiting here would block
 		// until SIGINT. Report a completed no-op immediately instead.
-		return noOpResult(o, info, stdout)
+		code, err := noOpResult(o, info, challenge, stdout)
+		if err != nil || code != 0 || challenge == nil {
+			return code, err
+		}
+		return waitLoginCompletion(ctx, o, d.Client, *challenge, stdout, stderr)
 	}
 
-	turnULID, err := ulid.Parse(turnID)
-	if err != nil {
-		return 1, fmt.Errorf("turn id %q: %w", turnID, err)
+	out := &turnOutput{turnID: turnID, runtime: info.Execution.Kind == session.ExecutionRuntime, seenRuntime: map[string]bool{}}
+	if !out.runtime {
+		turnULID, err := ulid.Parse(turnID)
+		if err != nil {
+			return 1, fmt.Errorf("turn id %q: %w", turnID, err)
+		}
+		out.turnULID = turnULID
 	}
-	out := &turnOutput{turnID: turnID, turnULID: turnULID}
 	enc := json.NewEncoder(stdout)
 	for {
 		select {
@@ -252,30 +261,78 @@ func runPrint(ctx context.Context, o printOptions, dopts dialOptions, prompt str
 // stream-json print nothing beyond what submit already wrote (a plugin.Notice's text, if
 // any); json prints a zero-result shape with stop_reason "none", a value outside
 // session.StopReason's own vocabulary since no turn ran to report a real one.
-func noOpResult(o printOptions, info protocol.SessionInfo, stdout io.Writer) (int, error) {
-	if o.Output == "json" {
-		res := printResult{SessionID: info.SessionID, Result: "", StopReason: session.StopReason("none")}
+func noOpResult(o printOptions, info protocol.SessionInfo, challenge *agentruntime.AuthChallenge, stdout io.Writer) (int, error) {
+	switch o.Output {
+	case "text":
+		if challenge != nil && challenge.Type == agentruntime.ChallengeDevice {
+			_, _ = fmt.Fprintf(stdout, "Open %s and enter code %s\n", challenge.VerificationURL, challenge.UserCode)
+		}
+	case "json":
+		res := printResult{SessionID: info.SessionID, Result: "", StopReason: session.StopReason("none"), AuthChallenge: challenge}
 		if err := json.NewEncoder(stdout).Encode(res); err != nil {
 			return 1, err
+		}
+	case "stream-json":
+		if challenge != nil {
+			if err := json.NewEncoder(stdout).Encode(map[string]any{"method": "runtime.login.challenge", "params": challenge}); err != nil {
+				return 1, err
+			}
 		}
 	}
 	return 0, nil
 }
 
+func waitLoginCompletion(ctx context.Context, o printOptions, client *protocol.Client, challenge agentruntime.AuthChallenge, stdout, stderr io.Writer) (int, error) {
+	enc := json.NewEncoder(stdout)
+	for {
+		select {
+		case <-ctx.Done():
+			return 130, nil
+		case n, ok := <-client.Notifications():
+			if !ok {
+				return 1, errors.New("server closed the connection")
+			}
+			if o.Output == "stream-json" {
+				if err := enc.Encode(map[string]any{"method": n.Method, "params": json.RawMessage(n.Params)}); err != nil {
+					return 1, err
+				}
+			}
+			if n.Method != protocol.NotifyRuntimeLoginCompleted {
+				continue
+			}
+			var completion agentruntime.LoginCompletion
+			if err := json.Unmarshal(n.Params, &completion); err != nil {
+				return 1, fmt.Errorf("runtime.login.completed: %w", err)
+			}
+			if completion.Runtime != challenge.Runtime || completion.LoginID != challenge.LoginID {
+				continue
+			}
+			if completion.Success {
+				return 0, nil
+			}
+			_, _ = fmt.Fprintln(stderr, completion.Error)
+			return 1, nil
+		}
+	}
+}
+
 // submit sends the prompt, routing a leading slash word to command.run. It returns the turn id,
 // or exit code 2 for an unknown command, or 0 with an empty turn id when a command produced no turn.
-func submit(ctx context.Context, client *protocol.Client, sessionID, prompt string, stdout, stderr io.Writer) (string, int, error) {
+func submit(ctx context.Context, client *protocol.Client, sessionID, prompt string, stdout, stderr io.Writer) (string, *agentruntime.AuthChallenge, int, error) {
 	if strings.HasPrefix(prompt, "/") {
 		name, args, _ := strings.Cut(strings.TrimPrefix(prompt, "/"), " ")
+		if name == "login" {
+			args = "device"
+		}
 		var res protocol.CommandRunResult
 		err := client.Call(ctx, protocol.MethodCommandRun, protocol.CommandRunParams{SessionID: sessionID, Name: name, Args: strings.TrimSpace(args)}, &res)
 		var perr *protocol.Error
 		if errors.As(err, &perr) && perr.Code == protocol.CodeNotFound {
 			_, _ = fmt.Fprintf(stderr, "unknown command /%s\n", name)
-			return "", 2, nil
+			return "", nil, 2, nil
 		}
 		if err != nil {
-			return "", 1, fmt.Errorf("/%s: %w", name, err)
+			return "", nil, 1, fmt.Errorf("/%s: %w", name, err)
 		}
 		if res.TurnID == "" {
 			if res.Notice != "" {
@@ -284,27 +341,29 @@ func submit(ctx context.Context, client *protocol.Client, sessionID, prompt stri
 				// this print path always prints the notice as it would for any other command.
 				_, _ = fmt.Fprintln(stdout, res.Notice)
 			}
-			return "", 0, nil
+			return "", res.AuthChallenge, 0, nil
 		}
-		return res.TurnID, 0, nil
+		return res.TurnID, nil, 0, nil
 	}
 	var res protocol.SessionSubmitResult
 	params := protocol.SessionSubmitParams{SessionID: sessionID, Content: []session.Block{session.TextBlock(prompt)}, Source: session.SourceTyped}
 	if err := client.Call(ctx, protocol.MethodSessionSubmit, params, &res); err != nil {
-		return "", 1, fmt.Errorf("submit: %w", err)
+		return "", nil, 1, fmt.Errorf("submit: %w", err)
 	}
-	return res.TurnID, 0, nil
+	return res.TurnID, nil, 0, nil
 }
 
 // turnOutput folds notifications into what the printer reports.
 type turnOutput struct {
-	turnID     string
-	turnULID   ulid.ULID // parsed turnID; entries below it belong to earlier turns
-	text       string
-	usage      session.Usage
-	stopReason session.StopReason
-	failure    session.TurnFailed // zero until a turn_failed entry arrives
-	state      string
+	turnID      string
+	turnULID    ulid.ULID // parsed turnID; entries below it belong to earlier turns
+	runtime     bool
+	seenRuntime map[string]bool
+	text        string
+	usage       session.Usage
+	stopReason  session.StopReason
+	failure     session.TurnFailed // zero until a turn_failed entry arrives
+	state       string
 }
 
 // observe folds one notification in and reports whether the turn is over. Entries from
@@ -314,7 +373,42 @@ type turnOutput struct {
 // turn sorts at or above it and every earlier entry sorts below.
 func (t *turnOutput) observe(n protocol.Notification) (bool, error) {
 	switch n.Method {
+	case protocol.NotifyRuntimeUsageUpdated:
+		if !t.runtime {
+			return false, nil
+		}
+		var p protocol.RuntimeUsageUpdated
+		if err := json.Unmarshal(n.Params, &p); err != nil {
+			return false, fmt.Errorf("runtime.usage.updated: %w", err)
+		}
+		if p.TurnID == t.turnID {
+			t.usage = p.Usage
+		}
+	case protocol.NotifyRuntimeEntry:
+		if !t.runtime {
+			return false, nil
+		}
+		var p protocol.RuntimeEntryParams
+		if err := json.Unmarshal(n.Params, &p); err != nil {
+			return false, fmt.Errorf("runtime.entry: %w", err)
+		}
+		if p.Entry.TurnID != t.turnID || t.seenRuntime[p.Entry.ID.String()] {
+			return false, nil
+		}
+		t.seenRuntime[p.Entry.ID.String()] = true
+		if p.Entry.Kind == "agent_message" {
+			if t.text != "" {
+				t.text += "\n"
+			}
+			t.text += session.TextOf(p.Entry.Content)
+		}
+		if p.Entry.Usage != (session.Usage{}) {
+			t.usage = p.Entry.Usage
+		}
 	case protocol.NotifyEntryAppended:
+		if t.runtime {
+			return false, nil
+		}
 		var ea protocol.EntryAppended
 		if err := json.Unmarshal(n.Params, &ea); err != nil {
 			return false, fmt.Errorf("entry.appended: %w", err)
@@ -339,6 +433,11 @@ func (t *turnOutput) observe(n protocol.Notification) (bool, error) {
 			return false, nil
 		}
 		t.state = ts.State
+		if t.runtime && ts.State == "completed" {
+			t.stopReason = session.StopEndTurn
+		} else if t.runtime && ts.State == "idle" {
+			t.stopReason = session.StopInterrupted
+		}
 		switch ts.State {
 		case "completed", "failed", "idle":
 			return true, nil
