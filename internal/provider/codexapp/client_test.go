@@ -59,10 +59,9 @@ func TestClientInitializesBeforeAnyOtherRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	methods := readMethods(t, logPath)
-	if got, want := strings.Join(methods, ","), "initialize,initialized"; got != want {
-		t.Fatalf("methods = %q, want %q", got, want)
-	}
+	// The write to the fake's stdin returns before the fake has logged the method, so
+	// a single read races the fake's own flush on a loaded runner.
+	waitForMethods(t, logPath, []string{"initialize", "initialized"})
 }
 
 func TestConcurrentStartProducesOneProcess(t *testing.T) {
@@ -88,13 +87,9 @@ func TestConcurrentStartProducesOneProcess(t *testing.T) {
 		}
 	}
 
-	methods := readMethods(t, logPath)
-	if got := count(methods, "initialize"); got != 1 {
-		t.Fatalf("initialize count = %d, want 1; methods = %v", got, methods)
-	}
-	if got := count(methods, "initialized"); got != 1 {
-		t.Fatalf("initialized count = %d, want 1; methods = %v", got, methods)
-	}
+	// The write to the fake's stdin returns before the fake has logged the method, so
+	// a single read races the fake's own flush on a loaded runner.
+	waitForMethods(t, logPath, []string{"initialize", "initialized"})
 }
 
 func TestStartRejectsUnreviewedCodexVersions(t *testing.T) {
@@ -484,11 +479,49 @@ func TestRedactRemovesJSONSecretValues(t *testing.T) {
 
 func readMethods(t *testing.T, path string) []string {
 	t.Helper()
-	b, err := os.ReadFile(path)
+	methods, err := readMethodsIfExists(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.Fields(string(b))
+	return methods
+}
+
+// readMethodsIfExists reports an empty log as no methods rather than an error: the fake
+// creates the file when it first logs, so the file's absence only means the fake has not
+// started yet.
+func readMethodsIfExists(path string) ([]string, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(string(b)), nil
+}
+
+func waitForMethods(t *testing.T, path string, want []string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		methods, err := readMethodsIfExists(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(methods) == len(want) {
+			if strings.Join(methods, ",") == strings.Join(want, ",") {
+				return
+			}
+			t.Fatalf("methods = %v, want %v", methods, want)
+		}
+		if len(methods) > len(want) {
+			t.Fatalf("methods = %v, want %v", methods, want)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %v; methods = %v", want, methods)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func waitForMethod(t *testing.T, path, want string) {
