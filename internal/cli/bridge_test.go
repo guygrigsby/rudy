@@ -88,6 +88,19 @@ func TestBridgeStopWithNoDaemonDoesNotLoadConfig(t *testing.T) {
 	}
 }
 
+func awaitBridgeHello(t *testing.T, env []string) {
+	t.Helper()
+	conn, err := protocol.DialUnix(context.Background(), socketIn(t, env), serveTestBudget)
+	if err != nil {
+		t.Fatalf("dial daemon socket: %v", err)
+	}
+	client := protocol.NewClient(conn)
+	defer func() { _ = client.Close() }()
+	if _, err := greet(callCtx(t), client, "bridge-test", "test", false); err != nil {
+		t.Fatalf("daemon hello: %v", err)
+	}
+}
+
 func TestBridgeStopIsIdempotentAndWaitsForSocketCleanup(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary and starts a daemon")
@@ -100,6 +113,7 @@ func TestBridgeStopIsIdempotentAndWaitsForSocketCleanup(t *testing.T) {
 	if out, err := start.CombinedOutput(); err != nil {
 		t.Fatalf("start through bridge: %v\n%s", err, out)
 	}
+	awaitBridgeHello(t, env)
 	stop := exec.Command(bin, "bridge", "--stop")
 	stop.Env = env
 	if out, err := stop.CombinedOutput(); err != nil {
