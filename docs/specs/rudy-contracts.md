@@ -824,7 +824,8 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `providers.<name>.base_url` | string | required | |
 | `providers.<name>.auth` | string | `` | `env:NAME` reads the environment; `cache:KEY` reads a `KEY=value` line from the file `secrets.file` names; empty means no auth header |
 | `providers.<name>.headers` | table | `{}` | sent on every request |
-| `providers.<name>.models_path` | string | `/v1/models` | discovery endpoint relative to `base_url`; pass 3: not yet implemented, the key is unread and each codec asks its own fixed path |
+| `providers.<name>.models_path` | string | `/models` | discovery endpoint: relative joins `base_url` (which conventionally ends in `/v1`), an absolute `http(s)` URL is used verbatim, so a proxy that mounts a route outside the one it lists can still be discovered; models listed there register under this provider's name, so list only the ids this endpoint serves |
+| `providers.<name>.models` | [string] | `[]` | explicit ids when the endpoint has no listing route; registered under this provider's name and, when non-empty, the only discovery that runs |
 | `providers.<name>.dialect` | `` or `clinepass` | `` | a dialect plugin that wraps the wire codec for this endpoint; the `openai_chat` plugin skips a provider that names one |
 | `plugins.disabled` | [string] | `[]` | linked or spawned plugins not to load |
 | `plugins.<name>` | table | `{}` | handed to the plugin verbatim on `plugin.init` |

@@ -52,7 +52,21 @@ type wireModel struct {
 }
 
 func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
-	hreq, err := c.newRequest(ctx, http.MethodGet, "/models", nil, nil)
+	// Models in config name the ids the endpoint serves, which is the whole answer when
+	// the endpoint has no listing route: aperture's root mount answers /models with a page,
+	// not a list. Explicit ids mean no fetch at all.
+	if len(c.opts.Models) > 0 {
+		out := make([]provider.Model, 0, len(c.opts.Models))
+		for _, id := range c.opts.Models {
+			out = append(out, configuredModel(c.opts.Name, id))
+		}
+		return out, nil
+	}
+	url := c.opts.ModelsURL
+	if url == "" {
+		url = c.opts.BaseURL + "/models" // New trimmed the trailing slash
+	}
+	hreq, err := c.newRequest(ctx, http.MethodGet, url, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +97,20 @@ func (c *Client) ListModels(ctx context.Context) ([]provider.Model, error) {
 		return strings.Compare(a.Ref.Model, b.Ref.Model)
 	})
 	return out, nil
+}
+
+// configuredModel is one id the config says an endpoint serves, for an endpoint with no
+// listing route. The id is all there is to know; the capability set is optimistic so the
+// model is usable and the registry records what discovery could not.
+func configuredModel(providerName, id string) provider.Model {
+	return provider.Model{
+		Ref:         session.ModelRef{Provider: providerName, Model: id},
+		DisplayName: id,
+		Capabilities: provider.Capabilities{
+			Tools:     true,
+			Reasoning: true,
+		},
+	}
 }
 
 func (c *Client) toModel(m wireModel) provider.Model {

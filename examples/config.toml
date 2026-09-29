@@ -252,11 +252,21 @@ name = "default"
 
 # One table per endpoint. wire is anthropic_messages, openai_chat or custom;
 # auth is env:NAME or cache:KEY, and is left out when the endpoint needs none.
-# The models themselves are discovered from the endpoint, never listed here.
+# The models themselves are discovered from the endpoint, never listed here, unless
+# the endpoint has no listing route: then models names the ids it serves, and
+# models_path can point discovery at another mount's listing.
 # [providers.aperture]
 # wire = "openai_chat"
 # base_url = "https://ai.example.ts.net/v1"
 # dialect = "clinepass"
+
+# # A route mounted outside the one that lists it: chat at the root, discovery
+# # from the /v1 mount, or no listing route at all with models naming the ids.
+# [providers.aperture-zai]
+# wire = "openai_chat"
+# base_url = "https://ai.example.ts.net"
+# models_path = "https://ai.example.ts.net/v1/models"
+# models = ["glm-5.3"]
 
 # [providers.anthropic]
 # wire = "anthropic_messages"

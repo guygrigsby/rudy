@@ -5,7 +5,11 @@ package openaichat
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/guygrigsby/rudy/internal/provider/httpx"
+	"github.com/guygrigsby/rudy/internal/session"
 )
 
 func TestListModelsFromFixture(t *testing.T) {
@@ -150,5 +154,73 @@ func TestUpstreamNamesWhoActuallyServesTheModel(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Errorf("models never listed: %v", want)
+	}
+}
+
+func TestListModelsAppendsConfiguredIDs(t *testing.T) {
+	// No listing route at all: the config says which ids the endpoint serves, and ListModels
+	// answers from it without asking the server. Each registers under the provider's name
+	// with the optimistic capability set.
+	var asked bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = true
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html>not a model list</html>"))
+	}))
+	t.Cleanup(srv.Close)
+	c := New(Options{
+		Name:    "aperture-zai",
+		BaseURL: srv.URL,
+		Models:  []string{"glm-5.3"},
+		HTTP:    httpx.New("test"),
+	})
+	models, err := c.ListModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asked {
+		t.Fatal("explicit models should skip the listing request")
+	}
+	if len(models) != 1 {
+		t.Fatalf("got %+v", models)
+	}
+	glm := models[0]
+	if glm.Ref.Model != "glm-5.3" || glm.Ref.Provider != "aperture-zai" || glm.DisplayName != "glm-5.3" {
+		t.Fatalf("got %+v", glm)
+	}
+	if !glm.Capabilities.Tools || !glm.Capabilities.Reasoning || glm.ContextWindow != 0 {
+		t.Fatalf("capabilities = %+v", glm.Capabilities)
+	}
+}
+
+func TestListModelsHonoursAbsoluteModelsURL(t *testing.T) {
+	// The listing lives on another mount than chat: aperture's root route serves
+	// /chat/completions while /v1/models holds the ids. models_path names the listing one
+	// absolutely, and the request must reach it untouched by BaseURL.
+	var listing http.Request
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		listing = *r
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"glm-5.3"}]}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := New(Options{
+		Name:      "aperture-zai",
+		BaseURL:   srv.URL, // root mount: chat goes here
+		ModelsURL: srv.URL + "/v1/models",
+		HTTP:      httpx.New("test"),
+	})
+	models, err := c.ListModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listing.URL.Path != "/v1/models" {
+		t.Fatalf("listing request went to %s", listing.URL.Path)
+	}
+	if len(models) != 1 || models[0].Ref != (session.ModelRef{Provider: "aperture-zai", Model: "glm-5.3"}) {
+		t.Fatalf("got %+v", models)
 	}
 }

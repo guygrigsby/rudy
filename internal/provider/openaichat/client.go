@@ -50,6 +50,12 @@ type Options struct {
 	Headers map[string]string // extra, verbatim
 	HTTP    *httpx.Client
 	Dialect Dialect // nil means the plain chat-completions shape
+	// ModelsURL is where ListModels asks; empty means BaseURL + /v1/models. An endpoint that
+	// serves one mounted route and lists under another names the listing one here.
+	ModelsURL string
+	// Models names the ids an endpoint with no listing route serves; when it is set,
+	// ListModels returns exactly these and never fetches.
+	Models []string
 }
 
 type Client struct {
@@ -72,7 +78,13 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body []byt
 	if body != nil {
 		r = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, c.opts.BaseURL+path, r)
+	// path is relative to BaseURL unless it is already a full URL, which is how ListModels
+	// asks an endpoint other than its own (providers.<name>.models_path).
+	raw := path
+	if !strings.HasPrefix(path, "http://") && !strings.HasPrefix(path, "https://") {
+		raw = c.opts.BaseURL + path
+	}
+	req, err := http.NewRequestWithContext(ctx, method, raw, r)
 	if err != nil {
 		return nil, err
 	}

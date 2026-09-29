@@ -51,7 +51,7 @@ func (p *providerPlugin) Init(ctx context.Context, h plugin.Host) error {
 			h.Notice(fmt.Sprintf("provider %s skipped: %v", name, err))
 			continue
 		}
-		client := codec.New(codec.Options{Name: name, BaseURL: pc.BaseURL, Token: token, Headers: pc.Headers, HTTP: p.http})
+		client := codec.New(codec.Options{Name: name, BaseURL: pc.BaseURL, Token: token, Headers: pc.Headers, HTTP: p.http, ModelsURL: pc.ModelsURL(), Models: pc.Models})
 		if err := h.RegisterProvider(client); err != nil {
 			h.Notice(fmt.Sprintf("provider %s skipped: %v", name, err))
 		}

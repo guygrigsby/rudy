@@ -18,11 +18,26 @@ import (
 
 // ProviderConfig is one [providers.<name>] table.
 type ProviderConfig struct {
-	Wire    string            `mapstructure:"wire"`     // openai_chat, anthropic_messages, custom
-	BaseURL string            `mapstructure:"base_url"` // ends with /v1
-	Auth    string            `mapstructure:"auth"`     // "", "env:NAME", "cache:KEY"
-	Headers map[string]string `mapstructure:"headers"`  // extra request headers, verbatim
-	Dialect string            `mapstructure:"dialect"`  // "" or clinepass; clinepass requires wire == openai_chat
+	Wire       string            `mapstructure:"wire"`        // openai_chat, anthropic_messages, custom
+	BaseURL    string            `mapstructure:"base_url"`    // ends with /v1
+	Auth       string            `mapstructure:"auth"`        // "", "env:NAME", "cache:KEY"
+	Headers    map[string]string `mapstructure:"headers"`     // extra request headers, verbatim
+	Dialect    string            `mapstructure:"dialect"`     // "" or clinepass; clinepass requires wire == openai_chat
+	ModelsPath string            `mapstructure:"models_path"` // where ListModels asks; relative joins BaseURL, an absolute URL is verbatim; default /models
+	Models     []string          `mapstructure:"models"`      // explicit ids when the endpoint has no listing route
+}
+
+// ModelsURL resolves ModelsPath against BaseURL: a relative path joins it, an absolute
+// http(s) URL stands alone, and an empty path is the OpenAI default under BaseURL.
+func (p ProviderConfig) ModelsURL() string {
+	if strings.HasPrefix(p.ModelsPath, "http://") || strings.HasPrefix(p.ModelsPath, "https://") {
+		return strings.TrimRight(p.ModelsPath, "/")
+	}
+	base := strings.TrimRight(p.BaseURL, "/")
+	if p.ModelsPath == "" {
+		return base + "/models"
+	}
+	return base + "/" + strings.TrimLeft(p.ModelsPath, "/")
 }
 
 // LayoutConfig is the [ui.layout] table.
@@ -603,6 +618,12 @@ func (c *Config) validate() error {
 		}
 		if p.Dialect != "" && p.Wire != "openai_chat" {
 			errs = append(errs, fmt.Errorf("config: providers.%s.dialect %q requires wire openai_chat, got %q", name, p.Dialect, p.Wire))
+		}
+		if p.ModelsPath != "" && !strings.HasPrefix(p.ModelsPath, "http://") && !strings.HasPrefix(p.ModelsPath, "https://") && strings.Contains(p.ModelsPath, "..") {
+			errs = append(errs, fmt.Errorf("config: providers.%s.models_path %q is relative and contains ..; make it absolute under base_url or a full URL", name, p.ModelsPath))
+		}
+		if len(p.Models) > 0 && p.Wire == "custom" {
+			errs = append(errs, fmt.Errorf("config: providers.%s.models lists ids for a custom provider, which a plugin discovers itself", name))
 		}
 	}
 	if c.Permissions.DoublePressMS <= 0 {

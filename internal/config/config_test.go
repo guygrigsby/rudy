@@ -578,3 +578,38 @@ func TestMaxTokensDefaultsToTheModelsOwn(t *testing.T) {
 		t.Error("max_tokens -1 loaded; want it refused")
 	}
 }
+
+func TestProviderModelsURL(t *testing.T) {
+	cases := []struct {
+		name string
+		p    config.ProviderConfig
+		want string
+	}{
+		{"default", config.ProviderConfig{BaseURL: "https://ai.example/v1"}, "https://ai.example/v1/models"},
+		{"default trims slash", config.ProviderConfig{BaseURL: "https://ai.example/v1/"}, "https://ai.example/v1/models"},
+		{"relative", config.ProviderConfig{BaseURL: "https://ai.example", ModelsPath: "/v1/models"}, "https://ai.example/v1/models"},
+		{"absolute", config.ProviderConfig{BaseURL: "https://ai.example", ModelsPath: "https://ai.example/v1/models"}, "https://ai.example/v1/models"},
+		{"absolute elsewhere", config.ProviderConfig{BaseURL: "https://ai.example", ModelsPath: "https://other.example/list/"}, "https://other.example/list"},
+	}
+	for _, tc := range cases {
+		if got := tc.p.ModelsURL(); got != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestProviderModelsPathAndModelsValidation(t *testing.T) {
+	base := strings.Replace(sampleTOML, `headers = { "X-Team" = "rudy" }`, `models = ["glm-5.3"]`, 1)
+	c, err := config.Load(writeConfig(t, base), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Providers["aperture"].Models; len(got) != 1 || got[0] != "glm-5.3" {
+		t.Errorf("models: %v", got)
+	}
+
+	bad := strings.Replace(sampleTOML, `headers = { "X-Team" = "rudy" }`, `models_path = "../elsewhere/models"`, 1)
+	if _, err := config.Load(writeConfig(t, bad), nil); err == nil {
+		t.Error("relative models_path with ..: want error")
+	}
+}
