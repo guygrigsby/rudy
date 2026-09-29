@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -128,6 +129,20 @@ func runTUI(ctx context.Context, build buildFunc, dopts dialOptions, resolve res
 	// The client has a terminal and has not taken it yet, so it is the one caller that can
 	// ask whether this workspace's own plugins may run (ADR 0025).
 	d, code, err := dial(ctx, build, BuildOptions{Stderr: stderr, Trust: askTrust(os.Stdin, stderr)}, dopts, "rudy-tui", true)
+	if err != nil && errors.Is(err, ErrNoProvider) && dopts.Host == "" && dopts.Socket == "" {
+		// A fresh install at a terminal gets the wizard in place of the error. The
+		// reader is shared with it, so the buffered line offering the wizard and the
+		// wizard's own prompts read one stream. Remote dials are another machine's
+		// config and get the error as printed.
+		r := bufio.NewReader(os.Stdin)
+		if offerSetup(r, stderr) {
+			if serr := runSetup(setupOptions{}, r, stderr, stderr); serr != nil {
+				_, _ = fmt.Fprintln(stderr, "rudy:", serr)
+			} else {
+				d, code, err = dial(ctx, build, BuildOptions{Stderr: stderr, Trust: askTrust(os.Stdin, stderr)}, dopts, "rudy-tui", true)
+			}
+		}
+	}
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return code

@@ -96,8 +96,14 @@ func (p *memPlugin) Init(ctx context.Context, h plugin.Host) error {
 	p.host = h
 	p.b = memory.New(memory.ResolveRoot(p.cfg.Dir, os.Getenv))
 	if !p.b.Exists() {
-		h.Notice(fmt.Sprintf("memory: no bundle at %s; run memory init", p.b.Root))
-		return nil
+		// First run is no reason to stay silent: the bundle is initialized in place,
+		// so memory works from the first session rather than after a separate step.
+		// A root that cannot be written is reported and memory stays off, as before.
+		if err := p.b.Init("", time.Now()); err != nil {
+			h.Notice(fmt.Sprintf("memory: no bundle at %s and it could not be initialized: %v", p.b.Root, err))
+			return nil
+		}
+		h.Notice(fmt.Sprintf("memory: initialized a bundle at %s", p.b.Root))
 	}
 	for _, hh := range []plugin.HookHandler{
 		{Point: plugin.HookSessionOpened, Handle: p.onOpened},

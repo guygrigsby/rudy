@@ -101,6 +101,11 @@ func promptTemplate(paths config.Paths, cfg *config.Config) (string, error) {
 	return "", nil
 }
 
+// ErrNoProvider marks the fresh-install build failure: nothing in config.toml names a
+// provider and no plugin registered one. The interactive client answers it by offering
+// the first-run wizard and one retry, so errors.Is is the contract between them.
+var ErrNoProvider = errors.New("rudy setup walks through a first connection")
+
 // shutdownBudget bounds the unwind of a half-built server, which has no running turn and no
 // client, so it only has to close the sessions it never opened.
 const shutdownBudget = 2 * time.Second
@@ -258,7 +263,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	// nothing is dialed below, so a timeout would be a lie. Name the file a provider goes
 	// in and the command that writes it, which is all a first run needs to hear.
 	if len(providers) == 0 && !hasDefaultRuntime && !hadSnapshot {
-		return nil, fmt.Errorf("no model provider is configured: %s has no [providers.*] table and no plugin registered one; rudy config sync writes that file with every key and what each is for", paths.ConfigFile())
+		return nil, fmt.Errorf("no model provider is configured: %s has no [providers.*] table and no provider plugin is loaded: %w", paths.ConfigFile(), ErrNoProvider)
 	}
 	if !hadSnapshot {
 		names := make([]string, len(providers))

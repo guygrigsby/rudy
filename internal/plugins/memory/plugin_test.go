@@ -1103,18 +1103,42 @@ func TestDisabledRegistersNothing(t *testing.T) {
 	}
 }
 
-func TestMissingBundleNoticesAndRegistersNothing(t *testing.T) {
+func TestMissingBundleIsInitializedInPlace(t *testing.T) {
 	h := &plugintest.Host{Name: "memory"}
 	dir := t.TempDir()
 	cfg := config.MemoryConfig{Dir: dir, Enabled: true}
 	if err := New(cfg, t.TempDir(), "0.1.0", nil).Init(context.Background(), h); err != nil {
 		t.Fatalf("init: %v", err)
 	}
+	b := memory.New(memory.ResolveRoot(dir, os.Getenv))
+	if !b.Exists() {
+		t.Fatalf("bundle at %s was not initialized", b.Root)
+	}
+	if len(h.Hooks) == 0 || len(h.RegisteredTools) == 0 || len(h.RegisteredCommands) == 0 {
+		t.Errorf("registered %+v, want hooks, tools and /memory", h)
+	}
+	want := "memory: initialized a bundle at " + b.Root
+	if len(h.Notices) != 1 || h.Notices[0] != want {
+		t.Errorf("notices %q, want %q", h.Notices, want)
+	}
+}
+
+func TestMissingBundleThatCannotBeInitializedRegistersNothing(t *testing.T) {
+	h := &plugintest.Host{Name: "memory"}
+	// A regular file where the bundle root would be built: nothing under it can be
+	// made, so init fails and memory stays off with the failure noticed.
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.MemoryConfig{Dir: filepath.Join(file, "root"), Enabled: true}
+	if err := New(cfg, t.TempDir(), "0.1.0", nil).Init(context.Background(), h); err != nil {
+		t.Fatalf("init: %v", err)
+	}
 	if len(h.Hooks)+len(h.RegisteredTools)+len(h.RegisteredCommands) != 0 {
 		t.Errorf("registered %+v", h)
 	}
-	want := "memory: no bundle at " + memory.New(memory.ResolveRoot(dir, os.Getenv)).Root + "; run memory init"
-	if len(h.Notices) != 1 || h.Notices[0] != want {
-		t.Errorf("notices %q, want %q", h.Notices, want)
+	if len(h.Notices) != 1 || !strings.Contains(h.Notices[0], "could not be initialized") {
+		t.Errorf("notices %q, want one about the failed init", h.Notices)
 	}
 }

@@ -26,6 +26,7 @@ var topLevelVerbs = map[string]string{
 	"help":       "cobra's own",
 	"completion": "cobra's own",
 	"install":    "the one verb everybody types; the noun form rudy plugins install remains (ADR 0025)",
+	"setup":      "the first-run wizard; like install, the verb a fresh install is told to type",
 }
 
 // verbs are the subcommand names this CLI uses. A new one has to be added here, which is
