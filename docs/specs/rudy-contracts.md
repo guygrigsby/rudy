@@ -840,7 +840,7 @@ nothing in config (ADR 0014 decision 2), so a `server.socket` key is one of the 
 | `web.exa_api_key` | string | `env:EXA_API_KEY` | where Exa's key comes from, same form. Brave is asked first and Exa answers when Brave cannot; no backend with a key means neither web tool is registered (ADR 0039) |
 | `web.max_results` | int | 5 | results one `web_search` returns, 1 through 20 |
 | `web.fetch_max_bytes` | int | 2000000 | most one `web_fetch` reads from a response before it stops reading; at least 1024 |
-| `web.allow_private_hosts` | bool | false | true lets `web_fetch` reach loopback, private, link-local and unique-local addresses, this machine's own interface addresses, and the IPv6 forms that embed one, checked at resolution and at every redirect. The fetch dials only the addresses the check vetted and never resolves the name a second time (ADR 0053) |
+| `web.allow_private_hosts` | bool | false | true lets `web_fetch` reach loopback, private, link-local and unique-local addresses, this machine's own interface addresses, and the IPv6 forms that embed one, checked at resolution and at every redirect. The fetch dials only the addresses the check vetted and never resolves the name a second time. `web_fetch` uses no HTTP proxy (ADR 0053) |
 
 ### themes/<name>.toml
 

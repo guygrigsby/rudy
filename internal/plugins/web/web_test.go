@@ -37,9 +37,19 @@ func testConfig() config.WebConfig {
 	return config.WebConfig{BraveAPIKey: "env:RUDY_TEST_WEB_KEY", MaxResults: 3, FetchMaxBytes: 1 << 20}
 }
 
-// loopbackResolver lets a test reach its own httptest server, which lives at exactly the
-// address the policy refuses by default. Only loopback is pretended public: everything else
-// resolves to itself, so a redirect to the metadata endpoint is still the real thing.
+// privateConfig is testConfig with the policy off, for a test that reads its own httptest
+// server: the fetch dials only the addresses it resolved, so loopback has to resolve to
+// itself and the policy has to let it through.
+func privateConfig() config.WebConfig {
+	cfg := testConfig()
+	cfg.AllowPrivateHosts = true
+	return cfg
+}
+
+// loopbackResolver pretends loopback is public, so a policy that is on can be exercised
+// against a test server's address; pair it with a dial seam, because the fetch dials the
+// resolved address, not the server. Everything else resolves to itself, so a redirect to the
+// metadata endpoint is still the real thing.
 func loopbackResolver(_ context.Context, host string) ([]net.IP, error) {
 	switch host {
 	case "127.0.0.1", "localhost", "::1":
@@ -147,7 +157,7 @@ func TestFetchReadsAPageAsText(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &webPlugin{cfg: testConfig(), version: "test", searcher: fakeSearcher{}, resolve: loopbackResolver}
+	p := &webPlugin{cfg: privateConfig(), version: "test", searcher: fakeSearcher{}}
 	res := invoke(t, fetchToolFor(t, p), `{"url":"`+srv.URL+`"}`)
 	got := text(res)
 	if res.IsError {
@@ -199,7 +209,10 @@ func TestFetchRechecksEveryRedirect(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &webPlugin{cfg: testConfig(), version: "test", searcher: fakeSearcher{}, resolve: loopbackResolver}
+	p := &webPlugin{cfg: testConfig(), version: "test", searcher: fakeSearcher{}, resolve: loopbackResolver,
+		dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+		}}
 	res := invoke(t, fetchToolFor(t, p), `{"url":"`+srv.URL+`"}`)
 	if !res.IsError || !strings.Contains(text(res), "refused") {
 		t.Fatalf("a redirect to the metadata endpoint was followed: %+v", res)
@@ -215,9 +228,9 @@ func TestFetchStopsReading(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testConfig()
+	cfg := privateConfig()
 	cfg.FetchMaxBytes = 4096
-	p := &webPlugin{cfg: cfg, version: "test", searcher: fakeSearcher{}, resolve: loopbackResolver}
+	p := &webPlugin{cfg: cfg, version: "test", searcher: fakeSearcher{}}
 	got := text(invoke(t, fetchToolFor(t, p), `{"url":"`+srv.URL+`"}`))
 	if !strings.Contains(got, "[truncated]") {
 		t.Error("a page over the byte limit came back without saying it was cut")
@@ -236,7 +249,7 @@ func TestFetchReportsTheServersRefusal(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p := &webPlugin{cfg: testConfig(), version: "test", searcher: fakeSearcher{}, resolve: loopbackResolver}
+	p := &webPlugin{cfg: privateConfig(), version: "test", searcher: fakeSearcher{}}
 	res := invoke(t, fetchToolFor(t, p), `{"url":"`+srv.URL+`"}`)
 	if !res.IsError || !strings.Contains(text(res), "17s") {
 		t.Fatalf("a 429 with Retry-After reads %q", text(res))

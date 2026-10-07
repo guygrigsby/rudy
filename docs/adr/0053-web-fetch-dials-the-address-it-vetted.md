@@ -36,5 +36,7 @@ embedded private address past the IPv4 switch (`rudy-75j`).
   ones.
 - `web.allow_private_hosts` still turns the whole policy off, for a test
   server on loopback.
+- `web_fetch` uses no HTTP proxy, since a proxy would resolve and connect outside
+  the policy.
 - The README sentence "a URL cannot reach this machine's own services" is
   true again against an attacker with a domain.
