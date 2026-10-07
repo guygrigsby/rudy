@@ -4,6 +4,7 @@ package gate
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -26,6 +27,38 @@ func (g *Gate) MatcherFor(tool string, args json.RawMessage) session.Matcher {
 		return session.Matcher{Tool: tool, Prefix: firstWords(strings.Fields(cmd), 2)}
 	}
 	return session.Matcher{Tool: tool, Prefix: calls[0].prefix()}
+}
+
+// CallSet is every matcher a tool input carries: for bash, one per call in bashCalls (the same
+// expansion Dangerous reads), in input order, duplicates kept; for every other tool, the one
+// {Tool} matcher. Never empty: an input that will not parse is one matcher over its fields, as
+// MatcherFor already does. An allowance covers an input only when it covers all of them (ADR
+// 0051 decision 1).
+func (g *Gate) CallSet(tool string, args json.RawMessage) []session.Matcher {
+	if tool != "bash" {
+		return []session.Matcher{{Tool: tool}}
+	}
+	calls := bashCalls(args)
+	if len(calls) == 0 {
+		return []session.Matcher{g.MatcherFor(tool, args)}
+	}
+	set := make([]session.Matcher, 0, len(calls))
+	for _, c := range calls {
+		set = append(set, session.Matcher{Tool: tool, Prefix: c.prefix()})
+	}
+	return set
+}
+
+// Uncovered is the first matcher in set that allowances do not contain, and ok false when
+// every one is covered. The first uncovered matcher is what a question carries and a
+// permission_decision records.
+func Uncovered(set []session.Matcher, allowances []session.Matcher) (session.Matcher, bool) {
+	for _, m := range set {
+		if !slices.Contains(allowances, m) {
+			return m, true
+		}
+	}
+	return session.Matcher{}, false
 }
 
 // Dangerous reports whether this call matches an entry of the dangerous set, and why. An
@@ -307,7 +340,7 @@ func expand(calls []call, depth int) []call {
 	out := calls
 	for _, c := range calls {
 		for _, inner := range unwrap(c) {
-			out = append(out, inner)
+			// expand returns inner itself first, then what inner runs.
 			out = append(out, expand([]call{inner}, depth+1)...)
 		}
 	}

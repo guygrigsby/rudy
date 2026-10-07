@@ -46,6 +46,9 @@ func New(dangerous []string) *Gate {
 // granted runs; then the mode decides, permissive running what is left and strict asking.
 // Nobody attached to answer turns every ask into a deny.
 //
+// An allowance covers an input only when it covers every call the input runs (ADR 0051): the
+// matcher of an ask is the first call not covered, so the answer grants what was asked about.
+//
 // Dangerous is checked before allowances deliberately. An allowance is keyed on the matcher,
 // and a bash matcher is only the first two words of the command, so an allowance granted for
 // "git push" also matches "git push --force". Checking allowances first would let the second
@@ -65,11 +68,12 @@ func (g *Gate) Evaluate(in Input) Verdict {
 		isDangerous = true
 		askReason = "dangerous " + entry
 	} else {
-		for _, a := range in.Allowances {
-			if a == m {
-				return Verdict{Decision: session.Allow, DecidedBy: session.ByAllowance, Matcher: m, Reason: fmt.Sprintf("allowance %s %s", m.Tool, m.Prefix)}
-			}
+		set := g.CallSet(in.Tool, in.Args)
+		uncovered, ok := Uncovered(set, in.Allowances)
+		if !ok {
+			return Verdict{Decision: session.Allow, DecidedBy: session.ByAllowance, Matcher: set[0], Reason: "allowances cover every call"}
 		}
+		m = uncovered
 		switch in.Mode {
 		case session.ModePermissive:
 			return Verdict{Decision: session.Allow, DecidedBy: session.ByMode, Matcher: m, Reason: "mode permissive"}

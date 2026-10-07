@@ -2369,7 +2369,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		return "", perr(protocol.CodeUnavailable, "provider not loaded: "+ls.model.Ref.Provider)
 	}
 	sid := ls.sess.ID().String()
-	la := &liveAsker{ls: ls, sid: sid}
+	la := &liveAsker{ls: ls, sid: sid, gate: s.d.Gate}
 	var asker turn.Asker
 	if len(ls.askers()) > 0 {
 		asker = la
