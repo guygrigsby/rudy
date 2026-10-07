@@ -44,6 +44,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/provider/httpx"
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/trust"
 )
 
 // Built is everything a command needs after wiring.
@@ -321,7 +322,7 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 // the first registration of a name wins. The roots are the data root (where rudy plugin
 // install puts them), the config root (where a user drops one by hand) and the workspace's
 // own .rudy, which is how a repository ships a plugin with itself.
-func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, commandTimeout time.Duration, notice func(string), trust TrustAsker) []plugin.Plugin {
+func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, commandTimeout time.Duration, notice func(string), ask TrustAsker) []plugin.Plugin {
 	// No working directory is no project scope, never a reason to fail the build.
 	cwd, _ := os.Getwd()
 	roots := []string{paths.Data, paths.Config}
@@ -337,7 +338,7 @@ func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Se
 		for _, err := range ownErrs {
 			notice(err.Error())
 		}
-		manifests = append(manifests, trustedOnly(paths, cwd, own, trust, notice)...)
+		manifests = append(manifests, trustedOnly(paths, cwd, own, ask, notice)...)
 	}
 	var workspaces []string
 	if cwd != "" {
@@ -359,17 +360,21 @@ func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Se
 // TrustAsker is how a caller asks the operator whether this workspace's own plugins may
 // run. It answers true only when a person said so. Nil is a caller that cannot ask, which is
 // every headless one: no answer means no, the rule the Gate keeps for an unsafe tool.
-type TrustAsker func(root string, manifests []plugin.Manifest) (bool, error)
+type TrustAsker func(root string, decls []trust.Declaration) (bool, error)
 
 // trustedOnly is the workspace's own manifests when the operator has trusted this workspace
 // as it stands, and nothing when they have not. A caller that cannot ask says why once,
 // naming what it did not run, so a plugin that is missing is never a mystery.
-func trustedOnly(paths config.Paths, cwd string, own []plugin.Manifest, trust TrustAsker, notice func(string)) []plugin.Manifest {
+func trustedOnly(paths config.Paths, cwd string, own []plugin.Manifest, ask TrustAsker, notice func(string)) []plugin.Manifest {
 	if len(own) == 0 {
 		return nil
 	}
-	store := pluginstore.New(paths.Data)
-	trusted, err := store.IsTrusted(cwd, own)
+	store := trust.NewStore(paths.Data)
+	decls := make([]trust.Declaration, 0, len(own))
+	for _, m := range own {
+		decls = append(decls, trust.PluginDeclaration(m))
+	}
+	trusted, err := store.IsTrusted(cwd, decls)
 	if err != nil {
 		notice(err.Error())
 		return nil
@@ -377,11 +382,11 @@ func trustedOnly(paths config.Paths, cwd string, own []plugin.Manifest, trust Tr
 	if trusted {
 		return own
 	}
-	if trust == nil {
+	if ask == nil {
 		notice(fmt.Sprintf("this workspace ships %d plugin(s) and is not trusted; run rudy plugins trust to allow them", len(own)))
 		return nil
 	}
-	ok, err := trust(cwd, own)
+	ok, err := ask(cwd, decls)
 	if err != nil {
 		notice(err.Error())
 		return nil
@@ -390,7 +395,7 @@ func trustedOnly(paths config.Paths, cwd string, own []plugin.Manifest, trust Tr
 		notice("this workspace's plugins were not trusted; none of them were started")
 		return nil
 	}
-	if err := store.Trust(cwd, own, time.Now()); err != nil {
+	if err := store.Trust(cwd, decls, time.Now()); err != nil {
 		notice(err.Error())
 	}
 	return own
