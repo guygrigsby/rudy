@@ -46,6 +46,8 @@ type webPlugin struct {
 	exaEndpoint string
 	// resolve is the policy's lookup, injected for the same reason.
 	resolve func(ctx context.Context, host string) ([]net.IP, error)
+	// dial is the fetcher's dial seam: what a test sees of the address the transport chose.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // New returns the plugin. The key is read from the environment at Init rather than here, so
@@ -58,27 +60,35 @@ func New(cfg config.WebConfig, version string, resolveSecret func(string) (strin
 func (*webPlugin) Name() string { return "tools.web" }
 
 func (p *webPlugin) Init(ctx context.Context, h plugin.Host) error {
+	f := &fetcher{
+		policy:    policy{allowPrivate: p.cfg.AllowPrivateHosts, resolve: p.resolve},
+		maxBytes:  p.cfg.FetchMaxBytes,
+		userAgent: "rudy/" + p.version + " (+https://github.com/guygrigsby/rudy)",
+		dial:      p.dial,
+	}
 	client := &http.Client{
 		Timeout: requestTimeout,
+		// The transport dials only the addresses the policy vetted (ADR 0053). No proxy: one
+		// would resolve and connect outside the policy. No keep-alive: a pooled connection
+		// must never serve a later fetch whose vetting differs.
+		Transport: &http.Transport{DialContext: f.dialVetted, DisableKeepAlives: true, Proxy: nil, ForceAttemptHTTP2: true},
 		// Redirects are followed by the fetcher, not by the client: every hop has to pass
 		// the policy again, and a client that follows them itself takes the second hop
 		// before anything has looked at it (ADR 0039).
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	agent := "rudy/" + p.version + " (+https://github.com/guygrigsby/rudy)"
+	agent := f.userAgent
+	// The search backends are fixed endpoints the operator configured, not model-chosen URLs,
+	// so they keep the default transport: the pinned dialer would refuse them for want of a
+	// vetted address.
+	searchClient := &http.Client{Timeout: requestTimeout, CheckRedirect: client.CheckRedirect}
 	lim := newLimiter(perHostDelay)
 
 	// Fetch first, and unconditionally: it takes a URL and reads it, so it asks no backend
 	// anything and a key would buy it nothing. ADR 0039 registered the two together and
 	// ADR 0040 separated them, because the rule cost an operator with no search key the
 	// ability to have a model read a page they pasted in.
-	f := &fetcher{
-		client:    client,
-		policy:    policy{allowPrivate: p.cfg.AllowPrivateHosts, resolve: p.resolve},
-		limiter:   lim,
-		maxBytes:  p.cfg.FetchMaxBytes,
-		userAgent: agent,
-	}
+	f.client, f.limiter = client, lim
 	if err := h.RegisterTool(tool.Tool{
 		Name:        "web_fetch",
 		Description: "Read an http or https URL and return the page as text. HTML is reduced to text and long pages are truncated.",
@@ -91,7 +101,7 @@ func (p *webPlugin) Init(ctx context.Context, h plugin.Host) error {
 
 	search := p.searcher
 	if search == nil {
-		backends := p.backends(client, agent, lim)
+		backends := p.backends(searchClient, agent, lim)
 		if len(backends) == 0 {
 			// No search, and not a failure either: a model that can see web_search and
 			// cannot use it spends a turn discovering that, and an operator who set no key

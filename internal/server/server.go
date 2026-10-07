@@ -51,6 +51,10 @@ type Deps struct {
 	Prompt string
 	// Home is the home directory of the process running this server, answered in the hello.
 	Home string
+	// Trusted says whether the operator trusted what root ships, read from the trust record
+	// at session.open rather than asked for: the daemon may serve a workspace it was not
+	// started in, and no asker means no (ADR 0050). Nil trusts no workspace.
+	Trusted func(root string) bool
 }
 
 // EntryIDResult answers session.set_model, set_mode, set_thinking, set_title and
@@ -708,6 +712,7 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// human's connection is the only one that can answer. Take the claim, then let the one
 	// predicate decide whether it holds, so the door and every routing walk say the same
 	// thing about who is an asker.
+	cn.name = p.Client
 	cn.asker = p.Asker
 	cn.asker = cn.isAsker()
 	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home}, nil
@@ -1565,12 +1570,26 @@ func firstNonEmpty(vs ...string) string {
 // registration, so installing a plugin cannot take a name that is already in use and cannot
 // change what an existing session resolves to (ADR 0028). Read per session rather than cached,
 // so a definition edited between two sessions takes effect on the second without a restart. ok
-// is false only for a name nothing defines; "" and "default" always resolve.
+// is false only for a name nothing defines; "" and "default" always resolve. The workspace root is
+// read only when Deps.Trusted says the operator trusted it, so a cloned repository cannot supply
+// default (ADR 0050).
 func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agentdef.Definition, bool) {
-	defs, errs := agentdef.Load([]string{
-		filepath.Join(s.d.Config.ConfigDir, "agents"),
-		filepath.Join(ws.Root, ".rudy", "agents"),
-	})
+	return agentdef.Resolve(s.agentDefs(cn, ws), name)
+}
+
+// agentDefs is every definition visible to a session in ws, with the notices resolveAgent
+// describes. A caller resolving more than one name loads once so the notices fire once.
+func (s *Server) agentDefs(cn *conn, ws session.Workspace) map[string]agentdef.Definition {
+	roots := []string{filepath.Join(s.d.Config.ConfigDir, "agents")}
+	wsAgents := filepath.Join(ws.Root, ".rudy", "agents")
+	if s.d.Trusted != nil && s.d.Trusted(ws.Root) {
+		roots = append(roots, wsAgents)
+	} else if md, _ := filepath.Glob(filepath.Join(wsAgents, "*.md")); len(md) > 0 {
+		// A repository's agents are its author's, not the operator's: an untrusted root's are
+		// never read, default included (ADR 0050).
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "workspace agents in " + wsAgents + " not loaded: the workspace is not trusted; run rudy plugins trust there"})
+	}
+	defs, errs := agentdef.Load(roots)
 	for _, e := range errs {
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: e.Error()})
 	}
@@ -1579,7 +1598,7 @@ func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agen
 			defs[n] = d
 		}
 	}
-	return agentdef.Resolve(defs, name)
+	return defs
 }
 
 // applyAgent stamps a definition and an already-resolved tool list onto a session that is not
@@ -1679,10 +1698,11 @@ func parentToolNames(parent *liveSession) []string {
 func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 	name := ls.sess.Agent()
 	ws := deriveInfo(ls.sess.ID(), ls.entries).Workspace
-	def, ok := s.resolveAgent(cn, ws, name)
+	defs := s.agentDefs(cn, ws)
+	def, ok := agentdef.Resolve(defs, name)
 	if !ok {
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "agent " + name + " is no longer defined; continuing under the default agent"})
-		def, _ = s.resolveAgent(cn, ws, "")
+		def, _ = agentdef.Resolve(defs, "")
 	}
 	s.applyAgent(ls, def, loggedTools(ls.sess, def))
 }
@@ -2350,7 +2370,7 @@ func (s *Server) startTurn(ls *liveSession, msg session.UserMessage) (string, *p
 		return "", perr(protocol.CodeUnavailable, "provider not loaded: "+ls.model.Ref.Provider)
 	}
 	sid := ls.sess.ID().String()
-	la := &liveAsker{ls: ls, sid: sid}
+	la := &liveAsker{ls: ls, sid: sid, gate: s.d.Gate}
 	var asker turn.Asker
 	if len(ls.askers()) > 0 {
 		asker = la

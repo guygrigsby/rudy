@@ -4,10 +4,13 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +34,16 @@ type fetcher struct {
 	limiter   *limiter
 	maxBytes  int
 	userAgent string
+	// dial is the dialer the transport uses once dialVetted has chosen the address. Nil is a
+	// net.Dialer with a 10s timeout; a test sets it to see what the transport was handed.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
+
+// vettedKey carries the addresses the policy accepted for the current hop to dialVetted.
+type vettedKey struct{}
+
+// dialTimeout bounds one connection attempt, as the default transport's dialer does.
+const dialTimeout = 10 * time.Second
 
 const (
 	// maxRedirects is how far a fetch follows. Each hop is checked against the policy
@@ -57,13 +69,14 @@ func (f *fetcher) fetch(ctx context.Context, raw string) (Page, error) {
 		if hop > maxRedirects {
 			return Page{}, fmt.Errorf("%w: more than %d redirects", errRefused, maxRedirects)
 		}
-		if err := f.policy.check(ctx, u); err != nil {
+		ips, err := f.policy.vet(ctx, u)
+		if err != nil {
 			return Page{}, err
 		}
 		if err := f.limiter.wait(ctx, hostOf(u)); err != nil {
 			return Page{}, err
 		}
-		res, err := f.get(ctx, u)
+		res, err := f.get(context.WithValue(ctx, vettedKey{}, ips), u)
 		if err != nil {
 			return Page{}, err
 		}
@@ -90,6 +103,57 @@ func (f *fetcher) fetch(ctx context.Context, raw string) (Page, error) {
 		}
 		return Page{URL: u.String(), Title: title, Text: text, Truncated: truncated}, nil
 	}
+}
+
+// dialVetted is the transport's DialContext. It dials the addresses the policy vetted for
+// this hop, which fetch put in ctx, and ignores the host in addr: the name was resolved once,
+// by the policy, and a second resolution is the window ADR 0053 closes. The port is kept. A
+// ctx without vetted addresses is an error, never a fallback to the name.
+func (f *fetcher) dialVetted(ctx context.Context, network, addr string) (net.Conn, error) {
+	ips, _ := ctx.Value(vettedKey{}).([]net.IP)
+	if len(ips) == 0 {
+		return nil, errors.New("no vetted address to dial")
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	dial := f.dial
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: dialTimeout}).DialContext
+	}
+	var errs []error
+	for _, ip := range ips {
+		conn, err := dial(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		// The dial was handed a vetted address; the peer must be one too, so a dial that
+		// landed elsewhere is refused rather than read.
+		if !slices.ContainsFunc(ips, peerIP(conn).Equal) {
+			_ = conn.Close()
+			errs = append(errs, fmt.Errorf("%w: the connection reached an address the policy did not vet", errRefused))
+			continue
+		}
+		return conn, nil
+	}
+	return nil, errors.Join(errs...)
+}
+
+// peerIP is the IP a connection is actually connected to, or nil when it cannot say.
+func peerIP(c net.Conn) net.IP {
+	switch a := c.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		return a.IP
+	case *net.IPAddr:
+		return a.IP
+	}
+	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
 }
 
 // get makes one request. No cookies, no credentials, no body: a fetch is a read of something

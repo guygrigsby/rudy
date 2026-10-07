@@ -122,7 +122,7 @@ var Sections = []Section{
 		Keys: []Doc{
 			{Key: "permissions.mode", Comment: "strict asks, permissive allows but still asks for the dangerous set, off allows everything.", Example: `"permissive"`},
 			{Key: "permissions.double_press_ms", Comment: "The window two Escapes have to fall inside to cancel a turn."},
-			{Key: "permissions.dangerous", Comment: `Always ask, unless the mode is off: a bash prefix, "tool:", or "tool:prefix".`},
+			{Key: "permissions.dangerous", Comment: `Always ask, unless the mode is off: a bash command with the tokens it requires in any order, "tool:", or "tool:entry" (ADR 0051).`},
 		},
 	},
 	{

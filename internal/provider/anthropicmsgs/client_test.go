@@ -12,6 +12,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -460,5 +461,30 @@ func TestErrorMessageFallsBackToTheStatus(t *testing.T) {
 		if got := errorMessage([]byte(c.body), c.status); got != c.want {
 			t.Errorf("errorMessage(%q, %d) = %q, want %q", c.body, c.status, got, c.want)
 		}
+	}
+}
+
+func TestCompleteRefusesARedirectAndLeaksNoCredential(t *testing.T) {
+	var leaked atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked.Add(1)
+	}))
+	t.Cleanup(target.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(origin.Close)
+	c := New(Options{Name: "anth", BaseURL: origin.URL, APIKey: "k", Headers: map[string]string{"X-Extra": "1"}, HTTP: httpx.New("test")})
+	err := c.Complete(context.Background(), provider.Request{
+		Model:     session.ModelRef{Provider: "anth", Model: "claude-sonnet-5"},
+		MaxTokens: 100,
+		Messages:  []provider.Message{{Role: provider.RoleUser, Content: []session.Block{session.TextBlock("hi")}}},
+		SessionID: ulid.Make(),
+	}, func(provider.Part) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "does not follow provider redirects") {
+		t.Fatalf("got %v", err)
+	}
+	if n := leaked.Load(); n != 0 {
+		t.Fatalf("target saw %d requests", n)
 	}
 }

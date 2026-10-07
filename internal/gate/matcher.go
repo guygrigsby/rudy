@@ -4,6 +4,7 @@ package gate
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 
 	"mvdan.cc/sh/v3/syntax"
@@ -21,75 +22,246 @@ func (g *Gate) MatcherFor(tool string, args json.RawMessage) session.Matcher {
 	if !ok {
 		return session.Matcher{Tool: tool}
 	}
-	calls, err := shellCalls(cmd)
-	if err != nil || len(calls) == 0 {
+	calls := bashCalls(args)
+	if len(calls) == 0 {
 		return session.Matcher{Tool: tool, Prefix: firstWords(strings.Fields(cmd), 2)}
 	}
-	return session.Matcher{Tool: tool, Prefix: firstWords(calls[0], 2)}
+	return session.Matcher{Tool: tool, Prefix: calls[0].prefix()}
 }
 
-// Dangerous reports whether this call matches an entry of the dangerous set, and which
-// entry it was. An entry takes one of three forms:
+// CallSet is every matcher a tool input carries: for bash, one per call in bashCalls (the same
+// expansion Dangerous reads), in input order, duplicates kept; for every other tool, the one
+// {Tool} matcher. Never empty: an input that will not parse is one matcher over its fields, as
+// MatcherFor already does. An allowance covers an input only when it covers all of them (ADR
+// 0051 decision 1).
+func (g *Gate) CallSet(tool string, args json.RawMessage) []session.Matcher {
+	if tool != "bash" {
+		return []session.Matcher{{Tool: tool}}
+	}
+	calls := bashCalls(args)
+	if len(calls) == 0 {
+		return []session.Matcher{g.MatcherFor(tool, args)}
+	}
+	set := make([]session.Matcher, 0, len(calls))
+	for _, c := range calls {
+		set = append(set, session.Matcher{Tool: tool, Prefix: c.prefix()})
+	}
+	return set
+}
+
+// Uncovered is the first matcher in set that allowances do not contain, and ok false when
+// every one is covered. The first uncovered matcher is what a question carries and a
+// permission_decision records.
+func Uncovered(set []session.Matcher, allowances []session.Matcher) (session.Matcher, bool) {
+	for _, m := range set {
+		if !slices.Contains(allowances, m) {
+			return m, true
+		}
+	}
+	return session.Matcher{}, false
+}
+
+// Dangerous reports whether this call matches an entry of the dangerous set, and why. An
+// entry takes one of three forms:
 //
-//	rm -rf        a bash command prefix, which is what every default is
+//	rm -rf        a bash command name and the tokens it requires, in any order
 //	web_fetch:    a tool, dangerous whatever its input
-//	bash:git push a tool and, for bash, a command prefix
+//	bash:git push a tool and, for bash, a command and its tokens
 //
 // For bash, every simple command in the input is checked, and so is every command a
 // wrapper runs: the set is what forces a question in permissive mode, and an entry that
-// `sh -c` walks around is an entry that does nothing (rudy-k0.34, rudy-y3d).
+// `sh -c` walks around is an entry that does nothing (rudy-k0.34, rudy-y3d). A call the
+// gate cannot read is dangerous without any entry: a command word or flag the shell will
+// expand, a shell given a script or its commands on input, source, a call wrapped past
+// the depth limit ("wrapped too deep") (ADR 0051).
 func (g *Gate) Dangerous(tool string, args json.RawMessage) (bool, string) {
-	var calls [][]string
+	var calls []call
 	if tool == "bash" {
-		if cmd, ok := bashCommand(args); ok {
-			calls = expand(shellCallsOrFields(cmd), 0)
-		}
+		calls = bashCalls(args)
 	}
 	for _, d := range g.dangerous {
-		entryTool, prefix, scoped := strings.Cut(d, ":")
+		entryTool, rest, scoped := strings.Cut(d, ":")
 		switch {
 		case scoped && entryTool != tool:
 			continue
-		case scoped && prefix == "":
+		case scoped && rest == "":
 			// A tool with no prefix: every call of it is dangerous, which is the only
 			// way to say "always ask" for a tool that is not bash.
 			return true, d
 		case tool != "bash":
-			// Every other entry is a bash command prefix, and no other tool has one.
+			// Every other entry is a bash command, and no other tool has one.
 			continue
 		}
 		want := d
 		if scoped {
-			want = prefix
+			want = rest
 		}
-		for _, call := range calls {
-			for _, joined := range callForms(call) {
-				if joined == want || strings.HasPrefix(joined, want+" ") {
-					return true, d
-				}
+		e := parseEntry(want)
+		for _, c := range calls {
+			if e.matches(c) {
+				return true, d
 			}
+		}
+	}
+	for _, c := range calls {
+		if reason, ok := c.refusal(); ok {
+			return true, reason
 		}
 	}
 	return false, ""
 }
 
-// callForms is the spellings of one call the set is read against: the words as written,
-// and, when the command was named by path or escaped, the same call under the name the
-// shell will actually run. unwrap already reads /bin/sh as the sh wrapper, and the entries
-// have to see /bin/rm as rm for the same reason: a set that any path walks around is a set
-// that does nothing. Both forms are kept, so an operator whose entry names a full path
-// still matches the command written that way.
-func callForms(call []string) []string {
-	if len(call) == 0 {
-		return nil
+// unreadable is the characters that make a word something other than what it spells: the
+// shell expands, escapes, braces or globs it before it runs, so the gate cannot say what
+// command or flag it becomes.
+const unreadable = "$`\\{*?[;"
+
+// call is one simple command the input runs, after wrapper expansion.
+type call struct {
+	words []string // as written, quotes dropped, expansions in source form
+	deep  bool     // runs something the wrapper depth limit stopped short of
+}
+
+// name is the command the shell will run: the last path element of the first word, with a
+// leading backslash dropped.
+func (c call) name() string { return shellName(c.words[0]) }
+
+// prefix is the key an allowance is matched on: the name and the second word, when there is one.
+func (c call) prefix() string {
+	if len(c.words) > 1 {
+		return c.name() + " " + c.words[1]
 	}
-	joined := strings.Join(call, " ")
-	head := shellName(call[0])
-	if head == call[0] {
-		return []string{joined}
+	return c.name()
+}
+
+// tokens is the arguments after normalization, so an entry and a command compare on what
+// they ask for and not how it is spelled: a bundle -rvf is -r -v -f, -R and --recursive are
+// -r, --force is -f, --flag=value is --flag, and a word that is not a flag stays as written.
+// A flag the gate cannot read gives no token; refusal reports it.
+func (c call) tokens() []string {
+	var out []string
+	for _, w := range c.words[1:] {
+		switch {
+		case isFlag(w) && strings.ContainsAny(flagName(w), unreadable):
+		case strings.HasPrefix(w, "--"):
+			name := flagName(w)
+			switch name {
+			case "--recursive":
+				name = "-r"
+			case "--force":
+				name = "-f"
+			}
+			out = append(out, name)
+		case isFlag(w):
+			for _, r := range flagName(w)[1:] {
+				if r == 'R' {
+					r = 'r'
+				}
+				out = append(out, "-"+string(r))
+			}
+		default:
+			out = append(out, w)
+		}
 	}
-	normalized := append([]string{head}, call[1:]...)
-	return []string{joined, strings.Join(normalized, " ")}
+	return out
+}
+
+// isFlag is a word that starts like a flag: a dash and something after it.
+func isFlag(w string) bool { return len(w) > 1 && w[0] == '-' }
+
+// flagName is a flag without its =value. The value is data the program reads, so
+// --include=*.go and -run=^T$ are readable flags; only the name decides.
+func flagName(w string) string {
+	name, _, _ := strings.Cut(w, "=")
+	return name
+}
+
+// unclassifiable is the first word among the command and every flag-like word that the
+// shell will rewrite before running, which the gate cannot read. A command word that is
+// exactly [ or [[ is the test builtin, a command in its own right and not a glob; only a
+// word that merely contains a bracket, like [a or ls[, stays unreadable.
+func (c call) unclassifiable() (string, bool) {
+	for i, w := range c.words {
+		if i == 0 && (w == "[" || w == "[[") {
+			continue
+		}
+		name := w
+		if i > 0 {
+			name = flagName(w)
+		}
+		if (i == 0 || isFlag(w)) && strings.ContainsAny(name, unreadable) {
+			return w, true
+		}
+	}
+	return "", false
+}
+
+// refusal is why the call is dangerous whatever the set says, if it is.
+func (c call) refusal() (string, bool) {
+	if c.deep {
+		return "wrapped too deep", true
+	}
+	if w, ok := c.unclassifiable(); ok {
+		return "unclassifiable command " + w, true
+	}
+	name := c.name()
+	switch {
+	case name == "source" || name == ".":
+		return "sources a file", true
+	case name == "eval":
+		if joined := strings.Join(c.words[1:], " "); strings.ContainsAny(joined, unreadable) {
+			return "unclassifiable command " + joined, true
+		}
+	case shellFlagged[name]:
+		script, _, file := shellScript(c.words)
+		switch {
+		case script != "":
+			return "", false
+		case file:
+			return "shell runs a script it was given", true
+		}
+		return "shell reads its commands from input", true
+	}
+	return "", false
+}
+
+// entry is a dangerous-set entry read the way a call is: a command name and the tokens it requires.
+type entry struct {
+	name   string
+	tokens []string
+}
+
+func parseEntry(s string) entry {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return entry{}
+	}
+	return entry{name: shellName(words[0]), tokens: call{words: words}.tokens()}
+}
+
+// matches is true when the call runs the entry's command, matching mkfs to mkfs.ext4, and
+// holds every token the entry requires, in any order.
+func (e entry) matches(c call) bool {
+	if e.name == "" {
+		return false
+	}
+	if n := c.name(); n != e.name && !strings.HasPrefix(n, e.name+".") {
+		return false
+	}
+	have := c.tokens()
+	for _, t := range e.tokens {
+		found := false
+		for _, h := range have {
+			if h == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // shellName is the command a word runs: its last path element, with a leading backslash
@@ -102,14 +274,30 @@ func shellName(word string) string {
 	return name
 }
 
+// bashCalls is every simple command of a bash input plus every command a wrapper runs, as
+// calls. An input the shell will refuse is still read, as its words.
+func bashCalls(args json.RawMessage) []call {
+	cmd, ok := bashCommand(args)
+	if !ok {
+		return nil
+	}
+	return expand(shellCallsOrFields(cmd), 0)
+}
+
 // shellCallsOrFields is the parsed simple commands of src, or its words when it does not
 // parse: an input the shell will refuse is still an input the set should be read against.
-func shellCallsOrFields(src string) [][]string {
-	calls, err := shellCalls(src)
-	if err != nil || len(calls) == 0 {
-		return [][]string{strings.Fields(src)}
+func shellCallsOrFields(src string) []call {
+	words, err := shellCalls(src)
+	if err != nil || len(words) == 0 {
+		words = [][]string{strings.Fields(src)}
 	}
-	return calls
+	out := make([]call, 0, len(words))
+	for _, w := range words {
+		if len(w) > 0 {
+			out = append(out, call{words: w})
+		}
+	}
+	return out
 }
 
 // wrapperDepth bounds how far a wrapper inside a wrapper is followed. Three is past
@@ -126,58 +314,194 @@ var shellFlagged = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash"
 var prefixWrappers = map[string]bool{
 	"env": true, "xargs": true, "nohup": true, "time": true, "exec": true, "command": true,
 	"sudo": true, "doas": true, "nice": true, "ionice": true, "timeout": true, "stdbuf": true,
-	"setsid": true, "watch": true,
+	"setsid": true, "watch": true, "caffeinate": true,
+}
+
+// wrapperValueFlags is, per wrapper, the short flags that take the next word as their
+// value. That word is not the command: `nice -n 10 rm -rf` runs rm. A value attached to its
+// flag (-n10) or joined with = (--adjustment=10) is one word and consumes nothing extra.
+// timeout's -k and -s are here beyond the table the ADR names, since `timeout -s KILL 5 rm`
+// would otherwise read KILL as the duration and 5 as the command.
+var wrapperValueFlags = map[string]map[string]bool{
+	"nice":       {"-n": true, "--adjustment": true},
+	"ionice":     {"-c": true, "-n": true, "-p": true, "--class": true, "--classdata": true, "--pid": true},
+	"xargs":      {"-n": true, "-I": true, "-L": true, "-P": true, "-d": true, "-s": true, "-a": true, "-E": true, "--max-args": true, "--max-procs": true, "--delimiter": true, "--max-chars": true, "--arg-file": true},
+	"watch":      {"-n": true},
+	"env":        {"-u": true, "-C": true, "-S": true, "--unset": true, "--chdir": true, "--split-string": true},
+	"exec":       {"-a": true},
+	"sudo":       {"-u": true, "-g": true, "-C": true, "-D": true, "-h": true, "-p": true, "-r": true, "-t": true, "-U": true, "--user": true, "--group": true, "--host": true, "--prompt": true, "--role": true, "--type": true, "--other-user": true},
+	"doas":       {"-u": true, "-C": true},
+	"stdbuf":     {"-i": true, "-o": true, "-e": true},
+	"caffeinate": {"-t": true, "-w": true},
+	"timeout":    {"-k": true, "-s": true, "--signal": true, "--kill-after": true},
 }
 
 // expand adds, for every call that runs another command, the command it runs. The wrapper
-// call itself stays in the set: `sudo ls` is still a sudo.
-func expand(calls [][]string, depth int) [][]string {
+// call itself stays in the set: `sudo ls` is still a sudo. At the depth limit a call that
+// still runs something is marked deep, which refuses it: what it runs is unread.
+func expand(calls []call, depth int) []call {
 	if depth >= wrapperDepth {
-		return calls
+		out := make([]call, len(calls))
+		for i, c := range calls {
+			c.deep = c.deep || len(unwrap(c)) > 0
+			out[i] = c
+		}
+		return out
 	}
 	out := calls
-	for _, call := range calls {
-		for _, inner := range unwrap(call) {
-			if len(inner) == 0 {
-				continue
-			}
-			out = append(out, inner)
-			out = append(out, expand([][]string{inner}, depth+1)...)
+	for _, c := range calls {
+		for _, inner := range unwrap(c) {
+			// expand returns inner itself first, then what inner runs.
+			out = append(out, expand([]call{inner}, depth+1)...)
 		}
 	}
 	return out
 }
 
+// shellValueFlags are the shell options that take the next word as their value, so that
+// word is neither the script nor the file: `bash -c -o pipefail 'rm -rf x'` runs rm.
+var shellValueFlags = map[string]bool{"-o": true, "-O": true, "--rcfile": true, "--init-file": true}
+
+// shellScript reads a shell's arguments the way the shell does. Options end at the first
+// word that is neither a flag nor an option's value; that word is the script file, and a -c
+// after it belongs to the script. Otherwise a short-flag bundle that holds c (-c, -lc, -cx)
+// makes the first such word the script. Long flags such as --norc are not bundles. script is
+// "" when -c is given with no script; file is true when the shell is given a file to run.
+func shellScript(words []string) (script string, hasC, file bool) {
+	for i := 1; i < len(words); i++ {
+		w := words[i]
+		switch {
+		case w == "--":
+			if hasC {
+				continue
+			}
+			return "", false, i+1 < len(words)
+		case shellValueFlags[w]:
+			i++
+		case isFlag(w):
+			if strings.HasPrefix(w, "--") {
+				continue
+			}
+			if strings.Contains(w, "c") {
+				hasC = true
+			}
+			// A bundle ending in o or O (-co) takes the next word as that option's value.
+			if strings.HasSuffix(w, "o") || strings.HasSuffix(w, "O") {
+				i++
+			}
+		case hasC:
+			return w, true, false
+		default:
+			return "", false, true
+		}
+	}
+	return "", hasC, false
+}
+
 // unwrap is what one call runs, if it runs anything: the parsed script of a shell's -c, the
 // parsed argument of eval, or the remainder of a prefix wrapper.
-func unwrap(call []string) [][]string {
-	if len(call) < 2 {
+func unwrap(c call) []call {
+	if len(c.words) < 2 {
 		return nil
 	}
-	head := shellName(call[0]) // /bin/sh and sh are the same wrapper
+	head := c.name() // /bin/sh and sh are the same wrapper
 	switch {
 	case head == "find":
-		return findExec(call)
+		return findExec(c.words)
 	case shellFlagged[head]:
-		for i := 1; i < len(call)-1; i++ {
-			// -c, and the bundles a login or interactive shell takes: -lc, -ic, -ec.
-			if strings.HasPrefix(call[i], "-") && strings.HasSuffix(call[i], "c") {
-				return shellCallsOrFields(call[i+1])
-			}
+		if script, _, _ := shellScript(c.words); script != "" {
+			return shellCallsOrFields(script)
 		}
 		return nil
 	case head == "eval":
-		return shellCallsOrFields(strings.Join(call[1:], " "))
+		return shellCallsOrFields(strings.Join(c.words[1:], " "))
 	case prefixWrappers[head]:
-		rest := call[1:]
-		for len(rest) > 0 && (strings.HasPrefix(rest[0], "-") || strings.Contains(rest[0], "=")) {
-			// env's assignments and a wrapper's own flags are not the command it runs.
-			rest = rest[1:]
+		var out []call
+		if head == "env" {
+			// env -S splits its value into the command it runs.
+			if script, ok := envSplitString(c.words[1:]); ok {
+				out = shellCallsOrFields(script)
+			}
 		}
-		if len(rest) == 0 {
-			return nil
+		rest := wrapped(head, c.words[1:])
+		switch {
+		case len(rest) == 0:
+		case head == "watch":
+			// watch hands its remainder to sh -c.
+			out = append(out, shellCallsOrFields(strings.Join(rest, " "))...)
+		default:
+			out = append(out, call{words: rest})
 		}
-		return [][]string{rest}
+		return out
+	}
+	return nil
+}
+
+// envSplitString is the value of env's -S or --split-string, which env splits into the
+// command it runs: the next word, or the text attached to the flag. It reads env's options
+// the way wrapped does, so the value of -u or -C is not mistaken for the command, and a
+// short bundle holding S (-iS) carries the flag.
+func envSplitString(words []string) (string, bool) {
+	valued := wrapperValueFlags["env"]
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		switch {
+		case !strings.HasPrefix(w, "-"):
+			if !strings.Contains(w, "=") {
+				return "", false
+			}
+		case strings.HasPrefix(w, "--split-string="):
+			return strings.TrimPrefix(w, "--split-string="), true
+		case w == "--split-string":
+			if i+1 < len(words) {
+				return words[i+1], true
+			}
+			return "", false
+		case strings.HasPrefix(w, "--"):
+			if valued[w] {
+				i++
+			}
+		default:
+			for k, r := range w[1:] {
+				if r != 'S' && r != 'u' && r != 'C' {
+					continue
+				}
+				attached := w[k+2:]
+				if attached == "" && i+1 < len(words) {
+					attached = words[i+1]
+					if r != 'S' {
+						i++
+					}
+				}
+				if r == 'S' {
+					return attached, true
+				}
+				break
+			}
+		}
+	}
+	return "", false
+}
+
+// wrapped is the command a prefix wrapper runs: what follows its flags, the values those
+// flags take, env's assignments and, for timeout, the duration.
+func wrapped(wrapper string, rest []string) []string {
+	valued := wrapperValueFlags[wrapper]
+	duration := wrapper == "timeout"
+	for len(rest) > 0 {
+		w := rest[0]
+		switch {
+		case strings.HasPrefix(w, "-"):
+			if valued[w] && len(rest) > 1 {
+				rest = rest[1:]
+			}
+		case strings.Contains(w, "="):
+		case duration:
+			duration = false
+		default:
+			return rest
+		}
+		rest = rest[1:]
 	}
 	return nil
 }
@@ -252,15 +576,14 @@ func partText(p syntax.WordPart) string {
 // to the ; or + that ends them, with the {} placeholder dropped. A cleanup task is exactly
 // where a model writes find -exec rm -rf, and find is not a prefix wrapper, so without this
 // the set never reads what it runs.
-func findExec(call []string) [][]string {
-	var out [][]string
-	for i := 0; i < len(call); i++ {
-		if call[i] != "-exec" && call[i] != "-execdir" && call[i] != "-ok" && call[i] != "-okdir" {
+func findExec(words []string) []call {
+	var out []call
+	for i := range words {
+		if words[i] != "-exec" && words[i] != "-execdir" && words[i] != "-ok" && words[i] != "-okdir" {
 			continue
 		}
 		var inner []string
-		for j := i + 1; j < len(call); j++ {
-			w := call[j]
+		for _, w := range words[i+1:] {
 			if w == ";" || w == "+" || w == `\;` {
 				break
 			}
@@ -270,7 +593,7 @@ func findExec(call []string) [][]string {
 			inner = append(inner, w)
 		}
 		if len(inner) > 0 {
-			out = append(out, inner)
+			out = append(out, call{words: inner})
 		}
 	}
 	return out

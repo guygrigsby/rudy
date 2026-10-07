@@ -30,7 +30,10 @@ type Client struct {
 func New(version string) *Client {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = 60 * time.Second
-	return &Client{HTTP: &http.Client{Transport: t}, Version: version, Sleep: time.Sleep, Now: time.Now}
+	// Never follow a redirect: Go would forward x-api-key, configured headers and hook
+	// headers to the new host. Do turns the 3xx into an error (ADR 0052).
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &Client{HTTP: &http.Client{Transport: t, CheckRedirect: noRedirect}, Version: version, Sleep: time.Sleep, Now: time.Now}
 }
 
 var backoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
@@ -115,6 +118,13 @@ func (c *Client) Do(ctx context.Context, req *http.Request, sessionID ulid.ULID)
 			delay = backoff[attempt]
 			continue
 		}
+		if isRedirect(resp.StatusCode) {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			return nil, &Error{Attempts: attempt + 1, Err: fmt.Errorf(
+				"httpx: %s %s: endpoint answered %d redirecting to %s; rudy does not follow provider redirects, set base_url to the endpoint that answers",
+				req.Method, req.URL, resp.StatusCode, locationHost(resp))}
+		}
 		if !Retryable(resp.StatusCode) {
 			return withAttempts(resp, attempt+1), nil
 		}
@@ -153,6 +163,24 @@ func (c *Client) Do(ctx context.Context, req *http.Request, sessionID ulid.ULID)
 		last = fmt.Errorf("httpx: %s %s: status %d", req.Method, req.URL, resp.StatusCode)
 	}
 	return nil, &Error{Attempts: len(backoff), Err: last}
+}
+
+func isRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
+}
+
+// locationHost names where a redirect points by scheme and host only, so the error never
+// carries a path or query the endpoint chose.
+func locationHost(resp *http.Response) string {
+	u, err := resp.Location()
+	if err != nil || u.Host == "" {
+		return "(no Location)"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // sleepCtx runs c.Sleep(d) to completion but returns as soon as ctx is done, so a

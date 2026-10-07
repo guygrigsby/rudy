@@ -4,6 +4,7 @@ package config
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -52,6 +53,6 @@ func ResolveSecret(ref string, env func(string) string, cachePath string) (strin
 		}
 		return "", fmt.Errorf("config: secret %s: %s not in %s; secrets.file names it", ref, key, cachePath)
 	default:
-		return "", fmt.Errorf("config: secret reference %q must be empty, env:NAME or cache:KEY", ref)
+		return "", errors.New("config: secret reference must be empty, env:NAME or cache:KEY; a key itself belongs in the environment or the secrets file, never in config.toml")
 	}
 }

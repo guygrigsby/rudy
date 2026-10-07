@@ -250,10 +250,20 @@ func newHarness(t *testing.T, prov *scriptProvider) *harness {
 // exercises, a fire that finds nothing and returns.
 func newHarnessWith(t *testing.T, prov *scriptProvider, extra ...plugin.Plugin) *harness {
 	t.Helper()
+	return newHarnessTrusting(t, prov, nil, extra...)
+}
+
+// newHarnessTrusting is newHarnessWith with Deps.Trusted set, for a test whose workspace ships
+// agent definitions it means to load.
+func newHarnessTrusting(t *testing.T, prov *scriptProvider, trusted func(string) bool, extra ...plugin.Plugin) *harness {
+	t.Helper()
 	fp := &fakePlugin{prov: prov}
-	srv, store := newServerWith(t, testConfig(), append([]plugin.Plugin{fp}, extra...)...)
+	srv, store := newServerTrusting(t, testConfig(), filepath.Join(t.TempDir(), "sessions"), "", trusted, append([]plugin.Plugin{fp}, extra...)...)
 	return &harness{srv: srv, ws: t.TempDir(), fp: fp, store: store}
 }
+
+// trustAll is a Deps.Trusted for a test whose workspace is the operator's own.
+func trustAll(string) bool { return true }
 
 // testConfig is what every server test starts from: the fake provider's one model, strict
 // permissions, no tool timeout.
@@ -281,6 +291,12 @@ func newServerWith(t *testing.T, cfg *config.Config, plugins ...plugin.Plugin) (
 // socket.
 func newServerAt(t *testing.T, cfg *config.Config, storeDir, socket string, plugins ...plugin.Plugin) (*server.Server, *session.Store) {
 	t.Helper()
+	return newServerTrusting(t, cfg, storeDir, socket, nil, plugins...)
+}
+
+// newServerTrusting is newServerAt with Deps.Trusted set: nil trusts no workspace.
+func newServerTrusting(t *testing.T, cfg *config.Config, storeDir, socket string, trusted func(string) bool, plugins ...plugin.Plugin) (*server.Server, *session.Store) {
+	t.Helper()
 	ctx := context.Background()
 	store, err := session.OpenStore(storeDir)
 	if err != nil {
@@ -298,6 +314,7 @@ func newServerAt(t *testing.T, cfg *config.Config, storeDir, socket string, plug
 		Hooks:    plugin.NewHookRunner(preg, 5*time.Second, func(string) {}),
 		Socket:   socket,
 		Home:     t.TempDir(),
+		Trusted:  trusted,
 	})
 	services := srv.PluginServices()
 	services.ProvidersChanged = func([]provider.Provider) {
@@ -3085,7 +3102,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	hr := &hookRecorder{}
 	cfg := testConfig()
 	cfg.ConfigDir = t.TempDir()
-	srv, store := newServerWith(t, cfg, ep, cp, subagents.New(cfg.ConfigDir), hr)
+	srv, store := newServerTrusting(t, cfg, filepath.Join(t.TempDir(), "sessions"), "", trustAll, ep, cp, subagents.New(cfg.ConfigDir, trustAll), hr)
 	ep.otherHost = cp.host
 
 	ctx := context.Background()
@@ -3352,7 +3369,7 @@ func TestForkKeepsTheAgentDefinition(t *testing.T) {
 	prov := &scriptProvider{textOnly: true}
 	// A second registered tool the definition leaves out, so "the fork kept the definition"
 	// and "the fork got the whole registry" are different answers.
-	h := newHarnessWith(t, prov, namedToolPlugin{"extra"})
+	h := newHarnessTrusting(t, prov, trustAll, namedToolPlugin{"extra"})
 	if err := os.MkdirAll(filepath.Join(h.ws, ".rudy", "agents"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -3401,7 +3418,7 @@ func TestForkKeepsTheAgentDefinition(t *testing.T) {
 // it from the root session too.
 func TestRootSessionKeepsTheAgentToolItsDefinitionLists(t *testing.T) {
 	prov := &scriptProvider{textOnly: true}
-	h := newHarnessWith(t, prov, subagents.New(t.TempDir()))
+	h := newHarnessTrusting(t, prov, trustAll, subagents.New(t.TempDir(), trustAll))
 	if err := os.MkdirAll(filepath.Join(h.ws, ".rudy", "agents"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -3526,12 +3543,18 @@ func newTestServer(t *testing.T) (*testServer, *testConn) {
 // its own plugin on top of that roster (a fake agent-contributing plugin, say).
 func newTestServerWithPlugins(t *testing.T, extra ...plugin.Plugin) (*testServer, *testConn) {
 	t.Helper()
+	return newTestServerTrusting(t, nil, extra...)
+}
+
+// newTestServerTrusting is newTestServerWithPlugins with Deps.Trusted set.
+func newTestServerTrusting(t *testing.T, trusted func(string) bool, extra ...plugin.Plugin) (*testServer, *testConn) {
+	t.Helper()
 	cfg := testConfig()
 	cfg.ConfigDir = t.TempDir()
 	prov := &agentProvider{}
 	op := &openerPlugin{prov: prov}
 	plugins := append([]plugin.Plugin{op, read.New(), bash.New(), edit.New(), write.New()}, extra...)
-	srv, store := newServerWith(t, cfg, plugins...)
+	srv, store := newServerTrusting(t, cfg, filepath.Join(t.TempDir(), "sessions"), "", trusted, plugins...)
 	t.Cleanup(op.closeAll)
 	ts := &testServer{srv: srv, store: store, configDir: cfg.ConfigDir, prov: prov, op: op}
 	cl := dialAs(t, srv, false)
