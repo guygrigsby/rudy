@@ -51,6 +51,10 @@ type Deps struct {
 	Prompt string
 	// Home is the home directory of the process running this server, answered in the hello.
 	Home string
+	// Trusted says whether the operator trusted what root ships, read from the trust record
+	// at session.open rather than asked for: the daemon may serve a workspace it was not
+	// started in, and no asker means no (ADR 0050). Nil trusts no workspace.
+	Trusted func(root string) bool
 }
 
 // EntryIDResult answers session.set_model, set_mode, set_thinking, set_title and
@@ -1565,12 +1569,20 @@ func firstNonEmpty(vs ...string) string {
 // registration, so installing a plugin cannot take a name that is already in use and cannot
 // change what an existing session resolves to (ADR 0028). Read per session rather than cached,
 // so a definition edited between two sessions takes effect on the second without a restart. ok
-// is false only for a name nothing defines; "" and "default" always resolve.
+// is false only for a name nothing defines; "" and "default" always resolve. The workspace root is
+// read only when Deps.Trusted says the operator trusted it, so a cloned repository cannot supply
+// default (ADR 0050).
 func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agentdef.Definition, bool) {
-	defs, errs := agentdef.Load([]string{
-		filepath.Join(s.d.Config.ConfigDir, "agents"),
-		filepath.Join(ws.Root, ".rudy", "agents"),
-	})
+	roots := []string{filepath.Join(s.d.Config.ConfigDir, "agents")}
+	wsAgents := filepath.Join(ws.Root, ".rudy", "agents")
+	if s.d.Trusted != nil && s.d.Trusted(ws.Root) {
+		roots = append(roots, wsAgents)
+	} else if md, _ := filepath.Glob(filepath.Join(wsAgents, "*.md")); len(md) > 0 {
+		// A repository's agents are its author's, not the operator's: an untrusted root's are
+		// never read, default included (ADR 0050).
+		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "workspace agents in " + wsAgents + " not loaded: the workspace is not trusted; run rudy plugins trust there"})
+	}
+	defs, errs := agentdef.Load(roots)
 	for _, e := range errs {
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: e.Error()})
 	}

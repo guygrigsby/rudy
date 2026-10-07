@@ -684,6 +684,9 @@ func (s *Spawned) RegisterAgent(name, description, prompt string, tools *[]strin
 	if err := s.refuseLate("agent", name); err != nil {
 		return err
 	}
+	if name == "default" {
+		return fmt.Errorf("%w: plugin %s: agent default: the default agent is the operator's, not a plugin's", protocol.ErrInvalidArgument, s.m.Name)
+	}
 	if description == "" {
 		return fmt.Errorf("%w: plugin %s: agent %s: description is required", protocol.ErrInvalidArgument, s.m.Name, name)
 	}

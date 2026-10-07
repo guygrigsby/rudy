@@ -217,6 +217,9 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	if err != nil {
 		notice(err.Error())
 	}
+	// The server reads the trust record per session.open rather than trusting the answer
+	// computed for the directory rudy started in: the daemon may serve another workspace.
+	trustStore := trust.NewStore(paths.Data)
 	srv := server.New(server.Deps{
 		Version:  o.Version,
 		Config:   cfg,
@@ -228,6 +231,11 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		Socket:   socket,
 		Prompt:   prompt,
 		Home:     paths.Home,
+		Trusted: func(root string) bool {
+			decls, _ := trust.Declarations(root)
+			ok, _ := trustStore.IsTrusted(root, decls)
+			return ok
+		},
 	})
 	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv, Prompt: prompt}
 	defer func() {
