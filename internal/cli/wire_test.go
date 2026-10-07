@@ -20,9 +20,12 @@ import (
 	"github.com/guygrigsby/rudy/internal/agentruntime"
 	"github.com/guygrigsby/rudy/internal/config"
 	"github.com/guygrigsby/rudy/internal/plugin"
+	memoryplugin "github.com/guygrigsby/rudy/internal/plugins/memory"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
+	"github.com/guygrigsby/rudy/internal/provider/httpx"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/trust"
 )
 
 // fakeProvider replays a script of parts, one script per Complete call, and records every
@@ -572,6 +575,94 @@ func writeManifest(t *testing.T, root, dir, name string) {
 	body := "name = \"" + name + "\"\nversion = \"0.1.0\"\nprotocol_version = 1\ncommand = \"" + name + "\"\n"
 	if err := os.WriteFile(filepath.Join(pdir, "plugin.toml"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// gateBuild runs Build with discovery on, in a workspace holding .rudy/mcp.toml with body,
+// and replaces the built-in set with the tools, the fake provider and the real MCP plugin
+// over whatever project path Build hands it. It returns the built server, the stderr text
+// and the project path the MCP plugin was given.
+func gateBuild(t *testing.T, workspace, body string, ask TrustAsker) (*Built, string, string) {
+	t.Helper()
+	base := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(base, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(base, "data"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(base, "cache"))
+	t.Setenv("XDG_RUNTIME_DIR", sockDir(t))
+	if err := os.MkdirAll(filepath.Join(workspace, ".rudy"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, ".rudy", "mcp.toml"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(workspace)
+	var project string
+	old := builtinPlugins
+	builtinPlugins = func(cfg *config.Config, paths config.Paths, _ *httpx.Client, env func(string) string, version string, _ memoryplugin.Summarize, mcpProject string) []plugin.Plugin {
+		project = mcpProject
+		resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cfg.Secrets.File) }
+		return append(BuiltinTools(), fakePlugin{&fakeProvider{}}, newMCPPlugin(cfg, paths, resolve, version, mcpProject))
+	}
+	t.Cleanup(func() { builtinPlugins = old })
+	var stderr bytes.Buffer
+	b, err := Build(context.Background(), BuildOptions{
+		Version: "test", Home: base, Stderr: &stderr, Trust: ask,
+		Overrides: map[string]any{"default.provider": "fake", "default.model": "m", "permissions.mode": "off"},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
+	return b, stderr.String(), project
+}
+
+func markerServer(marker string) string {
+	return "[servers.evil]\ntransport = \"stdio\"\ncommand = \"sh\"\nargs = [\"-c\", 'touch " + marker + "']\n"
+}
+
+func TestUntrustedWorkspaceLoadsUserMCPOnly(t *testing.T) {
+	ws := t.TempDir()
+	marker := filepath.Join(ws, "MARKER")
+	b, stderr, project := gateBuild(t, ws, markerServer(marker), nil)
+	if project != "" {
+		t.Errorf("project mcp path %q reached the plugin of an untrusted workspace", project)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("the untrusted workspace's MCP server ran")
+	}
+	for _, tl := range b.Plugins.Tools() {
+		if strings.HasPrefix(tl.Name, "mcp__") {
+			t.Errorf("tool %s registered from an untrusted workspace", tl.Name)
+		}
+	}
+	if !strings.Contains(stderr, "is not trusted") {
+		t.Errorf("no untrusted notice in %q", stderr)
+	}
+}
+
+func TestTrustedWorkspaceLoadsProjectMCP(t *testing.T) {
+	ws, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(ws, "MARKER")
+	var asked []trust.Declaration
+	_, _, project := gateBuild(t, ws, markerServer(marker), func(_ string, decls []trust.Declaration) (bool, error) {
+		asked = decls
+		return true, nil
+	})
+	if want := filepath.Join(ws, ".rudy", "mcp.toml"); project != want {
+		t.Errorf("project mcp path = %q, want %q", project, want)
+	}
+	if len(asked) != 1 || asked[0].Kind != trust.KindMCP || asked[0].Name != "evil" {
+		t.Errorf("asked about %v, want the one MCP server", asked)
+	}
+}
+
+func TestUnparseableProjectMCPIsNoticedNotFatal(t *testing.T) {
+	_, stderr, _ := gateBuild(t, t.TempDir(), "not toml [", nil)
+	if !strings.Contains(stderr, "mcp.toml") {
+		t.Errorf("no notice naming mcp.toml in %q", stderr)
 	}
 }
 
