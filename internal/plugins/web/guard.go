@@ -66,11 +66,16 @@ func (p policy) vet(ctx context.Context, u *url.URL) ([]net.IP, error) {
 	}
 	own := ownAddrs()
 	for _, ip := range ips {
-		if !public(ip) || slices.ContainsFunc(own, ip.Equal) {
+		if !public(ip) || isOwn(own, ip) || isOwn(own, embeddedV4(ip)) {
 			return nil, fmt.Errorf("%w: %s is not a public address", errRefused, host)
 		}
 	}
 	return ips, nil
+}
+
+// isOwn reports whether ip is one of this machine's addresses. A nil ip is not.
+func isOwn(own []net.IP, ip net.IP) bool {
+	return ip != nil && slices.ContainsFunc(own, ip.Equal)
 }
 
 // ownAddrs is every address on this machine's interfaces. A listener bound to all interfaces

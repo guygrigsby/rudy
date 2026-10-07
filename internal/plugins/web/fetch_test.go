@@ -207,6 +207,29 @@ func TestEmbeddedPrivateFormsRefused(t *testing.T) {
 	}
 }
 
+func TestEmbeddedOwnAddressRefused(t *testing.T) {
+	addrs, _ := net.InterfaceAddrs()
+	var own net.IP
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && !n.IP.IsLoopback() && n.IP.To4() != nil {
+			own = n.IP.To4()
+			break
+		}
+	}
+	if own == nil {
+		t.Skip("no non-loopback IPv4 interface address on this machine")
+	}
+	wrapped := net.ParseIP("64:ff9b::")
+	copy(wrapped[12:], own)
+	u, err := url.Parse("http://[" + wrapped.String() + "]/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (policy{}).check(context.Background(), u); err == nil {
+		t.Fatalf("check of %s, which embeds own address %s, was allowed", wrapped, own)
+	}
+}
+
 func TestConnectionToAnUnvettedPeerIsRefused(t *testing.T) {
 	var landed *peerConn
 	d := &dialLog{serve: func(string) (net.Conn, error) {

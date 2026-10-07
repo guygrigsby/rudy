@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -209,13 +210,26 @@ func TestFetchRechecksEveryRedirect(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// The seam connects to the test server but reports the vetted address as the peer, so
+	// the first hop succeeds and it is the second that has to be refused.
+	var dialed []string
 	p := &webPlugin{cfg: testConfig(), version: "test", searcher: fakeSearcher{}, resolve: loopbackResolver,
-		dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+		dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialed = append(dialed, addr)
+			c, err := (&net.Dialer{}).DialContext(ctx, network, srv.Listener.Addr().String())
+			if err != nil {
+				return nil, err
+			}
+			_, port, _ := net.SplitHostPort(addr)
+			ap, _ := netip.ParseAddrPort(net.JoinHostPort("93.184.216.34", port))
+			return &peerConn{Conn: c, remote: net.TCPAddrFromAddrPort(ap)}, nil
 		}}
 	res := invoke(t, fetchToolFor(t, p), `{"url":"`+srv.URL+`"}`)
-	if !res.IsError || !strings.Contains(text(res), "refused") {
-		t.Fatalf("a redirect to the metadata endpoint was followed: %+v", res)
+	if !res.IsError || !strings.Contains(text(res), "not a public address") {
+		t.Fatalf("a redirect to the metadata endpoint was not refused at the second hop: %+v", res)
+	}
+	if len(dialed) != 1 || strings.Contains(strings.Join(dialed, ","), "169.254.169.254") {
+		t.Errorf("dialed %v, want exactly the first hop", dialed)
 	}
 }
 
