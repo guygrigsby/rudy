@@ -438,23 +438,46 @@ func unwrap(c call) []call {
 }
 
 // envSplitString is the value of env's -S or --split-string, which env splits into the
-// command it runs: the next word, or the text attached to the flag.
+// command it runs: the next word, or the text attached to the flag. It reads env's options
+// the way wrapped does, so the value of -u or -C is not mistaken for the command, and a
+// short bundle holding S (-iS) carries the flag.
 func envSplitString(words []string) (string, bool) {
-	for i, w := range words {
+	valued := wrapperValueFlags["env"]
+	for i := 0; i < len(words); i++ {
+		w := words[i]
 		switch {
 		case !strings.HasPrefix(w, "-"):
 			if !strings.Contains(w, "=") {
 				return "", false
 			}
-		case w == "-S" || w == "--split-string":
+		case strings.HasPrefix(w, "--split-string="):
+			return strings.TrimPrefix(w, "--split-string="), true
+		case w == "--split-string":
 			if i+1 < len(words) {
 				return words[i+1], true
 			}
 			return "", false
-		case strings.HasPrefix(w, "--split-string="):
-			return strings.TrimPrefix(w, "--split-string="), true
-		case strings.HasPrefix(w, "-S"):
-			return w[2:], true
+		case strings.HasPrefix(w, "--"):
+			if valued[w] {
+				i++
+			}
+		default:
+			for k, r := range w[1:] {
+				if r != 'S' && r != 'u' && r != 'C' {
+					continue
+				}
+				attached := w[k+2:]
+				if attached == "" && i+1 < len(words) {
+					attached = words[i+1]
+					if r != 'S' {
+						i++
+					}
+				}
+				if r == 'S' {
+					return attached, true
+				}
+				break
+			}
 		}
 	}
 	return "", false

@@ -302,6 +302,11 @@ func TestDangerousNormalizedCalls(t *testing.T) {
 		{`nohup env nice rm -rf x`, "rm -rf"},
 		{`env -S 'rm -rf ~'`, "rm -rf"},
 		{`env --split-string='rm -rf ~'`, "rm -rf"},
+		{`env -u FOO -S 'rm -rf ~'`, "rm -rf"},
+		{`env -C /tmp -S 'rm -rf ~'`, "rm -rf"},
+		{`env --chdir=/tmp -S 'rm -rf ~'`, "rm -rf"},
+		{`env -iS 'rm -rf ~'`, "rm -rf"},
+		{`env -iS'rm -rf ~'`, "rm -rf"},
 		{`watch 'rm -rf ~'`, "rm -rf"},
 		{`watch -n 1 rm -rf x`, "rm -rf"},
 	}
@@ -322,7 +327,7 @@ func TestNotDangerous(t *testing.T) {
 		`git push origin main --tags`, `rm -f file`, `rm file`, `nice -n 10 go build`,
 		`timeout 5s go test ./...`, `bash -c 'ls'`, `sh -c "go test ./..."`,
 		`xargs -n 1 echo`, `find . -name x`, `grep -r foo .`, `chmod 644 file`,
-		`ddd`, `mkfsx`, `env -S 'go test ./...'`, `watch -n 1 'ls -la'`,
+		`ddd`, `mkfsx`, `env -S 'go test ./...'`, `env -u FOO go test ./...`, `watch -n 1 'ls -la'`,
 		`grep --include=*.go foo .`, `go test -run=^T$ ./...`,
 		`if [ -f x ]; then echo y; fi`, `[[ -n "$X" ]] && echo y`,
 	} {
