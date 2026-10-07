@@ -660,9 +660,17 @@ func TestTrustedWorkspaceLoadsProjectMCP(t *testing.T) {
 }
 
 func TestUnparseableProjectMCPIsNoticedNotFatal(t *testing.T) {
-	_, stderr, _ := gateBuild(t, t.TempDir(), "not toml [", nil)
+	b, stderr, project := gateBuild(t, t.TempDir(), "not toml [", nil)
 	if !strings.Contains(stderr, "mcp.toml") {
 		t.Errorf("no notice naming mcp.toml in %q", stderr)
+	}
+	if project != "" {
+		t.Errorf("unreadable project mcp path %q reached the plugin", project)
+	}
+	for _, st := range b.Plugins.Statuses() {
+		if st.Name == "mcp" && st.State != plugin.StateReady {
+			t.Errorf("mcp plugin %+v, want ready on the user scope alone", st)
+		}
 	}
 }
 

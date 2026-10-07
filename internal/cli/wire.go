@@ -199,9 +199,9 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		// plugin only when the workspace is trusted (ADR 0050).
 		mcpProject := ""
 		if cwd != "" {
-			var trusted bool
-			trusted, ownPlugins = workspaceTrust(paths, cwd, o.Trust, notice)
-			if trusted {
+			var trusted, mcpReadable bool
+			trusted, mcpReadable, ownPlugins = workspaceTrust(paths, cwd, o.Trust, notice)
+			if trusted && mcpReadable {
 				_, mcpProject = mcpplugin.Paths(paths.Config, cwd)
 			}
 		}
@@ -371,19 +371,26 @@ type TrustAsker func(root string, decls []trust.Declaration) (bool, error)
 // may. A workspace that declares nothing has nothing to gate and is trusted. A caller that
 // cannot ask says why once, naming what it did not run, so a missing plugin or server is
 // never a mystery; a yes is recorded so the question is asked once per change.
-func workspaceTrust(paths config.Paths, cwd string, ask TrustAsker, notice func(string)) (bool, []plugin.Manifest) {
+//
+// mcpReadable is false when the workspace's mcp.toml could not be read: a declaration with
+// no digest cannot be trusted, so the project MCP scope is withheld whatever the answer.
+func workspaceTrust(paths config.Paths, cwd string, ask TrustAsker, notice func(string)) (trusted, mcpReadable bool, own []plugin.Manifest) {
 	decls, errs := trust.Declarations(cwd)
+	mcpReadable = true
 	for _, err := range errs {
 		notice(err.Error())
+		if strings.Contains(err.Error(), "mcp.toml") {
+			mcpReadable = false
+		}
 	}
 	if len(decls) == 0 {
-		return true, nil
+		return true, mcpReadable, nil
 	}
 	store := trust.NewStore(paths.Data)
 	trusted, err := store.IsTrusted(cwd, decls)
 	if err != nil {
 		notice(err.Error())
-		return false, nil
+		return false, mcpReadable, nil
 	}
 	if !trusted {
 		if ask == nil {
@@ -399,16 +406,16 @@ func workspaceTrust(paths config.Paths, cwd string, ask TrustAsker, notice func(
 				}
 			}
 			notice(fmt.Sprintf("this workspace ships %d plugin(s), %d MCP server(s) and %d agent definition(s) and is not trusted; run rudy plugins trust to allow them", n[0], n[1], n[2]))
-			return false, nil
+			return false, mcpReadable, nil
 		}
 		ok, err := ask(cwd, decls)
 		if err != nil {
 			notice(err.Error())
-			return false, nil
+			return false, mcpReadable, nil
 		}
 		if !ok {
 			notice("this workspace's plugins, MCP servers and agents were not trusted; none of them were loaded")
-			return false, nil
+			return false, mcpReadable, nil
 		}
 		if err := store.Trust(cwd, decls, time.Now()); err != nil {
 			notice(err.Error())
@@ -416,8 +423,8 @@ func workspaceTrust(paths config.Paths, cwd string, ask TrustAsker, notice func(
 	}
 	// Discovery errors were noticed with the declarations above, and a corrupt lock file
 	// with the global roots, so only the manifests are wanted here.
-	own, _ := discoverPlugins([]string{filepath.Join(cwd, ".rudy")}, filepath.Join(paths.Data, pluginstore.LockFile))
-	return true, own
+	own, _ = discoverPlugins([]string{filepath.Join(cwd, ".rudy")}, filepath.Join(paths.Data, pluginstore.LockFile))
+	return true, mcpReadable, own
 }
 
 // discoverPlugins is Discover minus what the lock file disables. A disabled plugin is not
