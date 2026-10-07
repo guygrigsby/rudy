@@ -291,6 +291,10 @@ func TestDangerousNormalizedCalls(t *testing.T) {
 		{`timeout --signal KILL 5 rm -rf x`, "rm -rf"},
 		{`timeout -k 5 10 rm -rf x`, "rm -rf"},
 		{`bash -c`, "shell reads its commands from input"},
+		{`xargs --replace rm -rf x`, "rm -rf"},
+		{`xargs --max-procs 4 rm -rf x`, "rm -rf"},
+		{`bash -co pipefail 'rm -rf x'`, "rm -rf"},
+		{`bash -co pipefail`, "shell reads its commands from input"},
 		{`[a -f x`, "unclassifiable command [a"},
 		{`ls[ x`, "unclassifiable command ls["},
 	}

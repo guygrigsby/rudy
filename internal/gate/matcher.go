@@ -287,7 +287,7 @@ var prefixWrappers = map[string]bool{
 var wrapperValueFlags = map[string]map[string]bool{
 	"nice":       {"-n": true, "--adjustment": true},
 	"ionice":     {"-c": true, "-n": true, "-p": true, "--class": true, "--classdata": true, "--pid": true},
-	"xargs":      {"-n": true, "-I": true, "-L": true, "-P": true, "-d": true, "-s": true, "-a": true, "-E": true, "--max-args": true, "--max-procs": true, "--delimiter": true, "--max-chars": true, "--arg-file": true, "--replace": true},
+	"xargs":      {"-n": true, "-I": true, "-L": true, "-P": true, "-d": true, "-s": true, "-a": true, "-E": true, "--max-args": true, "--max-procs": true, "--delimiter": true, "--max-chars": true, "--arg-file": true},
 	"watch":      {"-n": true},
 	"env":        {"-u": true, "-C": true, "-S": true, "--unset": true, "--chdir": true, "--split-string": true},
 	"exec":       {"-a": true},
@@ -335,8 +335,15 @@ func shellScript(words []string) (script string, hasC, file bool) {
 		case shellValueFlags[w]:
 			i++
 		case isFlag(w):
-			if !strings.HasPrefix(w, "--") && strings.Contains(w, "c") {
+			if strings.HasPrefix(w, "--") {
+				continue
+			}
+			if strings.Contains(w, "c") {
 				hasC = true
+			}
+			// A bundle ending in o or O (-co) takes the next word as that option's value.
+			if strings.HasSuffix(w, "o") || strings.HasSuffix(w, "O") {
+				i++
 			}
 		case hasC:
 			return w, true, false
