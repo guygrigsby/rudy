@@ -303,6 +303,7 @@ func TestNotDangerous(t *testing.T) {
 		`timeout 5s go test ./...`, `bash -c 'ls'`, `sh -c "go test ./..."`,
 		`xargs -n 1 echo`, `find . -name x`, `grep -r foo .`, `chmod 644 file`,
 		`ddd`, `mkfsx`,
+		`if [ -f x ]; then echo y; fi`, `[[ -n "$X" ]] && echo y`,
 	} {
 		t.Run(cmd, func(t *testing.T) {
 			if dangerous, reason := g.Dangerous("bash", bashArgs(cmd)); dangerous {

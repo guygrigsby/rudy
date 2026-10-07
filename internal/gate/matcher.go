@@ -135,9 +135,14 @@ func (c call) tokens() []string {
 func isFlag(w string) bool { return len(w) > 1 && w[0] == '-' }
 
 // unclassifiable is the first word among the command and every flag-like word that the
-// shell will rewrite before running, which the gate cannot read.
+// shell will rewrite before running, which the gate cannot read. A command word that is
+// exactly [ or [[ is the test builtin, a command in its own right and not a glob; only a
+// word that merely contains a bracket, like [a or ls[, stays unreadable.
 func (c call) unclassifiable() (string, bool) {
 	for i, w := range c.words {
+		if i == 0 && (w == "[" || w == "[[") {
+			continue
+		}
 		if (i == 0 || isFlag(w)) && strings.ContainsAny(w, unreadable) {
 			return w, true
 		}
