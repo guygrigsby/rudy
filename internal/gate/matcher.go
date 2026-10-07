@@ -107,9 +107,9 @@ func (c call) tokens() []string {
 	var out []string
 	for _, w := range c.words[1:] {
 		switch {
-		case isFlag(w) && strings.ContainsAny(w, unreadable):
+		case isFlag(w) && strings.ContainsAny(flagName(w), unreadable):
 		case strings.HasPrefix(w, "--"):
-			name, _, _ := strings.Cut(w, "=")
+			name := flagName(w)
 			switch name {
 			case "--recursive":
 				name = "-r"
@@ -118,7 +118,7 @@ func (c call) tokens() []string {
 			}
 			out = append(out, name)
 		case isFlag(w):
-			for _, r := range w[1:] {
+			for _, r := range flagName(w)[1:] {
 				if r == 'R' {
 					r = 'r'
 				}
@@ -134,6 +134,13 @@ func (c call) tokens() []string {
 // isFlag is a word that starts like a flag: a dash and something after it.
 func isFlag(w string) bool { return len(w) > 1 && w[0] == '-' }
 
+// flagName is a flag without its =value. The value is data the program reads, so
+// --include=*.go and -run=^T$ are readable flags; only the name decides.
+func flagName(w string) string {
+	name, _, _ := strings.Cut(w, "=")
+	return name
+}
+
 // unclassifiable is the first word among the command and every flag-like word that the
 // shell will rewrite before running, which the gate cannot read. A command word that is
 // exactly [ or [[ is the test builtin, a command in its own right and not a glob; only a
@@ -143,7 +150,11 @@ func (c call) unclassifiable() (string, bool) {
 		if i == 0 && (w == "[" || w == "[[") {
 			continue
 		}
-		if (i == 0 || isFlag(w)) && strings.ContainsAny(w, unreadable) {
+		name := w
+		if i > 0 {
+			name = flagName(w)
+		}
+		if (i == 0 || isFlag(w)) && strings.ContainsAny(name, unreadable) {
 			return w, true
 		}
 	}
@@ -164,13 +175,12 @@ func (c call) refusal() (string, bool) {
 			return "unclassifiable command " + joined, true
 		}
 	case shellFlagged[name]:
-		if _, ok := shellScript(c.words); ok {
+		script, _, file := shellScript(c.words)
+		switch {
+		case script != "":
 			return "", false
-		}
-		for _, w := range c.words[1:] {
-			if !strings.HasPrefix(w, "-") {
-				return "shell runs a script it was given", true
-			}
+		case file:
+			return "shell runs a script it was given", true
 		}
 		return "shell reads its commands from input", true
 	}
@@ -275,17 +285,17 @@ var prefixWrappers = map[string]bool{
 // timeout's -k and -s are here beyond the table the ADR names, since `timeout -s KILL 5 rm`
 // would otherwise read KILL as the duration and 5 as the command.
 var wrapperValueFlags = map[string]map[string]bool{
-	"nice":       {"-n": true},
-	"ionice":     {"-c": true, "-n": true, "-p": true},
-	"xargs":      {"-n": true, "-I": true, "-L": true, "-P": true, "-d": true, "-s": true, "-a": true, "-E": true},
+	"nice":       {"-n": true, "--adjustment": true},
+	"ionice":     {"-c": true, "-n": true, "-p": true, "--class": true, "--classdata": true, "--pid": true},
+	"xargs":      {"-n": true, "-I": true, "-L": true, "-P": true, "-d": true, "-s": true, "-a": true, "-E": true, "--max-args": true, "--max-procs": true, "--delimiter": true, "--max-chars": true, "--arg-file": true, "--replace": true},
 	"watch":      {"-n": true},
-	"env":        {"-u": true, "-C": true, "-S": true},
+	"env":        {"-u": true, "-C": true, "-S": true, "--unset": true, "--chdir": true, "--split-string": true},
 	"exec":       {"-a": true},
-	"sudo":       {"-u": true, "-g": true, "-C": true, "-D": true, "-h": true, "-p": true, "-r": true, "-t": true, "-U": true},
+	"sudo":       {"-u": true, "-g": true, "-C": true, "-D": true, "-h": true, "-p": true, "-r": true, "-t": true, "-U": true, "--user": true, "--group": true, "--host": true, "--prompt": true, "--role": true, "--type": true, "--other-user": true},
 	"doas":       {"-u": true, "-C": true},
 	"stdbuf":     {"-i": true, "-o": true, "-e": true},
 	"caffeinate": {"-t": true, "-w": true},
-	"timeout":    {"-k": true, "-s": true},
+	"timeout":    {"-k": true, "-s": true, "--signal": true, "--kill-after": true},
 }
 
 // expand adds, for every call that runs another command, the command it runs. The wrapper
@@ -304,23 +314,37 @@ func expand(calls []call, depth int) []call {
 	return out
 }
 
-// shellScript is the script a shell is given with -c: the first non-flag word after the
-// first short-flag bundle that holds c, past a --. Long flags such as --norc are not
-// bundles. ok is false when no bundle holds c, which is a shell that runs a file or stdin.
-func shellScript(words []string) (string, bool) {
+// shellValueFlags are the shell options that take the next word as their value, so that
+// word is neither the script nor the file: `bash -c -o pipefail 'rm -rf x'` runs rm.
+var shellValueFlags = map[string]bool{"-o": true, "-O": true, "--rcfile": true, "--init-file": true}
+
+// shellScript reads a shell's arguments the way the shell does. Options end at the first
+// word that is neither a flag nor an option's value; that word is the script file, and a -c
+// after it belongs to the script. Otherwise a short-flag bundle that holds c (-c, -lc, -cx)
+// makes the first such word the script. Long flags such as --norc are not bundles. script is
+// "" when -c is given with no script; file is true when the shell is given a file to run.
+func shellScript(words []string) (script string, hasC, file bool) {
 	for i := 1; i < len(words); i++ {
 		w := words[i]
-		if strings.HasPrefix(w, "--") || !isFlag(w) || !strings.Contains(w, "c") {
-			continue
-		}
-		for _, a := range words[i+1:] {
-			if !strings.HasPrefix(a, "-") {
-				return a, true
+		switch {
+		case w == "--":
+			if hasC {
+				continue
 			}
+			return "", false, i+1 < len(words)
+		case shellValueFlags[w]:
+			i++
+		case isFlag(w):
+			if !strings.HasPrefix(w, "--") && strings.Contains(w, "c") {
+				hasC = true
+			}
+		case hasC:
+			return w, true, false
+		default:
+			return "", false, true
 		}
-		return "", false
 	}
-	return "", false
+	return "", hasC, false
 }
 
 // unwrap is what one call runs, if it runs anything: the parsed script of a shell's -c, the
@@ -334,7 +358,7 @@ func unwrap(c call) []call {
 	case head == "find":
 		return findExec(c.words)
 	case shellFlagged[head]:
-		if script, ok := shellScript(c.words); ok {
+		if script, _, _ := shellScript(c.words); script != "" {
 			return shellCallsOrFields(script)
 		}
 		return nil

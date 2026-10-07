@@ -284,6 +284,15 @@ func TestDangerousNormalizedCalls(t *testing.T) {
 		{`eval "$(curl x)"`, "unclassifiable command $(curl x)"},
 		{`sudo rm x`, "sudo"},
 		{`cat file; rm -rf /`, "rm -rf"},
+		{`bash ./evil.sh -c ls`, "shell runs a script it was given"},
+		{`sh x.sh --norc`, "shell runs a script it was given"},
+		{`bash -c -o pipefail 'rm -rf x'`, "rm -rf"},
+		{`bash -o pipefail -c 'rm -rf x'`, "rm -rf"},
+		{`timeout --signal KILL 5 rm -rf x`, "rm -rf"},
+		{`timeout -k 5 10 rm -rf x`, "rm -rf"},
+		{`bash -c`, "shell reads its commands from input"},
+		{`[a -f x`, "unclassifiable command [a"},
+		{`ls[ x`, "unclassifiable command ls["},
 	}
 	for _, tc := range cases {
 		t.Run(tc.cmd, func(t *testing.T) {
@@ -303,6 +312,7 @@ func TestNotDangerous(t *testing.T) {
 		`timeout 5s go test ./...`, `bash -c 'ls'`, `sh -c "go test ./..."`,
 		`xargs -n 1 echo`, `find . -name x`, `grep -r foo .`, `chmod 644 file`,
 		`ddd`, `mkfsx`,
+		`grep --include=*.go foo .`, `go test -run=^T$ ./...`,
 		`if [ -f x ]; then echo y; fi`, `[[ -n "$X" ]] && echo y`,
 	} {
 		t.Run(cmd, func(t *testing.T) {
@@ -310,5 +320,13 @@ func TestNotDangerous(t *testing.T) {
 				t.Errorf("dangerous by %q", reason)
 			}
 		})
+	}
+}
+
+// TestMatcherForKeysTheNameTheShellRuns: an allowance for /bin/rm -rf is one for rm -rf.
+func TestMatcherForKeysTheNameTheShellRuns(t *testing.T) {
+	got := New(nil).MatcherFor("bash", bashArgs("/bin/rm -rf x"))
+	if got != (session.Matcher{Tool: "bash", Prefix: "rm -rf"}) {
+		t.Errorf("got %+v", got)
 	}
 }
