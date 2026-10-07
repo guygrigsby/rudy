@@ -72,7 +72,8 @@ func Uncovered(set []session.Matcher, allowances []session.Matcher) (session.Mat
 // wrapper runs: the set is what forces a question in permissive mode, and an entry that
 // `sh -c` walks around is an entry that does nothing (rudy-k0.34, rudy-y3d). A call the
 // gate cannot read is dangerous without any entry: a command word or flag the shell will
-// expand, a shell given a script or its commands on input, source (ADR 0051).
+// expand, a shell given a script or its commands on input, source, a call wrapped past
+// the depth limit ("wrapped too deep") (ADR 0051).
 func (g *Gate) Dangerous(tool string, args json.RawMessage) (bool, string) {
 	var calls []call
 	if tool == "bash" {
@@ -118,6 +119,7 @@ const unreadable = "$`\\{*?[;"
 // call is one simple command the input runs, after wrapper expansion.
 type call struct {
 	words []string // as written, quotes dropped, expansions in source form
+	deep  bool     // runs something the wrapper depth limit stopped short of
 }
 
 // name is the command the shell will run: the last path element of the first word, with a
@@ -196,6 +198,9 @@ func (c call) unclassifiable() (string, bool) {
 
 // refusal is why the call is dangerous whatever the set says, if it is.
 func (c call) refusal() (string, bool) {
+	if c.deep {
+		return "wrapped too deep", true
+	}
 	if w, ok := c.unclassifiable(); ok {
 		return "unclassifiable command " + w, true
 	}
@@ -332,10 +337,16 @@ var wrapperValueFlags = map[string]map[string]bool{
 }
 
 // expand adds, for every call that runs another command, the command it runs. The wrapper
-// call itself stays in the set: `sudo ls` is still a sudo.
+// call itself stays in the set: `sudo ls` is still a sudo. At the depth limit a call that
+// still runs something is marked deep, which refuses it: what it runs is unread.
 func expand(calls []call, depth int) []call {
 	if depth >= wrapperDepth {
-		return calls
+		out := make([]call, len(calls))
+		for i, c := range calls {
+			c.deep = c.deep || len(unwrap(c)) > 0
+			out[i] = c
+		}
+		return out
 	}
 	out := calls
 	for _, c := range calls {
@@ -405,13 +416,48 @@ func unwrap(c call) []call {
 	case head == "eval":
 		return shellCallsOrFields(strings.Join(c.words[1:], " "))
 	case prefixWrappers[head]:
-		rest := wrapped(head, c.words[1:])
-		if len(rest) == 0 {
-			return nil
+		var out []call
+		if head == "env" {
+			// env -S splits its value into the command it runs.
+			if script, ok := envSplitString(c.words[1:]); ok {
+				out = shellCallsOrFields(script)
+			}
 		}
-		return []call{{words: rest}}
+		rest := wrapped(head, c.words[1:])
+		switch {
+		case len(rest) == 0:
+		case head == "watch":
+			// watch hands its remainder to sh -c.
+			out = append(out, shellCallsOrFields(strings.Join(rest, " "))...)
+		default:
+			out = append(out, call{words: rest})
+		}
+		return out
 	}
 	return nil
+}
+
+// envSplitString is the value of env's -S or --split-string, which env splits into the
+// command it runs: the next word, or the text attached to the flag.
+func envSplitString(words []string) (string, bool) {
+	for i, w := range words {
+		switch {
+		case !strings.HasPrefix(w, "-"):
+			if !strings.Contains(w, "=") {
+				return "", false
+			}
+		case w == "-S" || w == "--split-string":
+			if i+1 < len(words) {
+				return words[i+1], true
+			}
+			return "", false
+		case strings.HasPrefix(w, "--split-string="):
+			return strings.TrimPrefix(w, "--split-string="), true
+		case strings.HasPrefix(w, "-S"):
+			return w[2:], true
+		}
+	}
+	return "", false
 }
 
 // wrapped is the command a prefix wrapper runs: what follows its flags, the values those

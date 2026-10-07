@@ -297,6 +297,13 @@ func TestDangerousNormalizedCalls(t *testing.T) {
 		{`bash -co pipefail`, "shell reads its commands from input"},
 		{`[a -f x`, "unclassifiable command [a"},
 		{`ls[ x`, "unclassifiable command ls["},
+		{`nohup env nice time rm -rf ~`, "wrapped too deep"},
+		{`bash -c 'nohup nohup nohup rm -rf ~'`, "wrapped too deep"},
+		{`nohup env nice rm -rf x`, "rm -rf"},
+		{`env -S 'rm -rf ~'`, "rm -rf"},
+		{`env --split-string='rm -rf ~'`, "rm -rf"},
+		{`watch 'rm -rf ~'`, "rm -rf"},
+		{`watch -n 1 rm -rf x`, "rm -rf"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.cmd, func(t *testing.T) {
@@ -315,7 +322,7 @@ func TestNotDangerous(t *testing.T) {
 		`git push origin main --tags`, `rm -f file`, `rm file`, `nice -n 10 go build`,
 		`timeout 5s go test ./...`, `bash -c 'ls'`, `sh -c "go test ./..."`,
 		`xargs -n 1 echo`, `find . -name x`, `grep -r foo .`, `chmod 644 file`,
-		`ddd`, `mkfsx`,
+		`ddd`, `mkfsx`, `env -S 'go test ./...'`, `watch -n 1 'ls -la'`,
 		`grep --include=*.go foo .`, `go test -run=^T$ ./...`,
 		`if [ -f x ]; then echo y; fi`, `[[ -n "$X" ]] && echo y`,
 	} {
