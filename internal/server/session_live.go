@@ -472,12 +472,17 @@ type childAttachment struct {
 func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 	sid := ls.sess.ID()
 	ls.obsMu.Lock()
-	ls.conns = append(ls.conns, cn)
+	// A connection subscribes once: resuming a session it is already on must not make it a
+	// second asker, or the tripwire below fires with nobody new to announce.
+	already := slices.Contains(ls.conns, cn)
+	if !already {
+		ls.conns = append(ls.conns, cn)
+	}
 	// Every route onto a session ends here, so this is the one place a second asker can be
 	// caught (ADR 0054). Any same-user client may declare itself an asker; the trust model
 	// allows it and this is the tripwire that keeps it from being silent. Said to every
 	// subscriber, the newcomer included, since each of them is now answerable by one more.
-	if cn.isAsker() {
+	if cn.isAsker() && !already {
 		if n := len(ls.askersObsLocked()); n > 1 {
 			ls.broadcastObsLocked(protocol.NotifyNotice, protocol.NoticeParams{
 				Level: "warn",
