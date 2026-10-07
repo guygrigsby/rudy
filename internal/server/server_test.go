@@ -3102,7 +3102,7 @@ func TestChildSessionThroughThePluginClass(t *testing.T) {
 	hr := &hookRecorder{}
 	cfg := testConfig()
 	cfg.ConfigDir = t.TempDir()
-	srv, store := newServerTrusting(t, cfg, filepath.Join(t.TempDir(), "sessions"), "", trustAll, ep, cp, subagents.New(cfg.ConfigDir), hr)
+	srv, store := newServerTrusting(t, cfg, filepath.Join(t.TempDir(), "sessions"), "", trustAll, ep, cp, subagents.New(cfg.ConfigDir, trustAll), hr)
 	ep.otherHost = cp.host
 
 	ctx := context.Background()
@@ -3418,7 +3418,7 @@ func TestForkKeepsTheAgentDefinition(t *testing.T) {
 // it from the root session too.
 func TestRootSessionKeepsTheAgentToolItsDefinitionLists(t *testing.T) {
 	prov := &scriptProvider{textOnly: true}
-	h := newHarnessTrusting(t, prov, trustAll, subagents.New(t.TempDir()))
+	h := newHarnessTrusting(t, prov, trustAll, subagents.New(t.TempDir(), trustAll))
 	if err := os.MkdirAll(filepath.Join(h.ws, ".rudy", "agents"), 0o700); err != nil {
 		t.Fatal(err)
 	}

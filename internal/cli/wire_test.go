@@ -598,7 +598,7 @@ func gateBuild(t *testing.T, workspace, body string, ask TrustAsker) (*Built, st
 	t.Chdir(workspace)
 	var project string
 	old := builtinPlugins
-	builtinPlugins = func(cfg *config.Config, paths config.Paths, _ *httpx.Client, env func(string) string, version string, _ memoryplugin.Summarize, mcpProject string) []plugin.Plugin {
+	builtinPlugins = func(cfg *config.Config, paths config.Paths, _ *httpx.Client, env func(string) string, version string, _ memoryplugin.Summarize, mcpProject string, _ func(string) bool) []plugin.Plugin {
 		project = mcpProject
 		resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cfg.Secrets.File) }
 		return append(BuiltinTools(), fakePlugin{&fakeProvider{}}, newMCPPlugin(cfg, paths, resolve, version, mcpProject))

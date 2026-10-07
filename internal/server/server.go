@@ -1573,6 +1573,12 @@ func firstNonEmpty(vs ...string) string {
 // read only when Deps.Trusted says the operator trusted it, so a cloned repository cannot supply
 // default (ADR 0050).
 func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agentdef.Definition, bool) {
+	return agentdef.Resolve(s.agentDefs(cn, ws), name)
+}
+
+// agentDefs is every definition visible to a session in ws, with the notices resolveAgent
+// describes. A caller resolving more than one name loads once so the notices fire once.
+func (s *Server) agentDefs(cn *conn, ws session.Workspace) map[string]agentdef.Definition {
 	roots := []string{filepath.Join(s.d.Config.ConfigDir, "agents")}
 	wsAgents := filepath.Join(ws.Root, ".rudy", "agents")
 	if s.d.Trusted != nil && s.d.Trusted(ws.Root) {
@@ -1591,7 +1597,7 @@ func (s *Server) resolveAgent(cn *conn, ws session.Workspace, name string) (agen
 			defs[n] = d
 		}
 	}
-	return agentdef.Resolve(defs, name)
+	return defs
 }
 
 // applyAgent stamps a definition and an already-resolved tool list onto a session that is not
@@ -1691,10 +1697,11 @@ func parentToolNames(parent *liveSession) []string {
 func (s *Server) applyAgentFromLog(cn *conn, ls *liveSession) {
 	name := ls.sess.Agent()
 	ws := deriveInfo(ls.sess.ID(), ls.entries).Workspace
-	def, ok := s.resolveAgent(cn, ws, name)
+	defs := s.agentDefs(cn, ws)
+	def, ok := agentdef.Resolve(defs, name)
 	if !ok {
 		cn.notify(protocol.NotifyNotice, protocol.NoticeParams{Level: "warn", Text: "agent " + name + " is no longer defined; continuing under the default agent"})
-		def, _ = s.resolveAgent(cn, ws, "")
+		def, _ = agentdef.Resolve(defs, "")
 	}
 	s.applyAgent(ls, def, loggedTools(ls.sess, def))
 }

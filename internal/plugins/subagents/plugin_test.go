@@ -22,6 +22,8 @@ import (
 	"github.com/guygrigsby/rudy/internal/tool"
 )
 
+func trustAll(string) bool { return true }
+
 // writeDef writes a minimal agents/<name>.md under dir, creating it if needed.
 func writeDef(t *testing.T, dir, name, description string) {
 	t.Helper()
@@ -48,7 +50,7 @@ func TestTheRosterComesFromTheSessionNotTheProcess(t *testing.T) {
 	h := &plugintest.Host{Name: "subagents", Agents: []agentdef.Definition{
 		{Name: "migrator", Description: "writes migrations"},
 	}}
-	if err := New(dir).Init(context.Background(), h); err != nil {
+	if err := New(dir, trustAll).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.Hooks) != 1 || h.Hooks[0].Point != plugin.HookSessionOpened {
@@ -89,7 +91,7 @@ func TestARootDefinitionBeatsAWorkspaceOneAndAWorkspaceOneBeatsAPlugin(t *testin
 	h := &plugintest.Host{Name: "subagents", Agents: []agentdef.Definition{
 		{Name: "shared", Description: "the plugin's own"},
 	}}
-	if err := New(dir).Init(context.Background(), h); err != nil {
+	if err := New(dir, trustAll).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	res, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
@@ -123,7 +125,7 @@ func TestRosterNoticesAFileThatFailsToParse(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &plugintest.Host{Name: "subagents"}
-	if err := New(dir).Init(context.Background(), h); err != nil {
+	if err := New(dir, trustAll).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
@@ -141,7 +143,7 @@ func TestRosterNoticesAFileThatFailsToParse(t *testing.T) {
 // hook has nothing to add, so the runner should drop it rather than injecting an empty line.
 func TestRosterEmptyReturnsNoResult(t *testing.T) {
 	h := &plugintest.Host{Name: "subagents"}
-	if err := New(t.TempDir()).Init(context.Background(), h); err != nil {
+	if err := New(t.TempDir(), nil).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	res, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
@@ -163,7 +165,7 @@ func TestTheRosterIsNotOfferedToASubagent(t *testing.T) {
 	dir := t.TempDir()
 	writeDef(t, filepath.Join(dir, "agents"), "explorer", "reads the codebase")
 	h := &plugintest.Host{Name: "subagents"}
-	if err := New(dir).Init(context.Background(), h); err != nil {
+	if err := New(dir, trustAll).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	ws := session.Workspace{Root: t.TempDir()}
@@ -202,7 +204,7 @@ func TestRegistersTheAgentToolWithAStaticDescription(t *testing.T) {
 	dir := t.TempDir()
 	writeDef(t, filepath.Join(dir, "agents"), "explorer", "reads only")
 	h := &plugintest.Host{Name: "subagents"}
-	if err := New(dir).Init(context.Background(), h); err != nil {
+	if err := New(dir, trustAll).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.RegisteredTools) != 1 {
@@ -228,7 +230,7 @@ func TestRegistersTheAgentToolWithAStaticDescription(t *testing.T) {
 
 func TestInvokeRefusesBadInputAndReportsNoServer(t *testing.T) {
 	h := &plugintest.Host{Name: "subagents"}
-	if err := New(t.TempDir()).Init(context.Background(), h); err != nil {
+	if err := New(t.TempDir(), nil).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	invoke := h.RegisteredTools[0].Invoke
@@ -257,7 +259,7 @@ func TestInvokeRefusesBadInputAndReportsNoServer(t *testing.T) {
 // this reports on tools specifically.
 func TestInvokeReportsTheActualProblemWithTools(t *testing.T) {
 	h := &plugintest.Host{Name: "subagents"}
-	if err := New(t.TempDir()).Init(context.Background(), h); err != nil {
+	if err := New(t.TempDir(), nil).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	invoke := h.RegisteredTools[0].Invoke
@@ -397,7 +399,7 @@ func (h *pipeHost) Connect(context.Context) (*protocol.Client, error) {
 func agentTool(t *testing.T, conn protocol.Conn) func(context.Context, tool.Call) (tool.Result, error) {
 	t.Helper()
 	h := &pipeHost{Host: &plugintest.Host{Name: "subagents"}, conn: conn}
-	if err := New(t.TempDir()).Init(context.Background(), h); err != nil {
+	if err := New(t.TempDir(), nil).Init(context.Background(), h); err != nil {
 		t.Fatal(err)
 	}
 	return h.RegisteredTools[0].Invoke
@@ -537,5 +539,43 @@ func TestCancelInterruptsTheChildAndWaitsForIt(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the tool call never returned after the child rested")
+	}
+}
+
+// An untrusted workspace's agent descriptions never reach the session context (ADR 0050);
+// the operator's own agents show either way.
+func TestRosterOmitsUntrustedWorkspaceAgents(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trusted func(string) bool
+		want    bool
+	}{{"nil", nil, false}, {"trusted", trustAll, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeDef(t, filepath.Join(dir, "agents"), "explorer", "reads the codebase")
+			ws := t.TempDir()
+			writeDef(t, filepath.Join(ws, ".rudy", "agents"), "x", "INJECTED")
+			h := &plugintest.Host{Name: "subagents"}
+			if err := New(dir, tc.trusted).Init(context.Background(), h); err != nil {
+				t.Fatal(err)
+			}
+			res, err := h.Hooks[0].Handle(context.Background(), plugin.HookCall{
+				Point:   plugin.HookSessionOpened,
+				Payload: &plugin.SessionOpenedPayload{Workspace: session.Workspace{Root: ws}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, ok := res.(*plugin.SessionOpenedResult)
+			if !ok {
+				t.Fatalf("result = %T", res)
+			}
+			if got := strings.Contains(out.Context, "INJECTED"); got != tc.want {
+				t.Fatalf("context %q: contains INJECTED = %v, want %v", out.Context, got, tc.want)
+			}
+			if !strings.Contains(out.Context, "explorer") {
+				t.Fatalf("context %q lost the operator's agent", out.Context)
+			}
+		})
 	}
 }

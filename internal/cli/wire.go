@@ -190,6 +190,15 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	// A caller that named its own plugin set means exactly that set: no discovery, no child
 	// processes it did not ask for.
 	discover := set == nil
+	// The server and the subagent roster read the trust record per session.open rather than
+	// trusting the answer computed for the directory rudy started in: the daemon may serve
+	// another workspace. One closure, so they cannot disagree.
+	trustStore := trust.NewStore(paths.Data)
+	trusted := func(root string) bool {
+		decls, _ := trust.Declarations(root)
+		ok, _ := trustStore.IsTrusted(root, decls)
+		return ok
+	}
 	// No working directory is no project scope, never a reason to fail the build.
 	cwd, _ := os.Getwd()
 	var ownPlugins []plugin.Manifest
@@ -205,7 +214,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 				_, mcpProject = mcpplugin.Paths(paths.Config, cwd)
 			}
 		}
-		set = builtinPlugins(cfg, paths, httpc, env, o.Version, summarizeWith(cfg, registry, notice), mcpProject)
+		set = builtinPlugins(cfg, paths, httpc, env, o.Version, summarizeWith(cfg, registry, notice), mcpProject, trusted)
 	}
 	// The server is built before the plugins load, and takes its providers from them
 	// afterwards: a plugin's Host reaches the server through the protocol (Connect, Note,
@@ -217,9 +226,6 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	if err != nil {
 		notice(err.Error())
 	}
-	// The server reads the trust record per session.open rather than trusting the answer
-	// computed for the directory rudy started in: the daemon may serve another workspace.
-	trustStore := trust.NewStore(paths.Data)
 	srv := server.New(server.Deps{
 		Version:  o.Version,
 		Config:   cfg,
@@ -231,11 +237,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		Socket:   socket,
 		Prompt:   prompt,
 		Home:     paths.Home,
-		Trusted: func(root string) bool {
-			decls, _ := trust.Declarations(root)
-			ok, _ := trustStore.IsTrusted(root, decls)
-			return ok
-		},
+		Trusted:  trusted,
 	})
 	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv, Prompt: prompt}
 	defer func() {
@@ -457,10 +459,10 @@ func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []erro
 //
 // mcpProject is the project mcp.toml to read, or "" for the user file alone; the caller
 // passes it only for a trusted workspace.
-func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, env func(string) string, version string, summarize memoryplugin.Summarize, mcpProject string) []plugin.Plugin {
+func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, env func(string) string, version string, summarize memoryplugin.Summarize, mcpProject string, trusted func(root string) bool) []plugin.Plugin {
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cfg.Secrets.File) }
 	return append(BuiltinTools(), webplugin.New(cfg.Web, version, resolve),
-		subagents.New(paths.Config), codexplugin.New(codexapp.NewClient(codexapp.Command{CodexHome: filepath.Join(paths.Data, "codex")})), initcmd.New(), compactcmd.New(), commands.New(),
+		subagents.New(paths.Config, trusted), codexplugin.New(codexapp.NewClient(codexapp.Command{CodexHome: filepath.Join(paths.Data, "codex")})), initcmd.New(), compactcmd.New(), commands.New(),
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
 		newMCPPlugin(cfg, paths, resolve, version, mcpProject),
 		openaichatplugin.New(cfg.Providers, httpc, resolve),
