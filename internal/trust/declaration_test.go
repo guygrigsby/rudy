@@ -5,6 +5,7 @@ package trust_test
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -221,5 +222,27 @@ func TestMCPDigestFramingIsUnambiguous(t *testing.T) {
 	d := mcp.ServerConfig{Name: "s", Transport: mcp.TransportStdio, Command: "srv", Args: []string{"a", "b"}}
 	if trust.MCPDeclaration(c).Digest == trust.MCPDeclaration(d).Digest {
 		t.Error("args join ambiguously")
+	}
+}
+
+// TestUnparseableMCPIsATypedError: callers decide on the project MCP scope by type, never by
+// the text of the error.
+func TestUnparseableMCPIsATypedError(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, ".rudy")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "mcp.toml")
+	if err := os.WriteFile(path, []byte("not toml ["), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, errs := trust.Declarations(root)
+	var re *trust.ReadError
+	if len(errs) != 1 || !errors.As(errs[0], &re) || re.Path != path {
+		t.Fatalf("errs = %v, want one *trust.ReadError for %s", errs, path)
+	}
+	if !strings.Contains(errs[0].Error(), "mcp.toml") {
+		t.Errorf("message %q lost the path", errs[0])
 	}
 }

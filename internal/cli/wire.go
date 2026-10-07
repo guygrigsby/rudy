@@ -208,9 +208,9 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		// plugin only when the workspace is trusted (ADR 0050).
 		mcpProject := ""
 		if cwd != "" {
-			var trusted, mcpReadable bool
-			trusted, mcpReadable, ownPlugins = workspaceTrust(paths, cwd, o.Trust, notice)
-			if trusted && mcpReadable {
+			var wsTrusted, mcpReadable bool
+			wsTrusted, mcpReadable, ownPlugins = workspaceTrust(paths, cwd, o.Trust, notice)
+			if wsTrusted && mcpReadable {
 				_, mcpProject = mcpplugin.Paths(paths.Config, cwd)
 			}
 		}
@@ -389,7 +389,8 @@ func workspaceTrust(paths config.Paths, cwd string, ask TrustAsker, notice func(
 	mcpReadable = true
 	for _, err := range errs {
 		notice(err.Error())
-		if strings.Contains(err.Error(), "mcp.toml") {
+		var re *trust.ReadError
+		if errors.As(err, &re) {
 			mcpReadable = false
 		}
 	}

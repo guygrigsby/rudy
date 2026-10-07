@@ -155,6 +155,16 @@ func AgentDeclaration(name string, body []byte) Declaration {
 	return Declaration{Kind: KindAgent, Name: name, Digest: new(frame).str(string(body)).hash(), Summary: "agent " + name}
 }
 
+// ReadError is the project mcp.toml could not be read or parsed. A declaration with no
+// digest cannot be trusted, so a caller withholds the project MCP scope when it sees one.
+type ReadError struct {
+	Path string
+	Err  error
+}
+
+func (e *ReadError) Error() string { return e.Err.Error() }
+func (e *ReadError) Unwrap() error { return e.Err }
+
 // Declarations is everything root ships: manifests under root/.rudy, servers in
 // root/.rudy/mcp.toml and every root/.rudy/agents/*.md as bytes. A missing mcp.toml is none;
 // one that will not parse is one error and no MCP declarations. An agent file that will not
@@ -166,9 +176,10 @@ func Declarations(root string) ([]Declaration, []error) {
 	for _, m := range manifests {
 		out = append(out, PluginDeclaration(m))
 	}
-	f, err := mcp.ReadFile(filepath.Join(rudy, "mcp.toml"))
+	mcpPath := filepath.Join(rudy, "mcp.toml")
+	f, err := mcp.ReadFile(mcpPath)
 	if err != nil {
-		errs = append(errs, err)
+		errs = append(errs, &ReadError{Path: mcpPath, Err: err})
 	}
 	for _, c := range f.Servers {
 		out = append(out, MCPDeclaration(c))
