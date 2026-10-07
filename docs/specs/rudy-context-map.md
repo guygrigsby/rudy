@@ -35,6 +35,8 @@
 | Slash command | A client-facing command a plugin registers | Plugin |
 | Skill | A `SKILL.md` discovered under a skills root | Plugin |
 | Agent definition | A named profile of prompt, tools and model that a subagent session runs under | Plugin |
+| Workspace declaration | A plugin manifest, MCP server entry or agent definition a workspace ships under `.rudy`; something the workspace asks rudy to run or to say on its behalf | Plugin |
+| Trust record | The operator's one-time yes to a workspace's declarations as they stood, by digest; a changed declaration asks again | Plugin |
 | Request, Notification | What a client sends the server, what the server sends a client; JSON-RPC words | Protocol |
 | Server | One process-lifetime instance of the Session runtime, identified only while it is running | Session |
 | Shutdown | The Server's orderly terminal transition: stop admission, interrupt work, close runtime resources, then close its control connection | Session |
