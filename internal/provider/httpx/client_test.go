@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -309,19 +311,6 @@ func TestDoRefusesRedirectAndSendsNothingToTheTarget(t *testing.T) {
 	}
 }
 
-func TestRedirectToSubdomainStillRefused(t *testing.T) {
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "http://sub."+r.Host+"/x", http.StatusMovedPermanently)
-	}))
-	defer origin.Close()
-	c, _ := newClient(t)
-	req, _ := http.NewRequest(http.MethodGet, origin.URL, nil)
-	_, err := c.Do(context.Background(), req, ulid.ULID{})
-	if err == nil || !strings.Contains(err.Error(), "sub.127.0.0.1") {
-		t.Fatalf("want error naming the subdomain host, got %v", err)
-	}
-}
-
 func TestRedirectWithoutLocationIsNamed(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusFound)
@@ -332,5 +321,28 @@ func TestRedirectWithoutLocationIsNamed(t *testing.T) {
 	_, err := c.Do(context.Background(), req, ulid.ULID{})
 	if err == nil || !strings.Contains(err.Error(), "(no Location)") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// A redirect to a different host string for the same machine (127.0.0.1 to localhost) is
+// refused even though the target is reachable: the client never follows, so the recording
+// target sees nothing.
+func TestRedirectToSubdomainStillRefused(t *testing.T) {
+	target, seen := redirectTarget(t)
+	port := target.Listener.Addr().(*net.TCPAddr).Port
+	loc := "http://localhost:" + strconv.Itoa(port) + "/x"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, loc, http.StatusMovedPermanently)
+	}))
+	defer origin.Close()
+	c, _ := newClient(t)
+	req, _ := http.NewRequest(http.MethodGet, origin.URL, nil)
+	req.Header.Set("X-Api-Key", "secret")
+	_, err := c.Do(context.Background(), req, ulid.ULID{})
+	if err == nil || !strings.Contains(err.Error(), "does not follow provider redirects") || !strings.Contains(err.Error(), "localhost:") {
+		t.Fatalf("want a refusal naming localhost, got %v", err)
+	}
+	if n := seen.Load(); n != 0 {
+		t.Fatalf("target saw %d requests", n)
 	}
 }
