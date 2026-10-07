@@ -207,3 +207,31 @@ func TestEveryDefaultIsAKeyTheLinterKnows(t *testing.T) {
 		t.Errorf("the linter does not know keys rudy defaults: %v", fs)
 	}
 }
+
+// TestLintFlagsLiteralSecret: a key pasted where a reference belongs is reported on its
+// line, and the finding never repeats it.
+func TestLintFlagsLiteralSecret(t *testing.T) {
+	fs := lintFile(t, "[providers.default]\nauth = \"sk-ant-abc123\"\n\n[web]\nbrave_api_key = \"BSA-xyz\"\n")
+	if len(fs) != 2 {
+		t.Fatalf("want 2 findings, got %d: %v", len(fs), fs)
+	}
+	for i, line := range []int{2, 5} {
+		if fs[i].Line != line {
+			t.Errorf("finding %d on line %d, want %d", i, fs[i].Line, line)
+		}
+		if strings.Contains(fs[i].Text, "abc123") || strings.Contains(fs[i].Text, "xyz") {
+			t.Errorf("finding echoes the value: %s", fs[i].Text)
+		}
+	}
+	if want := "providers.default.auth holds a value, not a secret reference (env:NAME or cache:KEY); move the key to the environment or the secrets file"; fs[0].Text != want {
+		t.Errorf("text = %q", fs[0].Text)
+	}
+}
+
+func TestLintAcceptsReferences(t *testing.T) {
+	for _, v := range []string{`"env:KEY"`, `"cache:KEY"`, `""`} {
+		if fs := lintFile(t, "[providers.default]\nauth = "+v+"\n[web]\nexa_api_key = "+v+"\n"); len(fs) != 0 {
+			t.Errorf("%s: unexpected findings %v", v, fs)
+		}
+	}
+}
