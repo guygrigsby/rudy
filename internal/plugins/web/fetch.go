@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -124,12 +125,35 @@ func (f *fetcher) dialVetted(ctx context.Context, network, addr string) (net.Con
 	var errs []error
 	for _, ip := range ips {
 		conn, err := dial(ctx, network, net.JoinHostPort(ip.String(), port))
-		if err == nil {
-			return conn, nil
+		if err != nil {
+			errs = append(errs, err)
+			continue
 		}
-		errs = append(errs, err)
+		// The dial was handed a vetted address; the peer must be one too, so a dial that
+		// landed elsewhere is refused rather than read.
+		if !slices.ContainsFunc(ips, peerIP(conn).Equal) {
+			_ = conn.Close()
+			errs = append(errs, fmt.Errorf("%w: the connection reached an address the policy did not vet", errRefused))
+			continue
+		}
+		return conn, nil
 	}
 	return nil, errors.Join(errs...)
+}
+
+// peerIP is the IP a connection is actually connected to, or nil when it cannot say.
+func peerIP(c net.Conn) net.IP {
+	switch a := c.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		return a.IP
+	case *net.IPAddr:
+		return a.IP
+	}
+	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
 }
 
 // get makes one request. No cookies, no credentials, no body: a fetch is a read of something

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -34,9 +35,23 @@ func (d *dialLog) dialed() string {
 	return strings.Join(d.addrs, ",")
 }
 
-// pipeServing is one end of a pipe whose other end reads a request and writes resp.
-func pipeServing(resp string) (net.Conn, error) {
+// peerConn reports remote as its peer, since a pipe has no address of its own, and records
+// whether it was closed.
+type peerConn struct {
+	net.Conn
+	remote net.Addr
+	closed bool
+}
+
+func (p *peerConn) RemoteAddr() net.Addr { return p.remote }
+func (p *peerConn) Close() error         { p.closed = true; return p.Conn.Close() }
+
+// pipeServing is one end of a pipe whose other end reads a request and writes resp. The
+// returned conn claims to be connected to addr.
+func pipeServing(resp, addr string) (net.Conn, error) {
 	c, s := net.Pipe()
+	ap, _ := netip.ParseAddrPort(addr)
+	pc := &peerConn{Conn: c, remote: net.TCPAddrFromAddrPort(ap)}
 	go func() {
 		defer func() { _ = s.Close() }()
 		if _, err := http.ReadRequest(bufio.NewReader(s)); err != nil {
@@ -44,7 +59,7 @@ func pipeServing(resp string) (net.Conn, error) {
 		}
 		_, _ = s.Write([]byte(resp))
 	}()
-	return c, nil
+	return pc, nil
 }
 
 const (
@@ -72,7 +87,7 @@ func ips(s ...string) []net.IP {
 }
 
 func TestFetchDialsTheVettedAddressNotTheName(t *testing.T) {
-	d := &dialLog{serve: func(string) (net.Conn, error) { return pipeServing(okResp) }}
+	d := &dialLog{serve: func(addr string) (net.Conn, error) { return pipeServing(okResp, addr) }}
 	f := testFetcher(func(context.Context, string) ([]net.IP, error) { return ips("203.0.113.9"), nil }, d)
 	pg, err := f.fetch(context.Background(), "http://example.test:8080/")
 	if err != nil {
@@ -97,9 +112,9 @@ func TestFetchNeverResolvesTwice(t *testing.T) {
 	}
 	d := &dialLog{serve: func(addr string) (net.Conn, error) {
 		if strings.HasPrefix(addr, "203.0.113.1:") {
-			return pipeServing(redirectResp)
+			return pipeServing(redirectResp, addr)
 		}
-		return pipeServing(okResp)
+		return pipeServing(okResp, addr)
 	}}
 	f := testFetcher(resolve, d)
 	if _, err := f.fetch(context.Background(), "http://a.test/"); err != nil {
@@ -118,7 +133,7 @@ func TestSecondVettedAddressIsTried(t *testing.T) {
 		if strings.HasPrefix(addr, "203.0.113.1:") {
 			return nil, errors.New("connection refused")
 		}
-		return pipeServing(okResp)
+		return pipeServing(okResp, addr)
 	}}
 	f := testFetcher(func(context.Context, string) ([]net.IP, error) {
 		return ips("203.0.113.1", "203.0.113.2"), nil
@@ -189,5 +204,26 @@ func TestEmbeddedPrivateFormsRefused(t *testing.T) {
 		if got := public(net.ParseIP(tc.ip)); got != tc.public {
 			t.Errorf("public(%s) = %v, want %v", tc.ip, got, tc.public)
 		}
+	}
+}
+
+func TestConnectionToAnUnvettedPeerIsRefused(t *testing.T) {
+	var landed *peerConn
+	d := &dialLog{serve: func(string) (net.Conn, error) {
+		c, s := net.Pipe()
+		go func() { _ = s.Close() }()
+		landed = &peerConn{Conn: c, remote: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 80}}
+		return landed, nil
+	}}
+	f := testFetcher(func(context.Context, string) ([]net.IP, error) { return ips("203.0.113.9"), nil }, d)
+	_, err := f.fetch(context.Background(), "http://example.test/")
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("fetch = %v, want a refusal", err)
+	}
+	if strings.Contains(err.Error(), "127.0.0.1") {
+		t.Errorf("refusal names the address: %v", err)
+	}
+	if landed == nil || !landed.closed {
+		t.Error("the connection to the unvetted peer was not closed")
 	}
 }
