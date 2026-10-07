@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/guygrigsby/rudy/internal/plugin"
@@ -58,25 +59,54 @@ func hashHex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// kvLines is a map as sorted "k=v" lines, values exactly as written.
-func kvLines(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, k+"="+v)
-	}
-	sort.Strings(out)
-	return out
+// frame is the canonical encoding a declaration digest is taken over. Every field is
+// length-prefixed, so no value can run into its neighbour: a string is "s<len>:<bytes>", a
+// list is "l<count>:" and its strings, a map is "m<count>:" and its key and value strings
+// in key order. Values are exactly as written.
+type frame struct{ b []byte }
+
+func (f *frame) str(s string) *frame {
+	f.b = append(f.b, 's')
+	f.b = strconv.AppendInt(f.b, int64(len(s)), 10)
+	f.b = append(f.b, ':')
+	f.b = append(f.b, s...)
+	return f
 }
+
+func (f *frame) list(items []string) *frame {
+	f.b = append(f.b, 'l')
+	f.b = strconv.AppendInt(f.b, int64(len(items)), 10)
+	f.b = append(f.b, ':')
+	for _, it := range items {
+		f.str(it)
+	}
+	return f
+}
+
+func (f *frame) kv(m map[string]string) *frame {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	f.b = append(f.b, 'm')
+	f.b = strconv.AppendInt(f.b, int64(len(keys)), 10)
+	f.b = append(f.b, ':')
+	for _, k := range keys {
+		f.str(k).str(m[k])
+	}
+	return f
+}
+
+func (f *frame) hash() string { return hashHex(f.b) }
 
 // PluginDeclaration covers everything a manifest decides about what runs: command, args,
 // build, env and, when the command resolves to an executable inside the plugin's own
-// directory, that file's bytes. The resolution mirrors plugin.Spawned: only a bare command
-// name is looked for next to the manifest, so a checkout that swaps the binary changes the
+// directory, that file's bytes. The resolution mirrors plugin.Spawned: a command that is not an
+// absolute path is looked for next to the manifest, so a checkout that swaps the binary changes the
 // digest even though the manifest is byte-identical.
 func PluginDeclaration(m plugin.Manifest) Declaration {
-	lines := []string{m.Name, m.Version, m.Command, strings.Join(m.Args, " "), m.Build}
-	lines = append(lines, kvLines(m.Env)...)
-	lines = append(lines, executableLine(m))
+	f := new(frame).str(m.Name).str(m.Version).str(m.Command).list(m.Args).str(m.Build).kv(m.Env).str(executableLine(m))
 	summary := "runs: " + m.Command + " " + strings.Join(m.Args, " ")
 	if m.Build != "" {
 		summary += "; build: " + m.Build
@@ -84,19 +114,15 @@ func PluginDeclaration(m plugin.Manifest) Declaration {
 	return Declaration{
 		Kind:    KindPlugin,
 		Name:    m.Name,
-		Digest:  hashHex([]byte(strings.Join(lines, "\x00"))),
+		Digest:  f.hash(),
 		Summary: summary,
 	}
 }
 
-// executableLine is the digest line for the file a bare command resolves to in m.Dir.
+// executableLine is the digest line for the file the command resolves to in m.Dir.
 func executableLine(m plugin.Manifest) string {
-	if m.Dir == "" || filepath.IsAbs(m.Command) || filepath.Base(m.Command) != m.Command {
-		return "exec:none"
-	}
-	local := filepath.Join(m.Dir, m.Command)
-	fi, err := os.Stat(local)
-	if err != nil || !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 {
+	local, ok := plugin.LocalExecutable(m)
+	if !ok {
 		return "exec:none"
 	}
 	b, err := os.ReadFile(local)
@@ -110,10 +136,7 @@ func executableLine(m plugin.Manifest) string {
 // as written: a cache:KEY reference stays the reference, so the digest never holds a secret
 // and does not move when the secret behind it rotates.
 func MCPDeclaration(c mcp.ServerConfig) Declaration {
-	lines := []string{c.Name, string(c.Transport), c.Command, strings.Join(c.Args, " ")}
-	lines = append(lines, kvLines(c.Env)...)
-	lines = append(lines, c.URL)
-	lines = append(lines, kvLines(c.Headers)...)
+	f := new(frame).str(c.Name).str(string(c.Transport)).str(c.Command).list(c.Args).kv(c.Env).str(c.URL).kv(c.Headers)
 	summary := "stdio: " + c.Command + " " + strings.Join(c.Args, " ")
 	if c.Transport == mcp.TransportHTTP {
 		summary = "http: " + c.URL
@@ -121,7 +144,7 @@ func MCPDeclaration(c mcp.ServerConfig) Declaration {
 	return Declaration{
 		Kind:    KindMCP,
 		Name:    c.Name,
-		Digest:  hashHex([]byte(strings.Join(lines, "\x00"))),
+		Digest:  f.hash(),
 		Summary: summary,
 	}
 }
@@ -129,7 +152,7 @@ func MCPDeclaration(c mcp.ServerConfig) Declaration {
 // AgentDeclaration is an agent definition by its bytes: it replaces the system prompt, so
 // any edit is a change.
 func AgentDeclaration(name string, body []byte) Declaration {
-	return Declaration{Kind: KindAgent, Name: name, Digest: hashHex(body), Summary: "agent " + name}
+	return Declaration{Kind: KindAgent, Name: name, Digest: new(frame).str(string(body)).hash(), Summary: "agent " + name}
 }
 
 // Declarations is everything root ships: manifests under root/.rudy, servers in
