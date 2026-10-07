@@ -473,6 +473,18 @@ func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 	sid := ls.sess.ID()
 	ls.obsMu.Lock()
 	ls.conns = append(ls.conns, cn)
+	// Every route onto a session ends here, so this is the one place a second asker can be
+	// caught (ADR 0054). Any same-user client may declare itself an asker; the trust model
+	// allows it and this is the tripwire that keeps it from being silent. Said to every
+	// subscriber, the newcomer included, since each of them is now answerable by one more.
+	if cn.isAsker() {
+		if n := len(ls.askersObsLocked()); n > 1 {
+			ls.broadcastObsLocked(protocol.NotifyNotice, protocol.NoticeParams{
+				Level: "warn",
+				Text:  fmt.Sprintf("asker %s attached; %d askers can now answer this session's questions", cn.name, n),
+			})
+		}
+	}
 	at := attachment{
 		entries: append([]session.Entry(nil), ls.entries...),
 		info:    deriveInfo(sid, ls.entries),

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -546,4 +547,57 @@ func TestAnAnswerForAnotherTurnIsRefused(t *testing.T) {
 		t.Fatalf("the question was lost with the refusals: %v", err)
 	}
 	drain(t, cl, completedOn(info.SessionID))
+}
+
+// TestSecondAskerIsAnnounced pins the tripwire ADR 0054 keeps in place of a stricter trust
+// model: a headless attach is silent, and a second asker joining a session is told to every
+// subscriber, the first asker over the wire included, naming the client that joined.
+func TestSecondAskerIsAnnounced(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	first := h.dial(t, true)
+	info := h.open(t, first)
+
+	attachedNotice := func(n protocol.Notification) (string, bool) {
+		if n.Method != protocol.NotifyNotice {
+			return "", false
+		}
+		var p protocol.NoticeParams
+		if err := json.Unmarshal(n.Params, &p); err != nil {
+			t.Fatalf("notice params: %v", err)
+		}
+		if p.Level != "warn" || !strings.Contains(p.Text, "attached") {
+			return "", false
+		}
+		return p.Text, true
+	}
+
+	// A non-asker attaching changes who can answer nothing, so nothing is said.
+	viewer := h.dial(t, false)
+	resumeOn(t, viewer, info.SessionID)
+	select {
+	case n := <-first.Notifications():
+		if text, ok := attachedNotice(n); ok {
+			t.Fatalf("non-asker attach announced: %q", text)
+		}
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	joiner := protocol.NewClient(dialConn(t, h.srv))
+	t.Cleanup(func() { _ = joiner.Close() })
+	if err := joiner.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "joiner", Version: "0", Asker: true}, &protocol.ClientHelloResult{}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	resumeOn(t, joiner, info.SessionID)
+
+	var text string
+	drain(t, first, func(n protocol.Notification) bool {
+		var ok bool
+		text, ok = attachedNotice(n)
+		return ok
+	})
+	for _, want := range []string{"asker joiner attached", "2 askers"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice %q lacks %q", text, want)
+		}
+	}
 }

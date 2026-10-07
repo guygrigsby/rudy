@@ -712,6 +712,7 @@ func (s *Server) handleHello(cn *conn, raw json.RawMessage) (any, *protocol.Erro
 	// human's connection is the only one that can answer. Take the claim, then let the one
 	// predicate decide whether it holds, so the door and every routing walk say the same
 	// thing about who is an asker.
+	cn.name = p.Client
 	cn.asker = p.Asker
 	cn.asker = cn.isAsker()
 	return protocol.ClientHelloResult{Server: "rudy", Version: s.d.Version, InstanceID: s.instanceID.String(), Home: s.d.Home}, nil
