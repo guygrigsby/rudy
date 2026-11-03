@@ -3,4 +3,4 @@
 // module, and the manifest's `go build -o hello .` needs a go.mod there to build at all.
 module github.com/guygrigsby/rudy/examples/plugins/hello
 
-go 1.26.2
+go 1.26.10
