@@ -567,14 +567,27 @@ func (s *Spawned) startProcess(context.Context) (protocol.Conn, *protocol.Tail, 
 // command is the manifest's command, resolved against the plugin's own directory first: a
 // plugin that ships its binary next to its manifest names it plainly.
 func (s *Spawned) command() string {
-	if s.m.Dir == "" || filepath.IsAbs(s.m.Command) || filepath.Base(s.m.Command) != s.m.Command {
-		return s.m.Command
-	}
-	local := filepath.Join(s.m.Dir, s.m.Command)
-	if fi, err := os.Stat(local); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+	if local, ok := LocalExecutable(s.m); ok {
 		return local
 	}
 	return s.m.Command
+}
+
+// LocalExecutable is the file a manifest's command runs from the plugin's own directory:
+// any command that is not an absolute path is relative to m.Dir, whether a bare name or a
+// path such as ./bin/srv. ok is true when it names an existing regular file with an execute
+// bit. It is the one resolver Spawned runs and the trust digest covers, so what is
+// digested is what runs.
+func LocalExecutable(m Manifest) (path string, ok bool) {
+	if m.Dir == "" || m.Command == "" || filepath.IsAbs(m.Command) {
+		return "", false
+	}
+	local := filepath.Join(m.Dir, m.Command)
+	fi, err := os.Stat(local)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 {
+		return "", false
+	}
+	return local, true
 }
 
 func envPairs(env map[string]string) []string {
@@ -683,6 +696,9 @@ func (s *Spawned) RegisterRuntime(name string) error {
 func (s *Spawned) RegisterAgent(name, description, prompt string, tools *[]string, model, thinking string, maxTurns int) error {
 	if err := s.refuseLate("agent", name); err != nil {
 		return err
+	}
+	if name == "default" {
+		return fmt.Errorf("%w: plugin %s: agent default: the default agent is the operator's, not a plugin's", protocol.ErrInvalidArgument, s.m.Name)
 	}
 	if description == "" {
 		return fmt.Errorf("%w: plugin %s: agent %s: description is required", protocol.ErrInvalidArgument, s.m.Name, name)

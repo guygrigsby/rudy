@@ -12,8 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/guygrigsby/rudy/internal/plugin"
-	"github.com/guygrigsby/rudy/internal/pluginstore"
+	"github.com/guygrigsby/rudy/internal/trust"
 )
 
 // askTrust is the prompt a client with a terminal puts to the operator before this
@@ -23,16 +22,23 @@ import (
 // Anything but "y" is no, including an error and an empty line: the safe answer is the one
 // a hurried person gives.
 func askTrust(in io.Reader, out io.Writer) TrustAsker {
-	return func(root string, manifests []plugin.Manifest) (bool, error) {
-		_, _ = fmt.Fprintf(out, "\n%s ships %d plugin(s), which rudy would run as you:\n\n", root, len(manifests))
-		for _, m := range manifests {
-			_, _ = fmt.Fprintf(out, "  %s %s\n", m.Name, m.Version)
-			if m.Build != "" {
-				_, _ = fmt.Fprintf(out, "    build: %s\n", m.Build)
+	return func(root string, decls []trust.Declaration) (bool, error) {
+		var plugins, servers, agents int
+		for _, d := range decls {
+			switch d.Kind {
+			case trust.KindPlugin:
+				plugins++
+			case trust.KindMCP:
+				servers++
+			case trust.KindAgent:
+				agents++
 			}
-			_, _ = fmt.Fprintf(out, "    runs:  %s %s\n", m.Command, strings.Join(m.Args, " "))
 		}
-		_, _ = fmt.Fprint(out, "\nRun them in this workspace from now on? [y/N] ")
+		_, _ = fmt.Fprintf(out, "\n%s ships %d plugin(s), %d MCP server(s) and %d agent definition(s), which rudy would run or speak for as you:\n\n", root, plugins, servers, agents)
+		for _, d := range decls {
+			_, _ = fmt.Fprintf(out, "  %s\n    %s\n", d, d.Summary)
+		}
+		_, _ = fmt.Fprint(out, "\nTrust this workspace from now on? [y/N] ")
 		line, err := bufio.NewReader(in).ReadString('\n')
 		if err != nil && line == "" {
 			return false, nil
@@ -58,7 +64,7 @@ func newPluginsTrustCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			store := pluginstore.New(paths.Data)
+			store := trust.NewStore(paths.Data)
 			if forget {
 				if err := store.Untrust(cwd); err != nil {
 					return err
@@ -66,20 +72,20 @@ func newPluginsTrustCmd() *cobra.Command {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "forgot %s; its plugins will ask again\n", cwd)
 				return nil
 			}
-			manifests, errs := plugin.Discover([]string{cwd + "/.rudy"})
+			decls, errs := trust.Declarations(cwd)
 			for _, e := range errs {
 				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), e)
 			}
-			if len(manifests) == 0 {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s ships no plugins; nothing to trust\n", cwd)
+			if len(decls) == 0 {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s ships nothing under .rudy; nothing to trust\n", cwd)
 				return nil
 			}
-			if err := store.Trust(cwd, manifests, time.Now()); err != nil {
+			if err := store.Trust(cwd, decls, time.Now()); err != nil {
 				return err
 			}
-			names := make([]string, 0, len(manifests))
-			for _, m := range manifests {
-				names = append(names, m.Name)
+			names := make([]string, 0, len(decls))
+			for _, d := range decls {
+				names = append(names, d.String())
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "trusted %s: %s\n", cwd, strings.Join(names, ", "))
 			return nil

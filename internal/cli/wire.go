@@ -44,6 +44,7 @@ import (
 	"github.com/guygrigsby/rudy/internal/provider/httpx"
 	"github.com/guygrigsby/rudy/internal/server"
 	"github.com/guygrigsby/rudy/internal/session"
+	"github.com/guygrigsby/rudy/internal/trust"
 )
 
 // Built is everything a command needs after wiring.
@@ -189,8 +190,31 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 	// A caller that named its own plugin set means exactly that set: no discovery, no child
 	// processes it did not ask for.
 	discover := set == nil
+	// The server and the subagent roster read the trust record per session.open rather than
+	// trusting the answer computed for the directory rudy started in: the daemon may serve
+	// another workspace. One closure, so they cannot disagree.
+	trustStore := trust.NewStore(paths.Data)
+	trusted := func(root string) bool {
+		decls, _ := trust.Declarations(root)
+		ok, _ := trustStore.IsTrusted(root, decls)
+		return ok
+	}
+	// No working directory is no project scope, never a reason to fail the build.
+	cwd, _ := os.Getwd()
+	var ownPlugins []plugin.Manifest
 	if discover {
-		set = BuiltinPlugins(cfg, paths, httpc, env, o.Version, summarizeWith(cfg, registry, notice))
+		// Plugins and the project mcp.toml load once, here, in the directory rudy started
+		// in, and a repository is read before it is run: the project scope reaches the MCP
+		// plugin only when the workspace is trusted (ADR 0050).
+		mcpProject := ""
+		if cwd != "" {
+			var wsTrusted, mcpReadable bool
+			wsTrusted, mcpReadable, ownPlugins = workspaceTrust(paths, cwd, o.Trust, notice)
+			if wsTrusted && mcpReadable {
+				_, mcpProject = mcpplugin.Paths(paths.Config, cwd)
+			}
+		}
+		set = builtinPlugins(cfg, paths, httpc, env, o.Version, summarizeWith(cfg, registry, notice), mcpProject, trusted)
 	}
 	// The server is built before the plugins load, and takes its providers from them
 	// afterwards: a plugin's Host reaches the server through the protocol (Connect, Note,
@@ -213,6 +237,7 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		Socket:   socket,
 		Prompt:   prompt,
 		Home:     paths.Home,
+		Trusted:  trusted,
 	})
 	built := &Built{Version: o.Version, Paths: paths, Config: cfg, Store: store, Registry: registry, Plugins: plugins, Server: srv, Prompt: prompt}
 	defer func() {
@@ -223,8 +248,8 @@ func Build(ctx context.Context, o BuildOptions) (_ *Built, err error) {
 		}
 	}()
 	if discover {
-		set = append(set, spawnedPlugins(paths, plugins, srv, o.Version,
-			time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice, o.Trust)...)
+		set = append(set, spawnedPlugins(paths, plugins, srv, cwd, ownPlugins, o.Version,
+			time.Duration(cfg.HookTimeoutMS)*time.Millisecond, notice)...)
 	}
 	services := srv.PluginServices()
 	// Withdrawing a provider has to reach the provider registry's own copy, not just the
@@ -319,26 +344,16 @@ func storeFromEnv(env func(string) string, home string) (*session.Store, error) 
 // spawnedPlugins is every manifest the roots hold that the lock file has not disabled, in
 // discovery order, after the built-ins: a spawned plugin never shadows a linked one, since
 // the first registration of a name wins. The roots are the data root (where rudy plugin
-// install puts them), the config root (where a user drops one by hand) and the workspace's
-// own .rudy, which is how a repository ships a plugin with itself.
-func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, version string, commandTimeout time.Duration, notice func(string), trust TrustAsker) []plugin.Plugin {
-	// No working directory is no project scope, never a reason to fail the build.
-	cwd, _ := os.Getwd()
+// install puts them) and the config root (where a user drops one by hand); own is the
+// workspace's own .rudy plugins, which is how a repository ships a plugin with itself, and
+// is empty unless workspaceTrust trusted the workspace.
+func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Server, cwd string, own []plugin.Manifest, version string, commandTimeout time.Duration, notice func(string)) []plugin.Plugin {
 	roots := []string{paths.Data, paths.Config}
 	manifests, errs := discoverPlugins(roots, filepath.Join(paths.Data, pluginstore.LockFile))
 	for _, err := range errs {
 		notice(err.Error())
 	}
-	// The workspace's own plugins are separate, and load only if somebody agreed to this
-	// workspace: a repository is read before it is run, and opening one is not agreeing to
-	// execute what it declares (ADR 0025).
-	if cwd != "" {
-		own, ownErrs := discoverPlugins([]string{filepath.Join(cwd, ".rudy")}, filepath.Join(paths.Data, pluginstore.LockFile))
-		for _, err := range ownErrs {
-			notice(err.Error())
-		}
-		manifests = append(manifests, trustedOnly(paths, cwd, own, trust, notice)...)
-	}
+	manifests = append(manifests, own...)
 	var workspaces []string
 	if cwd != "" {
 		workspaces = []string{cwd}
@@ -359,41 +374,68 @@ func spawnedPlugins(paths config.Paths, plugins *plugin.Registry, srv *server.Se
 // TrustAsker is how a caller asks the operator whether this workspace's own plugins may
 // run. It answers true only when a person said so. Nil is a caller that cannot ask, which is
 // every headless one: no answer means no, the rule the Gate keeps for an unsafe tool.
-type TrustAsker func(root string, manifests []plugin.Manifest) (bool, error)
+type TrustAsker func(root string, decls []trust.Declaration) (bool, error)
 
-// trustedOnly is the workspace's own manifests when the operator has trusted this workspace
-// as it stands, and nothing when they have not. A caller that cannot ask says why once,
-// naming what it did not run, so a plugin that is missing is never a mystery.
-func trustedOnly(paths config.Paths, cwd string, own []plugin.Manifest, trust TrustAsker, notice func(string)) []plugin.Manifest {
-	if len(own) == 0 {
-		return nil
+// workspaceTrust says whether cwd's own declarations (plugins, MCP servers and agent
+// definitions, ADR 0050) may run, and returns the workspace's own plugin manifests when they
+// may. A workspace that declares nothing has nothing to gate and is trusted. A caller that
+// cannot ask says why once, naming what it did not run, so a missing plugin or server is
+// never a mystery; a yes is recorded so the question is asked once per change.
+//
+// mcpReadable is false when the workspace's mcp.toml could not be read: a declaration with
+// no digest cannot be trusted, so the project MCP scope is withheld whatever the answer.
+func workspaceTrust(paths config.Paths, cwd string, ask TrustAsker, notice func(string)) (trusted, mcpReadable bool, own []plugin.Manifest) {
+	decls, errs := trust.Declarations(cwd)
+	mcpReadable = true
+	for _, err := range errs {
+		notice(err.Error())
+		var re *trust.ReadError
+		if errors.As(err, &re) {
+			mcpReadable = false
+		}
 	}
-	store := pluginstore.New(paths.Data)
-	trusted, err := store.IsTrusted(cwd, own)
+	if len(decls) == 0 {
+		return true, mcpReadable, nil
+	}
+	store := trust.NewStore(paths.Data)
+	trusted, err := store.IsTrusted(cwd, decls)
 	if err != nil {
 		notice(err.Error())
-		return nil
+		return false, mcpReadable, nil
 	}
-	if trusted {
-		return own
+	if !trusted {
+		if ask == nil {
+			var n [3]int
+			for _, d := range decls {
+				switch d.Kind {
+				case trust.KindPlugin:
+					n[0]++
+				case trust.KindMCP:
+					n[1]++
+				case trust.KindAgent:
+					n[2]++
+				}
+			}
+			notice(fmt.Sprintf("this workspace ships %d plugin(s), %d MCP server(s) and %d agent definition(s) and is not trusted; run rudy plugins trust to allow them", n[0], n[1], n[2]))
+			return false, mcpReadable, nil
+		}
+		ok, err := ask(cwd, decls)
+		if err != nil {
+			notice(err.Error())
+			return false, mcpReadable, nil
+		}
+		if !ok {
+			notice("this workspace's plugins, MCP servers and agents were not trusted; none of them were loaded")
+			return false, mcpReadable, nil
+		}
+		if err := store.Trust(cwd, decls, time.Now()); err != nil {
+			notice(err.Error())
+		}
 	}
-	if trust == nil {
-		notice(fmt.Sprintf("this workspace ships %d plugin(s) and is not trusted; run rudy plugins trust to allow them", len(own)))
-		return nil
-	}
-	ok, err := trust(cwd, own)
-	if err != nil {
-		notice(err.Error())
-		return nil
-	}
-	if !ok {
-		notice("this workspace's plugins were not trusted; none of them were started")
-		return nil
-	}
-	if err := store.Trust(cwd, own, time.Now()); err != nil {
-		notice(err.Error())
-	}
-	return own
+	// Discovery errors were noticed with the declarations above, and a corrupt lock file
+	// with the global roots, so only the manifests are wanted here.
+	own, _ = discoverPlugins([]string{filepath.Join(cwd, ".rudy")}, filepath.Join(paths.Data, pluginstore.LockFile))
+	return true, mcpReadable, own
 }
 
 // discoverPlugins is Discover minus what the lock file disables. A disabled plugin is not
@@ -415,12 +457,15 @@ func discoverPlugins(roots []string, lockPath string) ([]plugin.Manifest, []erro
 // /skills, /memory, the kernel's own slash commands (/model, /help, /fork, /plugins), the
 // MCP servers from mcp.toml, the openai_chat and anthropic_messages providers, and the
 // clinepass dialect over openai_chat.
-func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, env func(string) string, version string, summarize memoryplugin.Summarize) []plugin.Plugin {
+//
+// mcpProject is the project mcp.toml to read, or "" for the user file alone; the caller
+// passes it only for a trusted workspace.
+func BuiltinPlugins(cfg *config.Config, paths config.Paths, httpc *httpx.Client, env func(string) string, version string, summarize memoryplugin.Summarize, mcpProject string, trusted func(root string) bool) []plugin.Plugin {
 	resolve := func(ref string) (string, error) { return config.ResolveSecret(ref, env, cfg.Secrets.File) }
 	return append(BuiltinTools(), webplugin.New(cfg.Web, version, resolve),
-		subagents.New(paths.Config), codexplugin.New(codexapp.NewClient(codexapp.Command{CodexHome: filepath.Join(paths.Data, "codex")})), initcmd.New(), compactcmd.New(), commands.New(),
+		subagents.New(paths.Config, trusted), codexplugin.New(codexapp.NewClient(codexapp.Command{CodexHome: filepath.Join(paths.Data, "codex")})), initcmd.New(), compactcmd.New(), commands.New(),
 		skillsplugin.New(cfg.Skills.Dirs), memoryplugin.New(cfg.Memory, cfg.Sessions.Dir, version, summarize),
-		newMCPPlugin(cfg, paths, resolve, version),
+		newMCPPlugin(cfg, paths, resolve, version, mcpProject),
 		openaichatplugin.New(cfg.Providers, httpc, resolve),
 		anthropicplugin.New(cfg.Providers, httpc, resolve),
 		clinepass.New(cfg.Providers, httpc, resolve))
@@ -439,18 +484,16 @@ func modelSources(plugins *plugin.Registry) []provider.ModelSource {
 	return sources
 }
 
-// newMCPPlugin is the mcp plugin over the user and project mcp.toml files. Plugins load once
-// at boot, before any session, so the project scope is the workspace rudy was started in; no
-// workspace there means the user scope is all there is, never a reason to fail the build.
-func newMCPPlugin(cfg *config.Config, paths config.Paths, resolve func(string) (string, error), version string) plugin.Plugin {
-	cwd, err := os.Getwd()
-	if err != nil {
-		// No working directory is no project scope, never a reason to fail the build.
-		cwd = ""
-	}
-	user, project := mcpplugin.Paths(paths.Config, cwd)
-	return mcpplugin.New(user, project, time.Duration(cfg.MCP.ConnectTimeoutMS)*time.Millisecond, resolve, version)
+// newMCPPlugin is the mcp plugin over the user mcp.toml and, when mcpProject is not empty,
+// the project one. Whether the project file may be read is the caller's decision.
+func newMCPPlugin(cfg *config.Config, paths config.Paths, resolve func(string) (string, error), version, mcpProject string) plugin.Plugin {
+	user, _ := mcpplugin.Paths(paths.Config, "")
+	return mcpplugin.New(user, mcpProject, time.Duration(cfg.MCP.ConnectTimeoutMS)*time.Millisecond, resolve, version)
 }
+
+// builtinPlugins is BuiltinPlugins as Build calls it; a test replaces it to see what
+// project path reaches the MCP plugin.
+var builtinPlugins = BuiltinPlugins
 
 // summarizeWith is the one prompt the memory plugin runs through a model. Nothing is resolved
 // at wire time: the provider registry is filled by plugin.Load, which happens after this

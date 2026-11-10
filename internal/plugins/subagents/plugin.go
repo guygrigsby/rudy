@@ -30,14 +30,18 @@ const schema = `{"type":"object","properties":{"agent":{"type":"string","descrip
 
 type agentPlugin struct {
 	configDir string
+	trusted   func(root string) bool
 	host      plugin.Host
 }
 
 // New returns the plugin. configDir is the user's rudy config directory, whose agents/
 // subdirectory is the first root the roster hook and the server both read; a workspace's own
 // .rudy/agents/ is the second, read fresh per session so an edit between sessions takes effect
-// without a restart.
-func New(configDir string) plugin.Plugin { return &agentPlugin{configDir: configDir} }
+// without a restart. trusted says whether the operator trusted a workspace root; the workspace's
+// agents are read only then, the same gate the server applies (ADR 0050). Nil trusts none.
+func New(configDir string, trusted func(root string) bool) plugin.Plugin {
+	return &agentPlugin{configDir: configDir, trusted: trusted}
+}
 
 func (p *agentPlugin) Name() string { return "subagents" }
 
@@ -62,9 +66,10 @@ func (p *agentPlugin) Init(_ context.Context, h plugin.Host) error {
 }
 
 // roster lists the definitions visible to one session: the operator's config directory, then
-// the workspace's own .rudy/agents, then whatever plugins registered, first name winning. That
-// is the same precedence resolveAgent uses to pick a definition, so what the roster advertises
-// is what a call actually gets.
+// the workspace's own .rudy/agents (only when trusted), then whatever plugins registered, first
+// name winning. That is the same precedence and the same trust gate resolveAgent uses, so what
+// the roster advertises is what a call actually gets, and an untrusted repository's agent
+// descriptions never reach the model's context.
 func (p *agentPlugin) roster(_ context.Context, call plugin.HookCall) (any, error) {
 	payload, ok := call.Payload.(*plugin.SessionOpenedPayload)
 	if !ok || payload == nil {
@@ -77,10 +82,11 @@ func (p *agentPlugin) roster(_ context.Context, call plugin.HookCall) (any, erro
 		// theoretical one (ADR 0028).
 		return nil, nil
 	}
-	defs, errs := agentdef.Load([]string{
-		filepath.Join(p.configDir, "agents"),
-		filepath.Join(payload.Workspace.Root, ".rudy", "agents"),
-	})
+	roots := []string{filepath.Join(p.configDir, "agents")}
+	if p.trusted != nil && p.trusted(payload.Workspace.Root) {
+		roots = append(roots, filepath.Join(payload.Workspace.Root, ".rudy", "agents"))
+	}
+	defs, errs := agentdef.Load(roots)
 	for _, e := range errs {
 		p.host.Notice(e.Error())
 	}

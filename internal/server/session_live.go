@@ -13,6 +13,7 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/guygrigsby/rudy/internal/agentruntime"
+	"github.com/guygrigsby/rudy/internal/gate"
 	"github.com/guygrigsby/rudy/internal/protocol"
 	"github.com/guygrigsby/rudy/internal/provider"
 	"github.com/guygrigsby/rudy/internal/session"
@@ -471,7 +472,24 @@ type childAttachment struct {
 func (ls *liveSession) subscribeLocked(cn *conn) attachment {
 	sid := ls.sess.ID()
 	ls.obsMu.Lock()
-	ls.conns = append(ls.conns, cn)
+	// A connection subscribes once: resuming a session it is already on must not make it a
+	// second asker, or the tripwire below fires with nobody new to announce.
+	already := slices.Contains(ls.conns, cn)
+	if !already {
+		ls.conns = append(ls.conns, cn)
+	}
+	// Every route onto a session ends here, so this is the one place a second asker can be
+	// caught (ADR 0054). Any same-user client may declare itself an asker; the trust model
+	// allows it and this is the tripwire that keeps it from being silent. Said to every
+	// subscriber, the newcomer included, since each of them is now answerable by one more.
+	if cn.isAsker() && !already {
+		if n := len(ls.askersObsLocked()); n > 1 {
+			ls.broadcastObsLocked(protocol.NotifyNotice, protocol.NoticeParams{
+				Level: "warn",
+				Text:  fmt.Sprintf("asker %s attached; %d askers can now answer this session's questions", cn.name, n),
+			})
+		}
+	}
 	at := attachment{
 		entries: append([]session.Entry(nil), ls.entries...),
 		info:    deriveInfo(sid, ls.entries),
@@ -815,10 +833,14 @@ type standingAsk struct {
 // the Gate's own verdict for this call (turn.Question.Dangerous): settleLocked must never settle
 // one from another call's session-scope allow (ADR 0011, ADR 0028 decision 4), so it is recorded
 // here rather than re-derived from the matcher, which cannot tell dangerous from ordinary.
+//
+// set is the question's call set (gate.CallSet over its input, computed once at ask time):
+// settleLocked retires the question only when allowances cover every matcher in it (ADR 0051).
 type pendingAsk struct {
 	ch        chan turn.Answer
 	key       askKey
 	dangerous bool
+	set       []session.Matcher
 }
 
 // liveAsker puts one turn's permission questions to every asker connection the session has
@@ -828,6 +850,7 @@ type liveAsker struct {
 	ls     *liveSession
 	sid    string
 	runner *turn.Runner
+	gate   *gate.Gate // reads a question's call set; the same Gate the runner evaluates with
 }
 
 // Ask is called from every goroutine running a tool call in the turn, so it may be re-entered
@@ -983,22 +1006,36 @@ func (ls *liveSession) resolveAnswer(toolUseID string, ans turn.Answer) (ch chan
 	return pend.ch, settle, found, already
 }
 
-// settleLocked retires every other tool_use currently asking under matcher m: a session-scope
-// allow just granted for m covers them too, by the same rule Gate.Evaluate applies to a call
-// that has not asked yet (ADR 0028 decision 4), so a question raised before that allowance
-// existed does not stay open asking for something already granted. A question the Gate marked
-// dangerous is never settled this way: ADR 0011 puts the dangerous set ahead of session
-// allowances in every mode but off, so a dangerous command must always take its own answer,
-// never one settled from a different call's allow, or settlement becomes a way to launder
-// consent past exactly the check ADR 0011 exists to enforce (two concurrent `rm -rf` calls on
-// different paths must not let a session allow on one silence the other). Caller holds mu; it
-// takes and releases obsMu itself, once, for the standing and answered bookkeeping each
-// retirement needs.
+// settleLocked retires every other tool_use currently asking whose call set the session's
+// allowances now cover entirely, with m, the matcher just granted, counted among them: a
+// session-scope allow covers a command only when it covers every call the command runs, by the
+// same rule Gate.Evaluate applies to a call that has not asked yet (ADR 0028 decision 4, ADR
+// 0051 decision 1), so a question raised before that allowance existed does not stay open
+// asking for something already granted, and one with a second, uncovered call keeps asking.
+// A question the Gate marked dangerous is never settled this way: ADR 0011 puts the dangerous
+// set ahead of session allowances in every mode but off, so a dangerous command must always
+// take its own answer, never one settled from a different call's allow, or settlement becomes
+// a way to launder consent past exactly the check ADR 0011 exists to enforce (two concurrent
+// `rm -rf` calls on different paths must not let a session allow on one silence the other).
+// Caller holds mu; it takes and releases obsMu itself, once, for the standing and answered
+// bookkeeping each retirement needs.
 func (ls *liveSession) settleLocked(m session.Matcher) []chan turn.Answer {
 	var chans []chan turn.Answer
 	var ids []string
+	var allowances []session.Matcher
+	if !ls.closed {
+		allowances = ls.sess.Allowances()
+	}
+	allowances = append(allowances, m)
 	for id, pend := range ls.pending {
-		if pend.key.matcher != m || pend.dangerous {
+		if pend.dangerous {
+			continue
+		}
+		set := pend.set
+		if len(set) == 0 {
+			set = []session.Matcher{pend.key.matcher}
+		}
+		if _, uncovered := gate.Uncovered(set, allowances); uncovered {
 			continue
 		}
 		chans = append(chans, pend.ch)
@@ -1033,7 +1070,7 @@ func (a *liveAsker) ask(ctx context.Context, q turn.Question) (turn.Answer, erro
 	ch := make(chan turn.Answer, 1)
 	abandon := make(chan struct{})
 	a.ls.mu.Lock()
-	a.ls.pending[q.ToolUseID] = pendingAsk{ch: ch, key: keyFor(q), dangerous: q.Dangerous}
+	a.ls.pending[q.ToolUseID] = pendingAsk{ch: ch, key: keyFor(q), dangerous: q.Dangerous, set: a.gate.CallSet(q.Tool, q.Input)}
 	a.ls.mu.Unlock()
 	askers := a.ls.stand(standingQuestion{req: req, abandon: abandon})
 	if len(askers) == 0 {

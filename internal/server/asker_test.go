@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -546,4 +547,85 @@ func TestAnAnswerForAnotherTurnIsRefused(t *testing.T) {
 		t.Fatalf("the question was lost with the refusals: %v", err)
 	}
 	drain(t, cl, completedOn(info.SessionID))
+}
+
+// TestSecondAskerIsAnnounced pins the tripwire ADR 0054 keeps in place of a stricter trust
+// model: a headless attach is silent, and a second asker joining a session is told to every
+// subscriber, the first asker over the wire included, naming the client that joined.
+func TestSecondAskerIsAnnounced(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	first := h.dial(t, true)
+	info := h.open(t, first)
+
+	attachedNotice := func(n protocol.Notification) (string, bool) {
+		if n.Method != protocol.NotifyNotice {
+			return "", false
+		}
+		var p protocol.NoticeParams
+		if err := json.Unmarshal(n.Params, &p); err != nil {
+			t.Fatalf("notice params: %v", err)
+		}
+		if p.Level != "warn" || !strings.Contains(p.Text, "attached") {
+			return "", false
+		}
+		return p.Text, true
+	}
+
+	// A non-asker attaching changes who can answer nothing, so nothing is said.
+	viewer := h.dial(t, false)
+	resumeOn(t, viewer, info.SessionID)
+
+	joiner := protocol.NewClient(dialConn(t, h.srv))
+	t.Cleanup(func() { _ = joiner.Close() })
+	if err := joiner.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "joiner", Version: "0", Asker: true}, &protocol.ClientHelloResult{}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	resumeOn(t, joiner, info.SessionID)
+
+	var text string
+	drain(t, first, func(n protocol.Notification) bool {
+		var ok bool
+		text, ok = attachedNotice(n)
+		return ok
+	})
+	for _, want := range []string{"asker joiner attached", "2 askers"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice %q lacks %q", text, want)
+		}
+	}
+}
+
+// TestReResumeIsNotASecondAsker: a connection already subscribed to a session that resumes it
+// again is still one asker, so the tripwire stays quiet; a genuinely new asker still trips it.
+func TestReResumeIsNotASecondAsker(t *testing.T) {
+	h := newHarness(t, &scriptProvider{})
+	first := h.dial(t, true)
+	info := h.open(t, first)
+	resumeOn(t, first, info.SessionID)
+
+	joiner := protocol.NewClient(dialConn(t, h.srv))
+	t.Cleanup(func() { _ = joiner.Close() })
+	if err := joiner.Call(context.Background(), protocol.MethodClientHello, protocol.ClientHelloParams{Client: "joiner", Version: "0", Asker: true}, &protocol.ClientHelloResult{}); err != nil {
+		t.Fatalf("hello: %v", err)
+	}
+	resumeOn(t, joiner, info.SessionID)
+
+	var text string
+	drain(t, first, func(n protocol.Notification) bool {
+		if n.Method != protocol.NotifyNotice {
+			return false
+		}
+		var p protocol.NoticeParams
+		if err := json.Unmarshal(n.Params, &p); err != nil {
+			t.Fatalf("notice params: %v", err)
+		}
+		if !strings.Contains(p.Text, "attached") {
+			return false
+		}
+		text = p.Text
+		return true
+	})
+	if !strings.Contains(text, "asker joiner attached") || !strings.Contains(text, "2 askers") {
+		t.Fatalf("first attached notice = %q, want joiner and 2 askers", text)
+	}
 }

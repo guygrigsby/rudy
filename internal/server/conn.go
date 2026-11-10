@@ -24,9 +24,12 @@ type conn struct {
 	// connection starts true: the server handed it out itself, so there is nothing to
 	// introduce. greeted is whether a client.hello has actually been answered, which is
 	// what makes a second one a refusal.
-	hello    bool
-	greeted  bool
-	asker    bool
+	hello   bool
+	greeted bool
+	asker   bool
+	// name is the client name from client.hello, what a notice names when this connection
+	// joins a session that already has an asker. Written once by the hello, before anything else dispatches.
+	name     string
 	sameUser bool
 	// plugin is the caller class: the plugin's name on a connection the server itself
 	// handed out through Host.Connect, or a spawned plugin's stdio peer, empty on every

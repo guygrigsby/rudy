@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -466,5 +467,25 @@ func TestADifferentIDAtTheSameIndexIsANewCall(t *testing.T) {
 	}
 	if len(ends) != 2 {
 		t.Errorf("tool_use_end parts = %v, want one per call", ends)
+	}
+}
+
+func TestCompleteRefusesARedirectAndLeaksNoCredential(t *testing.T) {
+	var leaked atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked.Add(1)
+	}))
+	t.Cleanup(target.Close)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(origin.Close)
+	c := New(Options{Name: "aperture", BaseURL: origin.URL + "/v1", Token: "tok", Headers: map[string]string{"X-Api-Key": "k"}, HTTP: httpx.New("test")})
+	err := c.Complete(context.Background(), simpleRequest(), func(provider.Part) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "does not follow provider redirects") {
+		t.Fatalf("got %v", err)
+	}
+	if n := leaked.Load(); n != 0 {
+		t.Fatalf("target saw %d requests", n)
 	}
 }

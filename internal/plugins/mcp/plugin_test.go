@@ -117,6 +117,21 @@ func (h *harness) hasNotice(want string) bool {
 	return false
 }
 
+// TestNewWithNoProjectPathReadsUserOnly: "" is the user scope alone, which is what the client
+// passes for a workspace nobody trusted.
+func TestNewWithNoProjectPathReadsUserOnly(t *testing.T) {
+	requireEcho(t)
+	h := loadServers(t, map[string]ServerConfig{
+		"echo": {Transport: TransportStdio, Command: echoBin},
+	})
+	if _, ok := h.reg.Tool("mcp__echo__echo"); !ok {
+		t.Fatalf("no mcp__echo__echo in %v", toolNames(h.reg))
+	}
+	if n := len(toolNames(h.reg)); n != 2 {
+		t.Fatalf("want the echo server's two tools, got %v", toolNames(h.reg))
+	}
+}
+
 func TestPluginRegistersOneServerAndNoticesTheOther(t *testing.T) {
 	h := load(t)
 	if st := h.reg.Statuses()[0]; st.Name != "mcp" || st.State != plugin.StateReady {

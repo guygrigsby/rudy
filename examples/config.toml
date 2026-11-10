@@ -72,8 +72,8 @@ file = ""
 mode = "strict"
 # The window two Escapes have to fall inside to cancel a turn.
 double_press_ms = 500
-# Always ask, unless the mode is off: a bash prefix, "tool:", or "tool:prefix".
-dangerous = ["rm -rf", "rm -r", "git push --force", "git push -f", "git reset --hard", "git clean", "sudo", "chmod -R", "chown -R", "mkfs", "dd"]
+# Always ask, unless the mode is off: a bash command with the tokens it requires in any order, "tool:", or "tool:entry" (ADR 0051).
+dangerous = ["rm -rf", "rm -r", "git push --force", "git push -f", "git push --force-with-lease", "git push --delete", "git reset --hard", "git clean", "sudo", "chmod -R", "chown -R", "mkfs", "dd"]
 
 # Where session logs live and when they are compacted.
 [sessions]

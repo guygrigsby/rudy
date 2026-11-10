@@ -64,6 +64,9 @@ func lintEntries(es []entry) []Finding {
 			skipping = nil
 		}
 		if root.resolve(e.path) != nil {
+			if isSecretKey(e.path) && literalString(e.value) {
+				out = append(out, Finding{Line: e.line, Text: strings.Join(e.path, ".") + " holds a value, not a secret reference (env:NAME or cache:KEY); move the key to the environment or the secrets file"})
+			}
 			continue
 		}
 		out = append(out, Finding{Line: e.line, Text: describe(root, es, i)})
@@ -72,6 +75,32 @@ func lintEntries(es []entry) []Finding {
 		}
 	}
 	return out
+}
+
+// isSecretKey reports whether path is a key that takes a secret reference: a provider's
+// auth, matched by shape because the provider name is the operator's, or a web API key.
+func isSecretKey(path []string) bool {
+	p := make([]string, len(path))
+	for i, s := range path {
+		p[i] = strings.ToLower(s)
+	}
+	switch {
+	case len(p) == 3 && p[0] == "providers" && p[2] == "auth":
+		return true
+	case len(p) == 2 && p[0] == "web" && (p[1] == "brave_api_key" || p[1] == "exa_api_key"):
+		return true
+	}
+	return false
+}
+
+// literalString reports whether a raw TOML value is a non-empty quoted string that is not
+// an env: or cache: reference. The finding built from it never carries the text itself.
+func literalString(raw string) bool {
+	if len(raw) < 2 || (raw[0] != '"' && raw[0] != '\'') {
+		return false
+	}
+	body, _, _ := strings.Cut(raw[1:], string(raw[0]))
+	return body != "" && !strings.HasPrefix(body, "env:") && !strings.HasPrefix(body, "cache:")
 }
 
 // describe is what to say about the entry at i, which the schema could not resolve.

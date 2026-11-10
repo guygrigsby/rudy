@@ -282,6 +282,21 @@ boundary everything is trusted, deliberately:
 - Installing a plugin runs its code. `rudy plugins install` builds from a
   source you named (ADR 0025), a linked plugin runs in this process, and a
   spawned one is a subprocess holding everything you hold.
+- A repository you open runs nothing of its own until you say so. Its
+  `.rudy/plugins`, `.rudy/mcp.toml` and `.rudy/agents` are declarations, and
+  rudy asks once per repository, listing them, before any of them loads; a
+  change to any of them asks again, and a client that cannot ask loads your
+  own scope only (ADR 0050). `AGENTS.md` and `.agents/skills` are read into
+  the model's context without asking: they run nothing, and the model reads
+  them like any other text in the repository.
+- In permissive mode with a daemon serving, a shell command the Gate has let
+  run once can attach to the socket as an asker and answer the model's later
+  questions itself, because it runs as you (ADR 0054). Rudy announces a
+  second asker joining a session; it does not stop one. For content you do
+  not trust, run strict mode with no daemon, which is what a plain `rudy`
+  does when nothing answers on the socket.
+- A provider request never follows a redirect, so the key leaves for the
+  host you configured and no other (ADR 0052).
 - A session log holds what the model saw: prompts, tool inputs, tool outputs
   and whatever a file read put in front of it, `0600` under a `0700`
   directory, unencrypted. Provider keys stay in config or the environment and
@@ -289,9 +304,10 @@ boundary everything is trusted, deliberately:
 - `web_fetch` puts somebody else's page into the model's context as text, and
   rudy puts no fence around it: a page can carry instructions and the model
   reads them like any other text. The tool is `unsafe`, so strict mode asks
-  before the first one, and it refuses loopback, private and link-local
-  addresses at every redirect so a URL cannot reach this machine's own
-  services (ADR 0039).
+  before the first one, and it refuses loopback, private, link-local and this
+  machine's own addresses at every redirect, dialing only the addresses it
+  checked, so a URL cannot reach this machine's own services (ADR 0039,
+  ADR 0053).
 - `--host` runs the kernel on another machine over ssh (ADR 0029). That trust
   is ssh's. Rudy adds no authentication of its own, and the daemon there
   applies this same model as the remote user.

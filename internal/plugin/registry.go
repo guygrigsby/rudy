@@ -701,6 +701,9 @@ func (h *host) checkProviderNamespace(name, kind string) error {
 }
 
 func (h *host) RegisterAgent(d agentdef.Definition) error {
+	if d.Name == "default" {
+		return fmt.Errorf("plugin %s: agent default: the default agent is the operator's, not a plugin's", h.name)
+	}
 	if d.Description == "" {
 		return fmt.Errorf("plugin %s: agent %s: description is required", h.name, d.Name)
 	}

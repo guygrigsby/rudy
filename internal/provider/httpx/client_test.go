@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -262,5 +264,85 @@ func TestDoDoesNotOutliveContextDuringBackoffSleep(t *testing.T) {
 	}
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("Do outlived its context: took %v against a 50ms timeout and a 1s backoff", elapsed)
+	}
+}
+
+// redirectTarget is a server that records every request it sees, standing in for the host a
+// hostile base_url redirects to.
+func redirectTarget(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var seen atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.Add(1)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &seen
+}
+
+func TestDoRefusesRedirectAndSendsNothingToTheTarget(t *testing.T) {
+	for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		target, seen := redirectTarget(t)
+		var hits atomic.Int32
+		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			http.Redirect(w, r, target.URL+"/steal", status)
+		}))
+		defer origin.Close()
+		c, slept := newClient(t)
+		req, _ := http.NewRequest(http.MethodPost, origin.URL, bytes.NewReader([]byte(`{"x":1}`)))
+		req.Header.Set("X-Api-Key", "secret")
+		_, err := c.Do(context.Background(), req, ulid.ULID{})
+		if err == nil {
+			t.Fatalf("%d: want error", status)
+		}
+		host := strings.TrimPrefix(target.URL, "http://")
+		if !strings.Contains(err.Error(), host) || !strings.Contains(err.Error(), "does not follow provider redirects") {
+			t.Errorf("%d: error %q does not name %s", status, err, host)
+		}
+		if strings.Contains(err.Error(), "/steal") {
+			t.Errorf("%d: error leaks the Location path: %q", status, err)
+		}
+		if n := seen.Load(); n != 0 {
+			t.Errorf("%d: target saw %d requests", status, n)
+		}
+		if hits.Load() != 1 || len(*slept) != 0 {
+			t.Errorf("%d: origin hits %d, sleeps %v; a 3xx is not retried", status, hits.Load(), *slept)
+		}
+	}
+}
+
+func TestRedirectWithoutLocationIsNamed(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer origin.Close()
+	c, _ := newClient(t)
+	req, _ := http.NewRequest(http.MethodGet, origin.URL, nil)
+	_, err := c.Do(context.Background(), req, ulid.ULID{})
+	if err == nil || !strings.Contains(err.Error(), "(no Location)") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// A redirect to a different host string for the same machine (127.0.0.1 to localhost) is
+// refused even though the target is reachable: the client never follows, so the recording
+// target sees nothing.
+func TestRedirectToSubdomainStillRefused(t *testing.T) {
+	target, seen := redirectTarget(t)
+	port := target.Listener.Addr().(*net.TCPAddr).Port
+	loc := "http://localhost:" + strconv.Itoa(port) + "/x"
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, loc, http.StatusMovedPermanently)
+	}))
+	defer origin.Close()
+	c, _ := newClient(t)
+	req, _ := http.NewRequest(http.MethodGet, origin.URL, nil)
+	req.Header.Set("X-Api-Key", "secret")
+	_, err := c.Do(context.Background(), req, ulid.ULID{})
+	if err == nil || !strings.Contains(err.Error(), "does not follow provider redirects") || !strings.Contains(err.Error(), "localhost:") {
+		t.Fatalf("want a refusal naming localhost, got %v", err)
+	}
+	if n := seen.Load(); n != 0 {
+		t.Fatalf("target saw %d requests", n)
 	}
 }

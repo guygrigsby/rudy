@@ -110,6 +110,8 @@ type entry struct {
 	line  int
 	path  []string
 	table bool
+	// value is the text after the = of a key, trimmed and comment-free; empty for a table.
+	value string
 }
 
 // entries is every table header and key in the file, in the order they are written.
@@ -135,12 +137,12 @@ func entries(lines []string) []entry {
 			table = splitKey(strings.Trim(line[:end+1], "[]"))
 			out = append(out, entry{line: i + 1, path: table, table: true})
 		default:
-			name, _, ok := strings.Cut(line, "=")
+			name, val, ok := strings.Cut(line, "=")
 			if !ok {
 				continue
 			}
 			key := append(append([]string{}, table...), splitKey(strings.TrimSpace(name))...)
-			out = append(out, entry{line: i + 1, path: key})
+			out = append(out, entry{line: i + 1, path: key, value: strings.TrimSpace(val)})
 			depth += brackets(line)
 		}
 	}

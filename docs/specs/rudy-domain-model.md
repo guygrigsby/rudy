@@ -169,7 +169,7 @@ local control and approval facts.
   fsynced `runtime_permission_decision` bound to that exact runtime request.
 - Entry payloads that carry provider bytes (tool_use input, thinking signatures, tool result content) are stored byte-exact and never re-marshaled.
 - At most one Turn is active per Session at any time.
-- An allowance matches a later tool_use only on `Matcher` equality: same tool and same prefix. A looser match is refused.
+- An allowance matches a later tool_use only on `Matcher` equality: same tool and same prefix. A looser match is refused. For `bash` the input's call set (every simple command it runs, after wrapper expansion, each reduced to a prefix) must be covered prefix by prefix: one uncovered call means the command asks, and the question names that call's prefix (ADR 0051).
 - A Session with at least one child fork refuses deletion.
 
 ### States
@@ -333,9 +333,9 @@ Value object, owned by `PermissionDecision`. The Gate's classification of a tool
 | Field | Type | Meaning |
 |---|---|---|
 | `tool` | string | The tool name |
-| `prefix` | string | The leading words of the command for `bash`; empty for every other tool |
+| `prefix` | string | For `bash`, the first two words of one simple command: the command name as the shell will run it (path and leading backslash stripped) and its second word. Empty for every other tool |
 
-Two matchers are equal only when both fields are equal. An allowance matches on `Matcher` equality and nothing looser.
+Two matchers are equal only when both fields are equal. An allowance matches on `Matcher` equality and nothing looser. A `bash` input has one matcher per simple command it runs (its call set, computed with the same wrapper expansion the dangerous set uses); the matcher a question carries and a `permission_decision` records is the first one in that set no allowance covers, so a session allow on it covers exactly that call next time (ADR 0051).
 
 ## ToolResult
 
@@ -581,7 +581,7 @@ Enumeration.
 |---|---|
 | `class` | The tool is safe; no question arose |
 | `mode` | Off or permissive let it through without asking |
-| `allowance` | A prior session-scope allow matched on `Matcher` equality |
+| `allowance` | Every matcher in the input's call set is covered by a prior session-scope allow (ADR 0051) |
 | `hook` | A `before_tool` handler decided |
 | `asker` | A human or client answered |
 | `no_asker` | Strict mode with nobody to ask; always a deny |
@@ -593,7 +593,7 @@ Enumeration. How long a permission answer holds.
 | Value | Means |
 |---|---|
 | `once` | This tool_use only. Every row not from an asker allow says `once` |
-| `session` | Every later tool_use with an equal `Matcher` in this session. Only an asker allow can say it |
+| `session` | Every later tool_use whose call set this `Matcher` covers, together with the session's other allowances, in this session. Only an asker allow can say it |
 
 ## ToolOutcome
 
@@ -1361,6 +1361,32 @@ Value object. One row of `plugins.lock.toml`.
 | `installedAt` | instant | |
 | `enabled` | bool | A disabled plugin is discovered and not spawned |
 
+## WorkspaceDeclaration
+
+Value object. One thing a workspace ships under `.rudy` that asks rudy to run code or to speak for it: a plugin manifest, an MCP server entry or an agent definition (ADR 0050).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `kind` | DeclarationKind | `plugin`, `mcp` or `agent` |
+| `name` | string | The manifest name, the `[servers.<name>]` key or the agent file's stem |
+| `digest` | string | hex sha256 of what the declaration would do. Plugin: name, version, command, args, build, the `env` table sorted, and the bytes of the executable when `command` resolves to a file inside the plugin directory. MCP: name, transport, command, args, `env`, `url` and `headers` as written, references unresolved. Agent: the file's bytes |
+| `summary` | string | One line for the question the operator answers: what it runs or names. Not part of the digest |
+
+Two declarations are equal when kind, name and digest are equal. A workspace's digest is the sha256 of its declarations' `kind`, `name` and `digest` lines, sorted.
+
+## TrustRecord
+
+Entity, identified by workspace root. The operator's yes to a workspace's declarations as they stood (ADR 0025, ADR 0050). Owned by nothing; `trust.toml` holds one per root.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `root` | string | The workspace root, absolute |
+| `digest` | string | The workspace digest the operator agreed to |
+| `declared` | [string] | `kind:name` of every declaration agreed to, sorted, for a person reading the file |
+| `trusted_at` | time | When |
+
+Behaviors: `Covers(declarations) bool` is true only when the workspace digest of the declarations given equals `digest`; a workspace that gained, lost or changed a declaration is not trusted for what it is now. A record is written only by a person's yes (the client's question, or `rudy plugins trust`), never by the server. Relationships: references a Workspace by root, 1-1.
+
 ## TranscriptRow
 
 Entity, owned by the Client context. One thing on screen, derived from entries and notifications; keyed by the entry id it came from, or by tool_use id for a tool row.
@@ -1696,7 +1722,7 @@ classDiagram
 
 ## Open, not assumed
 
-- Dangerous set for permissive mode: the exact tools and shell patterns that ask under `permissive` are undecided.
+- Dangerous set contents: the shipped entries are the config default. How an entry matches a call is decided (ADR 0051): command name plus required tokens in any order, after flag normalization; an unclassifiable call, a shell given a script or nothing, and `source` are dangerous without an entry.
 - Capabilities for unmatched proxy models: when catwalk has no entry for a proxy model id, `Capabilities` is empty. How to fill it (probe, config, assume a floor) is undecided.
 - Workspace skills path: `<workspace>/.agents/skills` is inferred as the workspace-scoped location. Confirm the exact path.
 - Double-press window: 500ms for the Esc cancel window is inferred, not stated.

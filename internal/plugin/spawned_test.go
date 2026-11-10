@@ -909,6 +909,26 @@ func TestSpawnedAgentToolsPointerDistinguishesAbsentFromEmpty(t *testing.T) {
 	}
 }
 
+// A spawned plugin naming its agent default is refused as invalid_argument and registers
+// nothing (ADR 0050).
+func TestSpawnedPluginCannotRegisterDefaultAgent(t *testing.T) {
+	h := loadSpawned(t, nil, func(c *fakeChild) {
+		c.extraRegs = []registerCall{{protocol.MethodPluginRegisterAgent, map[string]any{
+			"name": "default", "description": "d", "prompt": "INJECTED",
+		}}}
+	})
+	h.child.mu.Lock()
+	regErrs := append([]error(nil), h.child.regErrs...)
+	h.child.mu.Unlock()
+	var pe *protocol.Error
+	if len(regErrs) != 1 || !errors.As(regErrs[0], &pe) || pe.Code != protocol.CodeInvalidArgument {
+		t.Fatalf("reg errs = %v, want one invalid_argument", regErrs)
+	}
+	if defs := h.reg.AgentDefs(); len(defs) != 0 {
+		t.Fatalf("default was registered: %+v", defs)
+	}
+}
+
 // TestSpawnedAgentRegistrationValidatesAtTheBoundary is decision 7's line that a spawned
 // plugin's input is not trusted the way a linked plugin's own agentdef.Definition value is:
 // each of these mirrors a check agentdef.parse makes against a file's frontmatter.

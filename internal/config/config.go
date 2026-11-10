@@ -304,7 +304,7 @@ func Defaults() map[string]any {
 		"permissions.mode":            "strict",
 		"permissions.double_press_ms": 500,
 		"permissions.dangerous": []string{
-			"rm -rf", "rm -r", "git push --force", "git push -f", "git reset --hard",
+			"rm -rf", "rm -r", "git push --force", "git push -f", "git push --force-with-lease", "git push --delete", "git reset --hard",
 			"git clean", "sudo", "chmod -R", "chown -R", "mkfs", "dd",
 		},
 		"sessions.dir":                     "", // filled from paths.Data when still empty after Load
